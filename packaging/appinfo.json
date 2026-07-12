@@ -1,0 +1,15 @@
+{
+    "id": "io.unom.punktfunk.webos",
+    "version": "0.9.2",
+    "vendor": "unom",
+    "type": "native",
+    "main": "bin/punktfunk-webos",
+    "title": "punktfunk",
+    "icon": "icon.png",
+    "iconColor": "#1c1530",
+    "largeIcon": "icon_large.png",
+    "splashBackground": "splash.png",
+    "appDescription": "punktfunk — low-latency desktop/game streaming client",
+    "supportTouchMode": "full",
+    "useAllMouseButtons": true
+}

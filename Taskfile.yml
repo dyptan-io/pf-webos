@@ -1,0 +1,115 @@
+# The front door for building/packaging pf-webos — used directly on a Linux/macOS
+# dev box with Rust installed, inside Docker (no local Rust/NDK needed, see the
+# `docker:*` tasks), and in CI (.github/workflows/build.yml just runs
+# `task package`). The webOS-specific plumbing (fetching the cross-toolchain,
+# staging + invoking ares-package, the Docker wrappers) lives in
+# `taskfiles/toolchain.yml`, kept separate so this file stays short — run
+# `task --list-all` to see everything, including that file's tasks under the
+# `toolchain:` namespace.
+#
+# The only shell scripts left outside Task entirely are `scripts/cc-shim.sh`/
+# `cxx-shim.sh` — Cargo's `linker`/`CC`/`CXX` config needs an actual executable
+# path it invokes directly with a full compiler argv, not a task name.
+version: '3'
+
+# TV_HOST (used by deploy/deploy:log below) can live in a local, gitignored .env
+# instead of being typed on every invocation — see .env.example.
+dotenv: ['.env']
+
+includes:
+  toolchain:
+    taskfile: ./taskfiles/toolchain.yml
+    vars:
+      NDK_DIR: '{{.NDK_DIR}}'
+      SYSROOT: '{{.SYSROOT}}'
+      TARGET: '{{.TARGET}}'
+      RUST_IMAGE: '{{.RUST_IMAGE}}'
+
+vars:
+  NDK_DIR: .toolchains/arm-webos-linux-gnueabi_sdk-buildroot
+  SYSROOT: '{{.NDK_DIR}}/arm-webos-linux-gnueabi/sysroot'
+  TARGET: armv7-unknown-linux-gnueabi
+  RUST_IMAGE: rust:bookworm
+
+tasks:
+  build:
+    desc: Cross-compile the release binary (armv7-unknown-linux-gnueabi)
+    deps: [toolchain:all]
+    env:
+      # Modern CMake refuses vendored libopus's old cmake_minimum_required
+      # (audiopus_sys, pulled in transitively by punktfunk-core's `quic` feature).
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+    cmds:
+      - rustup target add {{.TARGET}}
+      - cargo build --release --target {{.TARGET}}
+
+  check:
+    desc: Quick cross-target `cargo check` (no release build/packaging)
+    deps: [toolchain:all]
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+    cmds:
+      - rustup target add {{.TARGET}}
+      - cargo check --target {{.TARGET}}
+
+  package:
+    desc: Build and package dist/*.ipk — this is the one you usually want
+    deps: [build, toolchain:ares-package]
+    cmds:
+      - task: toolchain:stage-and-package
+
+  docker:build:
+    desc: Same as `build`, fully inside Docker (no local Rust/NDK needed)
+    cmds:
+      - task: toolchain:docker-run
+        vars: {TARGET_TASK: build}
+
+  docker:check:
+    desc: Same as `check`, fully inside Docker
+    cmds:
+      - task: toolchain:docker-run
+        vars: {TARGET_TASK: check}
+
+  docker:package:
+    desc: Same as `package`, fully inside Docker — the one to reach for with no local Rust
+    cmds:
+      - task: toolchain:docker-run
+        vars: {TARGET_TASK: package}
+
+  docker:shell:
+    desc: Interactive shell in the build container (debugging)
+    cmds:
+      - task: toolchain:docker-shell
+
+  deploy:
+    desc: >-
+      Build, package, install on a real TV over SSH, and launch it — useful for
+      iterating/debugging on real hardware. Usage: task deploy TV_HOST=root@<tv-ip>
+      (or set TV_HOST in .env, see .env.example)
+    deps: [package]
+    requires:
+      vars: [TV_HOST]
+    cmds:
+      - task: toolchain:deploy
+        vars: {TV_HOST: '{{.TV_HOST}}'}
+
+  deploy:log:
+    desc: >-
+      Tail the app's log file on the TV over SSH. Usage:
+      task deploy:log TV_HOST=root@<tv-ip>
+    requires:
+      vars: [TV_HOST]
+    cmds:
+      - ssh {{.TV_HOST}} "tail -f /tmp/punktfunk-webos.log"
+
+  clean:
+    desc: Remove local build output (dist/) — keeps the toolchain/cargo caches
+    cmds:
+      - rm -rf dist
+
+  clean:all:
+    desc: Remove everything — dist/, .toolchains/, target/, and the Docker volumes
+    cmds:
+      - task: clean
+      - rm -rf .toolchains target
+      - task: toolchain:docker-volumes-rm
