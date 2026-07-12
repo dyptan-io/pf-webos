@@ -5,92 +5,85 @@ desktop and game streaming. Targets webOS 5.x+ (developed and verified live on a
 webOS 5.6**), packaged as a homebrew `.ipk` and sideloaded via
 [dev-manager-desktop](https://github.com/webosbrew/dev-manager-desktop).
 
-This client is **based on and depends on** the [punktfunk](https://git.unom.io/unom/punktfunk)
-project by **Enrico Bühler ([unom](https://unom.io))** — all credit for the protocol, FEC/crypto
-core, and host implementation belongs there. This repo contains only the webOS-specific client:
-an SDL2 UI, NDL DirectMedia hardware video decode, and webOS packaging, built directly on the
-upstream `punktfunk-core` crate (pulled in as a pinned git dependency — see `Cargo.toml`).
+Built on the upstream [punktfunk](https://git.unom.io/unom/punktfunk) project by **Enrico Bühler
+([unom](https://unom.io))** — all credit for the protocol, FEC/crypto core, and host implementation
+belongs there. This repo is only the webOS-specific client: an SDL2 UI, NDL DirectMedia hardware
+video decode, and webOS packaging, built directly on the upstream `punktfunk-core` crate (a pinned
+git dependency — see `Cargo.toml`).
 
-## What it does
+## Features
 
-- Discovers punktfunk hosts on the LAN (mDNS) or lets you add one manually by IP.
-- Pairs with a host via PIN, persists trust across restarts.
-- Configurable resolution (1080p/1440p/4K), frame rate, bitrate (10-150 Mbps slider), and HDR.
-- Shows the host's game library (if it has one) before streaming, so you can launch straight into
-  a specific game instead of a plain desktop session.
-- Hardware H.264/H.265 video decode via webOS's NDL DirectMedia API, audio via SDL2/PulseAudio.
-- Magic Remote friendly: d-pad menu navigation, pointer/mouse hover+click, direct PIN/IP entry via
-  the number pad, and the Red button as a reliable Back/disconnect substitute (see
-  `docs/NOTES.md` — the hardware Back button is intercepted by webOS's system launcher).
+- LAN discovery (mDNS) or add a host manually by IP; PIN pairing with persisted trust.
+- Configurable resolution (1080p/1440p/4K), frame rate, bitrate, and HDR.
+- Browses the host's game library (with cover art) and launches straight into a title.
+- Hardware H.264/H.265 decode via webOS's NDL DirectMedia API; audio via SDL2/PulseAudio.
+- Magic Remote friendly: d-pad navigation, pointer hover/click, number-pad PIN/IP entry, and the
+  Red button as a Back/disconnect substitute (see `docs/NOTES.md` for why).
 
-## Building
+## Tasks
 
-All build/package logic lives in `Taskfile.yml` ([go-task](https://taskfile.dev)) — the same
-logic runs locally and in CI, so there's only one place it's maintained. Local development always
-builds inside Docker: the webOS cross-toolchain only ships a Linux aarch64 build, so that's the
-one supported environment, regardless of your host OS/arch (an Intel/amd64 host transparently runs
-the container under QEMU emulation via `--platform linux/arm64`).
+Everything is a [go-task](https://taskfile.dev) target (`Taskfile.yml`) — the same tasks run
+locally and in CI, so there's only one place any of this is maintained. Run `task --list` for the
+full list (including the `native:*`/`toolchain:*` internals these build on).
 
-**Only Docker required — no local Rust/NDK at all:**
+| Task                  | What it does                                                    |
+| ---------------------- | ---------------------------------------------------------------- |
+| `task package`         | Build + package `dist/*.ipk` — the one you usually want          |
+| `task build` / `check` | Faster inner loop: just compile, or just `cargo check`           |
+| `task lint` / `fmt`    | `cargo clippy` / `cargo fmt`                                      |
+| `task deploy TV_HOST=root@<tv-ip>` | Build, package, install, and launch on a real TV over SSH |
+| `task deploy:log TV_HOST=root@<tv-ip>` | Tail the app's log on the TV                         |
+| `task shell`           | Interactive shell in the Docker build container (debugging)      |
+| `task clean` / `clean:all` | Remove `dist/`, or everything (toolchain/target/Docker volumes) |
 
-```sh
-task package   # fetches the toolchain (first run only, ~150MB), builds, packages, all in Docker
-```
-
-Runs the whole pipeline inside an ephemeral `docker run --rm` against the stock `rust` image (no
-custom Dockerfile). Caches (cargo registry/git, the webOS NDK, `target/`, `ares-package`) live in
-named Docker volumes, so repeat builds are fast; only `dist/*.ipk` lands on your machine.
-
-Output is `dist/io.dyptan.punktfunk.webos_<version>_arm.ipk`. Run `task --list` for every other
-task (`build`/`check` for a faster inner loop, `shell` to debug inside the container,
-`clean`/`clean:all`). CI (`.github/workflows/build.yml`) skips Docker and calls the `native:*`
-tasks directly, since its runner is already Linux aarch64.
-
-**Versioning**: the checked-in `appinfo.json`/`Cargo.toml` version stays a fixed `0.0.1` — webOS
-itself never sees a "real" version. Every `.ipk`, dev or release, gets the HEAD commit's short sha
-appended to its *filename* instead (e.g. `io.dyptan.punktfunk.webos_0.0.1+git.a1b2c3d4_arm.ipk`)
-for traceability. The actual release version only ever shows up in the Homebrew Channel manifest
-(`.github/workflows/build.yml`'s `release`-triggered job), generated from the GitHub Release tag.
-
-## Installing on a TV (Developer Mode required)
-
-```sh
-task deploy TV_HOST=root@<tv-ip>   # build, package, install, and launch over SSH
-task deploy:log TV_HOST=root@<tv-ip>   # tail the app's log afterward
-```
+**Only Docker is required — no local Rust/NDK install needed.** The webOS cross-toolchain only
+ships a Linux aarch64 build, so `build`/`check`/`package`/`lint` always run inside an ephemeral
+`docker run --rm` (against the stock `rust` image, no custom Dockerfile) — this works the same on
+an Intel/amd64 host too, via QEMU emulation. First run fetches the toolchain (~150MB); caches
+(cargo, the NDK, `target/`, `ares-package`) live in named Docker volumes after that, so repeat
+builds are fast. `fmt` runs natively (formatting doesn't need the cross toolchain). CI
+(`.github/workflows/build.yml`) skips Docker and calls the `native:*` tasks directly, since its
+runner is already Linux aarch64.
 
 Set `TV_HOST` once in a local `.env` (copy `.env.example`, gitignored) to skip typing it every
-time. Logs go to `/tmp/punktfunk-webos.log` on the TV (also readable directly over plain SSH —
-`/tmp` is shared between the app's jail and the host).
+time.
 
-## Installing via Homebrew Channel
+**Versioning**: `Cargo.toml`/`packaging/appinfo.json` stay a fixed `0.0.1` — webOS never sees a
+"real" version. Every `.ipk` gets the HEAD commit's short sha in its *filename* instead (e.g.
+`io.dyptan.punktfunk.webos_0.0.1+git.a1b2c3d4_arm.ipk`); the real release version only shows up in
+the Homebrew Channel manifest, generated from the GitHub Release tag by
+`.github/workflows/build.yml`'s `release`-triggered job.
 
-Once installed, updates and installs are one tap on the TV — no laptop/SSH needed:
+## Installing
 
-1. Install [Homebrew Channel](https://www.webosbrew.org/) itself (one-time, standard webOS
-   homebrew step).
-2. Open Homebrew Channel → Configuration → Add repository, and enter:
+**Directly on a TV** (Developer Mode required):
+
+```sh
+task deploy TV_HOST=root@<tv-ip>
+```
+
+**Via Homebrew Channel** (updates/installs from the TV, no laptop needed):
+
+1. Install [Homebrew Channel](https://www.webosbrew.org/) itself, if you haven't already.
+2. Homebrew Channel → Configuration → Add repository →
    `https://raw.githubusercontent.com/dyptan-io/pf-webos/main/repo.json`
-3. punktfunk now shows up in Homebrew Channel's app list, installable/updatable from there.
+3. punktfunk now shows up in Homebrew Channel's app list.
 
-Only published [GitHub Releases](https://github.com/dyptan-io/pf-webos/releases) appear this
-way — `repo.json` points at `.../releases/latest/download/...`, which only resolves once a
-release is published (`.github/workflows/release.yml`), so dev/CI builds never show up here.
+Only published [GitHub Releases](https://github.com/dyptan-io/pf-webos/releases) show up this way
+— dev/CI builds don't.
 
 ## Known platform limitations
 
-Two things that look like client bugs are actually confirmed webOS/SDL-webOS limitations, not
-fixable from application code — see `docs/NOTES.md` for the full research trail:
+Not fixable from application code — see `docs/NOTES.md` for the research trail:
 
-- **Frame rate only paces the stream, it doesn't change the TV panel's scan-out rate.** Neither
-  `webosbrew/SDL-webOS` nor any webOS system service exposes a way for a native app to set the
-  panel's actual refresh rate — only read it.
-- **The Magic Remote's hardware Back button is intercepted by webOS's system launcher** before
-  reaching any native app, in both menus and during streaming (a known upstream moonlight-tv
-  issue, not specific to this client). The Red color button is used as the reliable substitute
-  instead (short press = Back in menus, long press = disconnect during streaming).
+- **Frame rate paces the stream only; it can't change the TV panel's scan-out rate.** No webOS
+  system API exposes that to a native app.
+- **The Magic Remote's hardware Back button is intercepted by webOS's system launcher by
+  default** (a known upstream moonlight-tv issue too) — this client works around it (see
+  `docs/NOTES.md`), with the Red button kept as a fallback for firmware where the workaround isn't
+  honored.
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), matching the upstream
-punktfunk project, at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), matching upstream
+punktfunk, at your option.

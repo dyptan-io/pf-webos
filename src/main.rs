@@ -154,7 +154,8 @@ mod real {
     #[allow(clippy::too_many_arguments)]
     fn run_ui_flow(
         canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
-        texture_creator: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
+        frame_texture: &mut sdl2::render::Texture,
+        painter: &mut crate::ui::Painter,
         events: &mut sdl2::EventPump,
         game_controller: &sdl2::GameControllerSubsystem,
         identity: &(String, String),
@@ -162,6 +163,7 @@ mod real {
         font_label: &sdl2::ttf::Font,
         font_value: &sdl2::ttf::Font,
         font_title: &sdl2::ttf::Font,
+        icon_font: &sdl2::ttf::Font,
         log: &mut std::fs::File,
     ) -> Result<Option<ConnectOutcome>> {
         // Test/dev override: skip the UI entirely if a connect.conf was dropped
@@ -174,32 +176,32 @@ mod real {
 
         canvas.window_mut().show();
         let mut app = App::new(identity.clone(), log);
-        // Cover-art textures aren't `Send` (they borrow `texture_creator`, tied to
-        // this thread) — `app`'s art loader only ever hands over raw RGBA (see
-        // `art.rs`); turning those into textures happens here, each tick.
-        let mut art_textures: std::collections::HashMap<String, sdl2::render::Texture> =
-            std::collections::HashMap::new();
+        // Rasterized-text cache (see `ui::TextCache` docs) — created once here and
+        // threaded down through every render call for the rest of this UI-flow's
+        // lifetime so repeat draws of the same (font, text, color) reuse an
+        // already-rasterized+premultiplied `Pixmap` instead of re-rasterizing
+        // freetype glyphs on every ~60fps tick.
+        let mut text_cache = crate::ui::TextCache::new();
         let mut back_prev = false;
+        // Redraw-on-change: this screen has no time-based animation at all (no
+        // spinner/blink/marquee — confirmed by grepping the whole pre-stream UI for
+        // any `Instant`/frame-counter-driven visual state), so every pixel that can
+        // change only ever changes as a reaction to one of: an SDL event, a
+        // Discovery/art background result, or the raw scancode Back/Red edge below
+        // — anything else is a no-op tick. Without this, `app.render(...)` (and the
+        // `canvas.present()` vsync swap inside it) ran unconditionally every 16ms
+        // forever, even sitting on an untouched menu. Starts `true` so the first
+        // frame always draws.
+        let mut dirty = true;
         let target = 'ui: loop {
-            app.drain_discovery();
-            app.drain_art();
-            for (id, (w, h, rgba)) in &app.art_pixels {
-                if art_textures.contains_key(id) {
-                    continue;
-                }
-                let Ok(mut texture) =
-                    texture_creator.create_texture_static(sdl2::pixels::PixelFormatEnum::RGBA32, *w, *h)
-                else {
-                    continue;
-                };
-                if texture.update(None, rgba, (*w * 4) as usize).is_err() {
-                    continue;
-                }
-                texture.set_blend_mode(sdl2::render::BlendMode::Blend);
-                art_textures.insert(id.clone(), texture);
-            }
+            dirty |= app.drain_discovery();
+            dirty |= app.drain_art();
             for event in events.poll_iter() {
                 use sdl2::event::Event;
+                // Any event might change what's on screen (focus/hover, a typed
+                // digit, a screen transition) — simplest to mark dirty for all of
+                // them rather than re-litigate that per event kind.
+                dirty = true;
                 if let Event::Quit { .. } = event {
                     writeln!(log, "quit during UI")?;
                     return Ok(None);
@@ -275,18 +277,31 @@ mod real {
                 if let Some(target) = apply_back(&mut app, log) {
                     break 'ui target;
                 }
+                dirty = true;
             }
             back_prev = back_now;
+            if !dirty {
+                std::thread::sleep(Duration::from_millis(16));
+                continue;
+            }
+            dirty = false;
             app.render(
-                canvas,
-                texture_creator,
+                painter,
+                &mut text_cache,
                 font_label,
                 font_value,
                 font_title,
-                &art_textures,
+                icon_font,
                 display_mode.w as u32,
                 display_mode.h as u32,
             )?;
+            frame_texture
+                .update(None, painter.data(), (display_mode.w as usize) * 4)
+                .map_err(|e| anyhow::anyhow!("update frame texture: {e}"))?;
+            canvas
+                .copy(frame_texture, None, None)
+                .map_err(|e| anyhow::anyhow!("copy frame texture: {e}"))?;
+            canvas.present();
             std::thread::sleep(Duration::from_millis(16));
         };
         Ok(Some((
@@ -347,6 +362,20 @@ mod real {
         let texture_creator = canvas.texture_creator();
         writeln!(log, "window + canvas created")?;
 
+        // The pre-stream UI's whole rendering backend (see `ui.rs`'s module docs):
+        // `App::render` draws every screen into this one `Painter` (a software
+        // framebuffer) each dirty tick; `run_ui_flow` then uploads the finished
+        // buffer here and presents it — one texture/copy per frame, not one per
+        // widget/art-cover/text-label the way the old canvas-primitives version did.
+        let mut painter = crate::ui::Painter::new(display_mode.w as u32, display_mode.h as u32);
+        let mut frame_texture = texture_creator
+            .create_texture_static(
+                sdl2::pixels::PixelFormatEnum::RGBA32,
+                display_mode.w as u32,
+                display_mode.h as u32,
+            )
+            .map_err(|e| anyhow::anyhow!("create frame texture: {e}"))?;
+
         let mut events = sdl.event_pump().map_err(|e| anyhow::anyhow!("event pump: {e}"))?;
 
         let identity = store::load_or_create_identity().context("load_or_create_identity")?;
@@ -355,11 +384,13 @@ mod real {
         let font_label = crate::ui::load_font(&ttf, display_mode.h as u32, 22)?;
         let font_value = crate::ui::load_font(&ttf, display_mode.h as u32, 20)?;
         let font_title = crate::ui::load_font(&ttf, display_mode.h as u32, 40)?;
+        let icon_font = crate::ui::load_icon_font(&ttf)?;
 
         loop {
             let Some((host, port, fp, launch)) = run_ui_flow(
                 &mut canvas,
-                &texture_creator,
+                &mut frame_texture,
+                &mut painter,
                 &mut events,
                 &game_controller,
                 &identity,
@@ -367,6 +398,7 @@ mod real {
                 &font_label,
                 &font_value,
                 &font_title,
+                &icon_font,
                 log,
             )?
             else {

@@ -2,20 +2,22 @@
 //! bytes over the same mTLS-pinned management API `library::fetch_games` uses;
 //! decoding (via the pure-Rust `image` crate — no on-device libjpeg/libpng needed)
 //! happens on a dedicated thread so a slow/large library never blocks the UI loop.
-//! SDL2 `Texture`s aren't `Send` (they borrow a `TextureCreator` tied to the main
-//! thread's GL/window context), so this thread only ever produces raw RGBA pixels —
-//! `main.rs`'s render loop turns those into textures.
+//! Each decoded cover becomes a `tiny_skia::Pixmap` right here — unlike an SDL2
+//! `Texture` (which isn't `Send`, since it borrows a `TextureCreator` tied to the
+//! main thread's GL/window context), a `Pixmap` is a plain owned buffer, so it
+//! can cross the channel to the UI thread as the actual drawable object, with no
+//! separate GPU-texture-building/caching step over there.
 use std::sync::mpsc::{Receiver, Sender};
 
-use crate::library::GameEntry;
+use tiny_skia::{IntSize, Pixmap};
 
-/// One decoded cover, ready to become an SDL2 texture on the main thread.
+use crate::library::GameEntry;
+use crate::ui::premultiply_rgba;
+
+/// One decoded cover, ready to composite straight into the UI's frame `Painter`.
 pub struct ArtLoaded {
     pub game_id: String,
-    pub width: u32,
-    pub height: u32,
-    /// Tightly-packed RGBA8, row-major, `width * height * 4` bytes.
-    pub rgba: Vec<u8>,
+    pub pixmap: Pixmap,
 }
 
 /// Spawns one background thread that fetches+decodes every game's art (preferring
@@ -38,6 +40,15 @@ pub fn load_art_async(
     rx
 }
 
+/// Cap on the longer side of a decoded cover before it becomes a `Pixmap`. Source
+/// art (Steam CDN capsules etc.) commonly runs well past 1000px on a side, but the
+/// grid never draws a card anywhere near that — `ui::CARD_MIN_W` is 220px and even
+/// a 4K panel at the minimum 2-column layout tops out a few hundred px short of
+/// this cap (see `ui::grid_card_size`). Decoding at full source resolution wastes
+/// both host-thread decode time and (durably, for as long as the card is in
+/// `App::art`) buffer memory for pixels the panel can never actually show.
+const MAX_ART_DIMENSION: u32 = 480;
+
 fn fetch_all(
     host: &str,
     mgmt_port: u16,
@@ -46,26 +57,50 @@ fn fetch_all(
     games: &[GameEntry],
     tx: &Sender<ArtLoaded>,
 ) {
+    // One mTLS connection reused for every game's art in this batch — building a
+    // fresh `ureq::Agent` per request (the old code's `fetch_art` did this
+    // internally) means a fresh TCP+TLS handshake, including client-cert auth,
+    // for every single cover: real, avoidable latency and CPU cost that scales
+    // with library size. See `library::agent`'s docs.
+    let Ok(agent) = crate::library::agent(identity, fingerprint) else {
+        return;
+    };
     for game in games {
         let Some(path) = game.art.portrait.as_deref().or(game.art.header.as_deref()) else {
             continue;
         };
-        let Ok(bytes) = crate::library::fetch_art(host, mgmt_port, identity, fingerprint, path) else {
+        let Ok(bytes) = crate::library::fetch_art(&agent, host, mgmt_port, path) else {
             continue;
         };
         let Ok(decoded) = image::load_from_memory(&bytes) else {
             continue;
         };
+        let longer_side = decoded.width().max(decoded.height());
+        let decoded = if longer_side > MAX_ART_DIMENSION {
+            decoded.resize(
+                MAX_ART_DIMENSION,
+                MAX_ART_DIMENSION,
+                image::imageops::FilterType::Triangle,
+            )
+        } else {
+            decoded
+        };
         let rgba = decoded.to_rgba8();
         let (width, height) = rgba.dimensions();
+        let Some(size) = IntSize::from_wh(width, height) else {
+            continue;
+        };
+        let mut buf = rgba.into_raw();
+        premultiply_rgba(&mut buf);
+        let Some(pixmap) = Pixmap::from_vec(buf, size) else {
+            continue;
+        };
         // A receiver drop (host switched again before this batch finished) just
         // ends the thread early — nothing left to deliver to.
         if tx
             .send(ArtLoaded {
                 game_id: game.id.clone(),
-                width,
-                height,
-                rgba: rgba.into_raw(),
+                pixmap,
             })
             .is_err()
         {
