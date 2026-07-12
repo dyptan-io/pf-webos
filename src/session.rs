@@ -109,7 +109,7 @@ pub fn connect(
     let resolved_mode = client.mode();
     let codec = NdlCodec::from_wire(client.codec)
         .with_context(|| format!("host resolved an unsupported codec bit {}", client.codec))?;
-    let app_id = std::env::var("APPID").unwrap_or_else(|_| "io.unom.punktfunk.webos".into());
+    let app_id = std::env::var("APPID").unwrap_or_else(|_| "io.dyptan.punktfunk.webos".into());
     let ndl = NdlVideo::load(&app_id, resolved_mode.width as i32, resolved_mode.height as i32, codec)
         .context("NDL load")?;
     ndl.set_area(0, 0, display_w, display_h).context("NDL set_area")?;

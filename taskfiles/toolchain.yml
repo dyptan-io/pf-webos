@@ -166,12 +166,12 @@ tasks:
       - >-
         ssh -tt {{.TV_HOST}}
         "luna-send -i -n 1 -f luna://com.webos.appInstallService/dev/install
-        '{\"id\":\"io.unom.punktfunk.webos\",\"ipkUrl\":\"/tmp/{{.IPK_NAME}}\",\"subscribe\":true}'"
+        '{\"id\":\"io.dyptan.punktfunk.webos\",\"ipkUrl\":\"/tmp/{{.IPK_NAME}}\",\"subscribe\":true}'"
       - sleep 3
       - ssh {{.TV_HOST}} "rm -f /tmp/punktfunk-webos.log"
       - >-
         ssh -tt {{.TV_HOST}}
-        "luna-send -n 1 -f luna://com.webos.applicationManager/launch '{\"id\":\"io.unom.punktfunk.webos\"}'"
+        "luna-send -n 1 -f luna://com.webos.applicationManager/launch '{\"id\":\"io.dyptan.punktfunk.webos\"}'"
       - 'echo "launched — tail the log with: task deploy:log TV_HOST={{.TV_HOST}}"'
 
   # ------------------------------------------------------------------ package --
@@ -196,30 +196,19 @@ tasks:
         {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-strip "$STAGE_DIR/lib/libSDL2-2.0.so.0"
         cp packaging/appinfo.json packaging/icon.png packaging/icon_large.png packaging/splash.png "$STAGE_DIR/"
 
-        # webOS's appinfo.json "version" must be plain x.x.x — no git-sha suffix
-        # tolerated — so a tagged release build (`{{.RELEASE_TAG}}` non-empty)
-        # bakes the tag into the *staged copy* (never the checked-in file) and
-        # gets the right name for free, since ares-package derives its output
-        # filename from this version. A local/dev build leaves the checked-in
-        # version alone and gets the HEAD commit's short sha (`{{.GIT_SHA}}`)
-        # appended to the filename afterward instead, so it's still traceable to
-        # an exact build without touching the validated version field.
-        {{if .RELEASE_TAG}}
-        sed -i.bak 's/"version": *"[^"]*"/"version": "{{.RELEASE_TAG}}"/' "$STAGE_DIR/appinfo.json"
-        rm -f "$STAGE_DIR/appinfo.json.bak"
-        echo "release build: version {{.RELEASE_TAG}}"
-        {{end}}
-
+        # The checked-in appinfo.json version stays a fixed 0.0.1 always — webOS
+        # itself never sees a "real" version, only the Homebrew Channel manifest
+        # below does (its `version` is the only place the release tag lands).
+        # The .ipk filename is instead always traceable to an exact build via the
+        # HEAD commit's short sha (`{{.GIT_SHA}}`), release or not.
         mkdir -p dist
         ares-package "$STAGE_DIR" -o dist --force-arch arm
 
-        {{if not .RELEASE_TAG}}
         for f in dist/*_arm.ipk; do
           [ -e "$f" ] || continue
           case "$f" in *"+git.{{.GIT_SHA}}"*) continue ;; esac
           mv "$f" "${f%_arm.ipk}+git.{{.GIT_SHA}}_arm.ipk"
         done
-        {{end}}
 
         {{if .RELEASE_TAG}}
         # Homebrew Channel manifest (see README's "Installing via Homebrew Channel"
@@ -233,9 +222,9 @@ tasks:
         IPK_FILE="$(ls dist/*_arm.ipk)"
         IPK_SHA256="$(sha256sum "$IPK_FILE" | cut -d' ' -f1)"
         REPO="${GITHUB_REPOSITORY:-dyptan-io/pf-webos}"
-        cat > dist/io.unom.punktfunk.webos.manifest.json <<EOF
+        cat > dist/io.dyptan.punktfunk.webos.manifest.json <<EOF
         {
-          "id": "io.unom.punktfunk.webos",
+          "id": "io.dyptan.punktfunk.webos",
           "version": "{{.RELEASE_TAG}}",
           "type": "native",
           "title": "punktfunk",
@@ -247,7 +236,7 @@ tasks:
           "ipkHash": { "sha256": "$IPK_SHA256" }
         }
         EOF
-        echo "manifest: dist/io.unom.punktfunk.webos.manifest.json"
+        echo "manifest: dist/io.dyptan.punktfunk.webos.manifest.json"
         {{end}}
 
         echo "packaged:"

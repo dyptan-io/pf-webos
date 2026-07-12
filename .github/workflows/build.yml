@@ -3,8 +3,8 @@ name: Build
 # Every push to main/PR builds and uploads a dev .ipk as a build artifact. A
 # published GitHub Release additionally re-runs the same build against the
 # release tag (`task package` detects it via GITHUB_REF_TYPE/GITHUB_REF_NAME —
-# see taskfiles/toolchain.yml) and attaches the versioned .ipk + Homebrew
-# Channel manifest to the release page instead of just uploading an artifact.
+# see taskfiles/toolchain.yml) and attaches the .ipk + Homebrew Channel manifest
+# to the release page instead of just uploading an artifact.
 on:
   push:
     branches: [main]
@@ -50,7 +50,7 @@ jobs:
         if: github.event_name != 'release'
         uses: actions/upload-artifact@v4
         with:
-          name: pf-webos-ipk
+          name: io.dyptan.punktfunk.webos
           path: dist/*.ipk
 
       - name: Validate Homebrew manifest against schema

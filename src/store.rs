@@ -1,6 +1,6 @@
 //! Persisted client identity, known hosts, and stream settings — JSON files under
 //! the app's own writable directory (`$HOME`, e.g.
-//! `/media/developer/apps/usr/palm/applications/io.unom.punktfunk.webos/`). Mirrors
+//! `/media/developer/apps/usr/palm/applications/io.dyptan.punktfunk.webos/`). Mirrors
 //! `pf-client-core::trust`'s file-per-concern layout (identity PEMs / known-hosts
 //! JSON / settings JSON) so the shape is familiar, trimmed to what this client uses.
 use std::path::{Path, PathBuf};

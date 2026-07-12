@@ -44,15 +44,15 @@ Runs the whole pipeline inside an ephemeral `docker run --rm` against the stock 
 custom Dockerfile). Caches (cargo registry/git, the webOS NDK, `target/`, `ares-package`) live in
 named Docker volumes, so repeat builds are fast; only `dist/*.ipk` lands on your machine.
 
-Either way, output is `dist/io.unom.punktfunk.webos_<version>_arm.ipk`. Run `task --list` for every
+Either way, output is `dist/io.dyptan.punktfunk.webos_<version>_arm.ipk`. Run `task --list` for every
 other task (`build`/`check` for a faster inner loop, `docker:shell` to debug inside the container,
 `clean`/`clean:all`).
 
-**Versioning**: webOS's `appinfo.json` version must be plain `x.x.x`, so it isn't touched for a
-regular dev build — instead the HEAD commit's short sha is appended to the *filename* (e.g.
-`io.unom.punktfunk.webos_0.9.2+git.a1b2c3d4_arm.ipk`) for traceability. Building from a published
-GitHub Release (CI-only — see `.github/workflows/release.yml`) bakes the release tag into both the
-version field and the filename instead.
+**Versioning**: the checked-in `appinfo.json`/`Cargo.toml` version stays a fixed `0.0.1` — webOS
+itself never sees a "real" version. Every `.ipk`, dev or release, gets the HEAD commit's short sha
+appended to its *filename* instead (e.g. `io.dyptan.punktfunk.webos_0.0.1+git.a1b2c3d4_arm.ipk`)
+for traceability. The actual release version only ever shows up in the Homebrew Channel manifest
+(`.github/workflows/build.yml`'s `release`-triggered job), generated from the GitHub Release tag.
 
 ## Installing on a TV (Developer Mode required)
 
