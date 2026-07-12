@@ -38,7 +38,7 @@ mdns-sd = "0.20"
 # "ttf": SDL2_ttf + freetype are already on-device (confirmed on the CX), and we
 # render with LG's own system font (/usr/share/fonts/LG_Smart_UI-Regular.ttf) — see
 # ui.rs. No bundling needed, same build-time-link/runtime-resolve pattern as NDL.
-sdl2 = { version = "0.37", default-features = false, features = ["ttf"] }
+sdl2 = { version = "0.38", default-features = false, features = ["ttf"] }
 # Opus decode for the host's audio planes (audio.rs) — already a transitive dep via
 # punktfunk-core's `quic` feature (its C-ABI multistream path), but we call the crate
 # directly ourselves so it needs to be an explicit dependency too.

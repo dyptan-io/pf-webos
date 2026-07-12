@@ -2,7 +2,7 @@ name: Build
 
 # Every push to main/PR builds and uploads a dev .ipk as a build artifact. A
 # published GitHub Release additionally re-runs the same build against the
-# release tag (`task package` detects it via GITHUB_REF_TYPE/GITHUB_REF_NAME —
+# release tag (`task native:package` detects it via GITHUB_REF_TYPE/GITHUB_REF_NAME —
 # see taskfiles/toolchain.yml) and attaches the .ipk + Homebrew Channel manifest
 # to the release page instead of just uploading an artifact.
 on:
@@ -18,7 +18,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.sha }}
 
@@ -33,7 +33,7 @@ jobs:
           key: armv7-unknown-linux-gnueabi
 
       - name: Cache webOS toolchain + ares-package
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .toolchains
@@ -41,16 +41,16 @@ jobs:
           key: webos-toolchain-${{ runner.os }}-${{ hashFiles('taskfiles/toolchain.yml') }}
 
       - name: Install task
-        uses: arduino/setup-task@v2
+        uses: arduino/setup-task@v3
         with:
           version: 3
 
       - name: Build and package
-        run: task package
+        run: task native:package
 
       - name: Upload .ipk artifact
         if: github.event_name != 'release'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: io.dyptan.punktfunk.webos
           path: dist/*.ipk
@@ -69,7 +69,7 @@ jobs:
 
       - name: Attach .ipk and manifest to the release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.ipk

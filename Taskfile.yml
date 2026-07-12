@@ -1,11 +1,15 @@
-# The front door for building/packaging pf-webos — used directly on a Linux/macOS
-# dev box with Rust installed, inside Docker (no local Rust/NDK needed, see the
-# `docker:*` tasks), and in CI (.github/workflows/build.yml just runs
-# `task package`). The webOS-specific plumbing (fetching the cross-toolchain,
-# staging + invoking ares-package, the Docker wrappers) lives in
-# `taskfiles/toolchain.yml`, kept separate so this file stays short — run
-# `task --list-all` to see everything, including that file's tasks under the
-# `toolchain:` namespace.
+# The front door for building/packaging pf-webos. Local development always goes
+# through Docker (`build`/`check`/`package` below) — the webOS cross-toolchain
+# only ships a Linux aarch64 build (see `taskfiles/toolchain.yml`), so a Linux
+# aarch64 container is the one supported environment for humans, regardless of
+# host OS/arch. The `native:*` tasks are the real, un-containerized logic; they
+# exist for CI (`.github/workflows/build.yml`), whose runner already *is* Linux
+# aarch64 — no point nesting another container inside GitHub Actions' own.
+#
+# The webOS-specific plumbing (fetching the cross-toolchain, staging + invoking
+# ares-package, the Docker wrapper) lives in `taskfiles/toolchain.yml`, kept
+# separate so this file stays short — run `task --list-all` to see everything,
+# including that file's tasks under the `toolchain:` namespace.
 #
 # The only shell scripts left outside Task entirely are `scripts/cc-shim.sh`/
 # `cxx-shim.sh` — Cargo's `linker`/`CC`/`CXX` config needs an actual executable
@@ -33,7 +37,33 @@ vars:
 
 tasks:
   build:
-    desc: Cross-compile the release binary (armv7-unknown-linux-gnueabi)
+    desc: Cross-compile the release binary, inside Docker — the local dev entry point
+    cmds:
+      - task: toolchain:docker-run
+        vars: {TARGET_TASK: native:build}
+
+  check:
+    desc: Quick cross-target `cargo check`, inside Docker — the local dev entry point
+    cmds:
+      - task: toolchain:docker-run
+        vars: {TARGET_TASK: native:check}
+
+  package:
+    desc: Build and package dist/*.ipk, inside Docker — this is the one you usually want
+    cmds:
+      - task: toolchain:docker-run
+        vars: {TARGET_TASK: native:package}
+
+  shell:
+    desc: Interactive shell in the Docker build container (debugging)
+    cmds:
+      - task: toolchain:docker-shell
+
+  native:build:
+    desc: >-
+      Cross-compile directly on the host, no Docker — only meaningful on a Linux
+      aarch64 box with Rust already installed (used by CI; `build` is the local
+      dev entry point).
     deps: [toolchain:all]
     env:
       # Modern CMake refuses vendored libopus's old cmake_minimum_required
@@ -43,8 +73,8 @@ tasks:
       - rustup target add {{.TARGET}}
       - cargo build --release --target {{.TARGET}}
 
-  check:
-    desc: Quick cross-target `cargo check` (no release build/packaging)
+  native:check:
+    desc: Quick cross-target `cargo check`, no Docker (used by CI)
     deps: [toolchain:all]
     env:
       CMAKE_POLICY_VERSION_MINIMUM: '3.5'
@@ -52,34 +82,11 @@ tasks:
       - rustup target add {{.TARGET}}
       - cargo check --target {{.TARGET}}
 
-  package:
-    desc: Build and package dist/*.ipk — this is the one you usually want
-    deps: [build, toolchain:ares-package]
+  native:package:
+    desc: Build and package dist/*.ipk, no Docker (used by CI)
+    deps: [native:build, toolchain:ares-package]
     cmds:
       - task: toolchain:stage-and-package
-
-  docker:build:
-    desc: Same as `build`, fully inside Docker (no local Rust/NDK needed)
-    cmds:
-      - task: toolchain:docker-run
-        vars: {TARGET_TASK: build}
-
-  docker:check:
-    desc: Same as `check`, fully inside Docker
-    cmds:
-      - task: toolchain:docker-run
-        vars: {TARGET_TASK: check}
-
-  docker:package:
-    desc: Same as `package`, fully inside Docker — the one to reach for with no local Rust
-    cmds:
-      - task: toolchain:docker-run
-        vars: {TARGET_TASK: package}
-
-  docker:shell:
-    desc: Interactive shell in the build container (debugging)
-    cmds:
-      - task: toolchain:docker-shell
 
   deploy:
     desc: >-
