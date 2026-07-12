@@ -1,0 +1,274 @@
+# The webOS-specific "help utils" — fetching the cross-toolchain, staging/packaging
+# the .ipk, and the Docker plumbing. Kept out of the root Taskfile.yml so that one
+# stays short and readable; these are the building blocks it delegates to (via
+# `deps: [toolchain:all]` etc.) rather than something you usually invoke directly,
+# except `ares-package`/`fetch-device-libs`, which are useful standalone.
+#
+# Shared vars (NDK_DIR, SYSROOT, TARGET, RUST_IMAGE) are passed in explicitly from
+# the root Taskfile's `includes:` block — Task doesn't share `vars:` between a
+# parent and an included Taskfile by default.
+version: '3'
+
+vars:
+  SDL2_BACKPORT_RELEASE: release-2.30.12-webos.5
+  SDL2_BACKPORT_VERSION: 2.30.12
+  SDL2_BACKPORT_SONAME: libSDL2-2.0.so.0.3000.12
+  # Resolved once per invocation and referenced by `{{.GIT_SHA}}`/`{{.RELEASE_TAG}}`
+  # in stage-and-package below, instead of re-deriving them inline in that task's
+  # shell every time — the one place that knows "is this a tagged release build".
+  # GITHUB_REF_TYPE/GITHUB_REF_NAME are set automatically by GitHub Actions on
+  # every job, tag or not; empty RELEASE_TAG just means "not a release build".
+  GIT_SHA:
+    sh: git rev-parse --short=8 HEAD 2>/dev/null || echo unknown
+  RELEASE_TAG:
+    sh: |
+      if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+        echo "${GITHUB_REF_NAME#v}"
+      fi
+  # Shared by docker-run/docker-shell below — caches live in named volumes, never
+  # `/usr/local/cargo`/`/usr/local/rustup` themselves (a volume mount over either
+  # would blow away the base image's own Rust install).
+  DOCKER_MOUNTS: >-
+    -v {{.ROOT_DIR}}:/workspace
+    -v pf-webos-toolchains:/workspace/.toolchains
+    -v pf-webos-target:/workspace/target
+    -v pf-webos-cargo-registry:/usr/local/cargo/registry
+    -v pf-webos-cargo-git:/usr/local/cargo/git
+    -v pf-webos-apt-cache:/var/cache/apt/archives
+    -v pf-webos-tools:/opt/pf-webos-tools
+    -w /workspace
+    -e PATH=/opt/pf-webos-tools/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+tasks:
+  # ---------------------------------------------------------------- toolchain --
+
+  ndk:
+    desc: Fetch the webosbrew/native-toolchain cross-compiler (idempotent)
+    status:
+      - test -x {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-gcc
+    cmds:
+      - |
+        set -eu
+        # webosbrew/native-toolchain's releases only ever publish three assets
+        # (confirmed via its GitHub releases API, every release back to 2023):
+        # darwin-arm64, darwin-x86_64, linux-aarch64 — there has never been a
+        # linux-x86_64 build, and the real Linux ARM asset name is
+        # "linux-aarch64", not "linux-arm64".
+        case "$(uname -s)-$(uname -m)" in
+            Linux-aarch64|Linux-arm64) PLATFORM=linux-aarch64 ;;
+            Darwin-x86_64) PLATFORM=darwin-x86_64 ;;
+            Darwin-arm64) PLATFORM=darwin-arm64 ;;
+            *)
+                echo "no webosbrew/native-toolchain release for $(uname -s)-$(uname -m)" >&2
+                exit 1
+                ;;
+        esac
+        ASSET="arm-webos-linux-gnueabi_sdk-buildroot_${PLATFORM}.tar.bz2"
+        URL="https://github.com/webosbrew/native-toolchain/releases/latest/download/${ASSET}"
+        mkdir -p "$(dirname {{.NDK_DIR}})"
+        TMP="$(mktemp -d)"
+        trap 'rm -rf "$TMP"' EXIT
+        echo "downloading $URL"
+        curl -sL -o "$TMP/$ASSET" "$URL"
+        tar xjf "$TMP/$ASSET" -C "$(dirname {{.NDK_DIR}})"
+        sh {{.NDK_DIR}}/relocate-sdk.sh
+        # This toolchain build's baked-in default --sysroot points at a build-time
+        # path segment that doesn't exist post-relocate — cc-shim.sh/cxx-shim.sh
+        # pass --sysroot explicitly, so this is just a sanity check it can link at all.
+        echo 'int main(void) { return 0; }' | {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-gcc \
+            --sysroot={{.SYSROOT}} -x c -o "$TMP/probe" -
+        echo "webOS NDK ready at {{.NDK_DIR}}"
+
+  sdl2:
+    desc: Overlay webosbrew/SDL-webOS's webOS-patched SDL2 onto the NDK sysroot (idempotent)
+    deps: [ndk]
+    status:
+      - test "$(readlink {{.SYSROOT}}/usr/lib/libSDL2-2.0.so.0)" = "{{.SDL2_BACKPORT_SONAME}}"
+    cmds:
+      - |
+        set -eu
+        # The NDK's own bundled SDL2 is a generic buildroot package — it lacks
+        # webOS's custom Wayland shell-integration protocol
+        # (QT_WAYLAND_SHELL_INTEGRATION=webos), so its Wayland driver can't get a
+        # surface from the TV's compositor even with every env var webOS sets
+        # correctly (confirmed live on an LG CX). Every other native webOS SDL2
+        # app (aurora-tv/moonlight-tv, RetroArch-webOS) bundles this exact fork
+        # for the same reason.
+        TMP="$(mktemp -d)"
+        trap 'rm -rf "$TMP"' EXIT
+        ASSET="SDL2-{{.SDL2_BACKPORT_VERSION}}-webos.tar.gz"
+        URL="https://github.com/webosbrew/SDL-webOS/releases/download/{{.SDL2_BACKPORT_RELEASE}}/${ASSET}"
+        echo "downloading $URL"
+        curl -sL -o "$TMP/$ASSET" "$URL"
+        mkdir -p "$TMP/extracted"
+        tar xzf "$TMP/$ASSET" -C "$TMP/extracted"
+        cp -RL "$TMP/extracted/include/SDL2/." {{.SYSROOT}}/usr/include/SDL2/
+        cp -L "$TMP/extracted/lib/{{.SDL2_BACKPORT_SONAME}}" {{.SYSROOT}}/usr/lib/{{.SDL2_BACKPORT_SONAME}}
+        ln -sf {{.SDL2_BACKPORT_SONAME}} {{.SYSROOT}}/usr/lib/libSDL2-2.0.so.0
+        ln -sf {{.SDL2_BACKPORT_SONAME}} {{.SYSROOT}}/usr/lib/libSDL2.so
+        sed -i.bak "s/^Version:.*/Version: {{.SDL2_BACKPORT_VERSION}}/" {{.SYSROOT}}/usr/lib/pkgconfig/sdl2.pc
+        rm -f {{.SYSROOT}}/usr/lib/pkgconfig/sdl2.pc.bak
+        echo "webOS SDL2 backport overlaid onto {{.SYSROOT}}"
+
+  all:
+    desc: Fetch the full webOS cross-toolchain (NDK + SDL2 overlay) — idempotent
+    deps: [ndk, sdl2]
+
+  ares-package:
+    desc: Install ares-package (webosbrew/ares-cli-rs) if it isn't already on PATH
+    status:
+      - command -v ares-package
+    cmds:
+      # Needs a fairly recent stable Rust (its source uses let-chains).
+      - cargo install --git https://github.com/webosbrew/ares-cli-rs ares-package
+
+  fetch-device-libs:
+    desc: >-
+      Fallback only (normally unneeded — the NDK ships a link-time stub already):
+      pull libNDL_directmedia.so.1 off a real TV. Usage:
+      task toolchain:fetch-device-libs TV_HOST=user@host
+    deps: [ndk]
+    status:
+      - test -e {{.SYSROOT}}/usr/lib/libNDL_directmedia.so.1
+    cmds:
+      - |
+        set -eu
+        : "${TV_HOST:?pass TV_HOST=user@host (a webOS 5+ TV in Developer Mode with root SSH)}"
+        LIB=libNDL_directmedia.so.1.0.0
+        TMP="$(mktemp -d)"
+        trap 'rm -rf "$TMP"' EXIT
+        scp -o ConnectTimeout=8 "$TV_HOST:/usr/lib/$LIB" "$TMP/$LIB"
+        cp "$TMP/$LIB" {{.SYSROOT}}/usr/lib/$LIB
+        ln -sf $LIB {{.SYSROOT}}/usr/lib/libNDL_directmedia.so.1
+        echo "NDL DirectMedia build-time stub fetched from $TV_HOST"
+
+  deploy:
+    internal: true
+    requires:
+      vars: [TV_HOST]
+    vars:
+      # The .ipk filename varies with the version scheme above (git-sha or release
+      # tag), so it's resolved once here rather than guessed/hardcoded.
+      IPK_PATH:
+        sh: ls -t dist/*.ipk | head -1
+      IPK_NAME:
+        sh: basename {{.IPK_PATH}}
+    cmds:
+      - echo "installing {{.IPK_NAME}} on {{.TV_HOST}}"
+      - scp {{.IPK_PATH}} {{.TV_HOST}}:/tmp/
+      # -tt: luna-send needs a real PTY to print anything over a non-interactive
+      # SSH exec (see docs/NOTES.md) — without it this silently returns nothing
+      # even on success, easy to mistake for a hang. `-n 1` only waits for the
+      # *first* subscribed event (an ack that the install started, not that it
+      # finished) — installing is asynchronous, so launching immediately after
+      # can race it and get back "app is locked". The sleep below is the same
+      # margin the manually-verified deploy recipe in docs/NOTES.md used.
+      - >-
+        ssh -tt {{.TV_HOST}}
+        "luna-send -i -n 1 -f luna://com.webos.appInstallService/dev/install
+        '{\"id\":\"io.dyptan.punktfunk.webos\",\"ipkUrl\":\"/tmp/{{.IPK_NAME}}\",\"subscribe\":true}'"
+      - sleep 3
+      - ssh {{.TV_HOST}} "rm -f /tmp/punktfunk-webos.log"
+      - >-
+        ssh -tt {{.TV_HOST}}
+        "luna-send -n 1 -f luna://com.webos.applicationManager/launch '{\"id\":\"io.dyptan.punktfunk.webos\"}'"
+      - 'echo "launched — tail the log with: task deploy:log TV_HOST={{.TV_HOST}}"'
+
+  # ------------------------------------------------------------------ package --
+
+  stage-and-package:
+    internal: true
+    desc: Stage the stripped binary + bundled SDL2 + assets, then invoke ares-package
+    cmds:
+      - |
+        set -eu
+        STAGE_DIR="$(mktemp -d)"
+        trap 'rm -rf "$STAGE_DIR"' EXIT
+        mkdir -p "$STAGE_DIR/bin" "$STAGE_DIR/lib"
+        cp target/{{.TARGET}}/release/punktfunk-webos "$STAGE_DIR/bin/"
+        {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-strip "$STAGE_DIR/bin/punktfunk-webos"
+        # The CX's on-device libSDL2 is 2.0.10 — missing ABI symbols this binary
+        # needs. Bundle the exact .so the binary linked against (from the NDK
+        # sysroot, resolved to its real file behind the dev symlinks) under the
+        # SONAME the dynamic linker looks for, loaded via the $ORIGIN/../lib
+        # rpath build.rs sets.
+        cp -L {{.SYSROOT}}/usr/lib/libSDL2-2.0.so.0 "$STAGE_DIR/lib/libSDL2-2.0.so.0"
+        {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-strip "$STAGE_DIR/lib/libSDL2-2.0.so.0"
+        cp packaging/appinfo.json packaging/icon.png packaging/icon_large.png packaging/splash.png "$STAGE_DIR/"
+
+        # The checked-in appinfo.json version stays a fixed 0.0.1 always — webOS
+        # itself never sees a "real" version, only the Homebrew Channel manifest
+        # below does (its `version` is the only place the release tag lands).
+        # The .ipk filename is instead always traceable to an exact build via the
+        # HEAD commit's short sha (`{{.GIT_SHA}}`), release or not.
+        mkdir -p dist
+        ares-package "$STAGE_DIR" -o dist --force-arch arm
+
+        for f in dist/*_arm.ipk; do
+          [ -e "$f" ] || continue
+          case "$f" in *"+git.{{.GIT_SHA}}"*) continue ;; esac
+          mv "$f" "${f%_arm.ipk}+git.{{.GIT_SHA}}_arm.ipk"
+        done
+
+        {{if .RELEASE_TAG}}
+        # Homebrew Channel manifest (see README's "Installing via Homebrew Channel"
+        # section and repo.json at the repo root) — the released .ipk needs a
+        # sibling manifest.json describing it (schema:
+        # webosbrew/docs/schemas/HomebrewPackageManifest.schema.json) so repo.json's
+        # `manifestUrl` (pinned to .../releases/latest/download/...) resolves to
+        # something. GITHUB_REPOSITORY/GITHUB_REF_NAME are only set inside Actions;
+        # this whole block only ever runs there too, since RELEASE_TAG is only
+        # non-empty on a tagged release build (see release.yml).
+        IPK_FILE="$(ls dist/*_arm.ipk)"
+        IPK_SHA256="$(sha256sum "$IPK_FILE" | cut -d' ' -f1)"
+        REPO="${GITHUB_REPOSITORY:-dyptan-io/pf-webos}"
+        cat > dist/io.dyptan.punktfunk.webos.manifest.json <<EOF
+        {
+          "id": "io.dyptan.punktfunk.webos",
+          "version": "{{.RELEASE_TAG}}",
+          "type": "native",
+          "title": "punktfunk",
+          "appDescription": "punktfunk — low-latency desktop/game streaming client",
+          "iconUri": "https://raw.githubusercontent.com/${REPO}/main/packaging/icon_large.png",
+          "sourceUrl": "https://github.com/${REPO}",
+          "rootRequired": false,
+          "ipkUrl": "https://github.com/${REPO}/releases/download/${GITHUB_REF_NAME}/$(basename "$IPK_FILE")",
+          "ipkHash": { "sha256": "$IPK_SHA256" }
+        }
+        EOF
+        echo "manifest: dist/io.dyptan.punktfunk.webos.manifest.json"
+        {{end}}
+
+        echo "packaged:"
+        ls -lh dist/*.ipk
+
+  # ------------------------------------------------------------------- docker --
+  # Every `docker-*` task runs an ephemeral `docker run --rm` against the stock
+  # `rust` image (no custom Dockerfile) and re-invokes the *same* root tasks
+  # (`task build`/`task package`/`task check`) inside the container via a nested
+  # `task` install — no build logic is duplicated between the local and
+  # Dockerized paths. Only `dist/*.ipk` lands on the host.
+
+  docker-run:
+    internal: true
+    requires:
+      vars: [TARGET_TASK]
+    cmds:
+      - >-
+        docker run --rm {{.DOCKER_MOUNTS}} {{.RUST_IMAGE}}
+        sh -c '
+          apt-get update &&
+          apt-get install -y --no-install-recommends cmake curl ca-certificates git pkg-config build-essential xz-utils &&
+          curl -sL https://taskfile.dev/install.sh | sh -s -- -d -b /opt/pf-webos-tools/bin &&
+          task {{.TARGET_TASK}}
+        '
+
+  docker-shell:
+    internal: true
+    cmds:
+      - "docker run --rm -it {{.DOCKER_MOUNTS}} {{.RUST_IMAGE}} bash"
+
+  docker-volumes-rm:
+    internal: true
+    cmds:
+      - docker volume rm -f pf-webos-toolchains pf-webos-target pf-webos-cargo-registry pf-webos-cargo-git pf-webos-apt-cache pf-webos-tools

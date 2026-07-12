@@ -1,0 +1,74 @@
+name: Build
+
+# Every push to main/PR builds and uploads a dev .ipk as a build artifact. A
+# published GitHub Release additionally re-runs the same build against the
+# release tag (`task package` detects it via GITHUB_REF_TYPE/GITHUB_REF_NAME —
+# see taskfiles/toolchain.yml) and attaches the .ipk + Homebrew Channel manifest
+# to the release page instead of just uploading an artifact.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+
+jobs:
+  cross-build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.sha }}
+
+      - name: Install Rust (stable, prebuilt) + cross target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabi
+
+      - name: Cache cargo registry/git/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: armv7-unknown-linux-gnueabi
+
+      - name: Cache webOS toolchain + ares-package
+        uses: actions/cache@v4
+        with:
+          path: |
+            .toolchains
+            ~/.cargo/bin/ares-package
+          key: webos-toolchain-${{ runner.os }}-${{ hashFiles('taskfiles/toolchain.yml') }}
+
+      - name: Install task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3
+
+      - name: Build and package
+        run: task package
+
+      - name: Upload .ipk artifact
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: io.dyptan.punktfunk.webos
+          path: dist/*.ipk
+
+      - name: Validate Homebrew manifest against schema
+        if: github.event_name == 'release'
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/HomebrewPackageManifest.schema.json \
+            https://raw.githubusercontent.com/webosbrew/docs/main/schemas/HomebrewPackageManifest.schema.json
+          npx --yes ajv-cli@5 validate \
+            --spec=draft2020 \
+            -s /tmp/HomebrewPackageManifest.schema.json \
+            -d dist/*.manifest.json \
+            --strict=false
+
+      - name: Attach .ipk and manifest to the release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.ipk
+            dist/*.manifest.json

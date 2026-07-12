@@ -1,0 +1,52 @@
+[package]
+name = "punktfunk-webos"
+description = "Native LG webOS TV client for punktfunk — session pump direct on punktfunk-core, NDL DirectMedia hardware video decode, SDL2 window/gamepad/remote input."
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+authors = ["Enrico Bühler <enrico.buehler@unom.io>"]
+repository = "https://github.com/dyptan-io/pf-webos"
+
+[[bin]]
+name = "punktfunk-webos"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+# Pure Rust + libc (unix), portable — no FFmpeg/PipeWire/SDL3 baggage, unlike
+# pf-client-core's session::start() (see session.rs docs for why we don't use that).
+# Pinned to the punktfunk commit this client was developed/tested against — bump
+# deliberately, not automatically, since punktfunk-core's wire/ABI surface can move.
+punktfunk-core = { git = "https://git.unom.io/unom/punktfunk", rev = "89aa6767f9e161df0472781a9ae2b4e07ff9b015", features = [
+    "quic",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# LAN host discovery (discovery.rs) — pure Rust, same crate pf-client-core uses, but
+# a direct dependency here (see session.rs docs on why we don't depend on that crate).
+mdns-sd = "0.20"
+
+# `armv7-unknown-linux-gnueabi` (the webOS cross target) reports target_os = "linux",
+# same as a native Linux dev box — gated the same way pf-presenter (in the upstream
+# punktfunk repo) gates its SDL3 dependency to `cfg(any(target_os = "linux", windows))`,
+# so `cargo build` on macOS/Windows (no target_os=linux) doesn't need SDL2 at all;
+# main.rs has a stub body for that case. Found via pkg-config using the cross env
+# vars in .cargo/config.toml against the webOS sysroot (`task toolchain`) — no
+# bundled/static build.
+[target.'cfg(target_os = "linux")'.dependencies]
+# "ttf": SDL2_ttf + freetype are already on-device (confirmed on the CX), and we
+# render with LG's own system font (/usr/share/fonts/LG_Smart_UI-Regular.ttf) — see
+# ui.rs. No bundling needed, same build-time-link/runtime-resolve pattern as NDL.
+sdl2 = { version = "0.37", default-features = false, features = ["ttf"] }
+# Opus decode for the host's audio planes (audio.rs) — already a transitive dep via
+# punktfunk-core's `quic` feature (its C-ABI multistream path), but we call the crate
+# directly ourselves so it needs to be an explicit dependency too.
+opus = "0.3"
+# Game-library fetch from the host's management API over mTLS + fingerprint pinning
+# (library.rs) — a small standalone ureq+rustls client (not a dependency on the
+# upstream repo's pf-client-core crate — see session.rs docs). `ring` cross-compiles
+# cleanly for this target (already proven transitively via punktfunk-core's `quic`
+# feature above).
+ureq = "2"
+rustls = { version = "0.23", features = ["ring"] }

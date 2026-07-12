@@ -1,0 +1,15 @@
+# webOS TV cross target (see `task toolchain` in Taskfile.yml for the NDK fetch and
+# scripts/cc-shim.sh for why the linker isn't the NDK's gcc directly).
+[target.armv7-unknown-linux-gnueabi]
+linker = "scripts/cc-shim.sh"
+
+[env]
+CC_armv7_unknown_linux_gnueabi = { value = "scripts/cc-shim.sh", relative = true }
+CXX_armv7_unknown_linux_gnueabi = { value = "scripts/cxx-shim.sh", relative = true }
+AR_armv7_unknown_linux_gnueabi = { value = ".toolchains/arm-webos-linux-gnueabi_sdk-buildroot/bin/arm-webos-linux-gnueabi-gcc-ar", relative = true }
+PKG_CONFIG_ALLOW_CROSS_armv7_unknown_linux_gnueabi = "1"
+PKG_CONFIG_SYSROOT_DIR_armv7_unknown_linux_gnueabi = { value = ".toolchains/arm-webos-linux-gnueabi_sdk-buildroot/arm-webos-linux-gnueabi/sysroot", relative = true }
+PKG_CONFIG_LIBDIR_armv7_unknown_linux_gnueabi = { value = ".toolchains/arm-webos-linux-gnueabi_sdk-buildroot/arm-webos-linux-gnueabi/sysroot/usr/lib/pkgconfig", relative = true }
+# For the `cmake` crate (audiopus_sys's vendored libopus build, pulled in transitively
+# by punktfunk-core's `quic` feature — see Cargo.toml).
+CMAKE_TOOLCHAIN_FILE_armv7_unknown_linux_gnueabi = { value = ".toolchains/arm-webos-linux-gnueabi_sdk-buildroot/share/buildroot/toolchainfile.cmake", relative = true }
