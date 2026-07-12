@@ -4,11 +4,14 @@ This document captures the non-obvious decisions, platform limitations, and debu
 from building this client, so they don't have to be rediscovered. Developed and verified against
 a real **LG CX, webOS 5.6**, using root SSH access for logs/testing.
 
-## Toolchain (reproducible via `task toolchain` — see `Taskfile.yml`)
+## Toolchain (reproducible via `task toolchain:all` — see `Taskfile.yml`/`taskfiles/toolchain.yml`)
 
 - Cross target: `armv7-unknown-linux-gnueabi` (Rust tier-2) + `webosbrew/native-toolchain`'s
-  `arm-webos-linux-gnueabi-gcc` (buildroot, GCC 12.2.0). Ships a native **macOS arm64** build too
-  — no Docker/VM needed on Apple Silicon.
+  `arm-webos-linux-gnueabi-gcc` (buildroot, GCC 12.2.0). Only ships a **Linux aarch64** build for
+  Linux (no `linux-x86_64` release exists) — so local dev always runs inside the Docker build
+  container (`task build`/`check`/`package`, forced to `--platform linux/arm64` so this works the
+  same on an amd64 host too, via QEMU emulation). CI runs the `native:*` tasks directly instead,
+  since its runner is already Linux aarch64.
 - `.cargo/config.toml` wires the linker/CC/pkg-config env vars to `scripts/cc-shim.sh`/
   `cxx-shim.sh`, which pass `--sysroot` explicitly — this toolchain's baked-in default sysroot
   path is stale post-relocate.

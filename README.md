@@ -25,28 +25,26 @@ upstream `punktfunk-core` crate (pulled in as a pinned git dependency — see `C
 
 ## Building
 
-All build/package logic lives in `Taskfile.yml` ([go-task](https://taskfile.dev)) — the same tasks
-run locally, in Docker, and in CI, so there's only one place this logic is maintained.
+All build/package logic lives in `Taskfile.yml` ([go-task](https://taskfile.dev)) — the same
+logic runs locally and in CI, so there's only one place it's maintained. Local development always
+builds inside Docker: the webOS cross-toolchain only ships a Linux aarch64 build, so that's the
+one supported environment, regardless of your host OS/arch (an Intel/amd64 host transparently runs
+the container under QEMU emulation via `--platform linux/arm64`).
 
-**With Rust already installed** (macOS or Linux — the webosbrew NDK ships native builds for both):
-
-```sh
-task package   # fetches the toolchain (first run only, ~150MB), builds, packages
-```
-
-**With no local Rust/NDK at all — only Docker:**
+**Only Docker required — no local Rust/NDK at all:**
 
 ```sh
-task docker:package
+task package   # fetches the toolchain (first run only, ~150MB), builds, packages, all in Docker
 ```
 
 Runs the whole pipeline inside an ephemeral `docker run --rm` against the stock `rust` image (no
 custom Dockerfile). Caches (cargo registry/git, the webOS NDK, `target/`, `ares-package`) live in
 named Docker volumes, so repeat builds are fast; only `dist/*.ipk` lands on your machine.
 
-Either way, output is `dist/io.dyptan.punktfunk.webos_<version>_arm.ipk`. Run `task --list` for every
-other task (`build`/`check` for a faster inner loop, `docker:shell` to debug inside the container,
-`clean`/`clean:all`).
+Output is `dist/io.dyptan.punktfunk.webos_<version>_arm.ipk`. Run `task --list` for every other
+task (`build`/`check` for a faster inner loop, `shell` to debug inside the container,
+`clean`/`clean:all`). CI (`.github/workflows/build.yml`) skips Docker and calls the `native:*`
+tasks directly, since its runner is already Linux aarch64.
 
 **Versioning**: the checked-in `appinfo.json`/`Cargo.toml` version stays a fixed `0.0.1` — webOS
 itself never sees a "real" version. Every `.ipk`, dev or release, gets the HEAD commit's short sha

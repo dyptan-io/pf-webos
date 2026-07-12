@@ -49,17 +49,18 @@ tasks:
     cmds:
       - |
         set -eu
-        # webosbrew/native-toolchain's releases only ever publish three assets
-        # (confirmed via its GitHub releases API, every release back to 2023):
-        # darwin-arm64, darwin-x86_64, linux-aarch64 — there has never been a
-        # linux-x86_64 build, and the real Linux ARM asset name is
-        # "linux-aarch64", not "linux-arm64".
+        # webosbrew/native-toolchain's releases only ever publish a Linux
+        # aarch64 build for Linux (confirmed via its GitHub releases API, every
+        # release back to 2023 — there has never been a linux-x86_64 build).
+        # This task only ever runs inside the Linux/arm64 Docker build
+        # container (see docker-run below, always forced to --platform
+        # linux/arm64) or on an aarch64 CI runner, so that's the only case
+        # handled — no macOS/darwin branch needed since local dev never runs
+        # this natively on the host anymore.
         case "$(uname -s)-$(uname -m)" in
             Linux-aarch64|Linux-arm64) PLATFORM=linux-aarch64 ;;
-            Darwin-x86_64) PLATFORM=darwin-x86_64 ;;
-            Darwin-arm64) PLATFORM=darwin-arm64 ;;
             *)
-                echo "no webosbrew/native-toolchain release for $(uname -s)-$(uname -m)" >&2
+                echo "no webosbrew/native-toolchain release for $(uname -s)-$(uname -m) — this must run on Linux/aarch64 (inside the Docker container, or an aarch64 CI runner)" >&2
                 exit 1
                 ;;
         esac
@@ -254,10 +255,13 @@ tasks:
 
   # ------------------------------------------------------------------- docker --
   # Every `docker-*` task runs an ephemeral `docker run --rm` against the stock
-  # `rust` image (no custom Dockerfile) and re-invokes the *same* root tasks
-  # (`task build`/`task package`/`task check`) inside the container via a nested
-  # `task` install — no build logic is duplicated between the local and
-  # Dockerized paths. Only `dist/*.ipk` lands on the host.
+  # `rust` image (no custom Dockerfile) and re-invokes the root `native:*` tasks
+  # inside the container via a nested `task` install — no build logic is
+  # duplicated between CI's native path and this one. Only `dist/*.ipk` lands on
+  # the host. Forced to `--platform linux/arm64` regardless of host arch: the
+  # webOS NDK has no linux-x86_64 build, so an Intel/amd64 host transparently
+  # runs the container under QEMU emulation instead of failing outright — same
+  # effective environment (Linux aarch64) everywhere, host OS/arch aside.
 
   docker-run:
     internal: true
@@ -265,7 +269,7 @@ tasks:
       vars: [TARGET_TASK]
     cmds:
       - >-
-        docker run --rm {{.DOCKER_MOUNTS}} {{.RUST_IMAGE}}
+        docker run --rm --platform linux/arm64 {{.DOCKER_MOUNTS}} {{.RUST_IMAGE}}
         sh -c '
           apt-get update &&
           apt-get install -y --no-install-recommends cmake curl ca-certificates git pkg-config build-essential xz-utils &&
@@ -276,7 +280,7 @@ tasks:
   docker-shell:
     internal: true
     cmds:
-      - "docker run --rm -it {{.DOCKER_MOUNTS}} {{.RUST_IMAGE}} bash"
+      - "docker run --rm -it --platform linux/arm64 {{.DOCKER_MOUNTS}} {{.RUST_IMAGE}} bash"
 
   docker-volumes-rm:
     internal: true
