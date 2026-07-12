@@ -162,10 +162,64 @@ pub fn load_font<'a>(
         .map_err(|e| anyhow::anyhow!("load_font {SYSTEM_FONT_PATH}: {e}"))
 }
 
-/// Renders one line of text left-aligned at `(x, y)` (top-left), returning its width.
+/// Caches rasterized-text GPU textures across frames, keyed by the exact
+/// `(text, color, font)` that produced them. Without this, `draw_text` re-rasterized
+/// (freetype glyph lookup + blend) and re-uploaded a brand-new texture on *every*
+/// call — and every draw function in this module is called on every render tick
+/// (the pre-stream UI loop runs at ~60fps), so a static label like "Settings" paid
+/// that cost 60 times a second for pixels that never changed. `font` is identified
+/// by its address rather than any content: this client only ever loads three fonts
+/// once at startup (`font_label`/`font_value`/`font_title` in `main.rs`) and holds
+/// them for the whole UI-flow's lifetime, so a stable address is a safe, cheap
+/// stand-in for identity — `Font` itself exposes nothing hashable to key on instead.
+/// Entry count is naturally bounded by this app's own content (a handful of static
+/// labels, a bounded set of settings values, one row per known host/game) — no
+/// eviction needed; see module docs if that assumption ever stops holding.
+pub struct TextCache<'a> {
+    creator: &'a TextureCreator<WindowContext>,
+    entries: std::collections::HashMap<(String, u32, usize), sdl2::render::Texture<'a>>,
+}
+
+impl<'a> TextCache<'a> {
+    pub fn new(creator: &'a TextureCreator<WindowContext>) -> Self {
+        Self {
+            creator,
+            entries: std::collections::HashMap::new(),
+        }
+    }
+
+    fn key(font: &Font, text: &str, color: Color) -> (String, u32, usize) {
+        let packed_color = u32::from_be_bytes([color.r, color.g, color.b, color.a]);
+        (text.to_string(), packed_color, std::ptr::from_ref(font) as usize)
+    }
+
+    /// Returns the cached texture for `(font, text, color)`, rasterizing (and
+    /// caching) it first if this is the first time this exact combination has
+    /// been drawn.
+    fn get_or_create(&mut self, font: &Font, text: &str, color: Color) -> Result<&sdl2::render::Texture<'a>> {
+        let key = Self::key(font, text, color);
+        if !self.entries.contains_key(&key) {
+            let surface = font
+                .render(text)
+                .blended(color)
+                .map_err(|e| anyhow::anyhow!("render text: {e}"))?;
+            let texture = self
+                .creator
+                .create_texture_from_surface(&surface)
+                .context("texture from surface")?;
+            self.entries.insert(key.clone(), texture);
+        }
+        Ok(self.entries.get(&key).expect("just inserted"))
+    }
+}
+
+/// Renders one line of text left-aligned at `(x, y)` (top-left), returning its
+/// width. `text_cache` (see [`TextCache`]) makes repeat calls with the same
+/// `(font, text, color)` — the common case, since most on-screen text is static
+/// from one frame to the next — cheap: no re-rasterization, no new GPU texture.
 pub fn draw_text(
     canvas: &mut Canvas<Window>,
-    texture_creator: &TextureCreator<WindowContext>,
+    text_cache: &mut TextCache,
     font: &Font,
     text: &str,
     x: i32,
@@ -175,16 +229,10 @@ pub fn draw_text(
     if text.is_empty() {
         return Ok(0);
     }
-    let surface = font
-        .render(text)
-        .blended(color)
-        .map_err(|e| anyhow::anyhow!("render text: {e}"))?;
-    let texture = texture_creator
-        .create_texture_from_surface(&surface)
-        .context("texture from surface")?;
+    let texture = text_cache.get_or_create(font, text, color)?;
     let sdl2::render::TextureQuery { width, height, .. } = texture.query();
     canvas
-        .copy(&texture, None, Rect::new(x, y, width, height))
+        .copy(texture, None, Rect::new(x, y, width, height))
         .map_err(|e| anyhow::anyhow!("copy text texture: {e}"))?;
     Ok(width)
 }
@@ -366,7 +414,7 @@ fn tint_for(title: &str) -> Color {
 #[allow(clippy::too_many_arguments)]
 pub fn draw_poster_card(
     canvas: &mut Canvas<Window>,
-    texture_creator: &TextureCreator<WindowContext>,
+    text_cache: &mut TextCache,
     font_title: &Font,
     font_value: &Font,
     rect: Rect,
@@ -394,7 +442,7 @@ pub fn draw_poster_card(
             let art_h = r.height() as i32 - strip_h;
             draw_text(
                 canvas,
-                texture_creator,
+                text_cache,
                 font_title,
                 &initial,
                 r.x() + (r.width() as i32 - iw as i32) / 2,
@@ -414,7 +462,7 @@ pub fn draw_poster_card(
     let label = ellipsize(font_value, title, strip.width().saturating_sub(16));
     draw_text(
         canvas,
-        texture_creator,
+        text_cache,
         font_value,
         &label,
         strip.x() + 8,
@@ -599,7 +647,7 @@ pub fn draw_gear_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color, era
 #[allow(clippy::too_many_arguments)]
 pub fn draw_sidebar(
     canvas: &mut Canvas<Window>,
-    texture_creator: &TextureCreator<WindowContext>,
+    text_cache: &mut TextCache,
     font_label: &Font,
     font_title: &Font,
     entries: &[HostEntry],
@@ -607,14 +655,14 @@ pub fn draw_sidebar(
     screen_h: u32,
 ) -> Result<()> {
     fill_rounded_rect(canvas, Rect::new(0, 0, SIDEBAR_W, screen_h), 0, SIDEBAR_BG);
-    draw_text(canvas, texture_creator, font_title, "punktfunk", SIDEBAR_PAD, 56, WHITE)?;
+    draw_text(canvas, text_cache, font_title, "punktfunk", SIDEBAR_PAD, 56, WHITE)?;
 
     let add_row = entries.len();
     let settings_row = entries.len() + 1;
     for (i, entry) in entries.iter().enumerate() {
         draw_host_row(
             canvas,
-            texture_creator,
+            text_cache,
             font_label,
             i,
             entry.name(),
@@ -624,7 +672,7 @@ pub fn draw_sidebar(
     }
     draw_utility_row(
         canvas,
-        texture_creator,
+        text_cache,
         font_label,
         add_row,
         "+ Add host",
@@ -632,7 +680,7 @@ pub fn draw_sidebar(
     )?;
     draw_utility_row(
         canvas,
-        texture_creator,
+        text_cache,
         font_label,
         settings_row,
         "Settings",
@@ -642,7 +690,7 @@ pub fn draw_sidebar(
     if entries.is_empty() {
         draw_text(
             canvas,
-            texture_creator,
+            text_cache,
             font_label,
             "No hosts yet.",
             SIDEBAR_PAD,
@@ -655,7 +703,7 @@ pub fn draw_sidebar(
 
 fn draw_host_row(
     canvas: &mut Canvas<Window>,
-    texture_creator: &TextureCreator<WindowContext>,
+    text_cache: &mut TextCache,
     font_label: &Font,
     index: usize,
     name: &str,
@@ -679,7 +727,7 @@ fn draw_host_row(
     }
     draw_text(
         canvas,
-        texture_creator,
+        text_cache,
         font_label,
         name,
         drawn.x() + 18 + icon_size as i32 + 16,
@@ -691,7 +739,7 @@ fn draw_host_row(
 
 fn draw_utility_row(
     canvas: &mut Canvas<Window>,
-    texture_creator: &TextureCreator<WindowContext>,
+    text_cache: &mut TextCache,
     font_label: &Font,
     index: usize,
     label: &str,
@@ -714,7 +762,7 @@ fn draw_utility_row(
     }
     draw_text(
         canvas,
-        texture_creator,
+        text_cache,
         font_label,
         label.trim_start_matches('+').trim(),
         drawn.x() + 20 + icon_size as i32 + 16,
@@ -1004,7 +1052,7 @@ const SETTINGS_ICON_SIZE: u32 = 30;
 /// focus ring, matching this client's sidebar/grid visual language.
 pub fn draw_settings_rows(
     canvas: &mut Canvas<Window>,
-    texture_creator: &TextureCreator<WindowContext>,
+    text_cache: &mut TextCache,
     font_label: &Font,
     font_value: &Font,
     rows: &[SettingsRow],
@@ -1034,7 +1082,7 @@ pub fn draw_settings_rows(
         let label_x = icon_rect.x() + SETTINGS_ICON_SIZE as i32 + 20;
         draw_text(
             canvas,
-            texture_creator,
+            text_cache,
             font_label,
             &row.label,
             label_x,
@@ -1052,7 +1100,7 @@ pub fn draw_settings_rows(
                     pill_w,
                     52,
                 );
-                draw_dropdown_pill(canvas, texture_creator, font_value, pill, &row.value, focused)?;
+                draw_dropdown_pill(canvas, text_cache, font_value, pill, &row.value, focused)?;
             }
             RowKind::Slider => {
                 let value_w = font_value.size_of(&row.value).map_or(0, |(w, _)| w);
@@ -1060,7 +1108,7 @@ pub fn draw_settings_rows(
                 let value_x = drawn.x() + drawn.width() as i32 - control_pad - value_w as i32;
                 draw_text(
                     canvas,
-                    texture_creator,
+                    text_cache,
                     font_value,
                     &row.value,
                     value_x,
@@ -1092,7 +1140,7 @@ pub fn draw_settings_rows(
 /// A rounded pill button showing the current dropdown value + a small caret.
 pub fn draw_dropdown_pill(
     canvas: &mut Canvas<Window>,
-    texture_creator: &TextureCreator<WindowContext>,
+    text_cache: &mut TextCache,
     font: &Font,
     rect: Rect,
     label: &str,
@@ -1114,7 +1162,7 @@ pub fn draw_dropdown_pill(
     let text_w = font.size_of(&text).map_or(0, |(w, _)| w);
     draw_text(
         canvas,
-        texture_creator,
+        text_cache,
         font,
         &text,
         rect.x() + (rect.width() as i32 - text_w as i32) / 2,
@@ -1267,7 +1315,7 @@ pub fn draw_sun_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
 /// opened it, inside the settings modal card.
 pub fn draw_dropdown_overlay(
     canvas: &mut Canvas<Window>,
-    texture_creator: &TextureCreator<WindowContext>,
+    text_cache: &mut TextCache,
     font_value: &Font,
     options: &[String],
     focused_index: usize,
@@ -1286,7 +1334,7 @@ pub fn draw_dropdown_overlay(
         let drawn = draw_card(canvas, row_rect, focused);
         draw_text(
             canvas,
-            texture_creator,
+            text_cache,
             font_value,
             opt,
             drawn.x() + 20,
@@ -1408,7 +1456,7 @@ impl AddHostState {
 #[allow(clippy::too_many_arguments)]
 pub fn draw_highlighted_text(
     canvas: &mut Canvas<Window>,
-    texture_creator: &TextureCreator<WindowContext>,
+    text_cache: &mut TextCache,
     font: &Font,
     text: &str,
     focus_char: usize,
@@ -1421,7 +1469,7 @@ pub fn draw_highlighted_text(
     for (i, ch) in text.chars().enumerate() {
         let s = ch.to_string();
         let color = if i == focus_char { focus_color } else { base_color };
-        let w = draw_text(canvas, texture_creator, font, &s, cursor_x, y, color)?;
+        let w = draw_text(canvas, text_cache, font, &s, cursor_x, y, color)?;
         cursor_x += w as i32;
     }
     Ok(())

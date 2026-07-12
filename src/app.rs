@@ -127,8 +127,12 @@ impl App {
     }
 
     /// Merges freshly-discovered hosts into the entry list (known hosts keep their
-    /// paired status; a discovered host not yet known gets appended).
-    pub fn drain_discovery(&mut self) {
+    /// paired status; a discovered host not yet known gets appended). Returns
+    /// whether the sidebar actually changed — `main.rs`'s render loop uses this to
+    /// skip a redraw when a discovery tick found nothing new (see its dirty-flag
+    /// docs).
+    pub fn drain_discovery(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(found) = self.discovered.try_recv() {
             // `found.addr` is deliberate, not a typo for a nonexistent `found.host` —
             // `DiscoveredHost` (discovery.rs) only has `addr`, `KnownHost` (store.rs)
@@ -145,19 +149,25 @@ impl App {
                     .any(|e| matches!(e, HostEntry::Discovered(d) if d.addr == found.addr && d.port == found.port))
             {
                 self.entries.push(HostEntry::Discovered(found));
+                changed = true;
             }
         }
+        changed
     }
 
     /// Drains any cover art that's finished decoding since the last tick — called
     /// alongside `drain_discovery`. Raw pixels only; `main.rs` turns these into
-    /// SDL2 textures (see `art.rs`'s module docs for why the split).
-    pub fn drain_art(&mut self) {
-        let Some(rx) = &self.art_rx else { return };
+    /// SDL2 textures (see `art.rs`'s module docs for why the split). Returns
+    /// whether any new art actually arrived (see `drain_discovery`'s docs on why).
+    pub fn drain_art(&mut self) -> bool {
+        let Some(rx) = &self.art_rx else { return false };
+        let mut changed = false;
         while let Ok(loaded) = rx.try_recv() {
             self.art_pixels
                 .insert(loaded.game_id, (loaded.width, loaded.height, loaded.rgba));
+            changed = true;
         }
+        changed
     }
 
     /// Total sidebar nav positions: host rows + "+ Add host" + "Settings".
@@ -690,7 +700,7 @@ impl App {
     pub fn render(
         &self,
         canvas: &mut Canvas<Window>,
-        texture_creator: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
+        text_cache: &mut crate::ui::TextCache,
         font_label: &sdl2::ttf::Font,
         font_value: &sdl2::ttf::Font,
         font_title: &sdl2::ttf::Font,
@@ -701,32 +711,15 @@ impl App {
         canvas.set_draw_color(ui::BG);
         canvas.clear();
         self.render_home(
-            canvas,
-            texture_creator,
-            font_label,
-            font_value,
-            font_title,
-            art,
-            screen_w,
-            screen_h,
+            canvas, text_cache, font_label, font_value, font_title, art, screen_w, screen_h,
         )?;
 
         match self.screen {
             Screen::Home => {}
-            Screen::Pairing => {
-                self.render_pairing(canvas, texture_creator, font_label, font_title, screen_w, screen_h)?
-            }
-            Screen::Settings => {
-                self.render_settings(canvas, texture_creator, font_label, font_value, screen_w, screen_h)?
-            }
+            Screen::Pairing => self.render_pairing(canvas, text_cache, font_label, font_title, screen_w, screen_h)?,
+            Screen::Settings => self.render_settings(canvas, text_cache, font_label, font_value, screen_w, screen_h)?,
             Screen::AddHost => self.render_add_host(
-                canvas,
-                texture_creator,
-                font_label,
-                font_value,
-                font_title,
-                screen_w,
-                screen_h,
+                canvas, text_cache, font_label, font_value, font_title, screen_w, screen_h,
             )?,
         }
         canvas.present();
@@ -737,7 +730,7 @@ impl App {
     fn render_home(
         &self,
         canvas: &mut Canvas<Window>,
-        texture_creator: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
+        text_cache: &mut crate::ui::TextCache,
         font_label: &sdl2::ttf::Font,
         font_value: &sdl2::ttf::Font,
         font_title: &sdl2::ttf::Font,
@@ -751,7 +744,7 @@ impl App {
         };
         ui::draw_sidebar(
             canvas,
-            texture_creator,
+            text_cache,
             font_label,
             font_title,
             &self.entries,
@@ -764,7 +757,7 @@ impl App {
         if self.selected_host.is_none() {
             ui::draw_text(
                 canvas,
-                texture_creator,
+                text_cache,
                 font_label,
                 "No host selected — pick one from the list, or add one.",
                 grid_x + ui::GRID_PAD,
@@ -776,7 +769,7 @@ impl App {
         if let Some(status) = &self.home_status {
             ui::draw_text(
                 canvas,
-                texture_creator,
+                text_cache,
                 font_label,
                 status,
                 grid_x + ui::GRID_PAD,
@@ -794,7 +787,7 @@ impl App {
         let desktop_rect = ui::grid_card_rect(0, columns, grid_x, available_w);
         ui::draw_poster_card(
             canvas,
-            texture_creator,
+            text_cache,
             font_title,
             font_value,
             desktop_rect,
@@ -807,7 +800,7 @@ impl App {
             let rect = ui::grid_card_rect(idx, columns, grid_x, available_w);
             ui::draw_poster_card(
                 canvas,
-                texture_creator,
+                text_cache,
                 font_title,
                 font_value,
                 rect,
@@ -823,7 +816,7 @@ impl App {
     fn render_pairing(
         &self,
         canvas: &mut Canvas<Window>,
-        texture_creator: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
+        text_cache: &mut crate::ui::TextCache,
         font_label: &sdl2::ttf::Font,
         font_title: &sdl2::ttf::Font,
         screen_w: u32,
@@ -837,7 +830,7 @@ impl App {
 
         ui::draw_text(
             canvas,
-            texture_creator,
+            text_cache,
             font_title,
             "Pair with host",
             card.x() + 32,
@@ -846,7 +839,7 @@ impl App {
         )?;
         ui::draw_text(
             canvas,
-            texture_creator,
+            text_cache,
             font_label,
             "Enter the PIN shown in the host's pairing dialog.",
             card.x() + 32,
@@ -868,7 +861,7 @@ impl App {
             let tw = font_title.size_of(&text).map_or(0, |(w, _)| w);
             ui::draw_text(
                 canvas,
-                texture_creator,
+                text_cache,
                 font_title,
                 &text,
                 drawn.x() + (drawn.width() as i32 - tw as i32) / 2,
@@ -880,7 +873,7 @@ impl App {
             let color = if self.pairing_busy { ui::MUTED } else { ui::ERROR_RED };
             ui::draw_text(
                 canvas,
-                texture_creator,
+                text_cache,
                 font_label,
                 status,
                 card.x() + 32,
@@ -894,7 +887,7 @@ impl App {
     fn render_settings(
         &self,
         canvas: &mut Canvas<Window>,
-        texture_creator: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
+        text_cache: &mut crate::ui::TextCache,
         font_label: &sdl2::ttf::Font,
         font_value: &sdl2::ttf::Font,
         screen_w: u32,
@@ -907,7 +900,7 @@ impl App {
         ui::draw_close_icon(canvas, close_rect, if self.hover_close { ui::WHITE } else { ui::MUTED });
         ui::draw_text(
             canvas,
-            texture_creator,
+            text_cache,
             font_label,
             "Settings",
             card.x() + 40,
@@ -925,7 +918,7 @@ impl App {
         let rows = ui::settings_rows(&self.settings);
         ui::draw_settings_rows(
             canvas,
-            texture_creator,
+            text_cache,
             font_label,
             font_value,
             &rows,
@@ -936,7 +929,7 @@ impl App {
         if self.settings.bitrate_kbps > ui::BITRATE_WARN_KBPS {
             ui::draw_text(
                 canvas,
-                texture_creator,
+                text_cache,
                 font_value,
                 "Higher bitrate may be unstable on Wi-Fi — try Ethernet if streaming drops.",
                 content.x(),
@@ -949,7 +942,7 @@ impl App {
             let options = ui::dropdown_options(dd.row);
             let overlay_y = content.y() + (dd.row as i32 + 1) * (ui::SETTINGS_ROW_H as i32 + ui::SETTINGS_ROW_GAP);
             let overlay_rect = Rect::new(content.x(), overlay_y, content.width(), 0);
-            ui::draw_dropdown_overlay(canvas, texture_creator, font_value, &options, dd.focused, overlay_rect)?;
+            ui::draw_dropdown_overlay(canvas, text_cache, font_value, &options, dd.focused, overlay_rect)?;
         }
         Ok(())
     }
@@ -958,7 +951,7 @@ impl App {
     fn render_add_host(
         &self,
         canvas: &mut Canvas<Window>,
-        texture_creator: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
+        text_cache: &mut crate::ui::TextCache,
         font_label: &sdl2::ttf::Font,
         font_value: &sdl2::ttf::Font,
         font_title: &sdl2::ttf::Font,
@@ -973,7 +966,7 @@ impl App {
 
         ui::draw_text(
             canvas,
-            texture_creator,
+            text_cache,
             font_label,
             "Add host",
             card.x() + 32,
@@ -982,7 +975,7 @@ impl App {
         )?;
         ui::draw_text(
             canvas,
-            texture_creator,
+            text_cache,
             font_value,
             "Enter the host's IP address and port.",
             card.x() + 32,
@@ -997,7 +990,7 @@ impl App {
         let text_w = font_title.size_of(&text).map_or(0, |(w, _)| w);
         ui::draw_highlighted_text(
             canvas,
-            texture_creator,
+            text_cache,
             font_title,
             &text,
             focus_char,

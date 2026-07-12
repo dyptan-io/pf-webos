@@ -38,6 +38,16 @@ pub fn load_art_async(
     rx
 }
 
+/// Cap on the longer side of a decoded cover before it becomes an RGBA buffer/GPU
+/// texture. Source art (Steam CDN capsules etc.) commonly runs well past 1000px on
+/// a side, but the grid never draws a card anywhere near that — `ui::CARD_MIN_W`
+/// is 220px and even a 4K panel at the minimum 2-column layout tops out a few
+/// hundred px short of this cap (see `ui::grid_card_size`). Decoding/uploading at
+/// full source resolution wastes both host-thread decode time and (durably, for
+/// as long as the card is in `main.rs`'s texture cache) GPU texture memory for
+/// pixels the panel can never actually show.
+const MAX_ART_DIMENSION: u32 = 480;
+
 fn fetch_all(
     host: &str,
     mgmt_port: u16,
@@ -46,15 +56,33 @@ fn fetch_all(
     games: &[GameEntry],
     tx: &Sender<ArtLoaded>,
 ) {
+    // One mTLS connection reused for every game's art in this batch — building a
+    // fresh `ureq::Agent` per request (the old code's `fetch_art` did this
+    // internally) means a fresh TCP+TLS handshake, including client-cert auth,
+    // for every single cover: real, avoidable latency and CPU cost that scales
+    // with library size. See `library::agent`'s docs.
+    let Ok(agent) = crate::library::agent(identity, fingerprint) else {
+        return;
+    };
     for game in games {
         let Some(path) = game.art.portrait.as_deref().or(game.art.header.as_deref()) else {
             continue;
         };
-        let Ok(bytes) = crate::library::fetch_art(host, mgmt_port, identity, fingerprint, path) else {
+        let Ok(bytes) = crate::library::fetch_art(&agent, host, mgmt_port, path) else {
             continue;
         };
         let Ok(decoded) = image::load_from_memory(&bytes) else {
             continue;
+        };
+        let longer_side = decoded.width().max(decoded.height());
+        let decoded = if longer_side > MAX_ART_DIMENSION {
+            decoded.resize(
+                MAX_ART_DIMENSION,
+                MAX_ART_DIMENSION,
+                image::imageops::FilterType::Triangle,
+            )
+        } else {
+            decoded
         };
         let rgba = decoded.to_rgba8();
         let (width, height) = rgba.dimensions();

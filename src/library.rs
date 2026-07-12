@@ -76,7 +76,14 @@ fn base_url(addr: &str, mgmt_port: u16) -> String {
     }
 }
 
-fn agent(identity: &(String, String), pin: Option<[u8; 32]>) -> Result<ureq::Agent, LibraryError> {
+/// Builds one mTLS `ureq::Agent`, reusable across many requests to the same host
+/// (`ureq::Agent` owns a connection pool — reusing one instance keeps a TCP+TLS
+/// connection alive across calls instead of paying a fresh mutual-TLS handshake,
+/// including re-parsing the PEM identity, every single time). Exposed so
+/// `art.rs`'s per-game cover-art loop can build it once outside the loop, instead
+/// of what `fetch_art` used to do (build a fresh one — and a fresh handshake —
+/// per game, which is real, avoidable latency/CPU cost for a library of any size).
+pub fn agent(identity: &(String, String), pin: Option<[u8; 32]>) -> Result<ureq::Agent, LibraryError> {
     use rustls::pki_types::pem::PemObject;
     let bad = |what: &str, e: &dyn std::fmt::Display| LibraryError::Unreachable(format!("{what}: {e}"));
     // The ring provider, explicitly — the same one punktfunk-core's QUIC endpoints
@@ -122,16 +129,11 @@ pub fn fetch_games(
 }
 
 /// Fetches one piece of cover art's raw bytes (JPEG/PNG, undecoded) from a
-/// host-relative `art_path` (one of `GameEntry::art`'s fields) — same mTLS agent
-/// as `fetch_games`. Decoding happens in `art.rs`, off this module's REST concern.
-pub fn fetch_art(
-    addr: &str,
-    mgmt_port: u16,
-    identity: &(String, String),
-    pin: Option<[u8; 32]>,
-    art_path: &str,
-) -> Result<Vec<u8>, LibraryError> {
-    let agent = agent(identity, pin)?;
+/// host-relative `art_path` (one of `GameEntry::art`'s fields) — same mTLS pinning
+/// as `fetch_games`, but takes an already-built `agent` so a caller fetching many
+/// art paths in a row (see `art.rs`) reuses one connection instead of a fresh mTLS
+/// handshake per call. Decoding happens in `art.rs`, off this module's REST concern.
+pub fn fetch_art(agent: &ureq::Agent, addr: &str, mgmt_port: u16, art_path: &str) -> Result<Vec<u8>, LibraryError> {
     let url = format!("{}{art_path}", base_url(addr, mgmt_port));
     let mut buf = Vec::new();
     match agent.get(&url).call() {

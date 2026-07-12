@@ -179,10 +179,34 @@ mod real {
         // `art.rs`); turning those into textures happens here, each tick.
         let mut art_textures: std::collections::HashMap<String, sdl2::render::Texture> =
             std::collections::HashMap::new();
+        // Rasterized-text texture cache (see `ui::TextCache` docs) — created once
+        // here, alongside `art_textures`, and threaded down through every render
+        // call for the rest of this UI-flow's lifetime so repeat draws of the same
+        // (font, text, color) reuse a GPU texture instead of re-rasterizing freetype
+        // glyphs and re-uploading a new one on every ~60fps tick.
+        let mut text_cache = crate::ui::TextCache::new(texture_creator);
         let mut back_prev = false;
+        // Redraw-on-change: this screen has no time-based animation at all (no
+        // spinner/blink/marquee — confirmed by grepping the whole pre-stream UI for
+        // any `Instant`/frame-counter-driven visual state), so every pixel that can
+        // change only ever changes as a reaction to one of: an SDL event, a
+        // Discovery/art background result, or the raw scancode Back/Red edge below
+        // — anything else is a no-op tick. Without this, `app.render(...)` (and the
+        // `canvas.present()` vsync swap inside it) ran unconditionally every 16ms
+        // forever, even sitting on an untouched menu. Starts `true` so the first
+        // frame always draws.
+        let mut dirty = true;
         let target = 'ui: loop {
-            app.drain_discovery();
-            app.drain_art();
+            dirty |= app.drain_discovery();
+            dirty |= app.drain_art();
+            // `app.art_pixels` is the source of truth (cleared by `select_host` on
+            // every host switch — see app.rs) — drop any GPU texture whose id isn't
+            // in it anymore. Without this, switching hosts repeatedly during one
+            // app run only ever grew this cache: `art_pixels` cleared and refilled
+            // per host, but nothing ever removed the *previous* host's now-orphaned
+            // textures from here, leaking GPU texture memory for as long as the app
+            // ran (unbounded in the number of distinct hosts/games ever viewed).
+            art_textures.retain(|id, _| app.art_pixels.contains_key(id));
             for (id, (w, h, rgba)) in &app.art_pixels {
                 if art_textures.contains_key(id) {
                     continue;
@@ -200,6 +224,10 @@ mod real {
             }
             for event in events.poll_iter() {
                 use sdl2::event::Event;
+                // Any event might change what's on screen (focus/hover, a typed
+                // digit, a screen transition) — simplest to mark dirty for all of
+                // them rather than re-litigate that per event kind.
+                dirty = true;
                 if let Event::Quit { .. } = event {
                     writeln!(log, "quit during UI")?;
                     return Ok(None);
@@ -275,11 +303,17 @@ mod real {
                 if let Some(target) = apply_back(&mut app, log) {
                     break 'ui target;
                 }
+                dirty = true;
             }
             back_prev = back_now;
+            if !dirty {
+                std::thread::sleep(Duration::from_millis(16));
+                continue;
+            }
+            dirty = false;
             app.render(
                 canvas,
-                texture_creator,
+                &mut text_cache,
                 font_label,
                 font_value,
                 font_title,

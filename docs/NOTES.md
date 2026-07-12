@@ -4,6 +4,41 @@ This document captures the non-obvious decisions, platform limitations, and debu
 from building this client, so they don't have to be rediscovered. Developed and verified against
 a real **LG CX, webOS 5.6**, using root SSH access for logs/testing.
 
+## Memory/performance pass (2026-07-12)
+
+Not yet verified on real hardware — reasoned from code + a native macOS/Linux build only; treat
+as "should help" until profiled on-device, same caveat as anything else in this file not yet
+crossed off.
+
+- **`ui::TextCache`**: `ui::draw_text` used to rasterize (freetype) and upload a brand-new GPU
+  texture on *every* call, with zero caching — and every draw function runs on every render tick
+  of the ~60fps pre-stream UI loop, so a static label like "Settings" paid that cost 60×/sec for
+  pixels that never changed (`draw_highlighted_text`, used for PIN/IP entry, made this worse by
+  calling `draw_text` once per character). Now keyed by `(font address, text, color)` and reused
+  across frames — created once in `main.rs::run_ui_flow` alongside `art_textures`, threaded down
+  through every render call in place of the `texture_creator` parameter they used to take (nothing
+  in `ui.rs`/`app.rs` needed a raw `TextureCreator` for anything else).
+- **Redraw-on-change**: the same loop called `app.render(...)` (and its `canvas.present()` vsync
+  swap) unconditionally every 16ms tick forever, even sitting on a completely untouched menu. Safe
+  to skip when nothing changed *because* this UI has no time-based animation anywhere (no spinner/
+  blink/marquee) — every pixel that can change does so only in reaction to an SDL event, a
+  Discovery/art background result, or the raw scancode Back/Red edge, all of which now set a
+  `dirty` flag that gates the render call.
+- **Cover-art GPU texture leak**: `app.art_pixels` (raw RGBA) gets cleared on every host switch
+  (`select_host`), but `main.rs`'s `art_textures` (the GPU-texture cache built from it) was never
+  pruned to match — only ever grew. Switching hosts repeatedly during one run leaked every
+  previous host's textures for the rest of the app's life. Fixed with a `retain()` that syncs it
+  to `art_pixels` each tick.
+- **Cover art decoded at full source resolution**: Steam-CDN-style capsules commonly exceed
+  1000px on a side; the grid never draws a card anywhere near that (`ui::CARD_MIN_W` is 220px).
+  `art.rs` now downscales (aspect-preserved, cap 480px on the longer side) before the RGBA
+  buffer/GPU texture is created.
+- **A fresh mTLS handshake per cover-art fetch**: `library::fetch_art` built a brand-new
+  `ureq::Agent` (fresh TLS config, re-parsed PEM identity, fresh TCP+TLS handshake with
+  client-cert auth) on every call, and `art.rs` calls it once per game — a 30-50 game library paid
+  for that many redundant mutual-TLS handshakes to the *same* host. `library::agent` is now public
+  so `art.rs` builds one per batch and reuses it across every game's fetch.
+
 ## Linting (`task lint`/`task native:lint`, format via `task fmt`)
 
 `Cargo.toml`'s `[lints.clippy]` is a curated slice of `pedantic`/`nursery` lints, not a blanket
