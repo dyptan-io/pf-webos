@@ -156,6 +156,12 @@ pub fn connect(
 /// "≤ ~1/100ms" guidance).
 const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Above this, `NDL_DirectVideoPlay` is applying backpressure rather than accepting the
+/// access unit promptly — worth a log line even though (per aurora-tv's own investigation
+/// of the same NDL backend, see `docs/NOTES.md`) there's no known client-side fix once it
+/// happens; it's diagnostic signal for telling decoder-side stalls apart from network loss.
+const NDL_FEED_BACKPRESSURE_WARN: Duration = Duration::from_millis(20);
+
 fn video_pump(client: Arc<NativeClient>, ndl: NdlVideo, stop: Arc<AtomicBool>, is_hdr: bool, log: &mut std::fs::File) {
     let mut last_keyframe_request: Option<Instant> = None;
     let mut last_dropped_seen = client.frames_dropped();
@@ -183,8 +189,29 @@ fn video_pump(client: Arc<NativeClient>, ndl: NdlVideo, stop: Arc<AtomicBool>, i
                     }
                 }
 
-                if let Err(e) = ndl.play(&frame.data) {
+                let feed_start = Instant::now();
+                let play_result = ndl.play(&frame.data);
+                let feed_elapsed = feed_start.elapsed();
+                if feed_elapsed >= NDL_FEED_BACKPRESSURE_WARN {
+                    let _ = writeln!(
+                        log,
+                        "NDL_DirectVideoPlay slow: {:.1}ms (frame {}) — decoder backpressure, not network loss",
+                        feed_elapsed.as_secs_f32() * 1000.0,
+                        frame.frame_index
+                    );
+                }
+                if let Err(e) = play_result {
                     let _ = writeln!(log, "NDL play error (frame {}): {e:#}", frame.frame_index);
+                    // NDL rejected this access unit outright (e.g. a transient decoder hiccup
+                    // around an HDR/mode change) — request a fresh keyframe so later P-frames
+                    // don't decode against a reference NDL never actually accepted. Same throttle
+                    // as the network-loss path above; matches the recovery aurora-tv added for
+                    // its ss4s frontend's NOT_READY feed results left otherwise uncorrected.
+                    if last_keyframe_request.is_none_or(|t| t.elapsed() >= KEYFRAME_REQUEST_MIN_INTERVAL) {
+                        let _ = client.request_keyframe();
+                        let _ = ndl.flush();
+                        last_keyframe_request = Some(Instant::now());
+                    }
                 }
             }
             Err(punktfunk_core::PunktfunkError::NoFrame) => {}
