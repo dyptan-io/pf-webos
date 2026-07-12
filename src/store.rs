@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 fn app_dir() -> PathBuf {
-    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/tmp"))
+    std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from)
 }
 
 fn identity_paths() -> (PathBuf, PathBuf) {
@@ -23,8 +23,7 @@ pub fn load_or_create_identity() -> Result<(String, String)> {
     if let (Ok(cert), Ok(key)) = (std::fs::read_to_string(&cert_path), std::fs::read_to_string(&key_path)) {
         return Ok((cert, key));
     }
-    let identity =
-        punktfunk_core::quic::endpoint::generate_identity().context("generate_identity")?;
+    let identity = punktfunk_core::quic::endpoint::generate_identity().context("generate_identity")?;
     std::fs::write(&cert_path, &identity.0).context("write client-cert.pem")?;
     std::fs::write(&key_path, &identity.1).context("write client-key.pem")?;
     Ok(identity)
@@ -93,8 +92,11 @@ pub fn load_selected_host() -> Option<(String, u16)> {
 }
 
 pub fn save_selected_host(host: &str, port: u16) -> Result<()> {
-    let json = serde_json::to_string_pretty(&SelectedHost { host: host.to_string(), port })
-        .context("serialize selected host")?;
+    let json = serde_json::to_string_pretty(&SelectedHost {
+        host: host.to_string(),
+        port,
+    })
+    .context("serialize selected host")?;
     std::fs::write(selected_host_path(), json).context("write selected-host.json")
 }
 
@@ -115,7 +117,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings {
+        Self {
             width: 3840,
             height: 2160,
             refresh_hz: 60,

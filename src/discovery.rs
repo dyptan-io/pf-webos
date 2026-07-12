@@ -32,18 +32,17 @@ pub fn browse() -> std::sync::mpsc::Receiver<DiscoveredHost> {
                 };
                 // IPv4 only, same policy as the other clients — the core dials
                 // `format!("{host}:{port}").parse::<SocketAddr>()` over IPv4.
-                let Some(addr) = info.get_addresses_v4().iter().next().map(|a| a.to_string())
+                let Some(addr) = info
+                    .get_addresses_v4()
+                    .iter()
+                    .next()
+                    .map(std::string::ToString::to_string)
                 else {
                     continue;
                 };
                 let props = info.get_properties();
                 let host = DiscoveredHost {
-                    name: info
-                        .get_fullname()
-                        .split('.')
-                        .next()
-                        .unwrap_or("?")
-                        .to_string(),
+                    name: info.get_fullname().split('.').next().unwrap_or("?").to_string(),
                     addr,
                     port: info.get_port(),
                     mgmt_port: props.get_property_val_str("mgmt").and_then(|v| v.parse().ok()),

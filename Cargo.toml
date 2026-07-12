@@ -12,6 +12,30 @@ repository = "https://github.com/dyptan-io/pf-webos"
 name = "punktfunk-webos"
 path = "src/main.rs"
 
+[lints.clippy]
+# `clippy::all` (correctness/suspicious/style/complexity/perf) is already clean and
+# enabled by default — this section adds a curated slice of `pedantic`/`nursery`
+# lints worth enforcing project-wide, picked for being unambiguous idiom
+# improvements with near-zero false-positive rate. Deliberately NOT a blanket
+# `#![warn(clippy::pedantic)]`/`clippy::nursery`: this is an SDL2 2D-rendering
+# client where most pixel/rect/color math is small ints and floats bounded by a TV
+# panel's own resolution (well under 2^16 in every dimension) — the
+# `cast_possible_truncation`/`cast_sign_loss`/`cast_precision_loss`/
+# `cast_possible_wrap` lints alone accounted for over 300 of ~360 pedantic
+# warnings here, none of them a real risk at these magnitudes; enabling them
+# would mean annotating (or `try_from`-ing) hundreds of call sites for no actual
+# safety gain, drowning out the lints below that do catch something real.
+cast_lossless = "warn" # `x as WiderType` where `WiderType::from(x)` is exact and infallible — real, zero-cost cleanup.
+map_unwrap_or = "warn" # `.map(f).unwrap_or(a)`/`unwrap_or_else(g)` → `.map_or(a, f)`/`.map_or_else(g, f)`.
+use_self = "warn" # `Struct { .. }`/`Struct::method()` inside `impl Struct` → `Self`.
+doc_markdown = "warn" # Bare identifiers in doc comments that should be `` `backticked` ``.
+manual_let_else = "warn" # `match`/`if let` that just returns/continues on the other arm → `let ... else`.
+redundant_closure_for_method_calls = "warn"
+items_after_statements = "warn"
+match_same_arms = "warn"
+format_collect = "warn" # `.map(|x| format!(...)).collect::<String>()`-shaped loops building a String.
+suspicious_operation_groupings = "warn" # caught a real field-name mismatch risk once already — see app.rs.
+
 [dependencies]
 anyhow = "1"
 # Pure Rust + libc (unix), portable — no FFmpeg/PipeWire/SDL3 baggage, unlike

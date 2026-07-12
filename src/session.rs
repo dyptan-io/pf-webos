@@ -3,7 +3,7 @@
 //! `session::start()` — that crate's `[target.'cfg(any(target_os = "linux", windows))']`
 //! dependency table (FFmpeg/PipeWire/SDL3) activates on our target too (it also
 //! reports `target_os = "linux"`), and none of those are available or needed here: we
-//! decode video via NDL (hardware, OS-native) and audio via plain SDL2, not FFmpeg.
+//! decode video via NDL (hardware, OS-native) and audio via plain SDL2, not `FFmpeg`.
 //! See the `punktfunk-webos` plan/memory notes for the full rationale.
 //!
 //! Audio is pumped from the *main thread's* event loop (`main.rs`), not a spawned
@@ -11,6 +11,7 @@
 //! internally (confirmed via the sdl2 crate source: `SubsystemDrop` is `Rc`-backed),
 //! so it isn't `Send` and can't be moved into a new OS thread. `pump_audio_once`
 //! below is the non-blocking drain call `main.rs`'s loop makes each tick.
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -95,11 +96,10 @@ pub fn connect(
     )
     .context("connect")?;
     let client = Arc::new(client);
-    let fp_hex = client
-        .host_fingerprint
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let fp_hex = client.host_fingerprint.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    });
     writeln!(
         log,
         "connected: codec={} compositor={:?} audio_channels={} color={:?} fingerprint={fp_hex}",
@@ -110,8 +110,8 @@ pub fn connect(
     let codec = NdlCodec::from_wire(client.codec)
         .with_context(|| format!("host resolved an unsupported codec bit {}", client.codec))?;
     let app_id = std::env::var("APPID").unwrap_or_else(|_| "io.dyptan.punktfunk.webos".into());
-    let ndl = NdlVideo::load(&app_id, resolved_mode.width as i32, resolved_mode.height as i32, codec)
-        .context("NDL load")?;
+    let ndl =
+        NdlVideo::load(&app_id, resolved_mode.width as i32, resolved_mode.height as i32, codec).context("NDL load")?;
     ndl.set_area(0, 0, display_w, display_h).context("NDL set_area")?;
     writeln!(
         log,
@@ -243,21 +243,17 @@ pub fn pump_audio_once(client: &NativeClient, audio: &mut crate::audio::AudioPla
     // reaching the speaker" (PulseAudio-side inspection showed the stream reaching
     // a real, unmuted, 100%-volume hardware sink, so this checks the other end).
     static PACKET_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    loop {
-        match client.next_audio(Duration::ZERO) {
-            Ok(packet) => match audio.play(&packet.data) {
-                Ok(peak) => {
-                    let n = PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
-                    if n % 200 == 0 {
-                        let _ = writeln!(log, "audio decode peak amplitude: {peak:.4}");
-                    }
+    while let Ok(packet) = client.next_audio(Duration::ZERO) {
+        match audio.play(&packet.data) {
+            Ok(peak) => {
+                let n = PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n % 200 == 0 {
+                    let _ = writeln!(log, "audio decode peak amplitude: {peak:.4}");
                 }
-                Err(e) => {
-                    let _ = writeln!(log, "audio play error (seq {}): {e:#}", packet.seq);
-                }
-            },
-            Err(punktfunk_core::PunktfunkError::NoFrame) => break,
-            Err(_) => break,
+            }
+            Err(e) => {
+                let _ = writeln!(log, "audio play error (seq {}): {e:#}", packet.seq);
+            }
         }
     }
 }

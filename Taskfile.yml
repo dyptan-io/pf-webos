@@ -48,6 +48,17 @@ tasks:
     cmds:
       - task: toolchain:docker-shell
 
+  lint:
+    desc: Cross-target `cargo clippy` (the lint set in Cargo.toml's `[lints.clippy]`), inside Docker
+    cmds:
+      - task: toolchain:docker-run
+        vars: {TARGET_TASK: native:lint}
+
+  fmt:
+    desc: Format the whole crate with rustfmt (native — formatting doesn't need the cross toolchain)
+    cmds:
+      - cargo fmt
+
   native:build:
     desc: >-
       Cross-compile directly on the host, no Docker — only meaningful on a Linux
@@ -70,6 +81,16 @@ tasks:
     cmds:
       - rustup target add {{.TARGET}}
       - cargo check --target {{.TARGET}}
+
+  native:lint:
+    desc: Cross-target `cargo clippy`, no Docker (used by CI)
+    deps: [toolchain:all]
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+    cmds:
+      - rustup target add {{.TARGET}}
+      - rustup component add clippy
+      - cargo clippy --target {{.TARGET}} --all-targets -- -D warnings
 
   native:package:
     desc: Build and package dist/*.ipk, no Docker (used by CI)

@@ -22,11 +22,10 @@ impl AudioPlayer {
     /// `channels` is the host-resolved `NativeClient::audio_channels` (2/6/8) — the
     /// client MUST build its decoder from this, never its own request (see
     /// `punktfunk_core::client::NativeClient::audio_channels` docs).
-    pub fn new(sdl_audio: &sdl2::AudioSubsystem, channels: u8) -> Result<AudioPlayer> {
+    pub fn new(sdl_audio: &sdl2::AudioSubsystem, channels: u8) -> Result<Self> {
         let layout = layout_for(channels, false);
-        let decoder =
-            opus::MSDecoder::new(SAMPLE_RATE, layout.streams, layout.coupled, layout.mapping)
-                .map_err(|e| anyhow::anyhow!("opus MSDecoder::new: {e}"))?;
+        let decoder = opus::MSDecoder::new(SAMPLE_RATE, layout.streams, layout.coupled, layout.mapping)
+            .map_err(|e| anyhow::anyhow!("opus MSDecoder::new: {e}"))?;
         let spec = sdl2::audio::AudioSpecDesired {
             freq: Some(SAMPLE_RATE as i32),
             channels: Some(layout.channels),
@@ -36,7 +35,7 @@ impl AudioPlayer {
             .open_queue::<f32, _>(None, &spec)
             .map_err(|e| anyhow::anyhow!("SDL open_queue: {e}"))?;
         queue.resume();
-        Ok(AudioPlayer {
+        Ok(Self {
             queue,
             decoder,
             channels: layout.channels as usize,

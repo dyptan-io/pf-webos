@@ -55,7 +55,7 @@ pub fn button_event(button: Button, pressed: bool, pad: u8) -> InputEvent {
         code: button_bit(button),
         x: if pressed { 1 } else { 0 },
         y: 0,
-        flags: pad as u32,
+        flags: u32::from(pad),
     }
 }
 
@@ -65,8 +65,8 @@ pub fn button_event(button: Button, pressed: bool, pad: u8) -> InputEvent {
 /// rescaled.
 pub fn axis_event(axis: Axis, value: i16, pad: u8) -> InputEvent {
     let scaled = match axis {
-        Axis::TriggerLeft | Axis::TriggerRight => (value as i32 * 255) / 32767,
-        _ => value as i32,
+        Axis::TriggerLeft | Axis::TriggerRight => (i32::from(value) * 255) / 32767,
+        _ => i32::from(value),
     };
     InputEvent {
         kind: InputKind::GamepadAxis,
@@ -74,6 +74,6 @@ pub fn axis_event(axis: Axis, value: i16, pad: u8) -> InputEvent {
         code: axis_id(axis),
         x: scaled,
         y: 0,
-        flags: pad as u32,
+        flags: u32::from(pad),
     }
 }

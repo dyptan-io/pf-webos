@@ -157,7 +157,7 @@ pub fn load_font<'a>(
     height_px: u32,
     design_size: u16,
 ) -> Result<Font<'a, 'static>> {
-    let scaled = (design_size as u32 * height_px / 720).max(10) as u16;
+    let scaled = (u32::from(design_size) * height_px / 720).max(10) as u16;
     ttf.load_font(SYSTEM_FONT_PATH, scaled)
         .map_err(|e| anyhow::anyhow!("load_font {SYSTEM_FONT_PATH}: {e}"))
 }
@@ -193,14 +193,14 @@ pub fn draw_text(
 /// (moonlight-tv scroll-marquees long titles on focus instead — see the module docs
 /// on why this client keeps it simple).
 pub fn ellipsize(font: &Font, text: &str, max_w: u32) -> String {
-    if font.size_of(text).map(|(w, _)| w).unwrap_or(0) <= max_w {
+    if font.size_of(text).map_or(0, |(w, _)| w) <= max_w {
         return text.to_string();
     }
     let mut s: Vec<char> = text.chars().collect();
     while !s.is_empty() {
         s.pop();
         let candidate: String = s.iter().collect::<String>() + "…";
-        if font.size_of(&candidate).map(|(w, _)| w).unwrap_or(0) <= max_w {
+        if font.size_of(&candidate).map_or(0, |(w, _)| w) <= max_w {
             return candidate;
         }
     }
@@ -211,7 +211,7 @@ pub fn ellipsize(font: &Font, text: &str, max_w: u32) -> String {
 
 /// Fills a rounded rectangle one scanline at a time (a plain filled rect in the
 /// middle, an inset computed per-row from the corner circle's equation near the
-/// top/bottom edges) — no SDL2_gfx dependency, cheap enough for the handful of
+/// top/bottom edges) — no `SDL2_gfx` dependency, cheap enough for the handful of
 /// panels on screen at once.
 pub fn fill_rounded_rect(canvas: &mut Canvas<Window>, rect: Rect, radius: i32, color: Color) {
     let (w, h) = (rect.width() as i32, rect.height() as i32);
@@ -229,7 +229,11 @@ pub fn fill_rounded_rect(canvas: &mut Canvas<Window>, rect: Rect, radius: i32, c
         } else {
             -1
         };
-        let inset = if dy < 0 { 0 } else { r - (((r * r - dy * dy).max(0)) as f64).sqrt().round() as i32 };
+        let inset = if dy < 0 {
+            0
+        } else {
+            r - f64::from((r * r - dy * dy).max(0)).sqrt().round() as i32
+        };
         let row_w = (w - 2 * inset).max(0) as u32;
         if row_w == 0 {
             continue;
@@ -249,12 +253,18 @@ pub fn draw_rounded_rect_outline(canvas: &mut Canvas<Window>, rect: Rect, radius
         return;
     }
     let _ = canvas.draw_line((rect.x() + r, rect.y()), (rect.x() + w - r - 1, rect.y()));
-    let _ = canvas.draw_line((rect.x() + r, rect.y() + h - 1), (rect.x() + w - r - 1, rect.y() + h - 1));
+    let _ = canvas.draw_line(
+        (rect.x() + r, rect.y() + h - 1),
+        (rect.x() + w - r - 1, rect.y() + h - 1),
+    );
     let _ = canvas.draw_line((rect.x(), rect.y() + r), (rect.x(), rect.y() + h - r - 1));
-    let _ = canvas.draw_line((rect.x() + w - 1, rect.y() + r), (rect.x() + w - 1, rect.y() + h - r - 1));
+    let _ = canvas.draw_line(
+        (rect.x() + w - 1, rect.y() + r),
+        (rect.x() + w - 1, rect.y() + h - r - 1),
+    );
     for y in 0..r {
         let dy = r - 1 - y;
-        let inset = r - (((r * r - dy * dy).max(0)) as f64).sqrt().round() as i32;
+        let inset = r - f64::from((r * r - dy * dy).max(0)).sqrt().round() as i32;
         let _ = canvas.draw_point((rect.x() + inset, rect.y() + y));
         let _ = canvas.draw_point((rect.x() + w - inset - 1, rect.y() + y));
         let _ = canvas.draw_point((rect.x() + inset, rect.y() + h - 1 - y));
@@ -337,7 +347,9 @@ const POSTER_TINTS: [Color; 6] = [
 ];
 
 fn tint_for(title: &str) -> Color {
-    let hash = title.bytes().fold(5381u32, |h, b| h.wrapping_mul(33).wrapping_add(b as u32));
+    let hash = title
+        .bytes()
+        .fold(5381u32, |h, b| h.wrapping_mul(33).wrapping_add(u32::from(b)));
     POSTER_TINTS[hash as usize % POSTER_TINTS.len()]
 }
 
@@ -372,7 +384,12 @@ pub fn draw_poster_card(
         }
         None => {
             fill_rounded_rect(canvas, r, CARD_RADIUS, tint_for(title));
-            let initial = title.chars().find(|c| c.is_alphanumeric()).unwrap_or('?').to_uppercase().to_string();
+            let initial = title
+                .chars()
+                .find(|c| c.is_alphanumeric())
+                .unwrap_or('?')
+                .to_uppercase()
+                .to_string();
             let (iw, ih) = font_title.size_of(&initial).unwrap_or((0, 0));
             let art_h = r.height() as i32 - strip_h;
             draw_text(
@@ -387,7 +404,12 @@ pub fn draw_poster_card(
         }
     }
 
-    let strip = Rect::new(r.x() + 2, r.y() + r.height() as i32 - strip_h, r.width().saturating_sub(4), strip_h.max(0) as u32);
+    let strip = Rect::new(
+        r.x() + 2,
+        r.y() + r.height() as i32 - strip_h,
+        r.width().saturating_sub(4),
+        strip_h.max(0) as u32,
+    );
     fill_rounded_rect(canvas, strip, 0, Color::RGBA(0x00, 0x00, 0x00, 0x70));
     let label = ellipsize(font_value, title, strip.width().saturating_sub(16));
     draw_text(
@@ -441,29 +463,29 @@ pub enum HostEntry {
 impl HostEntry {
     pub fn name(&self) -> &str {
         match self {
-            HostEntry::Known(h) => &h.name,
-            HostEntry::Discovered(h) => &h.name,
+            Self::Known(h) => &h.name,
+            Self::Discovered(h) => &h.name,
         }
     }
     pub fn host(&self) -> &str {
         match self {
-            HostEntry::Known(h) => &h.host,
-            HostEntry::Discovered(h) => &h.addr,
+            Self::Known(h) => &h.host,
+            Self::Discovered(h) => &h.addr,
         }
     }
     pub fn port(&self) -> u16 {
         match self {
-            HostEntry::Known(h) => h.port,
-            HostEntry::Discovered(h) => h.port,
+            Self::Known(h) => h.port,
+            Self::Discovered(h) => h.port,
         }
     }
     pub fn is_paired(&self) -> bool {
-        matches!(self, HostEntry::Known(h) if h.fingerprint.is_some())
+        matches!(self, Self::Known(h) if h.fingerprint.is_some())
     }
     pub fn mgmt_port(&self) -> Option<u16> {
         match self {
-            HostEntry::Known(h) => h.mgmt_port,
-            HostEntry::Discovered(h) => h.mgmt_port,
+            Self::Known(h) => h.mgmt_port,
+            Self::Discovered(h) => h.mgmt_port,
         }
     }
 }
@@ -489,7 +511,12 @@ pub fn draw_lock_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
     fill_rounded_rect(canvas, body, 3, color);
     let shackle_w = (w as f32 * 0.55).round() as u32;
     let shackle_h = (h - body_h + 6).max(0) as u32;
-    let shackle = Rect::new(rect.x() + (w as u32 - shackle_w) as i32 / 2, rect.y(), shackle_w, shackle_h);
+    let shackle = Rect::new(
+        rect.x() + (w as u32 - shackle_w) as i32 / 2,
+        rect.y(),
+        shackle_w,
+        shackle_h,
+    );
     draw_rounded_rect_outline(canvas, shackle, (shackle_w / 2) as i32, color);
 }
 
@@ -511,8 +538,14 @@ pub fn draw_close_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
     let pad = w.min(h) / 4;
     canvas.set_draw_color(color);
     for off in -1..=1 {
-        let _ = canvas.draw_line((rect.x() + pad, rect.y() + pad + off), (rect.x() + w - pad, rect.y() + h - pad + off));
-        let _ = canvas.draw_line((rect.x() + w - pad, rect.y() + pad + off), (rect.x() + pad, rect.y() + h - pad + off));
+        let _ = canvas.draw_line(
+            (rect.x() + pad, rect.y() + pad + off),
+            (rect.x() + w - pad, rect.y() + h - pad + off),
+        );
+        let _ = canvas.draw_line(
+            (rect.x() + w - pad, rect.y() + pad + off),
+            (rect.x() + pad, rect.y() + h - pad + off),
+        );
     }
 }
 
@@ -521,31 +554,42 @@ pub fn draw_close_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
 /// `fill_rounded_rect` circles, the inner one erased in `erase_color`) with a few
 /// teeth projected outward, plus a center dot.
 pub fn draw_gear_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color, erase_color: Color) {
+    const TEETH: usize = 8;
+
     let cx = rect.x() + rect.width() as i32 / 2;
     let cy = rect.y() + rect.height() as i32 / 2;
     let outer_r = (rect.width().min(rect.height()) as i32) / 2 - 2;
-    let inner_r = (outer_r as f64 * 0.55).round() as i32;
-    let tooth_r = (outer_r as f64 * 1.05).round() as i32;
-    let tooth_w = (outer_r as f64 * 0.38).max(3.0).round() as u32;
+    let inner_r = (f64::from(outer_r) * 0.55).round() as i32;
+    let tooth_r = (f64::from(outer_r) * 1.05).round() as i32;
+    let tooth_w = (f64::from(outer_r) * 0.38).max(3.0).round() as u32;
 
-    const TEETH: usize = 8;
     canvas.set_draw_color(color);
     for i in 0..TEETH {
         let angle = i as f64 * std::f64::consts::TAU / TEETH as f64;
-        let tx = cx + (angle.cos() * tooth_r as f64).round() as i32;
-        let ty = cy + (angle.sin() * tooth_r as f64).round() as i32;
+        let tx = cx + (angle.cos() * f64::from(tooth_r)).round() as i32;
+        let ty = cy + (angle.sin() * f64::from(tooth_r)).round() as i32;
         let t = Rect::new(tx - tooth_w as i32 / 2, ty - tooth_w as i32 / 2, tooth_w, tooth_w);
         let _ = canvas.fill_rect(t);
     }
-    fill_rounded_rect(canvas, Rect::new(cx - outer_r, cy - outer_r, (outer_r * 2) as u32, (outer_r * 2) as u32), outer_r, color);
+    fill_rounded_rect(
+        canvas,
+        Rect::new(cx - outer_r, cy - outer_r, (outer_r * 2) as u32, (outer_r * 2) as u32),
+        outer_r,
+        color,
+    );
     fill_rounded_rect(
         canvas,
         Rect::new(cx - inner_r, cy - inner_r, (inner_r * 2) as u32, (inner_r * 2) as u32),
         inner_r,
         erase_color,
     );
-    let dot_r = ((inner_r as f64) * 0.4).max(2.0).round() as i32;
-    fill_rounded_rect(canvas, Rect::new(cx - dot_r, cy - dot_r, (dot_r * 2) as u32, (dot_r * 2) as u32), dot_r, color);
+    let dot_r = (f64::from(inner_r) * 0.4).max(2.0).round() as i32;
+    fill_rounded_rect(
+        canvas,
+        Rect::new(cx - dot_r, cy - dot_r, (dot_r * 2) as u32, (dot_r * 2) as u32),
+        dot_r,
+        color,
+    );
 }
 
 /// Draws the whole sidebar: a flat `SIDEBAR_BG` panel, a "punktfunk" wordmark at
@@ -568,10 +612,32 @@ pub fn draw_sidebar(
     let add_row = entries.len();
     let settings_row = entries.len() + 1;
     for (i, entry) in entries.iter().enumerate() {
-        draw_host_row(canvas, texture_creator, font_label, i, entry.name(), entry.is_paired(), focused_index == Some(i))?;
+        draw_host_row(
+            canvas,
+            texture_creator,
+            font_label,
+            i,
+            entry.name(),
+            entry.is_paired(),
+            focused_index == Some(i),
+        )?;
     }
-    draw_utility_row(canvas, texture_creator, font_label, add_row, "+ Add host", focused_index == Some(add_row))?;
-    draw_utility_row(canvas, texture_creator, font_label, settings_row, "Settings", focused_index == Some(settings_row))?;
+    draw_utility_row(
+        canvas,
+        texture_creator,
+        font_label,
+        add_row,
+        "+ Add host",
+        focused_index == Some(add_row),
+    )?;
+    draw_utility_row(
+        canvas,
+        texture_creator,
+        font_label,
+        settings_row,
+        "Settings",
+        focused_index == Some(settings_row),
+    )?;
 
     if entries.is_empty() {
         draw_text(
@@ -599,7 +665,12 @@ fn draw_host_row(
     let rect = sidebar_row_rect(index);
     let drawn = draw_card(canvas, rect, focused);
     let icon_size = 32u32;
-    let icon_rect = Rect::new(drawn.x() + 18, drawn.y() + (drawn.height() as i32 - icon_size as i32) / 2, icon_size, icon_size);
+    let icon_rect = Rect::new(
+        drawn.x() + 18,
+        drawn.y() + (drawn.height() as i32 - icon_size as i32) / 2,
+        icon_size,
+        icon_size,
+    );
     let icon_color = if focused { WHITE } else { MUTED };
     if paired {
         draw_tv_icon(canvas, icon_rect, icon_color);
@@ -629,7 +700,12 @@ fn draw_utility_row(
     let rect = sidebar_row_rect(index);
     let drawn = draw_card(canvas, rect, focused);
     let icon_size = 28u32;
-    let icon_rect = Rect::new(drawn.x() + 20, drawn.y() + (drawn.height() as i32 - icon_size as i32) / 2, icon_size, icon_size);
+    let icon_rect = Rect::new(
+        drawn.x() + 20,
+        drawn.y() + (drawn.height() as i32 - icon_size as i32) / 2,
+        icon_size,
+        icon_size,
+    );
     let icon_color = if focused { WHITE } else { MUTED };
     if label.starts_with('+') {
         draw_plus_icon(canvas, icon_rect, icon_color);
@@ -687,7 +763,14 @@ pub fn grid_card_rect(index: usize, columns: usize, grid_x: i32, available_w: u3
     Rect::new(x, y, card_w, card_h)
 }
 
-pub fn hit_test_grid_card(mouse_x: i32, mouse_y: i32, columns: usize, count: usize, grid_x: i32, available_w: u32) -> Option<usize> {
+pub fn hit_test_grid_card(
+    mouse_x: i32,
+    mouse_y: i32,
+    columns: usize,
+    count: usize,
+    grid_x: i32,
+    available_w: u32,
+) -> Option<usize> {
     if mouse_x < grid_x {
         return None;
     }
@@ -721,7 +804,12 @@ pub fn draw_modal_card(canvas: &mut Canvas<Window>, rect: Rect) {
 pub fn modal_close_rect(card_rect: Rect) -> Rect {
     const SIZE: u32 = 44;
     const MARGIN: i32 = 20;
-    Rect::new(card_rect.x() + card_rect.width() as i32 - MARGIN - SIZE as i32, card_rect.y() + MARGIN, SIZE, SIZE)
+    Rect::new(
+        card_rect.x() + card_rect.width() as i32 - MARGIN - SIZE as i32,
+        card_rect.y() + MARGIN,
+        SIZE,
+        SIZE,
+    )
 }
 
 // ------------------------------------------------------------------- settings --
@@ -775,7 +863,11 @@ pub const SETTINGS_ROW_COUNT: usize = 4;
 pub fn cycle<T: Copy + PartialEq>(options: &[T], current: T, forward: bool) -> T {
     let idx = options.iter().position(|&o| o == current).unwrap_or(0);
     let len = options.len();
-    let next = if forward { (idx + 1) % len } else { (idx + len - 1) % len };
+    let next = if forward {
+        (idx + 1) % len
+    } else {
+        (idx + len - 1) % len
+    };
     options[next]
 }
 
@@ -791,13 +883,12 @@ fn resolution_label(width: u32, height: u32) -> String {
     RESOLUTIONS
         .iter()
         .find(|(w, h, _)| *w == width && *h == height)
-        .map(|(_, _, s)| s.to_string())
-        .unwrap_or_else(|| format!("{width}x{height}"))
+        .map_or_else(|| format!("{width}x{height}"), |(_, _, s)| s.to_string())
 }
 
 pub fn settings_rows(settings: &Settings) -> Vec<SettingsRow> {
-    let bitrate_frac = (settings.bitrate_kbps.saturating_sub(BITRATE_MIN_KBPS)) as f32
-        / (BITRATE_MAX_KBPS - BITRATE_MIN_KBPS) as f32;
+    let bitrate_frac =
+        (settings.bitrate_kbps.saturating_sub(BITRATE_MIN_KBPS)) as f32 / (BITRATE_MAX_KBPS - BITRATE_MIN_KBPS) as f32;
     vec![
         SettingsRow {
             label: "Resolution".into(),
@@ -819,7 +910,11 @@ pub fn settings_rows(settings: &Settings) -> Vec<SettingsRow> {
         },
         SettingsRow {
             label: "HDR".into(),
-            value: if settings.hdr_enabled { "On".into() } else { "Off".into() },
+            value: if settings.hdr_enabled {
+                "On".into()
+            } else {
+                "Off".into()
+            },
             kind: RowKind::Toggle,
             fraction: 0.0,
         },
@@ -842,7 +937,10 @@ pub fn dropdown_current_index(settings: &Settings, row_index: usize) -> usize {
             .iter()
             .position(|(w, h, _)| *w == settings.width && *h == settings.height)
             .unwrap_or(0),
-        ROW_FRAMERATE => REFRESH_RATES.iter().position(|hz| *hz == settings.refresh_hz).unwrap_or(0),
+        ROW_FRAMERATE => REFRESH_RATES
+            .iter()
+            .position(|hz| *hz == settings.refresh_hz)
+            .unwrap_or(0),
         _ => 0,
     }
 }
@@ -879,8 +977,9 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
             true
         }
         ROW_BITRATE => {
-            let delta = BITRATE_STEP_KBPS as i64 * if forward { 1 } else { -1 };
-            let next = (settings.bitrate_kbps as i64 + delta).clamp(BITRATE_MIN_KBPS as i64, BITRATE_MAX_KBPS as i64);
+            let delta = i64::from(BITRATE_STEP_KBPS) * if forward { 1 } else { -1 };
+            let next = (i64::from(settings.bitrate_kbps) + delta)
+                .clamp(i64::from(BITRATE_MIN_KBPS), i64::from(BITRATE_MAX_KBPS));
             settings.bitrate_kbps = next as u32;
             true
         }
@@ -956,7 +1055,7 @@ pub fn draw_settings_rows(
                 draw_dropdown_pill(canvas, texture_creator, font_value, pill, &row.value, focused)?;
             }
             RowKind::Slider => {
-                let value_w = font_value.size_of(&row.value).map(|(w, _)| w).unwrap_or(0);
+                let value_w = font_value.size_of(&row.value).map_or(0, |(w, _)| w);
                 let track_w = 220u32.min(drawn.width() / 3);
                 let value_x = drawn.x() + drawn.width() as i32 - control_pad - value_w as i32;
                 draw_text(
@@ -977,7 +1076,12 @@ pub fn draw_settings_rows(
                 draw_slider_with_thumb(canvas, track, row.fraction, focused);
             }
             RowKind::Toggle => {
-                let switch = Rect::new(drawn.x() + drawn.width() as i32 - control_pad - 64, drawn.y() + (drawn.height() as i32 - 34) / 2, 64, 34);
+                let switch = Rect::new(
+                    drawn.x() + drawn.width() as i32 - control_pad - 64,
+                    drawn.y() + (drawn.height() as i32 - 34) / 2,
+                    64,
+                    34,
+                );
                 draw_switch(canvas, switch, row.value == "On");
             }
         }
@@ -996,9 +1100,18 @@ pub fn draw_dropdown_pill(
 ) -> Result<()> {
     let radius = rect.height() as i32 / 2;
     fill_rounded_rect(canvas, rect, radius, Color::RGBA(0xff, 0xff, 0xff, 0x12));
-    draw_rounded_rect_outline(canvas, rect, radius, if focused { ACCENT_BRIGHT } else { Color::RGBA(0xff, 0xff, 0xff, 0x30) });
+    draw_rounded_rect_outline(
+        canvas,
+        rect,
+        radius,
+        if focused {
+            ACCENT_BRIGHT
+        } else {
+            Color::RGBA(0xff, 0xff, 0xff, 0x30)
+        },
+    );
     let text = format!("{label}  ▾");
-    let text_w = font.size_of(&text).map(|(w, _)| w).unwrap_or(0);
+    let text_w = font.size_of(&text).map_or(0, |(w, _)| w);
     draw_text(
         canvas,
         texture_creator,
@@ -1027,7 +1140,12 @@ pub fn draw_slider_with_thumb(canvas: &mut Canvas<Window>, rect: Rect, fraction:
     let cy = rect.y() + rect.height() as i32 / 2;
     fill_rounded_rect(
         canvas,
-        Rect::new(cx - thumb_r + 2, cy - thumb_r + 3, (thumb_r * 2) as u32, (thumb_r * 2) as u32),
+        Rect::new(
+            cx - thumb_r + 2,
+            cy - thumb_r + 3,
+            (thumb_r * 2) as u32,
+            (thumb_r * 2) as u32,
+        ),
         thumb_r,
         Color::RGBA(0x00, 0x00, 0x00, 0x50),
     );
@@ -1044,17 +1162,40 @@ pub fn draw_slider_with_thumb(canvas: &mut Canvas<Window>, rect: Rect, fraction:
 /// off. Replaces the old checkbox for a more contemporary boolean control.
 pub fn draw_switch(canvas: &mut Canvas<Window>, rect: Rect, on: bool) {
     let radius = rect.height() as i32 / 2;
-    fill_rounded_rect(canvas, rect, radius, if on { ACCENT } else { Color::RGBA(0xff, 0xff, 0xff, 0x22) });
-    let knob_r = radius - 4;
-    let cy = rect.y() + rect.height() as i32 / 2;
-    let cx = if on { rect.x() + rect.width() as i32 - radius } else { rect.x() + radius };
     fill_rounded_rect(
         canvas,
-        Rect::new(cx - knob_r + 1, cy - knob_r + 2, (knob_r * 2) as u32, (knob_r * 2) as u32),
+        rect,
+        radius,
+        if on {
+            ACCENT
+        } else {
+            Color::RGBA(0xff, 0xff, 0xff, 0x22)
+        },
+    );
+    let knob_r = radius - 4;
+    let cy = rect.y() + rect.height() as i32 / 2;
+    let cx = if on {
+        rect.x() + rect.width() as i32 - radius
+    } else {
+        rect.x() + radius
+    };
+    fill_rounded_rect(
+        canvas,
+        Rect::new(
+            cx - knob_r + 1,
+            cy - knob_r + 2,
+            (knob_r * 2) as u32,
+            (knob_r * 2) as u32,
+        ),
         knob_r,
         Color::RGBA(0x00, 0x00, 0x00, 0x40),
     );
-    fill_rounded_rect(canvas, Rect::new(cx - knob_r, cy - knob_r, (knob_r * 2) as u32, (knob_r * 2) as u32), knob_r, WHITE);
+    fill_rounded_rect(
+        canvas,
+        Rect::new(cx - knob_r, cy - knob_r, (knob_r * 2) as u32, (knob_r * 2) as u32),
+        knob_r,
+        WHITE,
+    );
 }
 
 /// A small monitor/display glyph (a rounded-outline screen + a short stand) —
@@ -1074,7 +1215,12 @@ pub fn draw_monitor_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) 
 pub fn draw_clock_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
     let r = (rect.width().min(rect.height()) as i32) / 2 - 1;
     let (cx, cy) = (rect.x() + rect.width() as i32 / 2, rect.y() + rect.height() as i32 / 2);
-    draw_rounded_rect_outline(canvas, Rect::new(cx - r, cy - r, (r * 2) as u32, (r * 2) as u32), r, color);
+    draw_rounded_rect_outline(
+        canvas,
+        Rect::new(cx - r, cy - r, (r * 2) as u32, (r * 2) as u32),
+        r,
+        color,
+    );
     canvas.set_draw_color(color);
     let _ = canvas.draw_line((cx, cy), (cx, cy - (r as f32 * 0.6) as i32));
     let _ = canvas.draw_line((cx, cy), (cx + (r as f32 * 0.45) as i32, cy));
@@ -1095,20 +1241,26 @@ pub fn draw_bars_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
 
 /// A sun glyph (filled circle + short rays) — the HDR settings row.
 pub fn draw_sun_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
+    const RAYS: usize = 8;
+
     let outer_r = (rect.width().min(rect.height()) as i32) / 2;
-    let core_r = (outer_r as f64 * 0.55).round() as i32;
+    let core_r = (f64::from(outer_r) * 0.55).round() as i32;
     let (cx, cy) = (rect.x() + rect.width() as i32 / 2, rect.y() + rect.height() as i32 / 2);
     canvas.set_draw_color(color);
-    const RAYS: usize = 8;
     for i in 0..RAYS {
         let angle = i as f64 * std::f64::consts::TAU / RAYS as f64;
-        let x0 = cx + (angle.cos() * (core_r as f64 + 2.0)).round() as i32;
-        let y0 = cy + (angle.sin() * (core_r as f64 + 2.0)).round() as i32;
-        let x1 = cx + (angle.cos() * outer_r as f64).round() as i32;
-        let y1 = cy + (angle.sin() * outer_r as f64).round() as i32;
+        let x0 = cx + (angle.cos() * (f64::from(core_r) + 2.0)).round() as i32;
+        let y0 = cy + (angle.sin() * (f64::from(core_r) + 2.0)).round() as i32;
+        let x1 = cx + (angle.cos() * f64::from(outer_r)).round() as i32;
+        let y1 = cy + (angle.sin() * f64::from(outer_r)).round() as i32;
         let _ = canvas.draw_line((x0, y0), (x1, y1));
     }
-    fill_rounded_rect(canvas, Rect::new(cx - core_r, cy - core_r, (core_r * 2) as u32, (core_r * 2) as u32), core_r, color);
+    fill_rounded_rect(
+        canvas,
+        Rect::new(cx - core_r, cy - core_r, (core_r * 2) as u32, (core_r * 2) as u32),
+        core_r,
+        color,
+    );
 }
 
 /// Renders a dropdown's options as an overlay list anchored just below the row that
@@ -1167,24 +1319,36 @@ impl Default for AddHostState {
         // the IP address.
         let mut touched = [false; 17];
         touched[12..17].fill(true);
-        AddHostState { digits: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 7, 7, 7], index: 0, touched }
+        Self {
+            digits: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 7, 7, 7],
+            index: 0,
+            touched,
+        }
     }
 }
 
 impl AddHostState {
     fn octet(&self, i: usize) -> u8 {
         let d = &self.digits[i * 3..i * 3 + 3];
-        (d[0] as u32 * 100 + d[1] as u32 * 10 + d[2] as u32).min(255) as u8
+        (u32::from(d[0]) * 100 + u32::from(d[1]) * 10 + u32::from(d[2])).min(255) as u8
     }
 
     fn port_value(&self) -> u16 {
-        let v = self.digits[12..17].iter().fold(0u32, |acc, &digit| acc * 10 + digit as u32);
-        v.min(u16::MAX as u32) as u16
+        let v = self.digits[12..17]
+            .iter()
+            .fold(0u32, |acc, &digit| acc * 10 + u32::from(digit));
+        v.min(u32::from(u16::MAX)) as u16
     }
 
     pub fn host_and_port(&self) -> (String, u16) {
         (
-            format!("{}.{}.{}.{}", self.octet(0), self.octet(1), self.octet(2), self.octet(3)),
+            format!(
+                "{}.{}.{}.{}",
+                self.octet(0),
+                self.octet(1),
+                self.octet(2),
+                self.octet(3)
+            ),
             self.port_value(),
         )
     }

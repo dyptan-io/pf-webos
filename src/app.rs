@@ -85,10 +85,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(identity: (String, String), log: &mut std::fs::File) -> App {
+    pub fn new(identity: (String, String), log: &mut std::fs::File) -> Self {
         let known_hosts = store::load_known_hosts();
         let entries = known_hosts.iter().cloned().map(HostEntry::Known).collect();
-        let mut app = App {
+        let mut app = Self {
             screen: Screen::Home,
             known_hosts,
             discovered: crate::discovery::browse(),
@@ -114,7 +114,11 @@ impl App {
         // Restore the last-active sidebar host (if it's still known and paired)
         // so relaunching the app lands back on its game grid.
         if let Some((host, port)) = store::load_selected_host() {
-            if let Some(h) = app.known_hosts.iter().find(|h| h.host == host && h.port == port && h.fingerprint.is_some()) {
+            if let Some(h) = app
+                .known_hosts
+                .iter()
+                .find(|h| h.host == host && h.port == port && h.fingerprint.is_some())
+            {
                 let (host, port, mgmt_port) = (h.host.clone(), h.port, h.mgmt_port);
                 app.select_host(host, port, mgmt_port, log);
             }
@@ -126,6 +130,10 @@ impl App {
     /// paired status; a discovered host not yet known gets appended).
     pub fn drain_discovery(&mut self) {
         while let Ok(found) = self.discovered.try_recv() {
+            // `found.addr` is deliberate, not a typo for a nonexistent `found.host` —
+            // `DiscoveredHost` (discovery.rs) only has `addr`, `KnownHost` (store.rs)
+            // only has `host`; both hold the same kind of value (network address).
+            #[allow(clippy::suspicious_operation_groupings)]
             let already_known = self
                 .known_hosts
                 .iter()
@@ -147,7 +155,8 @@ impl App {
     pub fn drain_art(&mut self) {
         let Some(rx) = &self.art_rx else { return };
         while let Ok(loaded) = rx.try_recv() {
-            self.art_pixels.insert(loaded.game_id, (loaded.width, loaded.height, loaded.rgba));
+            self.art_pixels
+                .insert(loaded.game_id, (loaded.width, loaded.height, loaded.rgba));
         }
     }
 
@@ -168,14 +177,23 @@ impl App {
 
     fn sidebar_index_for_selected(&self) -> usize {
         match &self.selected_host {
-            Some((h, p)) => self.entries.iter().position(|e| e.host() == h && e.port() == *p).unwrap_or(0),
+            Some((h, p)) => self
+                .entries
+                .iter()
+                .position(|e| e.host() == h && e.port() == *p)
+                .unwrap_or(0),
             None => 0,
         }
     }
 
     /// Handles one menu event on the Home screen (sidebar + grid). Returns a
     /// `ConnectTarget` when a grid card is confirmed.
-    pub fn handle_home_event(&mut self, ev: MenuEvent, screen_w: u32, log: &mut std::fs::File) -> Option<ConnectTarget> {
+    pub fn handle_home_event(
+        &mut self,
+        ev: MenuEvent,
+        screen_w: u32,
+        log: &mut std::fs::File,
+    ) -> Option<ConnectTarget> {
         let sidebar_len = self.sidebar_len();
         let grid_len = self.grid_len();
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
@@ -280,12 +298,22 @@ impl App {
         self.home_focus = HomeFocus::Grid(0);
 
         let identity = (self.identity.0.clone(), self.identity.1.clone());
-        let fingerprint = self.known_hosts.iter().find(|h| h.host == host && h.port == port).and_then(|h| h.fingerprint);
+        let fingerprint = self
+            .known_hosts
+            .iter()
+            .find(|h| h.host == host && h.port == port)
+            .and_then(|h| h.fingerprint);
         let mgmt_port = mgmt_port.unwrap_or(crate::library::DEFAULT_MGMT_PORT);
         match crate::library::fetch_games(&host, mgmt_port, &identity, fingerprint) {
             Ok(games) => {
                 let _ = writeln!(log, "library: {} games from {host}:{mgmt_port}", games.len());
-                self.art_rx = Some(crate::art::load_art_async(host, mgmt_port, identity, fingerprint, games.clone()));
+                self.art_rx = Some(crate::art::load_art_async(
+                    host,
+                    mgmt_port,
+                    identity,
+                    fingerprint,
+                    games.clone(),
+                ));
                 self.games = games;
                 self.home_status = None;
             }
@@ -298,13 +326,28 @@ impl App {
 
     fn confirm_grid_card(&self, idx: usize) -> Option<ConnectTarget> {
         let (host, port) = self.selected_host.clone()?;
-        let fingerprint = self.known_hosts.iter().find(|h| h.host == host && h.port == port)?.fingerprint?;
-        let launch = if idx == 0 { None } else { Some(self.games.get(idx - 1)?.id.clone()) };
-        Some(ConnectTarget { host, port, fingerprint, launch })
+        let fingerprint = self
+            .known_hosts
+            .iter()
+            .find(|h| h.host == host && h.port == port)?
+            .fingerprint?;
+        let launch = if idx == 0 {
+            None
+        } else {
+            Some(self.games.get(idx - 1)?.id.clone())
+        };
+        Some(ConnectTarget {
+            host,
+            port,
+            fingerprint,
+            launch,
+        })
     }
 
     fn forget_host(&mut self, idx: usize) {
-        let HostEntry::Known(h) = &self.entries[idx] else { return };
+        let HostEntry::Known(h) = &self.entries[idx] else {
+            return;
+        };
         let (host, port) = (h.host.clone(), h.port);
         self.known_hosts.retain(|k| !(k.host == host && k.port == port));
         let _ = store::save_known_hosts(&self.known_hosts);
@@ -375,7 +418,7 @@ impl App {
         let port = entry.port();
         let name = entry.name().to_string();
         let mgmt_port = entry.mgmt_port();
-        let pin: String = self.pin_digits.iter().map(|d| d.to_string()).collect();
+        let pin: String = self.pin_digits.iter().map(std::string::ToString::to_string).collect();
         self.pairing_busy = true;
         self.pairing_status = Some("Pairing… confirm the PIN on the host".into());
         let _ = writeln!(log, "pairing with {host}:{port} (pin len {})", pin.len());
@@ -394,7 +437,13 @@ impl App {
                 let paired_host = host.clone();
                 store::upsert_known_host(
                     &mut self.known_hosts,
-                    KnownHost { name, host, port, fingerprint: Some(fingerprint), mgmt_port },
+                    KnownHost {
+                        name,
+                        host,
+                        port,
+                        fingerprint: Some(fingerprint),
+                        mgmt_port,
+                    },
                 );
                 let _ = store::save_known_hosts(&self.known_hosts);
                 self.entries = self.known_hosts.iter().cloned().map(HostEntry::Known).collect();
@@ -434,7 +483,11 @@ impl App {
         let total = ui::SETTINGS_ROW_COUNT;
         match ev {
             MenuEvent::Up => {
-                self.settings_focused = if self.settings_focused == 0 { total - 1 } else { self.settings_focused - 1 };
+                self.settings_focused = if self.settings_focused == 0 {
+                    total - 1
+                } else {
+                    self.settings_focused - 1
+                };
             }
             MenuEvent::Down => {
                 self.settings_focused = (self.settings_focused + 1) % total;
@@ -452,7 +505,10 @@ impl App {
             MenuEvent::Confirm => match self.settings_focused {
                 ui::ROW_RESOLUTION | ui::ROW_FRAMERATE => {
                     let focused = ui::dropdown_current_index(&self.settings, self.settings_focused);
-                    self.dropdown = Some(DropdownState { row: self.settings_focused, focused });
+                    self.dropdown = Some(DropdownState {
+                        row: self.settings_focused,
+                        focused,
+                    });
                 }
                 row => {
                     if ui::adjust_setting(&mut self.settings, row, true) {
@@ -513,11 +569,22 @@ impl App {
         let (host, port) = self.add_host.host_and_port();
         store::upsert_known_host(
             &mut self.known_hosts,
-            KnownHost { name: host.clone(), host: host.clone(), port, fingerprint: None, mgmt_port: None },
+            KnownHost {
+                name: host.clone(),
+                host: host.clone(),
+                port,
+                fingerprint: None,
+                mgmt_port: None,
+            },
         );
         let _ = store::save_known_hosts(&self.known_hosts);
         self.entries = self.known_hosts.iter().cloned().map(HostEntry::Known).collect();
-        self.home_focus = HomeFocus::Sidebar(self.entries.iter().position(|e| e.host() == host && e.port() == port).unwrap_or(0));
+        self.home_focus = HomeFocus::Sidebar(
+            self.entries
+                .iter()
+                .position(|e| e.host() == host && e.port() == port)
+                .unwrap_or(0),
+        );
         self.screen = Screen::Home;
     }
 
@@ -542,7 +609,12 @@ impl App {
         // Room for the title/divider above and the high-bitrate caution below.
         let card_h = content_h + 200;
         let card = ui::modal_card_rect(screen_w, screen_h, 0.56, card_h);
-        let content = Rect::new(card.x() + 40, card.y() + 120, card.width().saturating_sub(80), content_h);
+        let content = Rect::new(
+            card.x() + 40,
+            card.y() + 120,
+            card.width().saturating_sub(80),
+            content_h,
+        );
         (card, content)
     }
 
@@ -556,7 +628,9 @@ impl App {
                 }
                 let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
                 let columns = ui::grid_columns(available_w);
-                if let Some(idx) = ui::hit_test_grid_card(x, y, columns, self.grid_len(), ui::SIDEBAR_W as i32, available_w) {
+                if let Some(idx) =
+                    ui::hit_test_grid_card(x, y, columns, self.grid_len(), ui::SIDEBAR_W as i32, available_w)
+                {
                     self.home_focus = HomeFocus::Grid(idx);
                 }
             }
@@ -626,13 +700,34 @@ impl App {
     ) -> Result<()> {
         canvas.set_draw_color(ui::BG);
         canvas.clear();
-        self.render_home(canvas, texture_creator, font_label, font_value, font_title, art, screen_w, screen_h)?;
+        self.render_home(
+            canvas,
+            texture_creator,
+            font_label,
+            font_value,
+            font_title,
+            art,
+            screen_w,
+            screen_h,
+        )?;
 
         match self.screen {
             Screen::Home => {}
-            Screen::Pairing => self.render_pairing(canvas, texture_creator, font_label, font_title, screen_w, screen_h)?,
-            Screen::Settings => self.render_settings(canvas, texture_creator, font_label, font_value, screen_w, screen_h)?,
-            Screen::AddHost => self.render_add_host(canvas, texture_creator, font_label, font_value, font_title, screen_w, screen_h)?,
+            Screen::Pairing => {
+                self.render_pairing(canvas, texture_creator, font_label, font_title, screen_w, screen_h)?
+            }
+            Screen::Settings => {
+                self.render_settings(canvas, texture_creator, font_label, font_value, screen_w, screen_h)?
+            }
+            Screen::AddHost => self.render_add_host(
+                canvas,
+                texture_creator,
+                font_label,
+                font_value,
+                font_title,
+                screen_w,
+                screen_h,
+            )?,
         }
         canvas.present();
         Ok(())
@@ -654,7 +749,15 @@ impl App {
             HomeFocus::Sidebar(i) => Some(i),
             HomeFocus::Grid(_) => None,
         };
-        ui::draw_sidebar(canvas, texture_creator, font_label, font_title, &self.entries, sidebar_focus, screen_h)?;
+        ui::draw_sidebar(
+            canvas,
+            texture_creator,
+            font_label,
+            font_title,
+            &self.entries,
+            sidebar_focus,
+            screen_h,
+        )?;
 
         let grid_x = ui::SIDEBAR_W as i32;
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
@@ -671,7 +774,15 @@ impl App {
             return Ok(());
         }
         if let Some(status) = &self.home_status {
-            ui::draw_text(canvas, texture_creator, font_label, status, grid_x + ui::GRID_PAD, ui::GRID_TOP_Y, ui::MUTED)?;
+            ui::draw_text(
+                canvas,
+                texture_creator,
+                font_label,
+                status,
+                grid_x + ui::GRID_PAD,
+                ui::GRID_TOP_Y,
+                ui::MUTED,
+            )?;
         }
         let columns = ui::grid_columns(available_w);
         let grid_focus = match self.home_focus {
@@ -681,11 +792,29 @@ impl App {
         // Card 0 is always "Desktop" (a plain session, no game launch) — never has
         // fetched art of its own.
         let desktop_rect = ui::grid_card_rect(0, columns, grid_x, available_w);
-        ui::draw_poster_card(canvas, texture_creator, font_title, font_value, desktop_rect, "Desktop", None, grid_focus == Some(0))?;
+        ui::draw_poster_card(
+            canvas,
+            texture_creator,
+            font_title,
+            font_value,
+            desktop_rect,
+            "Desktop",
+            None,
+            grid_focus == Some(0),
+        )?;
         for (i, game) in self.games.iter().enumerate() {
             let idx = i + 1;
             let rect = ui::grid_card_rect(idx, columns, grid_x, available_w);
-            ui::draw_poster_card(canvas, texture_creator, font_title, font_value, rect, &game.title, art.get(&game.id), grid_focus == Some(idx))?;
+            ui::draw_poster_card(
+                canvas,
+                texture_creator,
+                font_title,
+                font_value,
+                rect,
+                &game.title,
+                art.get(&game.id),
+                grid_focus == Some(idx),
+            )?;
         }
         Ok(())
     }
@@ -706,7 +835,15 @@ impl App {
         let close_rect = ui::modal_close_rect(card);
         ui::draw_close_icon(canvas, close_rect, if self.hover_close { ui::WHITE } else { ui::MUTED });
 
-        ui::draw_text(canvas, texture_creator, font_title, "Pair with host", card.x() + 32, card.y() + 28, ui::WHITE)?;
+        ui::draw_text(
+            canvas,
+            texture_creator,
+            font_title,
+            "Pair with host",
+            card.x() + 32,
+            card.y() + 28,
+            ui::WHITE,
+        )?;
         ui::draw_text(
             canvas,
             texture_creator,
@@ -728,7 +865,7 @@ impl App {
             let focused = i == self.pin_digit_index;
             let drawn = ui::draw_card(canvas, rect, focused);
             let text = digit.to_string();
-            let tw = font_title.size_of(&text).map(|(w, _)| w).unwrap_or(0);
+            let tw = font_title.size_of(&text).map_or(0, |(w, _)| w);
             ui::draw_text(
                 canvas,
                 texture_creator,
@@ -741,7 +878,15 @@ impl App {
         }
         if let Some(status) = &self.pairing_status {
             let color = if self.pairing_busy { ui::MUTED } else { ui::ERROR_RED };
-            ui::draw_text(canvas, texture_creator, font_label, status, card.x() + 32, digit_y + 100, color)?;
+            ui::draw_text(
+                canvas,
+                texture_creator,
+                font_label,
+                status,
+                card.x() + 32,
+                digit_y + 100,
+                color,
+            )?;
         }
         Ok(())
     }
@@ -760,12 +905,33 @@ impl App {
         ui::draw_modal_card(canvas, card);
         let close_rect = ui::modal_close_rect(card);
         ui::draw_close_icon(canvas, close_rect, if self.hover_close { ui::WHITE } else { ui::MUTED });
-        ui::draw_text(canvas, texture_creator, font_label, "Settings", card.x() + 40, card.y() + 36, ui::WHITE)?;
+        ui::draw_text(
+            canvas,
+            texture_creator,
+            font_label,
+            "Settings",
+            card.x() + 40,
+            card.y() + 36,
+            ui::WHITE,
+        )?;
         canvas.set_draw_color(sdl2::pixels::Color::RGBA(0xff, 0xff, 0xff, 0x1e));
-        let _ = canvas.fill_rect(Rect::new(card.x() + 40, card.y() + 88, card.width().saturating_sub(80), 1));
+        let _ = canvas.fill_rect(Rect::new(
+            card.x() + 40,
+            card.y() + 88,
+            card.width().saturating_sub(80),
+            1,
+        ));
 
         let rows = ui::settings_rows(&self.settings);
-        ui::draw_settings_rows(canvas, texture_creator, font_label, font_value, &rows, self.settings_focused, content)?;
+        ui::draw_settings_rows(
+            canvas,
+            texture_creator,
+            font_label,
+            font_value,
+            &rows,
+            self.settings_focused,
+            content,
+        )?;
 
         if self.settings.bitrate_kbps > ui::BITRATE_WARN_KBPS {
             ui::draw_text(
@@ -805,7 +971,15 @@ impl App {
         let close_rect = ui::modal_close_rect(card);
         ui::draw_close_icon(canvas, close_rect, if self.hover_close { ui::WHITE } else { ui::MUTED });
 
-        ui::draw_text(canvas, texture_creator, font_label, "Add host", card.x() + 32, card.y() + 28, ui::WHITE)?;
+        ui::draw_text(
+            canvas,
+            texture_creator,
+            font_label,
+            "Add host",
+            card.x() + 32,
+            card.y() + 28,
+            ui::WHITE,
+        )?;
         ui::draw_text(
             canvas,
             texture_creator,
@@ -820,7 +994,7 @@ impl App {
         let focus_char = self.add_host.focus_char_index();
         let field = Rect::new(card.x() + 32, card.y() + 120, card.width().saturating_sub(64), 80);
         let drawn = ui::draw_card(canvas, field, true);
-        let text_w = font_title.size_of(&text).map(|(w, _)| w).unwrap_or(0);
+        let text_w = font_title.size_of(&text).map_or(0, |(w, _)| w);
         ui::draw_highlighted_text(
             canvas,
             texture_creator,

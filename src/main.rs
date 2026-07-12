@@ -12,13 +12,13 @@ mod audio;
 #[cfg(target_os = "linux")]
 mod discovery;
 #[cfg(target_os = "linux")]
-mod ndl;
-#[cfg(target_os = "linux")]
 mod gamepad;
 #[cfg(target_os = "linux")]
 mod library;
 #[cfg(target_os = "linux")]
 mod mouse;
+#[cfg(target_os = "linux")]
+mod ndl;
 #[cfg(target_os = "linux")]
 mod session;
 #[cfg(target_os = "linux")]
@@ -52,8 +52,7 @@ mod real {
     /// smoke-testing this binary on a Linux dev box before packaging).
     fn log_path() -> PathBuf {
         std::env::var_os("PUNKTFUNK_WEBOS_LOG_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
             .join("punktfunk-webos.log")
     }
 
@@ -84,7 +83,7 @@ mod real {
     /// Limelight's `clientRefreshRateX100`. 60 → 59, 120 → 119.
     fn ntsc_correct(nominal_hz: u32) -> u32 {
         match nominal_hz {
-            30 | 60 | 120 | 240 => ((nominal_hz as u64 * 1000 / 1001) as u32).max(1),
+            30 | 60 | 120 | 240 => ((u64::from(nominal_hz) * 1000 / 1001) as u32).max(1),
             other => other,
         }
     }
@@ -178,7 +177,8 @@ mod real {
         // Cover-art textures aren't `Send` (they borrow `texture_creator`, tied to
         // this thread) — `app`'s art loader only ever hands over raw RGBA (see
         // `art.rs`); turning those into textures happens here, each tick.
-        let mut art_textures: std::collections::HashMap<String, sdl2::render::Texture> = std::collections::HashMap::new();
+        let mut art_textures: std::collections::HashMap<String, sdl2::render::Texture> =
+            std::collections::HashMap::new();
         let mut back_prev = false;
         let target = 'ui: loop {
             app.drain_discovery();
@@ -187,9 +187,10 @@ mod real {
                 if art_textures.contains_key(id) {
                     continue;
                 }
-                let mut texture = match texture_creator.create_texture_static(sdl2::pixels::PixelFormatEnum::RGBA32, *w, *h) {
-                    Ok(t) => t,
-                    Err(_) => continue,
+                let Ok(mut texture) =
+                    texture_creator.create_texture_static(sdl2::pixels::PixelFormatEnum::RGBA32, *w, *h)
+                else {
+                    continue;
                 };
                 if texture.update(None, rgba, (*w * 4) as usize).is_err() {
                     continue;
@@ -222,9 +223,9 @@ mod real {
                     }
                     // Direct digit entry via the remote's number buttons — PIN entry
                     // on the pairing screen, IP:port entry on the add-host screen.
-                    Event::KeyDown {
-                        keycode: Some(k), ..
-                    } if matches!(app.screen, Screen::Pairing | Screen::AddHost) => {
+                    Event::KeyDown { keycode: Some(k), .. }
+                        if matches!(app.screen, Screen::Pairing | Screen::AddHost) =>
+                    {
                         if let Some(digit) = crate::ui::digit_key_value(k) {
                             match app.screen {
                                 Screen::Pairing => app.enter_pin_digit(digit, log),
@@ -237,12 +238,8 @@ mod real {
                     _ => {}
                 }
                 let menu_ev = match event {
-                    Event::KeyDown {
-                        keycode: Some(k), ..
-                    } => crate::ui::menu_event_for_key(k),
-                    Event::ControllerButtonDown { button, .. } => {
-                        crate::ui::menu_event_for_button(button)
-                    }
+                    Event::KeyDown { keycode: Some(k), .. } => crate::ui::menu_event_for_key(k),
+                    Event::ControllerButtonDown { button, .. } => crate::ui::menu_event_for_button(button),
                     Event::ControllerDeviceAdded { which, .. } => {
                         let _ = game_controller.open(which);
                         None
@@ -292,7 +289,12 @@ mod real {
             )?;
             std::thread::sleep(Duration::from_millis(16));
         };
-        Ok(Some((target.host, target.port, Some(target.fingerprint), target.launch)))
+        Ok(Some((
+            target.host,
+            target.port,
+            Some(target.fingerprint),
+            target.launch,
+        )))
     }
 
     fn run_inner(log: &mut std::fs::File) -> Result<()> {
@@ -317,15 +319,11 @@ mod real {
 
         let sdl = sdl2::init().map_err(|e| anyhow::anyhow!("SDL_Init: {e}"))?;
         let ttf = sdl2::ttf::init().map_err(|e| anyhow::anyhow!("SDL_ttf init: {e}"))?;
-        let video = sdl
-            .video()
-            .map_err(|e| anyhow::anyhow!("SDL video subsystem: {e}"))?;
+        let video = sdl.video().map_err(|e| anyhow::anyhow!("SDL video subsystem: {e}"))?;
         let game_controller = sdl
             .game_controller()
             .map_err(|e| anyhow::anyhow!("SDL game controller subsystem: {e}"))?;
-        let sdl_audio = sdl
-            .audio()
-            .map_err(|e| anyhow::anyhow!("SDL audio subsystem: {e}"))?;
+        let sdl_audio = sdl.audio().map_err(|e| anyhow::anyhow!("SDL audio subsystem: {e}"))?;
         writeln!(log, "SDL video subsystem up (driver: {})", video.current_video_driver())?;
 
         let display_mode = video
@@ -349,9 +347,7 @@ mod real {
         let texture_creator = canvas.texture_creator();
         writeln!(log, "window + canvas created")?;
 
-        let mut events = sdl
-            .event_pump()
-            .map_err(|e| anyhow::anyhow!("event pump: {e}"))?;
+        let mut events = sdl.event_pump().map_err(|e| anyhow::anyhow!("event pump: {e}"))?;
 
         let identity = store::load_or_create_identity().context("load_or_create_identity")?;
 
@@ -470,14 +466,14 @@ mod real {
                         Event::ControllerDeviceRemoved { .. } => {
                             controller = None;
                         }
-                        Event::KeyDown {
-                            keycode: Some(k), ..
-                        } if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) => {
+                        Event::KeyDown { keycode: Some(k), .. }
+                            if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) =>
+                        {
                             back_held_since.get_or_insert_with(Instant::now);
                         }
-                        Event::KeyUp {
-                            keycode: Some(k), ..
-                        } if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) => {
+                        Event::KeyUp { keycode: Some(k), .. }
+                            if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) =>
+                        {
                             back_held_since = None;
                         }
                         Event::ControllerButtonDown { button, .. } => {
