@@ -6,6 +6,8 @@
 #[cfg(target_os = "linux")]
 mod app;
 #[cfg(target_os = "linux")]
+mod art;
+#[cfg(target_os = "linux")]
 mod audio;
 #[cfg(target_os = "linux")]
 mod discovery;
@@ -15,6 +17,8 @@ mod ndl;
 mod gamepad;
 #[cfg(target_os = "linux")]
 mod library;
+#[cfg(target_os = "linux")]
+mod mouse;
 #[cfg(target_os = "linux")]
 mod session;
 #[cfg(target_os = "linux")]
@@ -33,6 +37,7 @@ mod real {
 
     use crate::app::{App, Screen};
     use crate::gamepad;
+    use crate::mouse;
     use crate::session;
     use crate::store;
     use crate::ui::MenuEvent;
@@ -84,10 +89,23 @@ mod real {
         }
     }
 
-    /// How long Back must be held during a stream before it disconnects and
-    /// returns to the menu — long enough that a normal game-input tap of the same
-    /// physical button (many games use B/Back-ish buttons) never triggers it.
+    /// How long the *keyboard*/*gamepad* Back-equivalent must be held during a
+    /// stream before it disconnects and returns to the menu — long enough that a
+    /// normal game-input tap of the same physical button (many games use
+    /// B/Back-ish buttons) never triggers it. The Magic Remote's own physical Back
+    /// (`ui::webos_back_button_down`)/Red (`webos_red_button_down`) keys need no
+    /// such hold: they're never forwarded to the host as game input, so an
+    /// immediate press is unambiguous.
     const LONG_PRESS_BACK: Duration = Duration::from_millis(1500);
+
+    /// How long the Magic Remote's real Back/Red must be held (continuously, checked
+    /// live during the hold rather than waiting for release) before quitting the app
+    /// outright, rather than just disconnecting to the menu — this app's own timer,
+    /// not the system's (see `run_inner`'s docs on why relying on webOS's own
+    /// long-press/Exit gesture turned out unreliable). Distinctly longer than
+    /// `LONG_PRESS_BACK` so it reads as a deliberate "hold much longer to quit", not
+    /// an accidental extension of a plain disconnect.
+    const HW_BACK_HOLD_QUITS: Duration = Duration::from_millis(2500);
 
     enum StreamOutcome {
         /// The system asked the app to close (not just this stream) — exit fully.
@@ -98,16 +116,20 @@ mod real {
     }
 
     /// Applies a `Back` to whichever screen is current — shared by the normal
-    /// keyboard/gamepad dispatch and the Magic Remote Red-button poll
-    /// (`ui::webos_red_button_down`). Red exists as a Back substitute because the
-    /// hardware Back button is intercepted by webOS's system launcher before it
-    /// reaches this app, in both the menu and during streaming — a confirmed
-    /// platform limitation (see `docs/NOTES.md`), not fixable by watching a
-    /// different keycode.
+    /// keyboard/gamepad dispatch and the raw scancode poll below (the real Back
+    /// button, `ui::webos_back_button_down`, plus Red as a secondary trigger,
+    /// `ui::webos_red_button_down` — kept since the access-policy hint that lets
+    /// Back reach the app isn't honored consistently across every firmware/model,
+    /// see `docs/NOTES.md`).
     fn apply_back(app: &mut App, log: &mut std::fs::File) -> Option<crate::app::ConnectTarget> {
         match app.screen {
-            Screen::HostList => {
+            // Home has nothing to "back out" of (it's the root screen) — Back is a
+            // shortcut straight to Settings instead, since it's otherwise reachable
+            // only via the sidebar's trailing row.
+            Screen::Home => {
                 app.screen = Screen::Settings;
+                app.dropdown = None;
+                app.settings_focused = 0;
                 None
             }
             Screen::Pairing => {
@@ -122,7 +144,6 @@ mod real {
                 app.handle_add_host_event(MenuEvent::Back);
                 None
             }
-            Screen::Library => app.handle_library_event(MenuEvent::Back),
         }
     }
 
@@ -153,20 +174,29 @@ mod real {
         }
 
         canvas.window_mut().show();
-        let mut app = App::new(identity.clone());
-        let mut red_prev = false;
+        let mut app = App::new(identity.clone(), log);
+        // Cover-art textures aren't `Send` (they borrow `texture_creator`, tied to
+        // this thread) — `app`'s art loader only ever hands over raw RGBA (see
+        // `art.rs`); turning those into textures happens here, each tick.
+        let mut art_textures: std::collections::HashMap<String, sdl2::render::Texture> = std::collections::HashMap::new();
+        let mut back_prev = false;
         let target = 'ui: loop {
             app.drain_discovery();
-            // Red is the reliable "Back" substitute (see `apply_back` docs) —
-            // polled once per tick alongside the normal event loop, since the
-            // hardware Back button can't be trusted to reach this app at all.
-            let red_now = crate::ui::webos_red_button_down();
-            if red_now && !red_prev {
-                if let Some(target) = apply_back(&mut app, log) {
-                    break 'ui target;
+            app.drain_art();
+            for (id, (w, h, rgba)) in &app.art_pixels {
+                if art_textures.contains_key(id) {
+                    continue;
                 }
+                let mut texture = match texture_creator.create_texture_static(sdl2::pixels::PixelFormatEnum::RGBA32, *w, *h) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if texture.update(None, rgba, (*w * 4) as usize).is_err() {
+                    continue;
+                }
+                texture.set_blend_mode(sdl2::render::BlendMode::Blend);
+                art_textures.insert(id.clone(), texture);
             }
-            red_prev = red_now;
             for event in events.poll_iter() {
                 use sdl2::event::Event;
                 if let Event::Quit { .. } = event {
@@ -178,7 +208,7 @@ mod real {
                 // focused (matches gamepad/remote Confirm behavior).
                 match event {
                     Event::MouseMotion { x, y, .. } => {
-                        app.handle_mouse_motion(x, y, display_mode.w as u32);
+                        app.handle_mouse_motion(x, y, display_mode.w as u32, display_mode.h as u32);
                         continue;
                     }
                     Event::MouseButtonDown {
@@ -222,31 +252,41 @@ mod real {
                 let Some(menu_ev) = menu_ev else { continue };
                 match app.screen {
                     // A keyboard/gamepad Back is a bonus shortcut to Settings; the
-                    // header Settings button (reachable via Up/Down + Confirm, or
-                    // the Red-button poll above) is the reliable primary path.
-                    Screen::HostList => {
+                    // sidebar's own Settings row (reachable via Up/Down + Confirm,
+                    // or the Red-button poll below) is the reliable primary path.
+                    Screen::Home => {
                         if menu_ev == MenuEvent::Back {
                             app.screen = Screen::Settings;
-                        } else {
-                            app.handle_host_list_event(menu_ev, log);
+                            app.dropdown = None;
+                            app.settings_focused = 0;
+                        } else if let Some(target) = app.handle_home_event(menu_ev, display_mode.w as u32, log) {
+                            break 'ui target;
                         }
                     }
                     Screen::Pairing => app.handle_pairing_event(menu_ev, log),
                     Screen::Settings => app.handle_settings_event(menu_ev),
                     Screen::AddHost => app.handle_add_host_event(menu_ev),
-                    Screen::Library => {
-                        if let Some(target) = app.handle_library_event(menu_ev) {
-                            break 'ui target;
-                        }
-                    }
                 }
             }
+            // Raw scancode poll (see `ui::webos_back_button_down`/`webos_red_button_down`
+            // docs) — done *after* draining `poll_iter()` above so
+            // `SDL_GetKeyboardState`'s snapshot reflects this tick's freshest pump, not
+            // the previous tick's. No hold-to-quit tier in the menu (see the streaming
+            // loop for that) — a plain Back here just navigates.
+            let back_now = crate::ui::webos_back_button_down() || crate::ui::webos_red_button_down();
+            if back_now && !back_prev {
+                if let Some(target) = apply_back(&mut app, log) {
+                    break 'ui target;
+                }
+            }
+            back_prev = back_now;
             app.render(
                 canvas,
                 texture_creator,
                 font_label,
                 font_value,
                 font_title,
+                &art_textures,
                 display_mode.w as u32,
                 display_mode.h as u32,
             )?;
@@ -256,6 +296,25 @@ mod real {
     }
 
     fn run_inner(log: &mut std::fs::File) -> Result<()> {
+        // Without this, webOS's system launcher intercepts the Magic Remote's Back
+        // button before this app's event queue ever sees it — the app just gets
+        // backgrounded to the launcher's app grid instead of getting a key event to
+        // handle itself. `webosbrew/SDL-webOS` (confirmed via its source,
+        // `src/video/wayland/SDL_waylandwebos.c`) exposes exactly this as a hint,
+        // consumed via `wl_webos_shell_surface_set_property` when the window's shell
+        // surface is set up — must be set before `video.window(...).build()` below.
+        // Harmless no-op on a non-webOS SDL2 (an unrecognized hint name is just
+        // ignored), so this doesn't need a target cfg.
+        //
+        // Deliberately NOT also setting `SDL_WEBOS_ACCESS_POLICY_KEYS_EXIT`: live
+        // testing showed that once it's on, a plain short Back press stops arriving
+        // as its own event at all (the system seems to buffer/withhold it while
+        // deciding whether it's the start of a long-press, and apparently only ever
+        // delivers *one* outcome) — so this app times the hold itself instead, same
+        // proven mechanism already used for the keyboard/gamepad Back-equivalent (see
+        // `LONG_PRESS_BACK` below), just fed by the real Back scancode too now.
+        sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "1");
+
         let sdl = sdl2::init().map_err(|e| anyhow::anyhow!("SDL_Init: {e}"))?;
         let ttf = sdl2::ttf::init().map_err(|e| anyhow::anyhow!("SDL_ttf init: {e}"))?;
         let video = sdl
@@ -322,18 +381,28 @@ mod real {
             let settings = store::load_settings();
             writeln!(log, "settings: {settings:?}")?;
 
-            // set_opacity confirmed unsupported live on this Wayland backend ("That
-            // operation is not supported") — fall back to hiding the window outright.
-            // NDL's video plane is documented to composite independent of our window
-            // (see ndl.rs docs), so an invisible/no window should still let it show.
-            // Only done now (not during the UI phase, which needs the window visible).
-            match canvas.window_mut().set_opacity(0.0) {
-                Ok(()) => writeln!(log, "window opacity set to 0 (transparent)")?,
-                Err(e) => {
-                    writeln!(log, "set_opacity(0.0) failed ({e}), hiding window instead")?;
-                    canvas.window_mut().hide();
-                }
-            }
+            // `hide()` (the previous approach here, when `set_opacity` fails — confirmed
+            // unsupported on this Wayland backend) unmaps the surface entirely, which
+            // stops it receiving pointer focus/motion at all — silently breaking the
+            // Magic Remote pointer → host-mouse forwarding above, since there's no
+            // mapped surface left for Wayland to route those events to (still fine for
+            // keyboard-style remote-key polling, which webOS seems to route by
+            // foreground app identity rather than surface focus). aurora-tv (the same
+            // NDL punch-through technique, with its own working pointer support) never
+            // hides its window at all — it stays mapped, just cleared fully transparent
+            // each frame so the video plane underneath shows through. Doing the same
+            // here: one transparent clear, window stays visible/mapped.
+            canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
+            canvas.clear();
+            canvas.present();
+            // The system draws its own cursor (a real SDL2 cursor this fork loads from
+            // `/usr/share/im/...` — confirmed via `SDL_waylandwebos_cursor.c`) tracking
+            // the physical remote directly; the host draws a second, independent one
+            // wherever our forwarded `MouseMoveAbs` puts it. Two visible cursors reads
+            // as "the pointer doesn't match the remote" — hide the local one so only
+            // the host's shows. Restored when back in the menu (`sdl.mouse()` is the
+            // same standard SDL2 API on any platform, not webOS-specific).
+            sdl.mouse().show_cursor(false);
 
             // SDL2/Wayland reports refresh_rate=0 in some launch contexts (confirmed:
             // the host's virtual-display driver rejected a literal "0 Hz" mode request
@@ -382,7 +451,8 @@ mod real {
 
             let mut controller = None;
             let mut back_held_since: Option<Instant> = None;
-            let mut red_prev = false;
+            let mut hw_back_held_since: Option<Instant> = None;
+            let mut hw_back_prev = false;
             let outcome = 'running: loop {
                 for event in events.poll_iter() {
                     use sdl2::event::Event;
@@ -428,26 +498,63 @@ mod real {
                             let ev = gamepad::axis_event(axis, value, 0);
                             let _ = session::send_input(&connected.client, &ev);
                         }
+                        // The Magic Remote's pointer mode surfaces as plain SDL2 mouse
+                        // events (same as the pre-stream menu's hover/click) — forwarded
+                        // to the host as real HID mouse input during a stream instead of
+                        // driving local UI focus (see `mouse.rs`).
+                        Event::MouseMotion { x, y, .. } => {
+                            let ev = mouse::move_event(x, y, display_mode.w as u32, display_mode.h as u32);
+                            let _ = session::send_input(&connected.client, &ev);
+                        }
+                        Event::MouseButtonDown { mouse_btn, .. } => {
+                            if let Some(ev) = mouse::button_event(mouse_btn, true) {
+                                let _ = session::send_input(&connected.client, &ev);
+                            }
+                        }
+                        Event::MouseButtonUp { mouse_btn, .. } => {
+                            if let Some(ev) = mouse::button_event(mouse_btn, false) {
+                                let _ = session::send_input(&connected.client, &ev);
+                            }
+                        }
+                        Event::MouseWheel { x, y, .. } => {
+                            if y != 0 {
+                                let ev = mouse::scroll_event(y, false);
+                                let _ = session::send_input(&connected.client, &ev);
+                            }
+                            if x != 0 {
+                                let ev = mouse::scroll_event(x, true);
+                                let _ = session::send_input(&connected.client, &ev);
+                            }
+                        }
                         _ => {}
                     }
                 }
-                // Raw scancode poll (see `ui::webos_red_button_down` docs for why
-                // this can't arrive as an ordinary `Event::KeyDown`) — edge-detected
-                // here since the state read is level-triggered. Red is a reliable
-                // Back substitute (see `apply_back` docs) — the hardware Back button
-                // is intercepted by webOS's system launcher before reaching this
-                // app, confirmed on real hardware, so it's fed into the same
-                // long-press-to-disconnect timer as a Back keypress.
-                let red_now = crate::ui::webos_red_button_down();
-                if red_now && !red_prev {
-                    back_held_since.get_or_insert_with(Instant::now);
-                } else if !red_now && red_prev {
-                    back_held_since = None;
+                // Raw scancode poll (see `ui::webos_back_button_down`/`webos_red_button_down`
+                // docs for why neither arrives as an ordinary `Event::KeyDown`) — timed
+                // entirely by this app now (see `run_inner`'s docs on why the system's
+                // own long-press/Exit gesture turned out unreliable). Back/Red are never
+                // forwarded to the host as game input, so unlike the keyboard/gamepad
+                // path below there's no "was that a real game button" ambiguity to guard
+                // against — any press disconnects on release; only a *much* longer hold
+                // (`HW_BACK_HOLD_QUITS`) quits outright, checked live during the hold so
+                // it doesn't need to wait for release.
+                let hw_back_now = crate::ui::webos_back_button_down() || crate::ui::webos_red_button_down();
+                if hw_back_now && !hw_back_prev {
+                    hw_back_held_since = Some(Instant::now());
                 }
-                red_prev = red_now;
+                if hw_back_now && hw_back_held_since.is_some_and(|t| t.elapsed() >= HW_BACK_HOLD_QUITS) {
+                    writeln!(log, "remote Back held — quitting")?;
+                    connected.client.disconnect_quit();
+                    break 'running StreamOutcome::Quit;
+                }
+                let hw_back_released = !hw_back_now && hw_back_prev && hw_back_held_since.is_some();
+                hw_back_prev = hw_back_now;
+                if !hw_back_now {
+                    hw_back_held_since = None;
+                }
 
-                if back_held_since.is_some_and(|t| t.elapsed() >= LONG_PRESS_BACK) {
-                    writeln!(log, "long-press back — disconnecting to menu")?;
+                if hw_back_released || back_held_since.is_some_and(|t| t.elapsed() >= LONG_PRESS_BACK) {
+                    writeln!(log, "back — disconnecting to menu")?;
                     // A deliberate user stop (not a network drop/backgrounding) — the
                     // host tears the virtual display down immediately instead of
                     // lingering for a reconnect that isn't coming (see the embedding
@@ -468,6 +575,7 @@ mod real {
 
             connected.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             crate::ndl::quit();
+            sdl.mouse().show_cursor(true);
             match outcome {
                 StreamOutcome::Quit => {
                     writeln!(log, "punktfunk-webos exiting cleanly")?;
