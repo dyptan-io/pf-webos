@@ -41,6 +41,12 @@ pub struct KnownHost {
     /// back to `library::DEFAULT_MGMT_PORT`.
     #[serde(default)]
     pub mgmt_port: Option<u16>,
+    /// Wake-on-LAN MAC(s) (`aa:bb:cc:dd:ee:ff`), learned from this host's mDNS `mac`
+    /// TXT while it was last seen awake (see `discovery::DiscoveredHost::mac` and
+    /// `app::App::drain_discovery`). Empty if never learned — a host in that state
+    /// can't be woken, so `app.rs` falls back to the plain unreachable message.
+    #[serde(default)]
+    pub mac: Vec<String>,
 }
 
 fn known_hosts_path() -> PathBuf {
@@ -60,11 +66,16 @@ pub fn save_known_hosts(hosts: &[KnownHost]) -> Result<()> {
 }
 
 /// Upserts by `(host, port)`, keeping the existing fingerprint if the new record
-/// doesn't have one (a fresh mDNS discovery shouldn't clobber a paired fingerprint).
+/// doesn't have one (a fresh mDNS discovery shouldn't clobber a paired fingerprint) —
+/// same reasoning for `mac`, learned separately (see `App::drain_discovery`) and not
+/// necessarily known again at the point something else re-upserts this host.
 pub fn upsert_known_host(hosts: &mut Vec<KnownHost>, mut new: KnownHost) {
     if let Some(existing) = hosts.iter_mut().find(|h| h.host == new.host && h.port == new.port) {
         if new.fingerprint.is_none() {
             new.fingerprint = existing.fingerprint;
+        }
+        if new.mac.is_empty() {
+            new.mac.clone_from(&existing.mac);
         }
         *existing = new;
     } else {
@@ -113,6 +124,14 @@ pub struct Settings {
     /// `ui::BITRATE_MIN_KBPS`/`BITRATE_MAX_KBPS`.
     pub bitrate_kbps: u32,
     pub hdr_enabled: bool,
+    /// Whether a Wake-on-LAN magic packet is sent automatically (no prompt) when a
+    /// known host turns out to be unreachable. Off by default — a first-time
+    /// unreachable host always asks. There's deliberately no settings-screen row for
+    /// this: it's toggled from the wake prompt itself (`app::App::handle_wake_event`),
+    /// which is also the only place that re-surfaces if turning it on doesn't
+    /// actually get the host back within a minute (see `app.rs`'s `tick_wake` docs).
+    #[serde(default)]
+    pub wol_auto_send: bool,
 }
 
 impl Default for Settings {
@@ -125,6 +144,7 @@ impl Default for Settings {
             // spot for this decode path — a sane default within the 10-150 slider range.
             bitrate_kbps: 40_000,
             hdr_enabled: true,
+            wol_auto_send: false,
         }
     }
 }
