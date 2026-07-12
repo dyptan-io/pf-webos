@@ -2,8 +2,9 @@
   "packages": [
     {
       "id": "io.dyptan.punktfunk.webos",
-      "title": "punktfunk",
+      "title": "Punktfunk",
       "shortDescription": "<p>Low-latency desktop and game streaming client for punktfunk hosts.</p>",
+      "fullDescriptionUrl": "https://raw.githubusercontent.com/dyptan-io/pf-webos/main/packaging/description.html",
       "iconUri": "https://raw.githubusercontent.com/dyptan-io/pf-webos/main/packaging/icon_large.png",
       "manifestUrl": "https://github.com/dyptan-io/pf-webos/releases/latest/download/io.dyptan.punktfunk.webos.manifest.json"
     }

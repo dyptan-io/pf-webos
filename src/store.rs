@@ -73,6 +73,31 @@ pub fn upsert_known_host(hosts: &mut Vec<KnownHost>, mut new: KnownHost) {
     }
 }
 
+fn selected_host_path() -> PathBuf {
+    app_dir().join("selected-host.json")
+}
+
+/// The sidebar host row the user last had active — so relaunching the app lands
+/// back on its game grid instead of an unfocused sidebar. `(host, port)`, not an
+/// index: `known_hosts` order isn't stable across a forget/re-add.
+#[derive(Clone, Serialize, Deserialize)]
+struct SelectedHost {
+    host: String,
+    port: u16,
+}
+
+pub fn load_selected_host() -> Option<(String, u16)> {
+    let s = std::fs::read_to_string(selected_host_path()).ok()?;
+    let sel: SelectedHost = serde_json::from_str(&s).ok()?;
+    Some((sel.host, sel.port))
+}
+
+pub fn save_selected_host(host: &str, port: u16) -> Result<()> {
+    let json = serde_json::to_string_pretty(&SelectedHost { host: host.to_string(), port })
+        .context("serialize selected host")?;
+    std::fs::write(selected_host_path(), json).context("write selected-host.json")
+}
+
 /// Stream settings: resolution/framerate/bitrate/HDR. See `main.rs`'s NTSC-correction
 /// docs for why `refresh_hz` here is the nominal (60/120), not the wire value.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

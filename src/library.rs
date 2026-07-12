@@ -3,9 +3,8 @@
 //! paired identity (no bearer token — the host authorizes by client certificate).
 //! A trimmed port of `pf-client-core::library` (same wire shape, same mTLS pinning
 //! verifier) rather than a dependency on that crate — see `session.rs`'s module docs
-//! for why this client doesn't pull in `pf-client-core` at all. Poster art isn't
-//! fetched here (no image-texture loading in this client yet — the library screen is
-//! a plain text list, consistent with the rest of this UI's flat rects-and-text look).
+//! for why this client doesn't pull in `pf-client-core` at all.
+use std::io::Read as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +16,22 @@ use serde::Deserialize;
 /// older host with no mgmt TXT at all) fall back here.
 pub const DEFAULT_MGMT_PORT: u16 = 47990;
 
+/// Cover-art paths for a title — each is a host-relative path (e.g.
+/// `/api/v1/library/art/steam:570/portrait`), fetched through the same mTLS-pinned
+/// management API `fetch_games` uses, not an external URL the client hits directly
+/// (the host proxies Steam CDN/custom art itself — see `punktfunk-host::library`).
+/// `art.rs` prefers `portrait` for the grid, falling back to `header`. `hero`/
+/// `logo` mirror the host's full wire shape (a future detail/hero view could use
+/// them) but nothing here reads them yet.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct Artwork {
+    pub portrait: Option<String>,
+    pub hero: Option<String>,
+    pub logo: Option<String>,
+    pub header: Option<String>,
+}
+
 /// One title in the host's unified library. `id` is store-qualified (`steam:<appid>`,
 /// `custom:<id>`) and doubles as the launch handle `session::connect`'s `launch`
 /// parameter takes — the host resolves the actual launch spec itself from `id`.
@@ -24,6 +39,10 @@ pub const DEFAULT_MGMT_PORT: u16 = 47990;
 pub struct GameEntry {
     pub id: String,
     pub title: String,
+    /// `#[serde(default)]` so an older host that omits art still decodes — the grid
+    /// just falls back to its placeholder card.
+    #[serde(default)]
+    pub art: Artwork,
 }
 
 /// Errors surfaced to the UI so it can explain what to do next.
@@ -96,6 +115,29 @@ pub fn fetch_games(
         Err(e) => return Err(classify(e)),
     };
     serde_json::from_str(&body).map_err(|e| LibraryError::Unreachable(format!("bad JSON: {e}")))
+}
+
+/// Fetches one piece of cover art's raw bytes (JPEG/PNG, undecoded) from a
+/// host-relative `art_path` (one of `GameEntry::art`'s fields) — same mTLS agent
+/// as `fetch_games`. Decoding happens in `art.rs`, off this module's REST concern.
+pub fn fetch_art(
+    addr: &str,
+    mgmt_port: u16,
+    identity: &(String, String),
+    pin: Option<[u8; 32]>,
+    art_path: &str,
+) -> Result<Vec<u8>, LibraryError> {
+    let agent = agent(identity, pin)?;
+    let url = format!("{}{art_path}", base_url(addr, mgmt_port));
+    let mut buf = Vec::new();
+    match agent.get(&url).call() {
+        Ok(resp) => resp
+            .into_reader()
+            .read_to_end(&mut buf)
+            .map_err(|e| LibraryError::Unreachable(format!("read art body: {e}")))?,
+        Err(e) => return Err(classify(e)),
+    };
+    Ok(buf)
 }
 
 fn classify(e: ureq::Error) -> LibraryError {

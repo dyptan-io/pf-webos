@@ -5,7 +5,7 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT OR Apache-2.0"
-authors = ["Enrico Bühler <enrico.buehler@unom.io>"]
+authors = ["Volodymyr Dyptan <volodymyr@dyptan.dev>"]
 repository = "https://github.com/dyptan-io/pf-webos"
 
 [[bin]]
@@ -18,7 +18,7 @@ anyhow = "1"
 # pf-client-core's session::start() (see session.rs docs for why we don't use that).
 # Pinned to the punktfunk commit this client was developed/tested against — bump
 # deliberately, not automatically, since punktfunk-core's wire/ABI surface can move.
-punktfunk-core = { git = "https://git.unom.io/unom/punktfunk", rev = "89aa6767f9e161df0472781a9ae2b4e07ff9b015", features = [
+punktfunk-core = { git = "https://git.unom.io/unom/punktfunk", rev = "76594f27c1da50676b33f5f3d96b67b0949ff952", features = [
     "quic",
 ] }
 serde = { version = "1", features = ["derive"] }
@@ -50,3 +50,7 @@ opus = "0.3"
 # feature above).
 ureq = "2"
 rustls = { version = "0.23", features = ["ring"] }
+# Decodes the management API's cover art (Steam CDN capsules/headers, custom-store
+# art) into raw RGBA for an SDL2 texture (library.rs/art.rs) — pure Rust codecs,
+# no system libjpeg/libpng dependency to find on-device.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

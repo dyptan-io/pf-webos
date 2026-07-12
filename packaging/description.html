@@ -1,0 +1,32 @@
+<h1>pf-webos</h1>
+<p>A native LG webOS TV client for <a href="https://git.unom.io/unom/punktfunk">punktfunk</a> —
+low-latency desktop and game streaming. Targets webOS 5.x+ (developed and verified live on an
+<strong>LG CX, webOS 5.6</strong>), packaged as a homebrew <code>.ipk</code> and sideloaded via
+<a href="https://github.com/webosbrew/dev-manager-desktop">dev-manager-desktop</a>.</p>
+
+<p>This client is <strong>based on and depends on</strong> the
+<a href="https://git.unom.io/unom/punktfunk">punktfunk</a> project by
+<strong>Enrico Bühler (<a href="https://unom.io">unom</a>)</strong> — all credit for the protocol,
+FEC/crypto core, and host implementation belongs there. This repo contains only the
+webOS-specific client: an SDL2 UI, NDL DirectMedia hardware video decode, and webOS packaging,
+built directly on the upstream <code>punktfunk-core</code> crate.</p>
+
+<h2>What it does</h2>
+<ul>
+  <li>Discovers punktfunk hosts on the LAN (mDNS) or lets you add one manually by IP.</li>
+  <li>Pairs with a host via PIN, persists trust across restarts.</li>
+  <li>Configurable resolution (1080p/1440p/4K), frame rate, bitrate (10-150 Mbps slider), and HDR.</li>
+  <li>Shows the host's game library (if it has one) before streaming, so you can launch straight
+    into a specific game instead of a plain desktop session.</li>
+  <li>Hardware H.264/H.265 video decode via webOS's NDL DirectMedia API, audio via
+    SDL2/PulseAudio.</li>
+  <li>Magic Remote friendly: d-pad menu navigation, pointer/mouse hover+click, direct PIN/IP entry
+    via the number pad, and the Red button as a reliable Back/disconnect substitute (the hardware
+    Back button is intercepted by webOS's system launcher).</li>
+</ul>
+
+<h2>License</h2>
+<p>Dual-licensed under
+<a href="https://github.com/dyptan-io/pf-webos/blob/main/LICENSE-MIT">MIT</a> or
+<a href="https://github.com/dyptan-io/pf-webos/blob/main/LICENSE-APACHE">Apache 2.0</a>, matching
+the upstream punktfunk project, at your option.</p>

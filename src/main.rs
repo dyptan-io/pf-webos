@@ -6,6 +6,8 @@
 #[cfg(target_os = "linux")]
 mod app;
 #[cfg(target_os = "linux")]
+mod art;
+#[cfg(target_os = "linux")]
 mod audio;
 #[cfg(target_os = "linux")]
 mod discovery;
@@ -106,8 +108,13 @@ mod real {
     /// different keycode.
     fn apply_back(app: &mut App, log: &mut std::fs::File) -> Option<crate::app::ConnectTarget> {
         match app.screen {
-            Screen::HostList => {
+            // Home has nothing to "back out" of (it's the root screen) — Back is a
+            // shortcut straight to Settings instead, since it's otherwise reachable
+            // only via the sidebar's trailing row.
+            Screen::Home => {
                 app.screen = Screen::Settings;
+                app.dropdown = None;
+                app.settings_focused = 0;
                 None
             }
             Screen::Pairing => {
@@ -122,7 +129,6 @@ mod real {
                 app.handle_add_host_event(MenuEvent::Back);
                 None
             }
-            Screen::Library => app.handle_library_event(MenuEvent::Back),
         }
     }
 
@@ -153,10 +159,29 @@ mod real {
         }
 
         canvas.window_mut().show();
-        let mut app = App::new(identity.clone());
+        let mut app = App::new(identity.clone(), log);
+        // Cover-art textures aren't `Send` (they borrow `texture_creator`, tied to
+        // this thread) — `app`'s art loader only ever hands over raw RGBA (see
+        // `art.rs`); turning those into textures happens here, each tick.
+        let mut art_textures: std::collections::HashMap<String, sdl2::render::Texture> = std::collections::HashMap::new();
         let mut red_prev = false;
         let target = 'ui: loop {
             app.drain_discovery();
+            app.drain_art();
+            for (id, (w, h, rgba)) in &app.art_pixels {
+                if art_textures.contains_key(id) {
+                    continue;
+                }
+                let mut texture = match texture_creator.create_texture_static(sdl2::pixels::PixelFormatEnum::RGBA32, *w, *h) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if texture.update(None, rgba, (*w * 4) as usize).is_err() {
+                    continue;
+                }
+                texture.set_blend_mode(sdl2::render::BlendMode::Blend);
+                art_textures.insert(id.clone(), texture);
+            }
             // Red is the reliable "Back" substitute (see `apply_back` docs) —
             // polled once per tick alongside the normal event loop, since the
             // hardware Back button can't be trusted to reach this app at all.
@@ -178,7 +203,7 @@ mod real {
                 // focused (matches gamepad/remote Confirm behavior).
                 match event {
                     Event::MouseMotion { x, y, .. } => {
-                        app.handle_mouse_motion(x, y, display_mode.w as u32);
+                        app.handle_mouse_motion(x, y, display_mode.w as u32, display_mode.h as u32);
                         continue;
                     }
                     Event::MouseButtonDown {
@@ -222,23 +247,20 @@ mod real {
                 let Some(menu_ev) = menu_ev else { continue };
                 match app.screen {
                     // A keyboard/gamepad Back is a bonus shortcut to Settings; the
-                    // header Settings button (reachable via Up/Down + Confirm, or
-                    // the Red-button poll above) is the reliable primary path.
-                    Screen::HostList => {
+                    // sidebar's own Settings row (reachable via Up/Down + Confirm,
+                    // or the Red-button poll above) is the reliable primary path.
+                    Screen::Home => {
                         if menu_ev == MenuEvent::Back {
                             app.screen = Screen::Settings;
-                        } else {
-                            app.handle_host_list_event(menu_ev, log);
+                            app.dropdown = None;
+                            app.settings_focused = 0;
+                        } else if let Some(target) = app.handle_home_event(menu_ev, display_mode.w as u32, log) {
+                            break 'ui target;
                         }
                     }
                     Screen::Pairing => app.handle_pairing_event(menu_ev, log),
                     Screen::Settings => app.handle_settings_event(menu_ev),
                     Screen::AddHost => app.handle_add_host_event(menu_ev),
-                    Screen::Library => {
-                        if let Some(target) = app.handle_library_event(menu_ev) {
-                            break 'ui target;
-                        }
-                    }
                 }
             }
             app.render(
@@ -247,6 +269,7 @@ mod real {
                 font_label,
                 font_value,
                 font_title,
+                &art_textures,
                 display_mode.w as u32,
                 display_mode.h as u32,
             )?;
