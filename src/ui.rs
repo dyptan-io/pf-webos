@@ -101,23 +101,23 @@ pub fn digit_key_value(keycode: sdl2::keyboard::Keycode) -> Option<u8> {
     })
 }
 
-/// Raw SDL2 scancode value the `webosbrew/SDL-webOS` fork (the one this client
+/// Raw SDL2 scancode values the `webosbrew/SDL-webOS` fork (the one this client
 /// already links against for its Wayland shell-integration protocol — see Cargo.toml
-/// docs) assigns to the Magic Remote's Red button (`include/SDL_scancode.h`'s
-/// `SDL_SCANCODE_WEBOS_RED`, translated from the X11 keycode 406 sourced from
-/// `/usr/share/X11/xkb/keycodes/lg`). Vanilla SDL2 doesn't define this, and
-/// rust-sdl2's `Scancode` enum only covers vanilla SDL2's scancode set — so it's
-/// unrepresentable as a `Scancode` value and doesn't arrive as `Event::KeyDown`/
-/// `KeyUp` at all through the safe event API. Reading it requires the raw
-/// keyboard-state array instead (see `webos_red_button_down`).
+/// docs) assigns to Magic Remote keys with no vanilla-SDL2 equivalent
+/// (`include/SDL_scancode.h`). Vanilla SDL2 doesn't define these, and rust-sdl2's
+/// `Scancode` enum only covers vanilla SDL2's scancode set — so they're
+/// unrepresentable as a `Scancode` value and don't arrive as `Event::KeyDown`/
+/// `KeyUp` at all through the safe event API. Reading them requires the raw
+/// keyboard-state array instead (see `scancode_down`).
+const SCANCODE_WEBOS_BACK: usize = 482;
+/// Translated from the X11 keycode 406 sourced from `/usr/share/X11/xkb/keycodes/lg`.
 const SCANCODE_WEBOS_RED: usize = 486;
 
-/// Polls the current (level, not edge) state of the Magic Remote's Red button
-/// directly from SDL2's raw keyboard-state array, bypassing rust-sdl2's `Scancode`
-/// enum entirely (see `SCANCODE_WEBOS_RED` docs for why). The caller is
-/// responsible for edge-detecting a press from consecutive polls (see `main.rs`,
-/// which uses Red as the reliable Back-button substitute).
-pub fn webos_red_button_down() -> bool {
+/// Polls the current (level, not edge) state of a raw webOS scancode directly from
+/// SDL2's keyboard-state array, bypassing rust-sdl2's `Scancode` enum entirely (see
+/// `SCANCODE_WEBOS_BACK`/`SCANCODE_WEBOS_RED` docs for why). The caller
+/// edge-detects a press from consecutive polls.
+fn scancode_down(scancode: usize) -> bool {
     unsafe {
         let mut numkeys = 0;
         let ptr = sdl2::sys::SDL_GetKeyboardState(&mut numkeys);
@@ -125,8 +125,27 @@ pub fn webos_red_button_down() -> bool {
             return false;
         }
         let state = std::slice::from_raw_parts(ptr, numkeys as usize);
-        state.get(SCANCODE_WEBOS_RED).copied().unwrap_or(0) != 0
+        state.get(scancode).copied().unwrap_or(0) != 0
     }
+}
+
+/// The Magic Remote's actual Back button — reaches the app at all only because
+/// `main.rs` sets the `SDL_WEBOS_ACCESS_POLICY_KEYS_BACK` hint before window
+/// creation (otherwise webOS's system launcher intercepts it first, backgrounding
+/// the app instead of delivering a key event). Even with that hint set, the key
+/// arrives as this raw scancode, not a `Scancode`/`Keycode` the safe event API
+/// recognizes (see `SCANCODE_WEBOS_BACK`'s docs) — same situation as the color
+/// buttons below.
+pub fn webos_back_button_down() -> bool {
+    scancode_down(SCANCODE_WEBOS_BACK)
+}
+
+/// Polls the current (level, not edge) state of the Magic Remote's Red button —
+/// kept as a secondary Back/disconnect trigger alongside the real Back button
+/// (`webos_back_button_down`) since the access-policy hint isn't honored
+/// consistently across every firmware/model (see `docs/NOTES.md`).
+pub fn webos_red_button_down() -> bool {
+    scancode_down(SCANCODE_WEBOS_RED)
 }
 
 // --------------------------------------------------------------------- text/font --
@@ -1036,7 +1055,60 @@ pub fn draw_switch(canvas: &mut Canvas<Window>, rect: Rect, on: bool) {
         Color::RGBA(0x00, 0x00, 0x00, 0x40),
     );
     fill_rounded_rect(canvas, Rect::new(cx - knob_r, cy - knob_r, (knob_r * 2) as u32, (knob_r * 2) as u32), knob_r, WHITE);
-    Ok(())
+}
+
+/// A small monitor/display glyph (a rounded-outline screen + a short stand) —
+/// the Resolution settings row.
+pub fn draw_monitor_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
+    let (w, h) = (rect.width() as i32, rect.height() as i32);
+    let screen_h = (h as f32 * 0.72).round() as i32;
+    let screen = Rect::new(rect.x(), rect.y(), w as u32, screen_h.max(0) as u32);
+    draw_rounded_rect_outline(canvas, screen, 4, color);
+    canvas.set_draw_color(color);
+    let stand_y = rect.y() + screen_h + (h - screen_h) / 2;
+    let _ = canvas.draw_line((rect.x() + w / 2 - w / 6, stand_y), (rect.x() + w / 2 + w / 6, stand_y));
+}
+
+/// A clock-face glyph (a circle outline + hour/minute hands) — the Frame rate
+/// settings row.
+pub fn draw_clock_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
+    let r = (rect.width().min(rect.height()) as i32) / 2 - 1;
+    let (cx, cy) = (rect.x() + rect.width() as i32 / 2, rect.y() + rect.height() as i32 / 2);
+    draw_rounded_rect_outline(canvas, Rect::new(cx - r, cy - r, (r * 2) as u32, (r * 2) as u32), r, color);
+    canvas.set_draw_color(color);
+    let _ = canvas.draw_line((cx, cy), (cx, cy - (r as f32 * 0.6) as i32));
+    let _ = canvas.draw_line((cx, cy), (cx + (r as f32 * 0.45) as i32, cy));
+}
+
+/// Three ascending bars (signal/throughput glyph) — the Bitrate settings row.
+pub fn draw_bars_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
+    let bar_w = (rect.width() as f32 / 4.0).round() as u32;
+    let gap = (rect.width() as f32 / 8.0).round() as i32;
+    canvas.set_draw_color(color);
+    for (i, h_frac) in [0.4, 0.7, 1.0].iter().enumerate() {
+        let bar_h = (rect.height() as f32 * h_frac).round() as u32;
+        let x = rect.x() + i as i32 * (bar_w as i32 + gap);
+        let y = rect.y() + rect.height() as i32 - bar_h as i32;
+        fill_rounded_rect(canvas, Rect::new(x, y, bar_w, bar_h), 2, color);
+    }
+}
+
+/// A sun glyph (filled circle + short rays) — the HDR settings row.
+pub fn draw_sun_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
+    let outer_r = (rect.width().min(rect.height()) as i32) / 2;
+    let core_r = (outer_r as f64 * 0.55).round() as i32;
+    let (cx, cy) = (rect.x() + rect.width() as i32 / 2, rect.y() + rect.height() as i32 / 2);
+    canvas.set_draw_color(color);
+    const RAYS: usize = 8;
+    for i in 0..RAYS {
+        let angle = i as f64 * std::f64::consts::TAU / RAYS as f64;
+        let x0 = cx + (angle.cos() * (core_r as f64 + 2.0)).round() as i32;
+        let y0 = cy + (angle.sin() * (core_r as f64 + 2.0)).round() as i32;
+        let x1 = cx + (angle.cos() * outer_r as f64).round() as i32;
+        let y1 = cy + (angle.sin() * outer_r as f64).round() as i32;
+        let _ = canvas.draw_line((x0, y0), (x1, y1));
+    }
+    fill_rounded_rect(canvas, Rect::new(cx - core_r, cy - core_r, (core_r * 2) as u32, (core_r * 2) as u32), core_r, color);
 }
 
 /// Renders a dropdown's options as an overlay list anchored just below the row that
@@ -1081,6 +1153,11 @@ pub fn draw_dropdown_overlay(
 pub struct AddHostState {
     pub digits: [u8; 17],
     pub index: usize,
+    /// Which slots the user has actually entered (typed a digit, or
+    /// left/right-adjusted one) — untouched IP-octet slots render as a blank
+    /// placeholder (`_`) rather than a misleading literal `0`. The port slots
+    /// start touched since `9777` is a real, usable default, not a placeholder.
+    touched: [bool; 17],
 }
 
 impl Default for AddHostState {
@@ -1088,7 +1165,9 @@ impl Default for AddHostState {
         // Prefills punktfunk's conventional default port (9777 — see
         // `store::dev_override_connect`'s fallback) so the user only has to dial in
         // the IP address.
-        AddHostState { digits: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 7, 7, 7], index: 0 }
+        let mut touched = [false; 17];
+        touched[12..17].fill(true);
+        AddHostState { digits: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 7, 7, 7], index: 0, touched }
     }
 }
 
@@ -1110,6 +1189,12 @@ impl AddHostState {
         )
     }
 
+    /// Marks the currently-indexed slot as entered — called whenever a digit
+    /// key or Left/Right actually sets a value, not on plain Up/Down navigation.
+    pub fn touch_current(&mut self) {
+        self.touched[self.index] = true;
+    }
+
     /// Maps `index` (0-16) to the character position in `display_text()`'s rendered
     /// string, so the UI can highlight the digit currently being edited — each
     /// 3-digit group is followed by one separator character (`.` x3, then `:`).
@@ -1121,26 +1206,34 @@ impl AddHostState {
         }
     }
 
+    fn ch(&self, i: usize) -> char {
+        if self.touched[i] {
+            (b'0' + self.digits[i]) as char
+        } else {
+            '_'
+        }
+    }
+
     pub fn display_text(&self) -> String {
         format!(
             "{}{}{}.{}{}{}.{}{}{}.{}{}{}:{}{}{}{}{}",
-            self.digits[0],
-            self.digits[1],
-            self.digits[2],
-            self.digits[3],
-            self.digits[4],
-            self.digits[5],
-            self.digits[6],
-            self.digits[7],
-            self.digits[8],
-            self.digits[9],
-            self.digits[10],
-            self.digits[11],
-            self.digits[12],
-            self.digits[13],
-            self.digits[14],
-            self.digits[15],
-            self.digits[16],
+            self.ch(0),
+            self.ch(1),
+            self.ch(2),
+            self.ch(3),
+            self.ch(4),
+            self.ch(5),
+            self.ch(6),
+            self.ch(7),
+            self.ch(8),
+            self.ch(9),
+            self.ch(10),
+            self.ch(11),
+            self.ch(12),
+            self.ch(13),
+            self.ch(14),
+            self.ch(15),
+            self.ch(16),
         )
     }
 }

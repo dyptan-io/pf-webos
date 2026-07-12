@@ -472,10 +472,12 @@ impl App {
             MenuEvent::Left => {
                 let d = &mut self.add_host.digits[self.add_host.index];
                 *d = (*d + 9) % 10;
+                self.add_host.touch_current();
             }
             MenuEvent::Right => {
                 let d = &mut self.add_host.digits[self.add_host.index];
                 *d = (*d + 1) % 10;
+                self.add_host.touch_current();
             }
             MenuEvent::Up => {
                 if self.add_host.index > 0 {
@@ -499,6 +501,7 @@ impl App {
     /// modal — same auto-advance idiom as `enter_pin_digit`.
     pub fn enter_add_host_digit(&mut self, digit: u8) {
         self.add_host.digits[self.add_host.index] = digit;
+        self.add_host.touch_current();
         if self.add_host.index + 1 < self.add_host.digits.len() {
             self.add_host.index += 1;
         } else {
@@ -520,14 +523,26 @@ impl App {
 
     // ---------------------------------------------------------------- mouse --
 
+    /// The pairing modal's card rect — shared by `render_pairing` and mouse
+    /// hit-testing so they can never disagree.
+    fn pairing_card_rect(screen_w: u32, screen_h: u32) -> Rect {
+        ui::modal_card_rect(screen_w, screen_h, 0.36, 340)
+    }
+
+    /// The add-host modal's card rect — shared by `render_add_host` and mouse
+    /// hit-testing.
+    fn add_host_card_rect(screen_w: u32, screen_h: u32) -> Rect {
+        ui::modal_card_rect(screen_w, screen_h, 0.46, 260)
+    }
+
     /// The settings modal's card/content rects — shared by `render` and mouse
     /// hit-testing so they can never disagree.
     fn settings_layout(screen_w: u32, screen_h: u32) -> (Rect, Rect) {
         let content_h = ui::SETTINGS_ROW_COUNT as u32 * (ui::SETTINGS_ROW_H + ui::SETTINGS_ROW_GAP as u32);
-        // +32 reserves a line below the rows for the high-bitrate caution.
-        let card_h = content_h + 172;
-        let card = ui::modal_card_rect(screen_w, screen_h, 0.42, card_h);
-        let content = Rect::new(card.x() + 32, card.y() + 96, card.width().saturating_sub(64), content_h);
+        // Room for the title/divider above and the high-bitrate caution below.
+        let card_h = content_h + 200;
+        let card = ui::modal_card_rect(screen_w, screen_h, 0.56, card_h);
+        let content = Rect::new(card.x() + 40, card.y() + 120, card.width().saturating_sub(80), content_h);
         (card, content)
     }
 
@@ -559,8 +574,12 @@ impl App {
                     }
                 }
             }
-            Screen::Pairing | Screen::AddHost => {
-                let card = ui::modal_card_rect(screen_w, screen_h, 0.36, 340);
+            Screen::Pairing => {
+                let card = Self::pairing_card_rect(screen_w, screen_h);
+                self.hover_close = ui::modal_close_rect(card).contains_point((x, y));
+            }
+            Screen::AddHost => {
+                let card = Self::add_host_card_rect(screen_w, screen_h);
                 self.hover_close = ui::modal_close_rect(card).contains_point((x, y));
             }
         }
@@ -682,7 +701,7 @@ impl App {
         screen_h: u32,
     ) -> Result<()> {
         ui::draw_modal_backdrop(canvas, screen_w, screen_h);
-        let card = ui::modal_card_rect(screen_w, screen_h, 0.36, 340);
+        let card = Self::pairing_card_rect(screen_w, screen_h);
         ui::draw_modal_card(canvas, card);
         let close_rect = ui::modal_close_rect(card);
         ui::draw_close_icon(canvas, close_rect, if self.hover_close { ui::WHITE } else { ui::MUTED });
@@ -741,7 +760,9 @@ impl App {
         ui::draw_modal_card(canvas, card);
         let close_rect = ui::modal_close_rect(card);
         ui::draw_close_icon(canvas, close_rect, if self.hover_close { ui::WHITE } else { ui::MUTED });
-        ui::draw_text(canvas, texture_creator, font_label, "Settings", card.x() + 32, card.y() + 32, ui::WHITE)?;
+        ui::draw_text(canvas, texture_creator, font_label, "Settings", card.x() + 40, card.y() + 36, ui::WHITE)?;
+        canvas.set_draw_color(sdl2::pixels::Color::RGBA(0xff, 0xff, 0xff, 0x1e));
+        let _ = canvas.fill_rect(Rect::new(card.x() + 40, card.y() + 88, card.width().saturating_sub(80), 1));
 
         let rows = ui::settings_rows(&self.settings);
         ui::draw_settings_rows(canvas, texture_creator, font_label, font_value, &rows, self.settings_focused, content)?;
@@ -779,7 +800,7 @@ impl App {
         screen_h: u32,
     ) -> Result<()> {
         ui::draw_modal_backdrop(canvas, screen_w, screen_h);
-        let card = ui::modal_card_rect(screen_w, screen_h, 0.46, 260);
+        let card = Self::add_host_card_rect(screen_w, screen_h);
         ui::draw_modal_card(canvas, card);
         let close_rect = ui::modal_close_rect(card);
         ui::draw_close_icon(canvas, close_rect, if self.hover_close { ui::WHITE } else { ui::MUTED });

@@ -118,21 +118,56 @@ not a working refresh-rate switch. The panel's actual scan-out rate is fixed at 
 (HDMI timing negotiated once, or user-toggled TV settings like TruMotion/Game Optimizer) — outside
 any homebrew app's reach. Kodi's webOS port has the same limitation.
 
-**The Magic Remote's hardware Back button is intercepted by webOS's system launcher** before it
-reaches a native app's event queue at all — in both menu screens and during an active stream, and
-not consistently across firmware/models. This is a **known upstream issue**
-(`mariotaku/moonlight-tv#179`, "Stream overlay not working") — moonlight-tv's own documented
-workaround is the same one this client uses: rebind in-app "Back"/"disconnect" to a **color
-button** instead of relying on the hardware Back key (moonlight-tv's wiki: *"Long press BACK or
-press exit button to open in-stream overlay"*). No `appinfo.json` flag, luna-service call, or
-SDL-webOS API exists to claim the hardware Back button for a native app (`disableBackHistoryAPI`
-is web-app/DOM-only, architecturally inapplicable to a native SDL2 binary).
+**~~The Magic Remote's hardware Back button can't be claimed by a native app~~ — corrected
+2026-07-12: it can.** The previous note here (and `mariotaku/moonlight-tv#179`, still open upstream)
+was right that Back is intercepted by webOS's system launcher *by default* — but there's a real,
+documented fix, just not one either project had wired up: `webosbrew/SDL-webOS`'s
+`src/video/wayland/SDL_waylandwebos.c` sets a Wayland shell-surface property,
+`_WEBOS_ACCESS_POLICY_KEYS_BACK`, gated behind the SDL hint `SDL_WEBOS_ACCESS_POLICY_KEYS_BACK`
+(`include/SDL_hints.h`) — set it to `"true"` **before window creation** and the launcher stops
+intercepting that key, delivering it to the app instead as a normal key event. `main.rs`'s
+`run_inner` sets it via `sdl2::hint::set(...)` right after `sdl2::init()`. The key still doesn't
+arrive as a recognizable `Scancode`/`Keycode` through the safe event API even with the hint set
+(`SDL_SCANCODE_WEBOS_BACK = 482`, same unrepresentable-raw-scancode situation as the color buttons
+below) — `ui::webos_back_button_down()` polls it the same way `webos_red_button_down()` already did.
 
-This client's fix: the Red color button (scancode 486 on the SDL-webOS fork — see below) is the
-reliable Back substitute. A short press applies `Back` to whatever menu screen is current; a long
-press (1.5s, mirroring moonlight-tv's own long-press convention) during an active stream
-disconnects back to the menu. The keyboard Escape/Backspace/AC_Back bindings are kept as
-best-effort secondary handlers (they do sometimes arrive), just never relied on as the only path.
+Kept Red as a **fallback**, not removed: the hint isn't necessarily honored on every firmware/model
+(unverified across the full device matrix), so both scancodes feed the same trigger in `main.rs`.
+
+**Tried and reverted: `SDL_WEBOS_ACCESS_POLICY_KEYS_EXIT` (the matching hint for the remote's own
+long-press-Back gesture, surfaced as the distinct `SDL_SCANCODE_WEBOS_EXIT = 505`) — turned unreliable
+live.** With it set, a plain *short* Back press stopped arriving as its own event at all — the system
+appears to buffer/withhold it while deciding whether it's the start of a long-press, and only ever
+delivers one outcome. Reverted: this app no longer sets that hint, and instead times the hold itself
+off the plain Back scancode (`HW_BACK_HOLD_QUITS`, 2.5s, checked live during the hold — not waiting
+for release) — the same self-timed approach already proven for the keyboard/gamepad Back-equivalent
+(`LONG_PRESS_BACK`, 1.5s), just with a longer threshold since quitting outright is a bigger action
+than disconnecting to the menu. A *release* before that threshold disconnects to the menu instead —
+so Back(482)/Red(486) now support both: quick press → menu, hold 2.5s+ → quit. Neither needs the
+keyboard/gamepad path's game-input-conflict guard, since neither is ever forwarded to the host as
+game input.
+
+**A hidden/unmapped window doesn't receive pointer input.** The stream-time window was `.hide()`n
+(since `set_opacity` isn't supported on this Wayland backend) so it wouldn't visually cover the NDL
+video plane — this silently broke the Magic Remote pointer → host-mouse forwarding (`mouse.rs`),
+since there's no mapped surface left for Wayland to route `MouseMotion`/button events to (keyboard-
+style remote-key *polling* still worked while hidden, suggesting webOS routes those by foreground-app
+identity rather than surface focus — a different path from pointer routing). aurora-tv (the same NDL
+punch-through technique, with its own working pointer support) never hides its window at all — it
+stays mapped, cleared fully transparent (`Color::RGBA(0,0,0,0)`) each frame instead so the video
+plane shows through underneath. `run_inner` now does the same.
+
+**Two independent cursors, not one out of sync.** Once the pointer reached the host, the visible
+cursor still looked "wrong" — moving faster than the physical remote. Cause: webOS draws its own
+local cursor (a real SDL2 cursor this fork loads from `/usr/share/im/cursorType*.png`, confirmed via
+`SDL_waylandwebos_cursor.c`) tracking the remote directly and instantly; the host draws a *second,
+independent* cursor wherever our forwarded `MouseMoveAbs` puts it, over the network, with its own
+latency. Two cursors that were never going to stay synced, not one buggy one. Fixed by hiding the
+local cursor during a stream (`sdl.mouse().show_cursor(false)`, restored for the menu) so only the
+host's own cursor is visible. `mouse.rs`'s `move_event` also applies a `SENSITIVITY` scale (0.55,
+centered on the panel's middle) since even with only one cursor visible, unscaled 1:1 absolute
+positioning still felt fast — the tradeoff is the true edge pixels need the remote pointer to go
+slightly past the panel's own edge to reach.
 
 **Magic Remote color buttons (Red/Green/Yellow/Blue) require raw scancode polling, not the safe
 SDL2 event API.** Confirmed: `webosbrew/SDL-webOS` (the fork this client links for Wayland shell
