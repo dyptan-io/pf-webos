@@ -14,25 +14,25 @@ crossed off.
   texture on *every* call, with zero caching — and every draw function runs on every render tick
   of the ~60fps pre-stream UI loop, so a static label like "Settings" paid that cost 60×/sec for
   pixels that never changed (`draw_highlighted_text`, used for PIN/IP entry, made this worse by
-  calling `draw_text` once per character). Now keyed by `(font address, text, color)` and reused
-  across frames — created once in `main.rs::run_ui_flow` alongside `art_textures`, threaded down
-  through every render call in place of the `texture_creator` parameter they used to take (nothing
-  in `ui.rs`/`app.rs` needed a raw `TextureCreator` for anything else).
+  calling `draw_text` once per character). Keyed by `(font address, text, color)` and reused across
+  frames — created once in `main.rs::run_ui_flow`, threaded down through every render call. (Since
+  the rendering-backend rewrite below, the cached value is a `tiny_skia::Pixmap`, not a GPU
+  texture, and `TextCache::new()` no longer takes a `texture_creator` at all — nothing in `ui.rs`
+  ever needed a raw `TextureCreator` for anything past this point.)
 - **Redraw-on-change**: the same loop called `app.render(...)` (and its `canvas.present()` vsync
   swap) unconditionally every 16ms tick forever, even sitting on a completely untouched menu. Safe
   to skip when nothing changed *because* this UI has no time-based animation anywhere (no spinner/
   blink/marquee) — every pixel that can change does so only in reaction to an SDL event, a
   Discovery/art background result, or the raw scancode Back/Red edge, all of which now set a
   `dirty` flag that gates the render call.
-- **Cover-art GPU texture leak**: `app.art_pixels` (raw RGBA) gets cleared on every host switch
-  (`select_host`), but `main.rs`'s `art_textures` (the GPU-texture cache built from it) was never
-  pruned to match — only ever grew. Switching hosts repeatedly during one run leaked every
-  previous host's textures for the rest of the app's life. Fixed with a `retain()` that syncs it
-  to `art_pixels` each tick.
+- ~~**Cover-art GPU texture leak**: `app.art_pixels` (raw RGBA) gets cleared on every host switch,
+  but `main.rs`'s separate GPU-texture cache built from it was never pruned to match.~~ Moot since
+  the rendering-backend rewrite below: `app.art` (a `HashMap<String, tiny_skia::Pixmap>`) *is* the
+  drawable object now, composited straight into the frame `Painter` — there's no second,
+  main.rs-owned GPU-texture cache left to fall out of sync with it at all.
 - **Cover art decoded at full source resolution**: Steam-CDN-style capsules commonly exceed
   1000px on a side; the grid never draws a card anywhere near that (`ui::CARD_MIN_W` is 220px).
-  `art.rs` now downscales (aspect-preserved, cap 480px on the longer side) before the RGBA
-  buffer/GPU texture is created.
+  `art.rs` downscales (aspect-preserved, cap 480px on the longer side) before the `Pixmap` is built.
 - **A fresh mTLS handshake per cover-art fetch**: `library::fetch_art` built a brand-new
   `ureq::Agent` (fresh TLS config, re-parsed PEM identity, fresh TCP+TLS handshake with
   client-cert auth) on every call, and `art.rs` calls it once per game — a 30-50 game library paid
@@ -154,12 +154,45 @@ webOS app; NDL's own audio path was never needed.
 
 ## UI
 
-Deliberately flat SDL2 2D primitives (rects, rounded-rect via per-scanline circle math, `SDL2_ttf`
-text) — no Skia/Vulkan available on webOS. Renders with LG's own on-device system font
-(`/usr/share/fonts/LG_Smart_UI-Regular.ttf`) — **assume it only reliably covers ASCII**: an
-earlier attempt at a "⚙ Settings" row using the U+2699 gear glyph rendered as a broken box.
-Anywhere an icon is needed, draw it as vector shapes instead (see `ui::draw_gear_icon`) rather
-than relying on a font glyph.
+Rendering backend (`ui::Painter`, added 2026-07-12): a `tiny_skia::Pixmap` software
+framebuffer — real anti-aliased fills/strokes and box-blurred drop shadows, pure Rust so it
+cross-compiles exactly like `image` already did. `App::render` draws every screen into one
+`Painter` per dirty tick; `main.rs` uploads the finished buffer to a single persistent SDL2
+texture and presents it — one texture/copy per frame, not one per widget/art-cover/text-label
+the way the previous hand-rolled per-scanline canvas primitives worked. Cover art (`art.rs`)
+and cached text (`ui::TextCache`) are both plain owned `Pixmap`s now too, composited straight
+into the frame buffer — no separate GPU-texture cache to keep in sync with them (the old
+`art_textures`-vs-`art_pixels` leak-prevention `retain()` dance in `main.rs` is gone; there's
+only one cache now). Cross-compiles and links cleanly (`task check`/`task lint`/`task build` all
+pass), but **not yet visually verified on real hardware or even a native Linux box** — this
+crate's SDL2/NDL-dependent modules only compile under `target_os = "linux"`, and this pass was
+authored on macOS, so the actual rendered look (AA quality, shadow softness, chevron/icon shapes)
+still needs a real on-device check before treating it as done — same caveat as the
+memory/performance pass above.
+
+Evaluated and deliberately **not** adopted: moonlight-tv's actual LVGL toolkit (its
+`src/app/lvgl` folder — a full retained-mode widget tree, cascading per-state/part styles, flex
+layout, focus groups, animations). Bridging real LVGL in via FFI would add a second
+cross-compiled C dependency (bindgen-for-arm-webos, on top of an already fragile toolchain — see
+below) plus its own display/input driver glue; reimplementing LVGL itself in Rust would be a
+multi-month framework project for a UI surface that's 4 screens (Home, Pairing, Settings, Add
+host). The actual gap versus moonlight-tv's polish was rendering quality (no AA, hard-edged flat
+"shadows"), not a missing widget/layout framework — `tiny-skia` closes that gap directly without
+either cost.
+
+Renders with LG's own on-device system font (`/usr/share/fonts/LG_Smart_UI-Regular.ttf`) —
+**assume it only reliably covers ASCII**: an earlier attempt at a "⚙ Settings" row using the
+U+2699 gear glyph rendered as a broken box. All 10 icons this UI uses (tv, lock, add, close,
+settings, monitor, schedule, signal, sun, chevron-down) were originally vector-drawn path math for
+exactly this reason, then replaced (2026-07-12) with real glyphs from a bundled, subsetted copy of
+Google's Material Icons font (`assets/icons/MaterialIcons-subset.ttf`, Apache 2.0 — provenance,
+codepoints, and the `pyftsubset` regeneration command are in `assets/icons/NOTICE.md`). Subsetted
+down to ~1.7 KB (from the full font's ~357 KB) since only those 10 glyphs are ever drawn; embedded
+via `include_bytes!` (no loose asset to stage/ship alongside the `.ipk`, no runtime path to
+resolve) and loaded once through `SDL2_ttf`'s `load_font_from_rwops` (`ui::load_icon_font`) — same
+`Font`/`TextCache` machinery real text already used, see `ui::draw_icon`. Loaded at one large fixed
+size and downscaled per icon rect via `Painter`'s bilinear `draw_pixmap_scaled`, rather than one
+`load_icon_font` call per distinct icon size.
 
 Menu navigation: keyboard arrows/Enter/Escape (matches however the Magic Remote's d-pad mode
 surfaces to SDL2) and SDL2 gamepad d-pad/A/B, plus direct numeric entry (the remote's number

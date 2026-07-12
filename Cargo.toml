@@ -75,6 +75,14 @@ opus = "0.3"
 ureq = "2"
 rustls = { version = "0.23", features = ["ring"] }
 # Decodes the management API's cover art (Steam CDN capsules/headers, custom-store
-# art) into raw RGBA for an SDL2 texture (library.rs/art.rs) — pure Rust codecs,
+# art) into raw RGBA for a `tiny_skia::Pixmap` (library.rs/art.rs) — pure Rust codecs,
 # no system libjpeg/libpng dependency to find on-device.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# The whole pre-stream UI's rendering backend (ui.rs) — a pure-Rust software
+# rasterizer (anti-aliased fills/strokes, real box-blurred shadows), replacing the
+# previous hand-rolled per-scanline SDL2 2D primitives (no Skia/Vulkan available on
+# webOS — see ui.rs's module docs). Pure Rust like `image` above, so it cross-compiles
+# the same way; `png-format` is off since this app only ever builds `Pixmap`s from
+# already-decoded buffers (SDL2_ttf glyph surfaces, `image`-decoded covers), never
+# loads a `.png` through tiny-skia itself.
+tiny-skia = { version = "0.12", default-features = false, features = ["std"] }

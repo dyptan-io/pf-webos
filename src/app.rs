@@ -7,12 +7,11 @@ use std::io::Write as _;
 
 use anyhow::Result;
 use sdl2::rect::Rect;
-use sdl2::render::Canvas;
-use sdl2::video::Window;
+use tiny_skia::Pixmap;
 
 use crate::library::GameEntry;
 use crate::store::{self, KnownHost, Settings};
-use crate::ui::{self, AddHostState, HostEntry, MenuEvent};
+use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};
 
 pub enum Screen {
     Home,
@@ -61,10 +60,10 @@ pub struct App {
     pub games: Vec<GameEntry>,
     /// Library loading/error message shown in the grid area in place of cards.
     pub home_status: Option<String>,
-    /// Decoded cover art, keyed by `GameEntry::id` — raw RGBA, not an SDL2 texture
-    /// (not `Send`; see `art.rs` docs). `main.rs`'s render loop turns new entries
-    /// into textures each tick.
-    pub art_pixels: std::collections::HashMap<String, (u32, u32, Vec<u8>)>,
+    /// Decoded cover art, keyed by `GameEntry::id` — a `tiny_skia::Pixmap` composited
+    /// straight into the frame `Painter`; see `art.rs` docs on why no separate
+    /// GPU-texture-building step is needed here.
+    pub art: std::collections::HashMap<String, Pixmap>,
     art_rx: Option<std::sync::mpsc::Receiver<crate::art::ArtLoaded>>,
     pub settings: Settings,
     pub settings_focused: usize,
@@ -97,7 +96,7 @@ impl App {
             selected_host: None,
             games: Vec::new(),
             home_status: None,
-            art_pixels: std::collections::HashMap::new(),
+            art: std::collections::HashMap::new(),
             art_rx: None,
             settings: store::load_settings(),
             settings_focused: 0,
@@ -156,15 +155,13 @@ impl App {
     }
 
     /// Drains any cover art that's finished decoding since the last tick — called
-    /// alongside `drain_discovery`. Raw pixels only; `main.rs` turns these into
-    /// SDL2 textures (see `art.rs`'s module docs for why the split). Returns
-    /// whether any new art actually arrived (see `drain_discovery`'s docs on why).
+    /// alongside `drain_discovery`. Returns whether any new art actually arrived
+    /// (see `drain_discovery`'s docs on why).
     pub fn drain_art(&mut self) -> bool {
         let Some(rx) = &self.art_rx else { return false };
         let mut changed = false;
         while let Ok(loaded) = rx.try_recv() {
-            self.art_pixels
-                .insert(loaded.game_id, (loaded.width, loaded.height, loaded.rgba));
+            self.art.insert(loaded.game_id, loaded.pixmap);
             changed = true;
         }
         changed
@@ -303,7 +300,7 @@ impl App {
         self.selected_host = Some((host.clone(), port));
         self.home_status = Some("Loading library…".into());
         self.games = Vec::new();
-        self.art_pixels.clear();
+        self.art.clear();
         self.art_rx = None;
         self.home_focus = HomeFocus::Grid(0);
 
@@ -699,42 +696,48 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
-        canvas: &mut Canvas<Window>,
+        painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
         font_label: &sdl2::ttf::Font,
         font_value: &sdl2::ttf::Font,
         font_title: &sdl2::ttf::Font,
-        art: &std::collections::HashMap<String, sdl2::render::Texture>,
+        icon_font: &sdl2::ttf::Font,
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
-        canvas.set_draw_color(ui::BG);
-        canvas.clear();
+        painter.clear(ui::BG);
         self.render_home(
-            canvas, text_cache, font_label, font_value, font_title, art, screen_w, screen_h,
+            painter, text_cache, font_label, font_value, font_title, icon_font, screen_w, screen_h,
         )?;
 
         match self.screen {
             Screen::Home => {}
-            Screen::Pairing => self.render_pairing(canvas, text_cache, font_label, font_title, screen_w, screen_h)?,
-            Screen::Settings => self.render_settings(canvas, text_cache, font_label, font_value, screen_w, screen_h)?,
+            Screen::Pairing => {
+                self.render_pairing(
+                    painter, text_cache, font_label, font_title, icon_font, screen_w, screen_h,
+                )?;
+            }
+            Screen::Settings => {
+                self.render_settings(
+                    painter, text_cache, font_label, font_value, icon_font, screen_w, screen_h,
+                )?;
+            }
             Screen::AddHost => self.render_add_host(
-                canvas, text_cache, font_label, font_value, font_title, screen_w, screen_h,
+                painter, text_cache, font_label, font_value, font_title, icon_font, screen_w, screen_h,
             )?,
         }
-        canvas.present();
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn render_home(
         &self,
-        canvas: &mut Canvas<Window>,
+        painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
         font_label: &sdl2::ttf::Font,
         font_value: &sdl2::ttf::Font,
         font_title: &sdl2::ttf::Font,
-        art: &std::collections::HashMap<String, sdl2::render::Texture>,
+        icon_font: &sdl2::ttf::Font,
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
@@ -743,10 +746,11 @@ impl App {
             HomeFocus::Grid(_) => None,
         };
         ui::draw_sidebar(
-            canvas,
+            painter,
             text_cache,
             font_label,
             font_title,
+            icon_font,
             &self.entries,
             sidebar_focus,
             screen_h,
@@ -756,7 +760,7 @@ impl App {
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
         if self.selected_host.is_none() {
             ui::draw_text(
-                canvas,
+                painter,
                 text_cache,
                 font_label,
                 "No host selected — pick one from the list, or add one.",
@@ -768,7 +772,7 @@ impl App {
         }
         if let Some(status) = &self.home_status {
             ui::draw_text(
-                canvas,
+                painter,
                 text_cache,
                 font_label,
                 status,
@@ -786,7 +790,7 @@ impl App {
         // fetched art of its own.
         let desktop_rect = ui::grid_card_rect(0, columns, grid_x, available_w);
         ui::draw_poster_card(
-            canvas,
+            painter,
             text_cache,
             font_title,
             font_value,
@@ -799,13 +803,13 @@ impl App {
             let idx = i + 1;
             let rect = ui::grid_card_rect(idx, columns, grid_x, available_w);
             ui::draw_poster_card(
-                canvas,
+                painter,
                 text_cache,
                 font_title,
                 font_value,
                 rect,
                 &game.title,
-                art.get(&game.id),
+                self.art.get(&game.id),
                 grid_focus == Some(idx),
             )?;
         }
@@ -815,21 +819,29 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     fn render_pairing(
         &self,
-        canvas: &mut Canvas<Window>,
+        painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
         font_label: &sdl2::ttf::Font,
         font_title: &sdl2::ttf::Font,
+        icon_font: &sdl2::ttf::Font,
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
-        ui::draw_modal_backdrop(canvas, screen_w, screen_h);
+        ui::draw_modal_backdrop(painter, screen_w, screen_h);
         let card = Self::pairing_card_rect(screen_w, screen_h);
-        ui::draw_modal_card(canvas, card);
+        ui::draw_modal_card(painter, card);
         let close_rect = ui::modal_close_rect(card);
-        ui::draw_close_icon(canvas, close_rect, if self.hover_close { ui::WHITE } else { ui::MUTED });
+        ui::draw_icon(
+            painter,
+            text_cache,
+            icon_font,
+            close_rect,
+            ui::ICON_CLOSE,
+            if self.hover_close { ui::WHITE } else { ui::MUTED },
+        )?;
 
         ui::draw_text(
-            canvas,
+            painter,
             text_cache,
             font_title,
             "Pair with host",
@@ -838,7 +850,7 @@ impl App {
             ui::WHITE,
         )?;
         ui::draw_text(
-            canvas,
+            painter,
             text_cache,
             font_label,
             "Enter the PIN shown in the host's pairing dialog.",
@@ -856,11 +868,11 @@ impl App {
             let x = start_x + i as i32 * (digit_w + digit_gap);
             let rect = Rect::new(x, digit_y, digit_w as u32, 80);
             let focused = i == self.pin_digit_index;
-            let drawn = ui::draw_card(canvas, rect, focused);
+            let drawn = ui::draw_card(painter, rect, focused);
             let text = digit.to_string();
             let tw = font_title.size_of(&text).map_or(0, |(w, _)| w);
             ui::draw_text(
-                canvas,
+                painter,
                 text_cache,
                 font_title,
                 &text,
@@ -872,7 +884,7 @@ impl App {
         if let Some(status) = &self.pairing_status {
             let color = if self.pairing_busy { ui::MUTED } else { ui::ERROR_RED };
             ui::draw_text(
-                canvas,
+                painter,
                 text_cache,
                 font_label,
                 status,
@@ -884,22 +896,31 @@ impl App {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_settings(
         &self,
-        canvas: &mut Canvas<Window>,
+        painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
         font_label: &sdl2::ttf::Font,
         font_value: &sdl2::ttf::Font,
+        icon_font: &sdl2::ttf::Font,
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
-        ui::draw_modal_backdrop(canvas, screen_w, screen_h);
+        ui::draw_modal_backdrop(painter, screen_w, screen_h);
         let (card, content) = Self::settings_layout(screen_w, screen_h);
-        ui::draw_modal_card(canvas, card);
+        ui::draw_modal_card(painter, card);
         let close_rect = ui::modal_close_rect(card);
-        ui::draw_close_icon(canvas, close_rect, if self.hover_close { ui::WHITE } else { ui::MUTED });
+        ui::draw_icon(
+            painter,
+            text_cache,
+            icon_font,
+            close_rect,
+            ui::ICON_CLOSE,
+            if self.hover_close { ui::WHITE } else { ui::MUTED },
+        )?;
         ui::draw_text(
-            canvas,
+            painter,
             text_cache,
             font_label,
             "Settings",
@@ -907,20 +928,18 @@ impl App {
             card.y() + 36,
             ui::WHITE,
         )?;
-        canvas.set_draw_color(sdl2::pixels::Color::RGBA(0xff, 0xff, 0xff, 0x1e));
-        let _ = canvas.fill_rect(Rect::new(
-            card.x() + 40,
-            card.y() + 88,
-            card.width().saturating_sub(80),
-            1,
-        ));
+        painter.fill_rect(
+            Rect::new(card.x() + 40, card.y() + 88, card.width().saturating_sub(80), 1),
+            sdl2::pixels::Color::RGBA(0xff, 0xff, 0xff, 0x1e),
+        );
 
         let rows = ui::settings_rows(&self.settings);
         ui::draw_settings_rows(
-            canvas,
+            painter,
             text_cache,
             font_label,
             font_value,
+            icon_font,
             &rows,
             self.settings_focused,
             content,
@@ -928,7 +947,7 @@ impl App {
 
         if self.settings.bitrate_kbps > ui::BITRATE_WARN_KBPS {
             ui::draw_text(
-                canvas,
+                painter,
                 text_cache,
                 font_value,
                 "Higher bitrate may be unstable on Wi-Fi — try Ethernet if streaming drops.",
@@ -942,7 +961,7 @@ impl App {
             let options = ui::dropdown_options(dd.row);
             let overlay_y = content.y() + (dd.row as i32 + 1) * (ui::SETTINGS_ROW_H as i32 + ui::SETTINGS_ROW_GAP);
             let overlay_rect = Rect::new(content.x(), overlay_y, content.width(), 0);
-            ui::draw_dropdown_overlay(canvas, text_cache, font_value, &options, dd.focused, overlay_rect)?;
+            ui::draw_dropdown_overlay(painter, text_cache, font_value, &options, dd.focused, overlay_rect)?;
         }
         Ok(())
     }
@@ -950,22 +969,30 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     fn render_add_host(
         &self,
-        canvas: &mut Canvas<Window>,
+        painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
         font_label: &sdl2::ttf::Font,
         font_value: &sdl2::ttf::Font,
         font_title: &sdl2::ttf::Font,
+        icon_font: &sdl2::ttf::Font,
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
-        ui::draw_modal_backdrop(canvas, screen_w, screen_h);
+        ui::draw_modal_backdrop(painter, screen_w, screen_h);
         let card = Self::add_host_card_rect(screen_w, screen_h);
-        ui::draw_modal_card(canvas, card);
+        ui::draw_modal_card(painter, card);
         let close_rect = ui::modal_close_rect(card);
-        ui::draw_close_icon(canvas, close_rect, if self.hover_close { ui::WHITE } else { ui::MUTED });
+        ui::draw_icon(
+            painter,
+            text_cache,
+            icon_font,
+            close_rect,
+            ui::ICON_CLOSE,
+            if self.hover_close { ui::WHITE } else { ui::MUTED },
+        )?;
 
         ui::draw_text(
-            canvas,
+            painter,
             text_cache,
             font_label,
             "Add host",
@@ -974,7 +1001,7 @@ impl App {
             ui::WHITE,
         )?;
         ui::draw_text(
-            canvas,
+            painter,
             text_cache,
             font_value,
             "Enter the host's IP address and port.",
@@ -986,10 +1013,10 @@ impl App {
         let text = self.add_host.display_text();
         let focus_char = self.add_host.focus_char_index();
         let field = Rect::new(card.x() + 32, card.y() + 120, card.width().saturating_sub(64), 80);
-        let drawn = ui::draw_card(canvas, field, true);
+        let drawn = ui::draw_card(painter, field, true);
         let text_w = font_title.size_of(&text).map_or(0, |(w, _)| w);
         ui::draw_highlighted_text(
-            canvas,
+            painter,
             text_cache,
             font_title,
             &text,

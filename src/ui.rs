@@ -2,16 +2,31 @@
 //! (known hosts + Add host/Settings) beside a detail grid (the selected host's
 //! games), plus centered modal cards for Pairing/Settings/Add host — modeled on
 //! `mariotaku/moonlight-tv`'s actual layout and dark palette (sidebar + app grid,
-//! outline-ring focus, near-square cards), reimplemented with plain SDL2 2D
-//! primitives (rects + `SDL2_ttf` text — no LVGL/Skia/Vulkan available here).
-//! Icons are vector-drawn, not a bundled icon font — this client bundles no
-//! fonts/assets, and the system font lacks the relevant glyphs anyway.
+//! outline-ring focus, near-square cards).
+//!
+//! Rendering itself goes through [`Painter`], a thin wrapper around a
+//! `tiny_skia::Pixmap` — a pure-Rust software rasterizer giving real anti-aliased
+//! fills/strokes and box-blurred shadows (no Skia/Vulkan/LVGL available on webOS;
+//! see `docs/NOTES.md`'s "UI" section for why this app doesn't adopt moonlight-tv's
+//! actual LVGL toolkit — this UI's whole screen count doesn't warrant a general
+//! widget/layout framework, just a better rasterizer than hand-rolled per-scanline
+//! SDL2 rects). `main.rs` builds one `Painter` sized to the display, `App::render`
+//! draws every screen into it each dirty tick, then `main.rs` uploads the finished
+//! buffer to a single SDL2 texture and presents it — one texture/copy per frame,
+//! not one per widget.
+//!
+//! Icons are glyphs from a small bundled, subsetted icon font (see the icons
+//! section below and `assets/icons/NOTICE.md`) — the system font covers ASCII
+//! only (see `SYSTEM_FONT_PATH`'s docs), so real icon glyphs need one of their own.
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
-use sdl2::render::{Canvas, TextureCreator};
 use sdl2::ttf::Font;
-use sdl2::video::{Window, WindowContext};
+use tiny_skia::{
+    Color as SkColor, FillRule, FilterQuality, IntSize, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform,
+};
 
 use crate::discovery::DiscoveredHost;
 use crate::store::{KnownHost, Settings};
@@ -32,6 +47,27 @@ pub const MODAL_SCRIM: Color = Color::RGBA(0x00, 0x00, 0x00, 0x80);
 
 /// LG's own system UI font — already on-device, no bundling needed (see Cargo.toml).
 pub const SYSTEM_FONT_PATH: &str = "/usr/share/fonts/LG_Smart_UI-Regular.ttf";
+
+// ------------------------------------------------------------------------ icons --
+// Every icon in this UI is a glyph from a bundled, subsetted copy of Google's
+// Material Icons font (`assets/icons/MaterialIcons-subset.ttf`, Apache 2.0 — see
+// `assets/icons/NOTICE.md` for provenance/license and how to regenerate the subset)
+// rather than a vector-drawn shape: the system font covers ASCII only (see
+// `load_font`'s docs), so real icon glyphs need a font of their own, and a real
+// icon font draws a cleaner tv/lock/gear/etc. than hand-rolled path math ever did.
+// Rendered the same way as any other text (`draw_icon` reuses `TextCache`/`Font`),
+// just scaled to fit the icon's rect afterward — see `draw_icon`.
+
+pub const ICON_TV: &str = "\u{E333}";
+pub const ICON_LOCK: &str = "\u{E897}";
+pub const ICON_ADD: &str = "\u{E145}";
+pub const ICON_CLOSE: &str = "\u{E5CD}";
+pub const ICON_SETTINGS: &str = "\u{E8B8}";
+pub const ICON_MONITOR: &str = "\u{EF5B}";
+pub const ICON_SCHEDULE: &str = "\u{E8B5}";
+pub const ICON_SIGNAL: &str = "\u{E202}";
+pub const ICON_SUN: &str = "\u{E430}";
+pub const ICON_CHEVRON_DOWN: &str = "\u{E5C5}";
 
 // -------------------------------------------------------------------- input map --
 
@@ -148,6 +184,260 @@ pub fn webos_red_button_down() -> bool {
     scancode_down(SCANCODE_WEBOS_RED)
 }
 
+// --------------------------------------------------------------------- painter --
+// The AA rendering backend: a `tiny_skia::Pixmap` framebuffer plus the handful of
+// primitive ops every higher-level `draw_*` function below is built from. Nothing
+// past this section touches SDL2 rendering at all — `Font`/`Surface` still come
+// from `SDL2_ttf` (text metrics/rasterization; see the text/font section), but the
+// actual pixels always end up composited into this same buffer.
+
+fn sk_color(c: Color) -> SkColor {
+    SkColor::from_rgba8(c.r, c.g, c.b, c.a)
+}
+
+/// A flat-color, anti-aliased `Paint` — every fill/stroke in this module uses one
+/// of these and nothing fancier (no gradients/patterns needed for this UI).
+fn solid_paint(color: Color) -> Paint<'static> {
+    let mut paint = Paint::default();
+    paint.set_color(sk_color(color));
+    paint.anti_alias = true;
+    paint
+}
+
+/// Builds a rounded-rect as a Bezier path — tiny-skia (unlike full Skia) has no
+/// built-in rounded-rect primitive. `k` is the standard cubic-Bezier
+/// circular-arc-approximation constant. Falls back to a plain rect once `radius`
+/// clamps to ~0.
+fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
+    /// The standard cubic-Bezier circular-arc-approximation constant.
+    const K: f32 = 0.552_284_7;
+
+    let r = radius.max(0.0).min(w / 2.0).min(h / 2.0);
+    let mut pb = PathBuilder::new();
+    if r < 0.5 {
+        pb.push_rect(tiny_skia::Rect::from_xywh(x, y, w, h)?);
+        return pb.finish();
+    }
+    let k = K * r;
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+    pb.close();
+    pb.finish()
+}
+
+/// One frame's whole-screen framebuffer. `App::render` draws every screen into a
+/// single `Painter`; `main.rs` uploads the result to one SDL2 texture and presents
+/// it, rather than issuing a texture copy per widget as the old canvas-based
+/// version did.
+pub struct Painter {
+    pixmap: Pixmap,
+}
+
+impl Painter {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            pixmap: Pixmap::new(width.max(1), height.max(1)).expect("nonzero framebuffer size"),
+        }
+    }
+
+    /// Raw premultiplied RGBA8 bytes, row-major, `width() * height() * 4` long —
+    /// the exact byte order `sdl2::pixels::PixelFormatEnum::RGBA32` expects, so
+    /// `main.rs` can upload it to an SDL2 texture with no further conversion (every
+    /// frame starts with an opaque `clear`, so alpha is 255 everywhere by the time
+    /// this is read — premultiplied and straight are then identical).
+    pub fn data(&self) -> &[u8] {
+        self.pixmap.data()
+    }
+
+    /// Fills the whole frame — always the first call of a frame, matching the old
+    /// canvas's `clear()` (this UI has no transparent regions of its own; whatever
+    /// isn't covered by a widget just shows this color).
+    pub fn clear(&mut self, color: Color) {
+        self.pixmap.fill(sk_color(color));
+    }
+
+    pub fn fill_rect(&mut self, rect: Rect, color: Color) {
+        self.fill_rounded_rect(rect, 0, color);
+    }
+
+    pub fn fill_rounded_rect(&mut self, rect: Rect, radius: i32, color: Color) {
+        let (w, h) = (rect.width() as f32, rect.height() as f32);
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let Some(path) = rounded_rect_path(rect.x() as f32, rect.y() as f32, w, h, radius as f32) else {
+            return;
+        };
+        self.fill(&path, color);
+    }
+
+    pub fn stroke_rounded_rect(&mut self, rect: Rect, radius: i32, color: Color, width: f32) {
+        let (w, h) = (rect.width() as f32, rect.height() as f32);
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let Some(path) = rounded_rect_path(rect.x() as f32, rect.y() as f32, w, h, radius as f32) else {
+            return;
+        };
+        let paint = solid_paint(color);
+        let stroke = Stroke {
+            width,
+            ..Stroke::default()
+        };
+        self.pixmap
+            .stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+
+    pub fn fill_circle(&mut self, cx: f32, cy: f32, r: f32, color: Color) {
+        if r <= 0.0 {
+            return;
+        }
+        let Some(path) = PathBuilder::from_circle(cx, cy, r) else {
+            return;
+        };
+        self.fill(&path, color);
+    }
+
+    fn fill(&mut self, path: &tiny_skia::Path, color: Color) {
+        let paint = solid_paint(color);
+        self.pixmap
+            .fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+
+    /// A soft, real (box-blurred) drop shadow for a rounded-rect shape, offset by
+    /// `(dx, dy)` — replaces the old flat single-offset hard-edged rect, which had
+    /// no actual softness to sell "shadow" at TV viewing distance.
+    pub fn fill_shadow(&mut self, rect: Rect, radius: i32, dx: f32, dy: f32, blur: f32, opacity: u8) {
+        draw_soft_shadow(&mut self.pixmap, rect, radius, dx, dy, blur, opacity);
+    }
+
+    pub fn draw_pixmap(&mut self, x: i32, y: i32, src: &Pixmap) {
+        self.pixmap
+            .draw_pixmap(x, y, src.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    }
+
+    /// Composites `src` scaled to exactly fill `dst` — `image`-decoded cover art
+    /// (see `art.rs`) is already downscaled close to display size, so bilinear here
+    /// is just a small final-fit correction, not doing the heavy lifting of the
+    /// downscale.
+    pub fn draw_pixmap_scaled(&mut self, dst: Rect, src: &Pixmap) {
+        let (dw, dh) = (dst.width() as f32, dst.height() as f32);
+        let (sw, sh) = (src.width() as f32, src.height() as f32);
+        if dw <= 0.0 || dh <= 0.0 || sw <= 0.0 || sh <= 0.0 {
+            return;
+        }
+        let transform = Transform::from_scale(dw / sw, dh / sh).post_translate(dst.x() as f32, dst.y() as f32);
+        let paint = PixmapPaint {
+            quality: FilterQuality::Bilinear,
+            ..PixmapPaint::default()
+        };
+        self.pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
+    }
+}
+
+/// How far a shadow's blur extends past the shape casting it, in px — a fixed
+/// constant (not derived from anything) picked to read as a soft TV-scale shadow.
+const SHADOW_BLUR: f32 = 14.0;
+
+/// Rasterizes `rect`'s rounded-rect shape into a small padded alpha buffer, box-blurs
+/// it (3 passes — a cheap approximation of a Gaussian blur, good enough at TV
+/// viewing distance for a drop shadow), then composites it as a black shadow offset
+/// by `(dx, dy)`.
+fn draw_soft_shadow(dst: &mut Pixmap, rect: Rect, radius: i32, dx: f32, dy: f32, blur: f32, opacity: u8) {
+    let pad = blur.ceil().max(0.0) as i32 + 1;
+    let (w, h) = (rect.width() as i32 + 2 * pad, rect.height() as i32 + 2 * pad);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let Some(mut shape) = Pixmap::new(w as u32, h as u32) else {
+        return;
+    };
+    let Some(path) = rounded_rect_path(
+        pad as f32,
+        pad as f32,
+        rect.width() as f32,
+        rect.height() as f32,
+        radius as f32,
+    ) else {
+        return;
+    };
+    let paint = solid_paint(Color::RGBA(0, 0, 0, opacity));
+    shape.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+
+    // tiny-skia stores premultiplied RGBA; a pure-black shape's R/G/B channels are
+    // always 0, so its alpha channel alone fully describes the shape — blur that
+    // channel directly rather than blurring all 4 for no visual difference.
+    let mut alpha: Vec<u8> = shape.data().iter().skip(3).step_by(4).copied().collect();
+    let radius_px = (blur / 2.0).round().max(1.0) as usize;
+    for _ in 0..3 {
+        box_blur(&mut alpha, w as usize, h as usize, radius_px);
+    }
+    for (i, a) in alpha.into_iter().enumerate() {
+        shape.data_mut()[i * 4 + 3] = a; // R/G/B stay 0 (premultiplied black)
+    }
+
+    dst.draw_pixmap(
+        rect.x() - pad + dx.round() as i32,
+        rect.y() - pad + dy.round() as i32,
+        shape.as_ref(),
+        &PixmapPaint::default(),
+        Transform::identity(),
+        None,
+    );
+}
+
+/// Separable box blur (horizontal pass into `tmp`, then vertical back into
+/// `pixels`) — both passes are the same 1D sliding-window average, just walking
+/// the buffer in a different direction (see `blur_1d`).
+fn box_blur(pixels: &mut [u8], w: usize, h: usize, radius: usize) {
+    if radius == 0 {
+        return;
+    }
+    let mut tmp = vec![0u8; pixels.len()];
+    for y in 0..h {
+        blur_1d(w, radius, |x| pixels[y * w + x], |x, v| tmp[y * w + x] = v);
+    }
+    for x in 0..w {
+        blur_1d(h, radius, |y| tmp[y * w + x], |y, v| pixels[y * w + x] = v);
+    }
+}
+
+/// A 1D sliding-window average over `len` samples (read/written through the given
+/// accessors, so the same core serves both a blur's horizontal and vertical
+/// passes), via a prefix sum so each output sample is O(1) regardless of `radius`.
+fn blur_1d(len: usize, radius: usize, read: impl Fn(usize) -> u8, mut write: impl FnMut(usize, u8)) {
+    let mut prefix = vec![0u32; len + 1];
+    for i in 0..len {
+        prefix[i + 1] = prefix[i] + u32::from(read(i));
+    }
+    for i in 0..len {
+        let lo = i.saturating_sub(radius);
+        let hi = (i + radius).min(len - 1);
+        let count = (hi - lo + 1) as u32;
+        write(i, ((prefix[hi + 1] - prefix[lo]) / count) as u8);
+    }
+}
+
+/// `tiny-skia` stores premultiplied alpha; `SDL2_ttf`'s `.blended()` glyph surfaces
+/// and `image`'s decoded covers are both straight alpha — every raw-RGBA buffer
+/// feeding a `Pixmap` (see `pixmap_from_ttf_surface`, `art.rs`) goes through this
+/// first.
+pub fn premultiply_rgba(rgba: &mut [u8]) {
+    for px in rgba.chunks_exact_mut(4) {
+        let a = u32::from(px[3]);
+        px[0] = ((u32::from(px[0]) * a) / 255) as u8;
+        px[1] = ((u32::from(px[1]) * a) / 255) as u8;
+        px[2] = ((u32::from(px[2]) * a) / 255) as u8;
+    }
+}
+
 // --------------------------------------------------------------------- text/font --
 
 /// Loads the system font at a size proportional to the display height (design
@@ -162,29 +452,67 @@ pub fn load_font<'a>(
         .map_err(|e| anyhow::anyhow!("load_font {SYSTEM_FONT_PATH}: {e}"))
 }
 
-/// Caches rasterized-text GPU textures across frames, keyed by the exact
-/// `(text, color, font)` that produced them. Without this, `draw_text` re-rasterized
-/// (freetype glyph lookup + blend) and re-uploaded a brand-new texture on *every*
-/// call — and every draw function in this module is called on every render tick
-/// (the pre-stream UI loop runs at ~60fps), so a static label like "Settings" paid
-/// that cost 60 times a second for pixels that never changed. `font` is identified
-/// by its address rather than any content: this client only ever loads three fonts
-/// once at startup (`font_label`/`font_value`/`font_title` in `main.rs`) and holds
-/// them for the whole UI-flow's lifetime, so a stable address is a safe, cheap
-/// stand-in for identity — `Font` itself exposes nothing hashable to key on instead.
-/// Entry count is naturally bounded by this app's own content (a handful of static
-/// labels, a bounded set of settings values, one row per known host/game) — no
-/// eviction needed; see module docs if that assumption ever stops holding.
-pub struct TextCache<'a> {
-    creator: &'a TextureCreator<WindowContext>,
-    entries: std::collections::HashMap<(String, u32, usize), sdl2::render::Texture<'a>>,
+/// The bundled icon font's raw bytes (see the icons section above) — embedded into
+/// the binary at compile time, so there's no install-time asset to stage/ship
+/// alongside the `.ipk` and no runtime path to resolve.
+static ICON_FONT_BYTES: &[u8] = include_bytes!("../assets/icons/MaterialIcons-subset.ttf");
+
+/// Loads the bundled icon font at a fixed, generously large size — icon glyphs are
+/// always drawn through `draw_icon`, which composites (and, via `Painter`'s
+/// bilinear `draw_pixmap_scaled`, downscales) the rasterized glyph to fit whatever
+/// rect the caller actually wants, so a single oversized rasterization (rather than
+/// one `load_icon_font` call per distinct icon size, the way the three text fonts
+/// each get their own) is enough to stay crisp at every icon size this UI uses.
+pub fn load_icon_font(ttf: &sdl2::ttf::Sdl2TtfContext) -> Result<Font<'_, 'static>> {
+    let rwops = sdl2::rwops::RWops::from_bytes(ICON_FONT_BYTES).map_err(|e| anyhow::anyhow!("icon font rwops: {e}"))?;
+    ttf.load_font_from_rwops(rwops, 128)
+        .map_err(|e| anyhow::anyhow!("load_icon_font: {e}"))
 }
 
-impl<'a> TextCache<'a> {
-    pub fn new(creator: &'a TextureCreator<WindowContext>) -> Self {
+/// Converts an `SDL2_ttf`-rendered glyph-run surface into an owned, premultiplied
+/// `tiny_skia::Pixmap`. Goes through `convert_format(RGBA32)` first so the byte
+/// order in memory is always R,G,B,A regardless of `SDL2_ttf`'s actual output format
+/// or host endianness — the same `RGBA32` convention `main.rs`/`art.rs` already rely
+/// on for raw RGBA buffers.
+fn pixmap_from_ttf_surface(surface: &sdl2::surface::Surface) -> Result<Pixmap> {
+    let surface = surface
+        .convert_format(sdl2::pixels::PixelFormatEnum::RGBA32)
+        .map_err(|e| anyhow::anyhow!("convert glyph surface: {e}"))?;
+    let (w, h) = (surface.width(), surface.height());
+    let pitch = surface.pitch() as usize;
+    let row_bytes = w as usize * 4;
+    let mut rgba = vec![0u8; row_bytes * h as usize];
+    surface.with_lock(|src| {
+        for y in 0..h as usize {
+            let start = y * pitch;
+            rgba[y * row_bytes..(y + 1) * row_bytes].copy_from_slice(&src[start..start + row_bytes]);
+        }
+    });
+    premultiply_rgba(&mut rgba);
+    Pixmap::from_vec(rgba, IntSize::from_wh(w, h).context("zero-sized glyph surface")?).context("build glyph pixmap")
+}
+
+/// Caches rasterized-text `Pixmap`s across frames, keyed by the exact
+/// `(text, color, font)` that produced them. Without this, `draw_text` re-rasterized
+/// (freetype glyph lookup + blend + premultiply) on *every* call — and every draw
+/// function in this module is called on every render tick (the pre-stream UI loop
+/// runs at ~60fps), so a static label like "Settings" paid that cost 60 times a
+/// second for pixels that never changed. `font` is identified by its address rather
+/// than any content: this client only ever loads three fonts once at startup
+/// (`font_label`/`font_value`/`font_title` in `main.rs`) and holds them for the
+/// whole UI-flow's lifetime, so a stable address is a safe, cheap stand-in for
+/// identity — `Font` itself exposes nothing hashable to key on instead. Entry count
+/// is naturally bounded by this app's own content (a handful of static labels, a
+/// bounded set of settings values, one row per known host/game) — no eviction
+/// needed; see module docs if that assumption ever stops holding.
+pub struct TextCache {
+    entries: HashMap<(String, u32, usize), Pixmap>,
+}
+
+impl TextCache {
+    pub fn new() -> Self {
         Self {
-            creator,
-            entries: std::collections::HashMap::new(),
+            entries: HashMap::new(),
         }
     }
 
@@ -193,32 +521,35 @@ impl<'a> TextCache<'a> {
         (text.to_string(), packed_color, std::ptr::from_ref(font) as usize)
     }
 
-    /// Returns the cached texture for `(font, text, color)`, rasterizing (and
+    /// Returns the cached `Pixmap` for `(font, text, color)`, rasterizing (and
     /// caching) it first if this is the first time this exact combination has
     /// been drawn.
-    fn get_or_create(&mut self, font: &Font, text: &str, color: Color) -> Result<&sdl2::render::Texture<'a>> {
+    fn get_or_create(&mut self, font: &Font, text: &str, color: Color) -> Result<&Pixmap> {
         let key = Self::key(font, text, color);
         if !self.entries.contains_key(&key) {
             let surface = font
                 .render(text)
                 .blended(color)
                 .map_err(|e| anyhow::anyhow!("render text: {e}"))?;
-            let texture = self
-                .creator
-                .create_texture_from_surface(&surface)
-                .context("texture from surface")?;
-            self.entries.insert(key.clone(), texture);
+            let pixmap = pixmap_from_ttf_surface(&surface)?;
+            self.entries.insert(key.clone(), pixmap);
         }
         Ok(self.entries.get(&key).expect("just inserted"))
+    }
+}
+
+impl Default for TextCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 /// Renders one line of text left-aligned at `(x, y)` (top-left), returning its
 /// width. `text_cache` (see [`TextCache`]) makes repeat calls with the same
 /// `(font, text, color)` — the common case, since most on-screen text is static
-/// from one frame to the next — cheap: no re-rasterization, no new GPU texture.
+/// from one frame to the next — cheap: no re-rasterization, no re-premultiplying.
 pub fn draw_text(
-    canvas: &mut Canvas<Window>,
+    painter: &mut Painter,
     text_cache: &mut TextCache,
     font: &Font,
     text: &str,
@@ -229,12 +560,28 @@ pub fn draw_text(
     if text.is_empty() {
         return Ok(0);
     }
-    let texture = text_cache.get_or_create(font, text, color)?;
-    let sdl2::render::TextureQuery { width, height, .. } = texture.query();
-    canvas
-        .copy(texture, None, Rect::new(x, y, width, height))
-        .map_err(|e| anyhow::anyhow!("copy text texture: {e}"))?;
+    let pixmap = text_cache.get_or_create(font, text, color)?;
+    let width = pixmap.width();
+    painter.draw_pixmap(x, y, pixmap);
     Ok(width)
+}
+
+/// Draws one icon glyph (one of the `ICON_*` constants above) from the bundled icon
+/// font, scaled to fill `rect` — the same `TextCache` that caches on-screen text
+/// caches these too (a `Font`'s address plus the glyph string is already a unique,
+/// stable cache key — see [`TextCache`] — so a second cache wasn't needed just
+/// because this one holds icons instead of words).
+pub fn draw_icon(
+    painter: &mut Painter,
+    text_cache: &mut TextCache,
+    icon_font: &Font,
+    rect: Rect,
+    glyph: &str,
+    color: Color,
+) -> Result<()> {
+    let pixmap = text_cache.get_or_create(icon_font, glyph, color)?;
+    painter.draw_pixmap_scaled(rect, pixmap);
+    Ok(())
 }
 
 /// Truncates `text` with a trailing "…" so it fits within `max_w` pixels in `font`
@@ -255,76 +602,9 @@ pub fn ellipsize(font: &Font, text: &str, max_w: u32) -> String {
     "…".to_string()
 }
 
-// ------------------------------------------------------------------- primitives --
-
-/// Fills a rounded rectangle one scanline at a time (a plain filled rect in the
-/// middle, an inset computed per-row from the corner circle's equation near the
-/// top/bottom edges) — no `SDL2_gfx` dependency, cheap enough for the handful of
-/// panels on screen at once.
-pub fn fill_rounded_rect(canvas: &mut Canvas<Window>, rect: Rect, radius: i32, color: Color) {
-    let (w, h) = (rect.width() as i32, rect.height() as i32);
-    let r = radius.max(0).min(h / 2).min(w / 2);
-    canvas.set_draw_color(color);
-    if r == 0 || w <= 0 || h <= 0 {
-        let _ = canvas.fill_rect(rect);
-        return;
-    }
-    for y in 0..h {
-        let dy = if y < r {
-            r - 1 - y
-        } else if y >= h - r {
-            y - (h - r)
-        } else {
-            -1
-        };
-        let inset = if dy < 0 {
-            0
-        } else {
-            r - f64::from((r * r - dy * dy).max(0)).sqrt().round() as i32
-        };
-        let row_w = (w - 2 * inset).max(0) as u32;
-        if row_w == 0 {
-            continue;
-        }
-        let _ = canvas.fill_rect(Rect::new(rect.x() + inset, rect.y() + y, row_w, 1));
-    }
-}
-
-/// A single-pixel rounded outline, matching `fill_rounded_rect`'s corner curve —
-/// straight edges via `draw_line`, corners plotted point-by-point per scanline.
-pub fn draw_rounded_rect_outline(canvas: &mut Canvas<Window>, rect: Rect, radius: i32, color: Color) {
-    let (w, h) = (rect.width() as i32, rect.height() as i32);
-    let r = radius.max(0).min(h / 2).min(w / 2);
-    canvas.set_draw_color(color);
-    if r == 0 || w <= 0 || h <= 0 {
-        let _ = canvas.draw_rect(rect);
-        return;
-    }
-    let _ = canvas.draw_line((rect.x() + r, rect.y()), (rect.x() + w - r - 1, rect.y()));
-    let _ = canvas.draw_line(
-        (rect.x() + r, rect.y() + h - 1),
-        (rect.x() + w - r - 1, rect.y() + h - 1),
-    );
-    let _ = canvas.draw_line((rect.x(), rect.y() + r), (rect.x(), rect.y() + h - r - 1));
-    let _ = canvas.draw_line(
-        (rect.x() + w - 1, rect.y() + r),
-        (rect.x() + w - 1, rect.y() + h - r - 1),
-    );
-    for y in 0..r {
-        let dy = r - 1 - y;
-        let inset = r - f64::from((r * r - dy * dy).max(0)).sqrt().round() as i32;
-        let _ = canvas.draw_point((rect.x() + inset, rect.y() + y));
-        let _ = canvas.draw_point((rect.x() + w - inset - 1, rect.y() + y));
-        let _ = canvas.draw_point((rect.x() + inset, rect.y() + h - 1 - y));
-        let _ = canvas.draw_point((rect.x() + w - inset - 1, rect.y() + h - 1 - y));
-    }
-}
-
 // -------------------------------------------------------------------- focus/cards --
 
-/// A slight softening of moonlight-tv's near-square (~2px) tile radius — with no
-/// AA/shadow-blur to sell true sharpness at TV viewing distance, a small radius
-/// reads cleaner on plain filled rects.
+/// A slight softening of moonlight-tv's near-square (~2px) tile radius.
 pub const CARD_RADIUS: i32 = 10;
 pub const MODAL_RADIUS: i32 = 20;
 
@@ -347,9 +627,8 @@ fn inflate(rect: Rect, focused: bool) -> Rect {
 
 /// moonlight-tv's focus cue is an outline ring offset outward from the tile, not a
 /// filled/background change — bright accent blue, invisible unless focused. Two
-/// passes at increasing offset/decreasing alpha approximate a soft glow (no blur
-/// primitive available in plain SDL2 2D).
-pub fn draw_focus_ring(canvas: &mut Canvas<Window>, rect: Rect, radius: i32) {
+/// passes at increasing offset/decreasing alpha approximate a soft glow.
+pub fn draw_focus_ring(painter: &mut Painter, rect: Rect, radius: i32) {
     let passes = [(3, 0xff), (6, 0x60)];
     for (offset, alpha) in passes {
         let ring = Rect::new(
@@ -359,26 +638,25 @@ pub fn draw_focus_ring(canvas: &mut Canvas<Window>, rect: Rect, radius: i32) {
             rect.height() + 2 * offset as u32,
         );
         let color = Color::RGBA(ACCENT_BRIGHT.r, ACCENT_BRIGHT.g, ACCENT_BRIGHT.b, alpha);
-        draw_rounded_rect_outline(canvas, ring, radius + offset, color);
+        painter.stroke_rounded_rect(ring, radius + offset, color, 2.0);
     }
 }
 
-/// A flat drop-shadow approximation (one soft dark rect offset down-right, no blur
-/// available) — matches the reference's shadowed-card look cheaply.
-fn draw_card_shadow(canvas: &mut Canvas<Window>, rect: Rect, radius: i32) {
-    let shadow = Rect::new(rect.x() + 3, rect.y() + 5, rect.width(), rect.height());
-    fill_rounded_rect(canvas, shadow, radius, Color::RGBA(0x00, 0x00, 0x00, 0x60));
+/// A soft, real drop shadow (see [`Painter::fill_shadow`]) — matches the reference's
+/// shadowed-card look.
+fn draw_card_shadow(painter: &mut Painter, rect: Rect, radius: i32) {
+    painter.fill_shadow(rect, radius, 3.0, 5.0, SHADOW_BLUR, 0x60);
 }
 
 /// Draws a plain surface card (sidebar rows, settings rows, PIN/IP digit boxes) —
 /// shadow, `SIDEBAR_BG` fill, and a focus ring when focused. Returns the (possibly
 /// zoom-inflated) rect actually drawn, so callers can center content inside it.
-pub fn draw_card(canvas: &mut Canvas<Window>, rect: Rect, focused: bool) -> Rect {
+pub fn draw_card(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
     let r = inflate(rect, focused);
-    draw_card_shadow(canvas, r, CARD_RADIUS);
-    fill_rounded_rect(canvas, r, CARD_RADIUS, SIDEBAR_BG);
+    draw_card_shadow(painter, r, CARD_RADIUS);
+    painter.fill_rounded_rect(r, CARD_RADIUS, SIDEBAR_BG);
     if focused {
-        draw_focus_ring(canvas, r, CARD_RADIUS);
+        draw_focus_ring(painter, r, CARD_RADIUS);
     }
     r
 }
@@ -401,37 +679,33 @@ fn tint_for(title: &str) -> Color {
     POSTER_TINTS[hash as usize % POSTER_TINTS.len()]
 }
 
-/// Draws one game/Desktop tile: a tinted placeholder "poster" (no real cover art —
-/// the host's management API only returns `{id, title}`) with a large initial
-/// letter, plus a bottom title strip — same tile shape moonlight-tv's cover image
-/// occupies, filled with a stand-in look instead of a fetched image.
-/// Draws one game/Desktop tile. `art`, when `Some` (a decoded cover already turned
-/// into a texture by `main.rs` — see `art.rs`), fills the whole card, same as
+/// Draws one game/Desktop tile. `art`, when `Some` (a decoded cover, already
+/// downscaled and premultiplied by `art.rs`), fills the whole card, same as
 /// moonlight-tv's cover-image tiles; `None` falls back to a tinted placeholder +
 /// initial letter (no real art fetched yet, or the host has none for this title).
 /// Either way a bottom title strip overlays the art/tint, matching the reference's
 /// always-present (ellipsized) title label.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_poster_card(
-    canvas: &mut Canvas<Window>,
+    painter: &mut Painter,
     text_cache: &mut TextCache,
     font_title: &Font,
     font_value: &Font,
     rect: Rect,
     title: &str,
-    art: Option<&sdl2::render::Texture>,
+    art: Option<&Pixmap>,
     focused: bool,
 ) -> Result<()> {
     let r = inflate(rect, focused);
-    draw_card_shadow(canvas, r, CARD_RADIUS);
+    draw_card_shadow(painter, r, CARD_RADIUS);
 
     let strip_h = (font_value.height() + 16).min(r.height() as i32 / 3);
     match art {
-        Some(texture) => {
-            let _ = canvas.copy(texture, None, r);
+        Some(pixmap) => {
+            painter.draw_pixmap_scaled(r, pixmap);
         }
         None => {
-            fill_rounded_rect(canvas, r, CARD_RADIUS, tint_for(title));
+            painter.fill_rounded_rect(r, CARD_RADIUS, tint_for(title));
             let initial = title
                 .chars()
                 .find(|c| c.is_alphanumeric())
@@ -441,7 +715,7 @@ pub fn draw_poster_card(
             let (iw, ih) = font_title.size_of(&initial).unwrap_or((0, 0));
             let art_h = r.height() as i32 - strip_h;
             draw_text(
-                canvas,
+                painter,
                 text_cache,
                 font_title,
                 &initial,
@@ -458,10 +732,10 @@ pub fn draw_poster_card(
         r.width().saturating_sub(4),
         strip_h.max(0) as u32,
     );
-    fill_rounded_rect(canvas, strip, 0, Color::RGBA(0x00, 0x00, 0x00, 0x70));
+    painter.fill_rect(strip, Color::RGBA(0x00, 0x00, 0x00, 0x70));
     let label = ellipsize(font_value, title, strip.width().saturating_sub(16));
     draw_text(
-        canvas,
+        painter,
         text_cache,
         font_value,
         &label,
@@ -471,7 +745,7 @@ pub fn draw_poster_card(
     )?;
 
     if focused {
-        draw_focus_ring(canvas, r, CARD_RADIUS);
+        draw_focus_ring(painter, r, CARD_RADIUS);
     }
     Ok(())
 }
@@ -538,132 +812,32 @@ impl HostEntry {
     }
 }
 
-/// Draws a simple flat "TV" glyph — a rounded-outline screen + a short stand —
-/// for a paired/available sidebar host row.
-pub fn draw_tv_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
-    let (w, h) = (rect.width() as i32, rect.height() as i32);
-    let screen_h = (h as f32 * 0.72).round() as i32;
-    let screen = Rect::new(rect.x(), rect.y(), w as u32, screen_h.max(0) as u32);
-    draw_rounded_rect_outline(canvas, screen, 4, color);
-    canvas.set_draw_color(color);
-    let stand_y = rect.y() + screen_h + (h - screen_h) / 2;
-    let _ = canvas.draw_line((rect.x() + w / 2 - w / 6, stand_y), (rect.x() + w / 2 + w / 6, stand_y));
-}
-
-/// A padlock glyph (shackle arc approximated by a rounded outline, filled body) —
-/// for a not-yet-paired sidebar host row.
-pub fn draw_lock_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
-    let (w, h) = (rect.width() as i32, rect.height() as i32);
-    let body_h = (h as f32 * 0.58).round() as i32;
-    let body = Rect::new(rect.x(), rect.y() + h - body_h, w as u32, body_h.max(0) as u32);
-    fill_rounded_rect(canvas, body, 3, color);
-    let shackle_w = (w as f32 * 0.55).round() as u32;
-    let shackle_h = (h - body_h + 6).max(0) as u32;
-    let shackle = Rect::new(
-        rect.x() + (w as u32 - shackle_w) as i32 / 2,
-        rect.y(),
-        shackle_w,
-        shackle_h,
-    );
-    draw_rounded_rect_outline(canvas, shackle, (shackle_w / 2) as i32, color);
-}
-
-/// A "+" glyph for the sidebar's "Add host" row.
-pub fn draw_plus_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
-    let (w, h) = (rect.width() as i32, rect.height() as i32);
-    let pad = w.min(h) / 4;
-    let (cx, cy) = (rect.x() + w / 2, rect.y() + h / 2);
-    canvas.set_draw_color(color);
-    for off in -1..=1 {
-        let _ = canvas.draw_line((rect.x() + pad, cy + off), (rect.x() + w - pad, cy + off));
-        let _ = canvas.draw_line((cx + off, rect.y() + pad), (cx + off, rect.y() + h - pad));
-    }
-}
-
-/// An "X" glyph — modal close buttons.
-pub fn draw_close_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
-    let (w, h) = (rect.width() as i32, rect.height() as i32);
-    let pad = w.min(h) / 4;
-    canvas.set_draw_color(color);
-    for off in -1..=1 {
-        let _ = canvas.draw_line(
-            (rect.x() + pad, rect.y() + pad + off),
-            (rect.x() + w - pad, rect.y() + h - pad + off),
-        );
-        let _ = canvas.draw_line(
-            (rect.x() + w - pad, rect.y() + pad + off),
-            (rect.x() + pad, rect.y() + h - pad + off),
-        );
-    }
-}
-
-/// The gear (settings) icon inscribed in `rect` — vector-drawn, not a font glyph
-/// (the system font has no gear/U+2699 glyph). A ring body (via two nested
-/// `fill_rounded_rect` circles, the inner one erased in `erase_color`) with a few
-/// teeth projected outward, plus a center dot.
-pub fn draw_gear_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color, erase_color: Color) {
-    const TEETH: usize = 8;
-
-    let cx = rect.x() + rect.width() as i32 / 2;
-    let cy = rect.y() + rect.height() as i32 / 2;
-    let outer_r = (rect.width().min(rect.height()) as i32) / 2 - 2;
-    let inner_r = (f64::from(outer_r) * 0.55).round() as i32;
-    let tooth_r = (f64::from(outer_r) * 1.05).round() as i32;
-    let tooth_w = (f64::from(outer_r) * 0.38).max(3.0).round() as u32;
-
-    canvas.set_draw_color(color);
-    for i in 0..TEETH {
-        let angle = i as f64 * std::f64::consts::TAU / TEETH as f64;
-        let tx = cx + (angle.cos() * f64::from(tooth_r)).round() as i32;
-        let ty = cy + (angle.sin() * f64::from(tooth_r)).round() as i32;
-        let t = Rect::new(tx - tooth_w as i32 / 2, ty - tooth_w as i32 / 2, tooth_w, tooth_w);
-        let _ = canvas.fill_rect(t);
-    }
-    fill_rounded_rect(
-        canvas,
-        Rect::new(cx - outer_r, cy - outer_r, (outer_r * 2) as u32, (outer_r * 2) as u32),
-        outer_r,
-        color,
-    );
-    fill_rounded_rect(
-        canvas,
-        Rect::new(cx - inner_r, cy - inner_r, (inner_r * 2) as u32, (inner_r * 2) as u32),
-        inner_r,
-        erase_color,
-    );
-    let dot_r = (f64::from(inner_r) * 0.4).max(2.0).round() as i32;
-    fill_rounded_rect(
-        canvas,
-        Rect::new(cx - dot_r, cy - dot_r, (dot_r * 2) as u32, (dot_r * 2) as u32),
-        dot_r,
-        color,
-    );
-}
-
 /// Draws the whole sidebar: a flat `SIDEBAR_BG` panel, a "punktfunk" wordmark at
 /// the top, one row per host (icon reflects paired/not-paired), then trailing
 /// "+ Add host"/"Settings" utility rows. `focused_index` is `Some` only when
 /// sidebar itself has focus (see `app.rs`'s `HomeFocus`).
 #[allow(clippy::too_many_arguments)]
 pub fn draw_sidebar(
-    canvas: &mut Canvas<Window>,
+    painter: &mut Painter,
     text_cache: &mut TextCache,
     font_label: &Font,
     font_title: &Font,
+    icon_font: &Font,
     entries: &[HostEntry],
     focused_index: Option<usize>,
     screen_h: u32,
 ) -> Result<()> {
-    fill_rounded_rect(canvas, Rect::new(0, 0, SIDEBAR_W, screen_h), 0, SIDEBAR_BG);
-    draw_text(canvas, text_cache, font_title, "punktfunk", SIDEBAR_PAD, 56, WHITE)?;
+    painter.fill_rect(Rect::new(0, 0, SIDEBAR_W, screen_h), SIDEBAR_BG);
+    draw_text(painter, text_cache, font_title, "punktfunk", SIDEBAR_PAD, 56, WHITE)?;
 
     let add_row = entries.len();
     let settings_row = entries.len() + 1;
     for (i, entry) in entries.iter().enumerate() {
         draw_host_row(
-            canvas,
+            painter,
             text_cache,
             font_label,
+            icon_font,
             i,
             entry.name(),
             entry.is_paired(),
@@ -671,17 +845,19 @@ pub fn draw_sidebar(
         )?;
     }
     draw_utility_row(
-        canvas,
+        painter,
         text_cache,
         font_label,
+        icon_font,
         add_row,
         "+ Add host",
         focused_index == Some(add_row),
     )?;
     draw_utility_row(
-        canvas,
+        painter,
         text_cache,
         font_label,
+        icon_font,
         settings_row,
         "Settings",
         focused_index == Some(settings_row),
@@ -689,7 +865,7 @@ pub fn draw_sidebar(
 
     if entries.is_empty() {
         draw_text(
-            canvas,
+            painter,
             text_cache,
             font_label,
             "No hosts yet.",
@@ -701,17 +877,19 @@ pub fn draw_sidebar(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_host_row(
-    canvas: &mut Canvas<Window>,
+    painter: &mut Painter,
     text_cache: &mut TextCache,
     font_label: &Font,
+    icon_font: &Font,
     index: usize,
     name: &str,
     paired: bool,
     focused: bool,
 ) -> Result<()> {
     let rect = sidebar_row_rect(index);
-    let drawn = draw_card(canvas, rect, focused);
+    let drawn = draw_card(painter, rect, focused);
     let icon_size = 32u32;
     let icon_rect = Rect::new(
         drawn.x() + 18,
@@ -720,13 +898,10 @@ fn draw_host_row(
         icon_size,
     );
     let icon_color = if focused { WHITE } else { MUTED };
-    if paired {
-        draw_tv_icon(canvas, icon_rect, icon_color);
-    } else {
-        draw_lock_icon(canvas, icon_rect, icon_color);
-    }
+    let glyph = if paired { ICON_TV } else { ICON_LOCK };
+    draw_icon(painter, text_cache, icon_font, icon_rect, glyph, icon_color)?;
     draw_text(
-        canvas,
+        painter,
         text_cache,
         font_label,
         name,
@@ -738,15 +913,16 @@ fn draw_host_row(
 }
 
 fn draw_utility_row(
-    canvas: &mut Canvas<Window>,
+    painter: &mut Painter,
     text_cache: &mut TextCache,
     font_label: &Font,
+    icon_font: &Font,
     index: usize,
     label: &str,
     focused: bool,
 ) -> Result<()> {
     let rect = sidebar_row_rect(index);
-    let drawn = draw_card(canvas, rect, focused);
+    let drawn = draw_card(painter, rect, focused);
     let icon_size = 28u32;
     let icon_rect = Rect::new(
         drawn.x() + 20,
@@ -755,13 +931,14 @@ fn draw_utility_row(
         icon_size,
     );
     let icon_color = if focused { WHITE } else { MUTED };
-    if label.starts_with('+') {
-        draw_plus_icon(canvas, icon_rect, icon_color);
+    let glyph = if label.starts_with('+') {
+        ICON_ADD
     } else {
-        draw_gear_icon(canvas, icon_rect, icon_color, drawn_bg_for(focused));
-    }
+        ICON_SETTINGS
+    };
+    draw_icon(painter, text_cache, icon_font, icon_rect, glyph, icon_color)?;
     draw_text(
-        canvas,
+        painter,
         text_cache,
         font_label,
         label.trim_start_matches('+').trim(),
@@ -770,14 +947,6 @@ fn draw_utility_row(
         if focused { WHITE } else { MUTED },
     )?;
     Ok(())
-}
-
-fn drawn_bg_for(focused: bool) -> Color {
-    // The gear icon punches an "erase" hole for its inner circle — must match
-    // whatever's actually beneath it (the card's own fill, which doesn't change
-    // with focus — only the ring/zoom do — so this is always SIDEBAR_BG).
-    let _ = focused;
-    SIDEBAR_BG
 }
 
 // ------------------------------------------------------------------------ grid --
@@ -829,9 +998,8 @@ pub fn hit_test_grid_card(
 
 /// Dims the already-rendered frame beneath a modal (Settings/Pairing/Add host all
 /// render on top of the current Home frame, then this, then their own card).
-pub fn draw_modal_backdrop(canvas: &mut Canvas<Window>, screen_w: u32, screen_h: u32) {
-    canvas.set_draw_color(MODAL_SCRIM);
-    let _ = canvas.fill_rect(Rect::new(0, 0, screen_w, screen_h));
+pub fn draw_modal_backdrop(painter: &mut Painter, screen_w: u32, screen_h: u32) {
+    painter.fill_rect(Rect::new(0, 0, screen_w, screen_h), MODAL_SCRIM);
 }
 
 /// A centered glass card of `(width_frac * screen_w, height)`.
@@ -842,10 +1010,10 @@ pub fn modal_card_rect(screen_w: u32, screen_h: u32, width_frac: f32, height: u3
     Rect::new(x, y, w, height)
 }
 
-pub fn draw_modal_card(canvas: &mut Canvas<Window>, rect: Rect) {
-    draw_card_shadow(canvas, rect, MODAL_RADIUS);
-    fill_rounded_rect(canvas, rect, MODAL_RADIUS, SIDEBAR_BG);
-    draw_rounded_rect_outline(canvas, rect, MODAL_RADIUS, Color::RGBA(0xff, 0xff, 0xff, 0x18));
+pub fn draw_modal_card(painter: &mut Painter, rect: Rect) {
+    draw_card_shadow(painter, rect, MODAL_RADIUS);
+    painter.fill_rounded_rect(rect, MODAL_RADIUS, SIDEBAR_BG);
+    painter.stroke_rounded_rect(rect, MODAL_RADIUS, Color::RGBA(0xff, 0xff, 0xff, 0x18), 1.5);
 }
 
 /// The modal close (X) button rect, top-right inset of `card_rect`.
@@ -1050,11 +1218,13 @@ const SETTINGS_ICON_SIZE: u32 = 30;
 /// interior, below its title/divider) — icon + label on the left, a dropdown
 /// pill / slider / modern switch on the right. Each row is its own card with a
 /// focus ring, matching this client's sidebar/grid visual language.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_settings_rows(
-    canvas: &mut Canvas<Window>,
+    painter: &mut Painter,
     text_cache: &mut TextCache,
     font_label: &Font,
     font_value: &Font,
+    icon_font: &Font,
     rows: &[SettingsRow],
     focused_index: usize,
     content_rect: Rect,
@@ -1063,7 +1233,7 @@ pub fn draw_settings_rows(
         let y = content_rect.y() + i as i32 * (SETTINGS_ROW_H as i32 + SETTINGS_ROW_GAP);
         let focused = i == focused_index;
         let row_rect = Rect::new(content_rect.x(), y, content_rect.width(), SETTINGS_ROW_H);
-        let drawn = draw_card(canvas, row_rect, focused);
+        let drawn = draw_card(painter, row_rect, focused);
 
         let icon_pad = 24;
         let icon_rect = Rect::new(
@@ -1073,15 +1243,16 @@ pub fn draw_settings_rows(
             SETTINGS_ICON_SIZE,
         );
         let icon_color = if focused { WHITE } else { MUTED };
-        match row.kind {
-            RowKind::Dropdown if i == ROW_RESOLUTION => draw_monitor_icon(canvas, icon_rect, icon_color),
-            RowKind::Dropdown => draw_clock_icon(canvas, icon_rect, icon_color),
-            RowKind::Slider => draw_bars_icon(canvas, icon_rect, icon_color),
-            RowKind::Toggle => draw_sun_icon(canvas, icon_rect, icon_color),
-        }
+        let glyph = match row.kind {
+            RowKind::Dropdown if i == ROW_RESOLUTION => ICON_MONITOR,
+            RowKind::Dropdown => ICON_SCHEDULE,
+            RowKind::Slider => ICON_SIGNAL,
+            RowKind::Toggle => ICON_SUN,
+        };
+        draw_icon(painter, text_cache, icon_font, icon_rect, glyph, icon_color)?;
         let label_x = icon_rect.x() + SETTINGS_ICON_SIZE as i32 + 20;
         draw_text(
-            canvas,
+            painter,
             text_cache,
             font_label,
             &row.label,
@@ -1100,14 +1271,14 @@ pub fn draw_settings_rows(
                     pill_w,
                     52,
                 );
-                draw_dropdown_pill(canvas, text_cache, font_value, pill, &row.value, focused)?;
+                draw_dropdown_pill(painter, text_cache, font_value, icon_font, pill, &row.value, focused)?;
             }
             RowKind::Slider => {
                 let value_w = font_value.size_of(&row.value).map_or(0, |(w, _)| w);
                 let track_w = 220u32.min(drawn.width() / 3);
                 let value_x = drawn.x() + drawn.width() as i32 - control_pad - value_w as i32;
                 draw_text(
-                    canvas,
+                    painter,
                     text_cache,
                     font_value,
                     &row.value,
@@ -1121,7 +1292,7 @@ pub fn draw_settings_rows(
                     track_w,
                     10,
                 );
-                draw_slider_with_thumb(canvas, track, row.fraction, focused);
+                draw_slider_with_thumb(painter, track, row.fraction, focused);
             }
             RowKind::Toggle => {
                 let switch = Rect::new(
@@ -1130,26 +1301,27 @@ pub fn draw_settings_rows(
                     64,
                     34,
                 );
-                draw_switch(canvas, switch, row.value == "On");
+                draw_switch(painter, switch, row.value == "On");
             }
         }
     }
     Ok(())
 }
 
-/// A rounded pill button showing the current dropdown value + a small caret.
+/// A rounded pill button showing the current dropdown value + a small chevron
+/// (`ICON_CHEVRON_DOWN`, replacing a hand-drawn triangle — see the icons section).
 pub fn draw_dropdown_pill(
-    canvas: &mut Canvas<Window>,
+    painter: &mut Painter,
     text_cache: &mut TextCache,
     font: &Font,
+    icon_font: &Font,
     rect: Rect,
     label: &str,
     focused: bool,
 ) -> Result<()> {
     let radius = rect.height() as i32 / 2;
-    fill_rounded_rect(canvas, rect, radius, Color::RGBA(0xff, 0xff, 0xff, 0x12));
-    draw_rounded_rect_outline(
-        canvas,
+    painter.fill_rounded_rect(rect, radius, Color::RGBA(0xff, 0xff, 0xff, 0x12));
+    painter.stroke_rounded_rect(
         rect,
         radius,
         if focused {
@@ -1157,15 +1329,25 @@ pub fn draw_dropdown_pill(
         } else {
             Color::RGBA(0xff, 0xff, 0xff, 0x30)
         },
+        1.5,
     );
-    let text = format!("{label}  ▾");
-    let text_w = font.size_of(&text).map_or(0, |(w, _)| w);
+    let chevron_size = 20u32;
+    let chevron_pad = 16;
+    let chevron_rect = Rect::new(
+        rect.x() + rect.width() as i32 - chevron_pad - chevron_size as i32,
+        rect.y() + (rect.height() as i32 - chevron_size as i32) / 2,
+        chevron_size,
+        chevron_size,
+    );
+    draw_icon(painter, text_cache, icon_font, chevron_rect, ICON_CHEVRON_DOWN, WHITE)?;
+    let text_w = font.size_of(label).map_or(0, |(w, _)| w);
+    let text_x = rect.x() + ((rect.width() as i32 - chevron_size as i32 - chevron_pad) - text_w as i32) / 2;
     draw_text(
-        canvas,
+        painter,
         text_cache,
         font,
-        &text,
-        rect.x() + (rect.width() as i32 - text_w as i32) / 2,
+        label,
+        text_x.max(rect.x()),
         rect.y() + (rect.height() as i32 - font.height()) / 2,
         WHITE,
     )?;
@@ -1174,44 +1356,27 @@ pub fn draw_dropdown_pill(
 
 /// A round-thumbed slider track, shadowed knob (matches the reference's
 /// slider-knob-shadow theme touch).
-pub fn draw_slider_with_thumb(canvas: &mut Canvas<Window>, rect: Rect, fraction: f32, focused: bool) {
+pub fn draw_slider_with_thumb(painter: &mut Painter, rect: Rect, fraction: f32, focused: bool) {
     let track_h = rect.height();
-    let track = Rect::new(rect.x(), rect.y(), rect.width(), track_h);
-    fill_rounded_rect(canvas, track, track_h as i32 / 2, Color::RGBA(0xff, 0xff, 0xff, 0x22));
+    painter.fill_rounded_rect(rect, track_h as i32 / 2, Color::RGBA(0xff, 0xff, 0xff, 0x22));
     let filled_w = (rect.width() as f32 * fraction.clamp(0.0, 1.0)) as u32;
     if filled_w > 0 {
         let filled = Rect::new(rect.x(), rect.y(), filled_w.max(track_h), track_h);
-        fill_rounded_rect(canvas, filled, track_h as i32 / 2, ACCENT);
+        painter.fill_rounded_rect(filled, track_h as i32 / 2, ACCENT);
     }
-    let thumb_r = 14i32;
-    let cx = rect.x() + filled_w as i32;
-    let cy = rect.y() + rect.height() as i32 / 2;
-    fill_rounded_rect(
-        canvas,
-        Rect::new(
-            cx - thumb_r + 2,
-            cy - thumb_r + 3,
-            (thumb_r * 2) as u32,
-            (thumb_r * 2) as u32,
-        ),
-        thumb_r,
-        Color::RGBA(0x00, 0x00, 0x00, 0x50),
-    );
-    fill_rounded_rect(
-        canvas,
-        Rect::new(cx - thumb_r, cy - thumb_r, (thumb_r * 2) as u32, (thumb_r * 2) as u32),
-        thumb_r,
-        if focused { WHITE } else { MUTED },
-    );
+    let thumb_r = 14.0;
+    let cx = rect.x() as f32 + filled_w as f32;
+    let cy = rect.y() as f32 + rect.height() as f32 / 2.0;
+    painter.fill_circle(cx + 2.0, cy + 3.0, thumb_r, Color::RGBA(0x00, 0x00, 0x00, 0x50));
+    painter.fill_circle(cx, cy, thumb_r, if focused { WHITE } else { MUTED });
 }
 
 /// A modern sliding pill switch (iOS/Android-style) — accent-filled track with
 /// the knob at the right when on, muted track with the knob at the left when
-/// off. Replaces the old checkbox for a more contemporary boolean control.
-pub fn draw_switch(canvas: &mut Canvas<Window>, rect: Rect, on: bool) {
+/// off.
+pub fn draw_switch(painter: &mut Painter, rect: Rect, on: bool) {
     let radius = rect.height() as i32 / 2;
-    fill_rounded_rect(
-        canvas,
+    painter.fill_rounded_rect(
         rect,
         radius,
         if on {
@@ -1220,101 +1385,21 @@ pub fn draw_switch(canvas: &mut Canvas<Window>, rect: Rect, on: bool) {
             Color::RGBA(0xff, 0xff, 0xff, 0x22)
         },
     );
-    let knob_r = radius - 4;
-    let cy = rect.y() + rect.height() as i32 / 2;
+    let knob_r = radius as f32 - 4.0;
+    let cy = rect.y() as f32 + rect.height() as f32 / 2.0;
     let cx = if on {
-        rect.x() + rect.width() as i32 - radius
+        rect.x() as f32 + rect.width() as f32 - radius as f32
     } else {
-        rect.x() + radius
+        rect.x() as f32 + radius as f32
     };
-    fill_rounded_rect(
-        canvas,
-        Rect::new(
-            cx - knob_r + 1,
-            cy - knob_r + 2,
-            (knob_r * 2) as u32,
-            (knob_r * 2) as u32,
-        ),
-        knob_r,
-        Color::RGBA(0x00, 0x00, 0x00, 0x40),
-    );
-    fill_rounded_rect(
-        canvas,
-        Rect::new(cx - knob_r, cy - knob_r, (knob_r * 2) as u32, (knob_r * 2) as u32),
-        knob_r,
-        WHITE,
-    );
-}
-
-/// A small monitor/display glyph (a rounded-outline screen + a short stand) —
-/// the Resolution settings row.
-pub fn draw_monitor_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
-    let (w, h) = (rect.width() as i32, rect.height() as i32);
-    let screen_h = (h as f32 * 0.72).round() as i32;
-    let screen = Rect::new(rect.x(), rect.y(), w as u32, screen_h.max(0) as u32);
-    draw_rounded_rect_outline(canvas, screen, 4, color);
-    canvas.set_draw_color(color);
-    let stand_y = rect.y() + screen_h + (h - screen_h) / 2;
-    let _ = canvas.draw_line((rect.x() + w / 2 - w / 6, stand_y), (rect.x() + w / 2 + w / 6, stand_y));
-}
-
-/// A clock-face glyph (a circle outline + hour/minute hands) — the Frame rate
-/// settings row.
-pub fn draw_clock_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
-    let r = (rect.width().min(rect.height()) as i32) / 2 - 1;
-    let (cx, cy) = (rect.x() + rect.width() as i32 / 2, rect.y() + rect.height() as i32 / 2);
-    draw_rounded_rect_outline(
-        canvas,
-        Rect::new(cx - r, cy - r, (r * 2) as u32, (r * 2) as u32),
-        r,
-        color,
-    );
-    canvas.set_draw_color(color);
-    let _ = canvas.draw_line((cx, cy), (cx, cy - (r as f32 * 0.6) as i32));
-    let _ = canvas.draw_line((cx, cy), (cx + (r as f32 * 0.45) as i32, cy));
-}
-
-/// Three ascending bars (signal/throughput glyph) — the Bitrate settings row.
-pub fn draw_bars_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
-    let bar_w = (rect.width() as f32 / 4.0).round() as u32;
-    let gap = (rect.width() as f32 / 8.0).round() as i32;
-    canvas.set_draw_color(color);
-    for (i, h_frac) in [0.4, 0.7, 1.0].iter().enumerate() {
-        let bar_h = (rect.height() as f32 * h_frac).round() as u32;
-        let x = rect.x() + i as i32 * (bar_w as i32 + gap);
-        let y = rect.y() + rect.height() as i32 - bar_h as i32;
-        fill_rounded_rect(canvas, Rect::new(x, y, bar_w, bar_h), 2, color);
-    }
-}
-
-/// A sun glyph (filled circle + short rays) — the HDR settings row.
-pub fn draw_sun_icon(canvas: &mut Canvas<Window>, rect: Rect, color: Color) {
-    const RAYS: usize = 8;
-
-    let outer_r = (rect.width().min(rect.height()) as i32) / 2;
-    let core_r = (f64::from(outer_r) * 0.55).round() as i32;
-    let (cx, cy) = (rect.x() + rect.width() as i32 / 2, rect.y() + rect.height() as i32 / 2);
-    canvas.set_draw_color(color);
-    for i in 0..RAYS {
-        let angle = i as f64 * std::f64::consts::TAU / RAYS as f64;
-        let x0 = cx + (angle.cos() * (f64::from(core_r) + 2.0)).round() as i32;
-        let y0 = cy + (angle.sin() * (f64::from(core_r) + 2.0)).round() as i32;
-        let x1 = cx + (angle.cos() * f64::from(outer_r)).round() as i32;
-        let y1 = cy + (angle.sin() * f64::from(outer_r)).round() as i32;
-        let _ = canvas.draw_line((x0, y0), (x1, y1));
-    }
-    fill_rounded_rect(
-        canvas,
-        Rect::new(cx - core_r, cy - core_r, (core_r * 2) as u32, (core_r * 2) as u32),
-        core_r,
-        color,
-    );
+    painter.fill_circle(cx + 1.0, cy + 2.0, knob_r, Color::RGBA(0x00, 0x00, 0x00, 0x40));
+    painter.fill_circle(cx, cy, knob_r, WHITE);
 }
 
 /// Renders a dropdown's options as an overlay list anchored just below the row that
 /// opened it, inside the settings modal card.
 pub fn draw_dropdown_overlay(
-    canvas: &mut Canvas<Window>,
+    painter: &mut Painter,
     text_cache: &mut TextCache,
     font_value: &Font,
     options: &[String],
@@ -1325,15 +1410,15 @@ pub fn draw_dropdown_overlay(
     let gap = 6i32;
     let overlay_h = options.len() as i32 * (row_h as i32 + gap);
     let bg_rect = Rect::new(rect.x(), rect.y(), rect.width(), overlay_h.max(0) as u32);
-    fill_rounded_rect(canvas, bg_rect, CARD_RADIUS, Color::RGBA(0x10, 0x10, 0x10, 0xf0));
-    draw_rounded_rect_outline(canvas, bg_rect, CARD_RADIUS, Color::RGBA(0xff, 0xff, 0xff, 0x20));
+    painter.fill_rounded_rect(bg_rect, CARD_RADIUS, Color::RGBA(0x10, 0x10, 0x10, 0xf0));
+    painter.stroke_rounded_rect(bg_rect, CARD_RADIUS, Color::RGBA(0xff, 0xff, 0xff, 0x20), 1.5);
     for (i, opt) in options.iter().enumerate() {
         let y = rect.y() + i as i32 * (row_h as i32 + gap);
         let row_rect = Rect::new(rect.x(), y, rect.width(), row_h);
         let focused = i == focused_index;
-        let drawn = draw_card(canvas, row_rect, focused);
+        let drawn = draw_card(painter, row_rect, focused);
         draw_text(
-            canvas,
+            painter,
             text_cache,
             font_value,
             opt,
@@ -1455,7 +1540,7 @@ impl AddHostState {
 /// screen to show which digit Left/Right/number-keys currently edit.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_highlighted_text(
-    canvas: &mut Canvas<Window>,
+    painter: &mut Painter,
     text_cache: &mut TextCache,
     font: &Font,
     text: &str,
@@ -1469,7 +1554,7 @@ pub fn draw_highlighted_text(
     for (i, ch) in text.chars().enumerate() {
         let s = ch.to_string();
         let color = if i == focus_char { focus_color } else { base_color };
-        let w = draw_text(canvas, text_cache, font, &s, cursor_x, y, color)?;
+        let w = draw_text(painter, text_cache, font, &s, cursor_x, y, color)?;
         cursor_x += w as i32;
     }
     Ok(())
