@@ -125,6 +125,18 @@ state-machine loops with no natural seam, for a line-count threshold alone.
   quarter of the screen.
 - **NTSC framerate correction** (`main.rs`'s `ntsc_correct()`, matching aurora-tv's formula):
   1000/1001 × nominal, applied only to 30/60/120/240, floored to a whole Hz. 60→59, 120→119.
+- **Loss recovery is required, not optional**: punktfunk's stream has no periodic IDRs, so
+  unrecoverable loss produces reference-missing delta frames NDL *silently conceals* (no decode
+  error, just a frozen/garbled picture that never self-heals on its own). `session.rs`'s
+  `video_pump` calls `client.note_frame_index()` on every frame (cheap, idempotent, fires a
+  throttled RFI request internally on a forward gap) plus a throttled `request_keyframe()`
+  backstop when `frames_dropped()` climbs.
+- HDR mastering metadata can change over a session (different content, different mastering
+  values) — `video_pump` drains `next_hdr_meta` every frame (non-blocking) and applies whatever
+  arrives to NDL, rather than fetching it once at connect time.
+- `disconnect_quit()` is called only on a deliberate user "stop" (long-press-Back) — the host
+  tears the virtual display down immediately instead of lingering for a reconnect. Every other
+  exit path (host ended the session, app quit) leaves the connection to close normally.
 
 ## Audio
 
@@ -173,18 +185,18 @@ not a working refresh-rate switch. The panel's actual scan-out rate is fixed at 
 (HDMI timing negotiated once, or user-toggled TV settings like TruMotion/Game Optimizer) — outside
 any homebrew app's reach. Kodi's webOS port has the same limitation.
 
-**~~The Magic Remote's hardware Back button can't be claimed by a native app~~ — corrected
-2026-07-12: it can.** The previous note here (and `mariotaku/moonlight-tv#179`, still open upstream)
-was right that Back is intercepted by webOS's system launcher *by default* — but there's a real,
-documented fix, just not one either project had wired up: `webosbrew/SDL-webOS`'s
-`src/video/wayland/SDL_waylandwebos.c` sets a Wayland shell-surface property,
-`_WEBOS_ACCESS_POLICY_KEYS_BACK`, gated behind the SDL hint `SDL_WEBOS_ACCESS_POLICY_KEYS_BACK`
-(`include/SDL_hints.h`) — set it to `"true"` **before window creation** and the launcher stops
-intercepting that key, delivering it to the app instead as a normal key event. `main.rs`'s
-`run_inner` sets it via `sdl2::hint::set(...)` right after `sdl2::init()`. The key still doesn't
-arrive as a recognizable `Scancode`/`Keycode` through the safe event API even with the hint set
-(`SDL_SCANCODE_WEBOS_BACK = 482`, same unrepresentable-raw-scancode situation as the color buttons
-below) — `ui::webos_back_button_down()` polls it the same way `webos_red_button_down()` already did.
+**The Magic Remote's hardware Back button *can* be claimed by a native app** — Back is intercepted
+by webOS's system launcher *by default* (still an open issue upstream, `mariotaku/moonlight-tv#179`),
+but there's a real fix neither that project nor an earlier version of this doc knew about:
+`webosbrew/SDL-webOS`'s `src/video/wayland/SDL_waylandwebos.c` sets a Wayland shell-surface
+property, `_WEBOS_ACCESS_POLICY_KEYS_BACK`, gated behind the SDL hint
+`SDL_WEBOS_ACCESS_POLICY_KEYS_BACK` (`include/SDL_hints.h`) — set it to `"true"` **before window
+creation** and the launcher stops intercepting that key, delivering it to the app instead as a
+normal key event. `main.rs`'s `run_inner` sets it via `sdl2::hint::set(...)` right after
+`sdl2::init()`. The key still doesn't arrive as a recognizable `Scancode`/`Keycode` through the
+safe event API even with the hint set (`SDL_SCANCODE_WEBOS_BACK = 482`, same unrepresentable-raw-
+scancode situation as the color buttons below) — `ui::webos_back_button_down()` polls it the same
+way `webos_red_button_down()` already did.
 
 Kept Red as a **fallback**, not removed: the hint isn't necessarily honored on every firmware/model
 (unverified across the full device matrix), so both scancodes feed the same trigger in `main.rs`.
@@ -235,76 +247,21 @@ value is unrecoverable through the safe event API. The fix (`ui::webos_red_butto
 the raw SDL2 keyboard-state array directly (`sdl2::sys::SDL_GetKeyboardState` → `*const u8`,
 indexed by raw scancode int) — a level read, so the caller edge-detects the down-transition itself.
 
-## Removed: the in-stream diagnostics overlay (2026-07-12)
+## Don't re-add: an in-stream diagnostics overlay
 
-An earlier pass added a Magic Remote Green-button toggle for an in-stream log/stats overlay
-(`session::SharedStats`, `logbuf::Logger`'s ring buffer, `main.rs`'s `render_stream_overlay`). It
-was removed entirely — not just disabled — after it crashed the app on the real CX the first time
-it was exercised live: toggling `window.show()`/`window.hide()` on the normally-hidden SDL2 window
-(hidden during streaming so NDL's punch-through video plane shows through unobstructed) while NDL's
-hardware video plane was actively compositing killed the process silently (no panic message, no
-`Result::Err` logged — it just disappeared from `ps aux`), almost certainly a native crash inside
-the Wayland backend that Rust can't catch or convert into a recoverable error.
-
-If an in-stream overlay is wanted again, treat it as a new feature rather than reviving this one,
-and in particular:
-
-- Test any window-visibility change in complete isolation first, logging immediately before and
-  after each SDL call, so a crash pinpoints exactly which operation caused it.
-- Confirm whether per-pixel alpha transparency on a freshly-shown window actually composites over
-  NDL's video plane at all on this compositor — `SDL_SetWindowOpacity` (whole-window uniform
-  opacity, a *different* mechanism) was already confirmed unsupported here ("That operation is not
-  supported"), which doesn't answer the per-pixel-alpha question but suggests this compositor's
-  window transparency handling in general hasn't been proven reliable.
-
-Loss recovery (`note_frame_index`/`request_keyframe`) and continuous HDR metadata polling — added
-in the same pass as the diagnostics overlay, but functionally unrelated to it — were kept; see
-below.
-
-## Cross-checked against the upstream embedding guide (2026-07-12)
-
-Upstream punktfunk ships a C-ABI embedding guide (`docs/embedding-the-c-abi.md` in the
-punktfunk repo) aimed at ports that link `punktfunk-core` directly rather than through this
-Rust crate — but the underlying protocol/lifecycle contract is identical either way. Diffing
-this client against its checklist (§15) turned up one real gap, now fixed, plus two smaller ones:
-
-- **Loss recovery was completely missing** — the single most important item in the guide
-  ("this is the part you must get right"). `video_pump` only ever read `frames_dropped()` for
-  the stats overlay display; it never called `client.note_frame_index()` or
-  `client.request_keyframe()`/`request_rfi()`. Under punktfunk's infinite-GOP stream (no
-  periodic IDRs), unrecoverable loss produces reference-missing delta frames the decoder
-  *silently conceals* — no decode error, just a frozen/garbled picture that would never
-  self-heal without an explicit recovery signal. Fixed: `note_frame_index(frame.frame_index)`
-  on every received frame (cheap, idempotent, fires a throttled RFI request internally on a
-  forward gap), plus a throttled (`KEYFRAME_REQUEST_MIN_INTERVAL = 100ms`) `request_keyframe()`
-  backstop when `frames_dropped()` climbs — the guide's own "complete, correct recovery policy
-  on its own" combination.
-- **HDR mastering metadata was fetched once, not continuously.** The original code called
-  `next_hdr_meta` exactly once, synchronously, right after connect. The guide is explicit that a
-  host can emit *updated* metadata over the life of a session (different content, different
-  mastering values) and the client should "apply the latest." Fixed: moved into `video_pump`'s
-  loop as a cheap non-blocking (`Duration::ZERO`) drain every frame, applying whatever arrives
-  to NDL, instead of a one-shot fetch at connect time.
-- **`disconnect_quit` was never called.** The guide distinguishes a deliberate user "stop" (host
-  tears down the virtual display immediately) from a network drop/backgrounding (a plain `close`
-  — via `Drop` — lets the host linger for a reconnect). This client's long-press-Back-to-disconnect
-  is unambiguously the former, so it now calls `connected.client.disconnect_quit()` right before
-  breaking out of the stream loop. Every other exit path (host ended the session, app quit)
-  deliberately leaves this alone.
-
-Not gaps, already correct: identity persistence + PIN pairing + fingerprint pinning; connecting
-off the UI thread and building the decoder from the *resolved* codec/color (`client.mode()`/
-`client.codec`), never the request; one thread per plane (video on its own thread, audio pumped
-from the main thread only — see above); `flags = (w<<16)|h`-style pointer semantics don't apply
-here since Magic Remote pointer input is only used for this client's own pre-stream menu, never
-forwarded to the host as `MOUSE_MOVE_ABS`/touch during an active stream (a deliberate scope
-choice, not an oversight — this client doesn't offer host-side mouse/touch control at all yet).
+Tried once (a Magic Remote Green-button toggle for an in-stream log/stats overlay) and removed
+entirely after it crashed the app on the real CX: toggling `window.show()`/`window.hide()` on the
+normally-hidden SDL2 window (hidden during streaming so NDL's punch-through video plane shows
+through unobstructed) while NDL's hardware video plane was actively compositing killed the process
+silently — no panic, no logged error, just gone from `ps aux`. Almost certainly a native crash
+inside the Wayland backend that Rust can't catch. If this is wanted again: treat it as new work,
+test any window-visibility change in total isolation first (log immediately before/after each SDL
+call), and confirm per-pixel alpha on a freshly-shown window actually composites over NDL's plane
+on this compositor at all — whole-window `SDL_SetWindowOpacity` is already confirmed unsupported
+here, which doesn't answer the per-pixel question but doesn't inspire confidence either.
 
 ## Known gaps / not yet done
 
-- **Game library poster art**: the library screen currently shows a plain text list. Showing
-  cover art would need an image-texture loading/caching pipeline (fetch via the host's
-  `/api/v1/library/art/...` proxy, decode, cache as SDL textures) — not yet built.
 - **HDR wiring** is implemented (`video_caps`, static + continuously-updated display metadata,
   per-content `NDL_DirectVideoSetHDRInfo` forwarding) but not yet visually confirmed on a real
   HDR-negotiated session.
