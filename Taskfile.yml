@@ -1,19 +1,8 @@
-# The front door for building/packaging pf-webos. Local development always goes
-# through Docker (`build`/`check`/`package` below) — the webOS cross-toolchain
-# only ships a Linux aarch64 build (see `taskfiles/toolchain.yml`), so a Linux
-# aarch64 container is the one supported environment for humans, regardless of
-# host OS/arch. The `native:*` tasks are the real, un-containerized logic; they
-# exist for CI (`.github/workflows/build.yml`), whose runner already *is* Linux
-# aarch64 — no point nesting another container inside GitHub Actions' own.
-#
-# The webOS-specific plumbing (fetching the cross-toolchain, staging + invoking
-# ares-package, the Docker wrapper) lives in `taskfiles/toolchain.yml`, kept
-# separate so this file stays short — run `task --list-all` to see everything,
-# including that file's tasks under the `toolchain:` namespace.
-#
-# The only shell scripts left outside Task entirely are `scripts/cc-shim.sh`/
-# `cxx-shim.sh` — Cargo's `linker`/`CC`/`CXX` config needs an actual executable
-# path it invokes directly with a full compiler argv, not a task name.
+# `build`/`check`/`package` (local dev) always run inside Docker, since the
+# webOS cross-toolchain only ships a Linux aarch64 build. `native:*` is the
+# same logic without Docker, used by CI (already a Linux aarch64 runner).
+# webOS-specific plumbing lives in `taskfiles/toolchain.yml`, kept separate so
+# this file stays short.
 version: '3'
 
 # TV_HOST (used by deploy/deploy:log below) can live in a local, gitignored .env
