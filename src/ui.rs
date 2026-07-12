@@ -68,6 +68,7 @@ pub const ICON_SCHEDULE: &str = "\u{E8B5}";
 pub const ICON_SIGNAL: &str = "\u{E202}";
 pub const ICON_SUN: &str = "\u{E430}";
 pub const ICON_CHEVRON_DOWN: &str = "\u{E5C5}";
+pub const ICON_POWER: &str = "\u{E8AC}";
 
 // -------------------------------------------------------------------- input map --
 
@@ -810,6 +811,14 @@ impl HostEntry {
             Self::Discovered(h) => h.mgmt_port,
         }
     }
+    /// Wake-on-LAN MAC(s) known for this entry so far — empty until it's been seen
+    /// advertising its `mac` mDNS TXT at least once (see `discovery::DiscoveredHost::mac`).
+    pub fn mac(&self) -> &[String] {
+        match self {
+            Self::Known(h) => &h.mac,
+            Self::Discovered(h) => &h.mac,
+        }
+    }
 }
 
 /// Draws the whole sidebar: a flat `SIDEBAR_BG` panel, a "punktfunk" wordmark at
@@ -1303,6 +1312,65 @@ pub fn draw_settings_rows(
                 );
                 draw_switch(painter, switch, row.value == "On");
             }
+        }
+    }
+    Ok(())
+}
+
+/// The Wake modal's two rows — "Send Wake-on-LAN now" and the "Always send
+/// automatically" toggle (see `app::WakeState`) — drawn with the same icon +
+/// label + control row language as `draw_settings_rows`, but as a fixed pair
+/// rather than a data-driven list, since these rows live outside the Settings
+/// screen. `content` is the first row's rect; the second is stacked directly
+/// below it using `SETTINGS_ROW_GAP`, same as `draw_settings_rows`.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_wake_rows(
+    painter: &mut Painter,
+    text_cache: &mut TextCache,
+    font_label: &Font,
+    icon_font: &Font,
+    content: Rect,
+    send_label: &str,
+    focused_index: usize,
+    auto_send: bool,
+) -> Result<()> {
+    let icon_pad = 24;
+    let control_pad = 28;
+    for (i, label) in [send_label, "Always send automatically"].into_iter().enumerate() {
+        let row_rect = Rect::new(
+            content.x(),
+            content.y() + i as i32 * (SETTINGS_ROW_H as i32 + SETTINGS_ROW_GAP),
+            content.width(),
+            SETTINGS_ROW_H,
+        );
+        let focused = i == focused_index;
+        let drawn = draw_card(painter, row_rect, focused);
+        let color = if focused { WHITE } else { MUTED };
+        let icon_rect = Rect::new(
+            drawn.x() + icon_pad,
+            drawn.y() + (drawn.height() as i32 - SETTINGS_ICON_SIZE as i32) / 2,
+            SETTINGS_ICON_SIZE,
+            SETTINGS_ICON_SIZE,
+        );
+        draw_icon(painter, text_cache, icon_font, icon_rect, ICON_POWER, color)?;
+        draw_text(
+            painter,
+            text_cache,
+            font_label,
+            label,
+            icon_rect.x() + SETTINGS_ICON_SIZE as i32 + 20,
+            drawn.y() + (drawn.height() as i32 - font_label.height()) / 2,
+            color,
+        )?;
+        // Only the second row ("Always send automatically") has a control.
+        if i == 1 {
+            let switch = Rect::new(
+                drawn.x() + drawn.width() as i32 - control_pad - 64,
+                drawn.y() + (drawn.height() as i32 - 34) / 2,
+                64,
+                34,
+            );
+            draw_switch(painter, switch, auto_send);
         }
     }
     Ok(())

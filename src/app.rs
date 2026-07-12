@@ -4,6 +4,7 @@
 //! `ui.rs`'s module docs). `ui.rs` owns drawing/input-mapping primitives,
 //! `store.rs` owns persistence, `discovery.rs` owns mDNS.
 use std::io::Write as _;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use sdl2::rect::Rect;
@@ -18,6 +19,49 @@ pub enum Screen {
     Pairing,
     Settings,
     AddHost,
+    /// "This configured host is unreachable — send it a Wake-on-LAN signal?" — see
+    /// `WakeState`'s docs.
+    Wake,
+}
+
+/// How often the magic packet is re-sent while a wake is in flight — see
+/// `App::tick_wake`.
+const WAKE_RESEND_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How long a *silent* auto-send (`Settings::wol_auto_send`) waits before giving up on
+/// staying quiet and surfacing the wake prompt anyway — see `App::tick_wake`.
+const WAKE_ESCALATE_AFTER: Duration = Duration::from_secs(60);
+
+/// State for the "configured host is unreachable — wake it?" flow: both the interactive
+/// prompt (`Screen::Wake`) and the silent background wait behind an auto-send live here,
+/// distinguished by `silent`. Entered from `App::start_wake` when a known/paired host's
+/// library fetch fails as genuinely unreachable and at least one Wake-on-LAN MAC is on
+/// record for it (learned from its mDNS advert while it was last awake — see
+/// `App::drain_discovery`); a host with no MAC on record can't be woken at all, so that
+/// case still falls back to the old plain-error message.
+pub struct WakeState {
+    host: String,
+    port: u16,
+    name: String,
+    mac: Vec<String>,
+    /// The original library error, restored into `home_status` if the user backs out
+    /// without sending — so declining the prompt looks exactly like it did before this
+    /// flow existed.
+    reason: String,
+    /// Row focus on the modal: `0` = "Send Wake-on-LAN now", `1` = the "Always send
+    /// automatically" toggle.
+    focused: usize,
+    /// Whether a packet has gone out for the current wait window.
+    sent: bool,
+    /// When the current wait window started (its first send) — drives the 60s
+    /// escalation.
+    since: Option<Instant>,
+    last_attempt: Option<Instant>,
+    /// `true` while this wait is running quietly because `wol_auto_send` fired it with
+    /// no prompt shown — `App::tick_wake` flips it (and shows the prompt) once
+    /// `WAKE_ESCALATE_AFTER` passes with the host still unreachable, so the user gets a
+    /// chance to turn auto-send back off instead of it failing forever in silence.
+    silent: bool,
 }
 
 /// Which pane of Home currently has focus, and where within it.
@@ -69,6 +113,8 @@ pub struct App {
     pub settings_focused: usize,
     pub dropdown: Option<DropdownState>,
     pub add_host: AddHostState,
+    /// The active "host unreachable — wake it?" prompt/wait, if any — see `WakeState`.
+    pub wake: Option<WakeState>,
     /// PIN entry: 4 digits, each 0-9, edited one at a time.
     pub pin_digits: [u8; 4],
     pub pin_digit_index: usize,
@@ -102,6 +148,7 @@ impl App {
             settings_focused: 0,
             dropdown: None,
             add_host: AddHostState::default(),
+            wake: None,
             pin_digits: [0; 4],
             pin_digit_index: 0,
             pairing_status: None,
@@ -126,16 +173,37 @@ impl App {
     }
 
     /// Merges freshly-discovered hosts into the entry list (known hosts keep their
-    /// paired status; a discovered host not yet known gets appended). Returns
-    /// whether the sidebar actually changed — `main.rs`'s render loop uses this to
-    /// skip a redraw when a discovery tick found nothing new (see its dirty-flag
-    /// docs).
-    pub fn drain_discovery(&mut self) -> bool {
+    /// paired status; a discovered host not yet known gets appended), learns each
+    /// known host's Wake-on-LAN MAC(s) from its live advert while it's awake to
+    /// advertise them, and — if a wake is in flight (`self.wake`) — notices when the
+    /// waking host reappears on mDNS and reconnects. Returns whether the sidebar
+    /// actually changed — `main.rs`'s render loop uses this to skip a redraw when a
+    /// discovery tick found nothing new (see its dirty-flag docs).
+    pub fn drain_discovery(&mut self, log: &mut std::fs::File) -> bool {
         let mut changed = false;
+        let mut mac_learned = false;
+        let mut woke = None;
+        // `found.addr` throughout this loop is deliberate, not a typo for a nonexistent
+        // `found.host` — `DiscoveredHost` (discovery.rs) only has `addr`, `WakeState`/
+        // `KnownHost` only have `host`; both hold the same kind of value (network address).
         while let Ok(found) = self.discovered.try_recv() {
-            // `found.addr` is deliberate, not a typo for a nonexistent `found.host` —
-            // `DiscoveredHost` (discovery.rs) only has `addr`, `KnownHost` (store.rs)
-            // only has `host`; both hold the same kind of value (network address).
+            #[allow(clippy::suspicious_operation_groupings)]
+            if let Some(w) = &self.wake {
+                if found.addr == w.host && found.port == w.port {
+                    woke = Some((found.addr.clone(), found.port, found.mgmt_port));
+                }
+            }
+            #[allow(clippy::suspicious_operation_groupings)]
+            let known = self
+                .known_hosts
+                .iter_mut()
+                .find(|h| h.host == found.addr && h.port == found.port);
+            if let Some(known) = known {
+                if !found.mac.is_empty() && known.mac != found.mac {
+                    known.mac.clone_from(&found.mac);
+                    mac_learned = true;
+                }
+            }
             #[allow(clippy::suspicious_operation_groupings)]
             let already_known = self
                 .known_hosts
@@ -150,6 +218,16 @@ impl App {
                 self.entries.push(HostEntry::Discovered(found));
                 changed = true;
             }
+        }
+        if mac_learned {
+            let _ = store::save_known_hosts(&self.known_hosts);
+        }
+        if let Some((host, port, mgmt_port)) = woke {
+            let _ = writeln!(log, "wake succeeded: {host}:{port} back on mDNS");
+            self.wake = None;
+            self.screen = Screen::Home;
+            self.select_host(host, port, mgmt_port, log);
+            changed = true;
         }
         changed
     }
@@ -326,8 +404,120 @@ impl App {
             }
             Err(e) => {
                 let _ = writeln!(log, "library fetch failed ({host}:{mgmt_port}): {e}");
-                self.home_status = Some(format!("{e} (Desktop is still available.)"));
+                let reason = format!("{e} (Desktop is still available.)");
+                let mac = self
+                    .known_hosts
+                    .iter()
+                    .find(|h| h.host == host && h.port == port)
+                    .map(|h| h.mac.clone())
+                    .unwrap_or_default();
+                // Only a genuinely unreachable host (no route/refused/timed out) is worth
+                // offering a wake for — `NotPaired`/`PinMismatch`/`Http` all mean the host
+                // answered, so Wake-on-LAN wouldn't be the fix. A host with no MAC on
+                // record yet (never seen advertising) can't be woken either.
+                if matches!(e, crate::library::LibraryError::Unreachable(_)) && !mac.is_empty() {
+                    self.start_wake(host, port, mac, reason, log);
+                } else {
+                    self.home_status = Some(reason);
+                }
             }
+        }
+    }
+
+    /// Enters the "host unreachable — wake it?" flow (see `WakeState`'s docs). With
+    /// `Settings::wol_auto_send` off, this shows the prompt right away, replacing what
+    /// used to be a plain error message. With it on, the packet fires immediately and
+    /// silently — the prompt only appears if the host still hasn't come back a minute
+    /// later (`tick_wake`), which is also the one place that setting can be turned back
+    /// off (no separate settings row for it — see `Settings::wol_auto_send`).
+    fn start_wake(&mut self, host: String, port: u16, mac: Vec<String>, reason: String, log: &mut std::fs::File) {
+        let name = self
+            .known_hosts
+            .iter()
+            .find(|h| h.host == host && h.port == port)
+            .map_or_else(|| host.clone(), |h| h.name.clone());
+        let auto = self.settings.wol_auto_send;
+        let mut wake = WakeState {
+            host,
+            port,
+            name,
+            mac,
+            reason,
+            focused: if auto { 1 } else { 0 },
+            sent: false,
+            since: None,
+            last_attempt: None,
+            silent: auto,
+        };
+        if auto {
+            Self::send_wake(&mut wake, log);
+        } else {
+            self.screen = Screen::Wake;
+        }
+        self.wake = Some(wake);
+    }
+
+    /// Fires (or re-fires) the magic packet for an in-flight wake, bumping its resend
+    /// timer — shared by the modal's explicit "Send" action and `tick_wake`'s periodic
+    /// resend.
+    fn send_wake(wake: &mut WakeState, log: &mut std::fs::File) {
+        crate::wol::wake_and_log(&wake.mac, wake.host.parse().ok(), &wake.name, log);
+        let now = Instant::now();
+        wake.sent = true;
+        wake.since.get_or_insert(now);
+        wake.last_attempt = Some(now);
+    }
+
+    /// Advances an in-flight wake: resends the packet every `WAKE_RESEND_INTERVAL`, and
+    /// — for a silent auto-send that still hasn't gotten the host back after
+    /// `WAKE_ESCALATE_AFTER` — surfaces the prompt so the user can turn `wol_auto_send`
+    /// back off. "The host is back" itself is noticed in `drain_discovery` (a fresh
+    /// mDNS resolve matching this host), not here; this only owns the resend/escalate
+    /// timers. Called every UI tick regardless of which screen is up, same as
+    /// `drain_discovery`/`drain_art`, since a silent wait runs with no modal open at
+    /// all. Returns whether anything visible changed (same "skip a redraw" contract as
+    /// those).
+    pub fn tick_wake(&mut self, log: &mut std::fs::File) -> bool {
+        let Some(wake) = &mut self.wake else { return false };
+        let now = Instant::now();
+        let mut changed = false;
+
+        let due = match wake.last_attempt {
+            None => true,
+            Some(t) => now.duration_since(t) >= WAKE_RESEND_INTERVAL,
+        };
+        if due {
+            Self::send_wake(wake, log);
+            changed = true;
+        }
+
+        if wake.silent && wake.since.is_some_and(|t| now.duration_since(t) >= WAKE_ESCALATE_AFTER) {
+            wake.silent = false;
+            wake.focused = 1; // land on the toggle — the likely reason the user is here
+            self.screen = Screen::Wake;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Handles one menu event on the Wake modal: Up/Down move focus between the two
+    /// rows, Confirm sends (row 0) or flips the auto-send toggle (row 1), Left/Right
+    /// also flip the toggle when it's focused (matching the Settings modal's toggle
+    /// idiom), Back dismisses back to the plain error text `WakeState::reason` carries.
+    pub fn handle_wake_event(&mut self, ev: MenuEvent, log: &mut std::fs::File) {
+        let Some(wake) = self.wake.as_mut() else { return };
+        match ev {
+            MenuEvent::Up | MenuEvent::Down => wake.focused = 1 - wake.focused,
+            MenuEvent::Confirm | MenuEvent::Left | MenuEvent::Right if wake.focused == 1 => {
+                self.settings.wol_auto_send = !self.settings.wol_auto_send;
+                let _ = store::save_settings(&self.settings);
+            }
+            MenuEvent::Confirm => Self::send_wake(wake, log),
+            MenuEvent::Back => {
+                self.home_status = self.wake.take().map(|w| w.reason);
+                self.screen = Screen::Home;
+            }
+            MenuEvent::Left | MenuEvent::Right | MenuEvent::Secondary => {}
         }
     }
 
@@ -425,6 +615,7 @@ impl App {
         let port = entry.port();
         let name = entry.name().to_string();
         let mgmt_port = entry.mgmt_port();
+        let mac = entry.mac().to_vec();
         let pin: String = self.pin_digits.iter().map(std::string::ToString::to_string).collect();
         self.pairing_busy = true;
         self.pairing_status = Some("Pairing… confirm the PIN on the host".into());
@@ -450,6 +641,7 @@ impl App {
                         port,
                         fingerprint: Some(fingerprint),
                         mgmt_port,
+                        mac,
                     },
                 );
                 let _ = store::save_known_hosts(&self.known_hosts);
@@ -582,6 +774,7 @@ impl App {
                 port,
                 fingerprint: None,
                 mgmt_port: None,
+                mac: Vec::new(),
             },
         );
         let _ = store::save_known_hosts(&self.known_hosts);
@@ -607,6 +800,11 @@ impl App {
     /// hit-testing.
     fn add_host_card_rect(screen_w: u32, screen_h: u32) -> Rect {
         ui::modal_card_rect(screen_w, screen_h, 0.46, 260)
+    }
+
+    /// The wake modal's card rect — shared by `render_wake` and mouse hit-testing.
+    fn wake_card_rect(screen_w: u32, screen_h: u32) -> Rect {
+        ui::modal_card_rect(screen_w, screen_h, 0.42, 420)
     }
 
     /// The settings modal's card/content rects — shared by `render` and mouse
@@ -663,6 +861,10 @@ impl App {
                 let card = Self::add_host_card_rect(screen_w, screen_h);
                 self.hover_close = ui::modal_close_rect(card).contains_point((x, y));
             }
+            Screen::Wake => {
+                let card = Self::wake_card_rect(screen_w, screen_h);
+                self.hover_close = ui::modal_close_rect(card).contains_point((x, y));
+            }
         }
     }
 
@@ -674,6 +876,7 @@ impl App {
                 Screen::Settings => self.handle_settings_event(MenuEvent::Back),
                 Screen::Pairing => self.handle_pairing_event(MenuEvent::Back, log),
                 Screen::AddHost => self.handle_add_host_event(MenuEvent::Back),
+                Screen::Wake => self.handle_wake_event(MenuEvent::Back, log),
                 Screen::Home => {}
             }
             return None;
@@ -688,6 +891,10 @@ impl App {
                 None
             }
             Screen::Pairing | Screen::AddHost => None,
+            Screen::Wake => {
+                self.handle_wake_event(MenuEvent::Confirm, log);
+                None
+            }
         }
     }
 
@@ -724,6 +931,9 @@ impl App {
             }
             Screen::AddHost => self.render_add_host(
                 painter, text_cache, font_label, font_value, font_title, icon_font, screen_w, screen_h,
+            )?,
+            Screen::Wake => self.render_wake(
+                painter, text_cache, font_label, font_title, icon_font, screen_w, screen_h,
             )?,
         }
         Ok(())
@@ -1025,6 +1235,82 @@ impl App {
             drawn.y() + (drawn.height() as i32 - font_title.height()) / 2,
             ui::WHITE,
             ui::ACCENT_BRIGHT,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_wake(
+        &self,
+        painter: &mut Painter,
+        text_cache: &mut crate::ui::TextCache,
+        font_label: &sdl2::ttf::Font,
+        font_title: &sdl2::ttf::Font,
+        icon_font: &sdl2::ttf::Font,
+        screen_w: u32,
+        screen_h: u32,
+    ) -> Result<()> {
+        let Some(wake) = &self.wake else { return Ok(()) };
+        ui::draw_modal_backdrop(painter, screen_w, screen_h);
+        let card = Self::wake_card_rect(screen_w, screen_h);
+        ui::draw_modal_card(painter, card);
+        let close_rect = ui::modal_close_rect(card);
+        ui::draw_icon(
+            painter,
+            text_cache,
+            icon_font,
+            close_rect,
+            ui::ICON_CLOSE,
+            if self.hover_close { ui::WHITE } else { ui::MUTED },
+        )?;
+
+        ui::draw_text(
+            painter,
+            text_cache,
+            font_title,
+            "Host unreachable",
+            card.x() + 32,
+            card.y() + 28,
+            ui::WHITE,
+        )?;
+        let status = if wake.sent {
+            format!(
+                "Sent a wake signal to {} — waiting for it to come back online…",
+                wake.name
+            )
+        } else {
+            format!("Couldn't reach {} — it may be powered off or asleep.", wake.name)
+        };
+        ui::draw_text(
+            painter,
+            text_cache,
+            font_label,
+            &status,
+            card.x() + 32,
+            card.y() + 84,
+            ui::MUTED,
+        )?;
+
+        let content = Rect::new(
+            card.x() + 32,
+            card.y() + 150,
+            card.width().saturating_sub(64),
+            ui::SETTINGS_ROW_H,
+        );
+        let send_label = if wake.sent {
+            "Send again"
+        } else {
+            "Send Wake-on-LAN now"
+        };
+        ui::draw_wake_rows(
+            painter,
+            text_cache,
+            font_label,
+            icon_font,
+            content,
+            send_label,
+            wake.focused,
+            self.settings.wol_auto_send,
         )?;
         Ok(())
     }

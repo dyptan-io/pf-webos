@@ -25,6 +25,8 @@ mod session;
 mod store;
 #[cfg(target_os = "linux")]
 mod ui;
+#[cfg(target_os = "linux")]
+mod wol;
 
 #[cfg(target_os = "linux")]
 mod real {
@@ -143,6 +145,10 @@ mod real {
                 app.handle_add_host_event(MenuEvent::Back);
                 None
             }
+            Screen::Wake => {
+                app.handle_wake_event(MenuEvent::Back, log);
+                None
+            }
         }
     }
 
@@ -194,8 +200,9 @@ mod real {
         // frame always draws.
         let mut dirty = true;
         let target = 'ui: loop {
-            dirty |= app.drain_discovery();
+            dirty |= app.drain_discovery(log);
             dirty |= app.drain_art();
+            dirty |= app.tick_wake(log);
             for event in events.poll_iter() {
                 use sdl2::event::Event;
                 // Any event might change what's on screen (focus/hover, a typed
@@ -265,6 +272,7 @@ mod real {
                     Screen::Pairing => app.handle_pairing_event(menu_ev, log),
                     Screen::Settings => app.handle_settings_event(menu_ev),
                     Screen::AddHost => app.handle_add_host_event(menu_ev),
+                    Screen::Wake => app.handle_wake_event(menu_ev, log),
                 }
             }
             // Raw scancode poll (see `ui::webos_back_button_down`/`webos_red_button_down`
