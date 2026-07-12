@@ -4,6 +4,23 @@ This document captures the non-obvious decisions, platform limitations, and debu
 from building this client, so they don't have to be rediscovered. Developed and verified against
 a real **LG CX, webOS 5.6**, using root SSH access for logs/testing.
 
+## Linting (`task lint`/`task native:lint`, format via `task fmt`)
+
+`Cargo.toml`'s `[lints.clippy]` is a curated slice of `pedantic`/`nursery` lints, not a blanket
+`#![warn(clippy::pedantic)]`. Tried the blanket version first: it surfaced ~360 warnings, and over
+300 of them were `cast_possible_truncation`/`cast_sign_loss`/`cast_precision_loss`/
+`cast_possible_wrap` on the SDL2 rect/color/font pixel-math scattered through `ui.rs`/`app.rs` —
+none a real risk (every value involved is bounded by a TV panel's own resolution, nowhere near
+`i32`/`u32` limits), and fixing them would mean `try_from`/`#[allow]`-ing hundreds of call sites
+for zero actual safety gain. Picked out the lints that were both real and low-noise instead
+(`cast_lossless`, `use_self`, `map_unwrap_or`, `doc_markdown`, `manual_let_else`,
+`redundant_closure_for_method_calls`, `items_after_statements`, `match_same_arms`,
+`format_collect`, `suspicious_operation_groupings`) and left the rest at their default (`clippy::all`)
+level. `clippy::cargo` (dependency-version-duplication lints) and `too_many_lines` (main.rs's
+event-loop functions) are deliberately not enabled — the former is out of this crate's control
+(comes from `punktfunk-core`'s own transitive deps), the latter would force splitting cohesive
+state-machine loops with no natural seam, for a line-count threshold alone.
+
 ## Toolchain (reproducible via `task toolchain:all` — see `Taskfile.yml`/`taskfiles/toolchain.yml`)
 
 - Cross target: `armv7-unknown-linux-gnueabi` (Rust tier-2) + `webosbrew/native-toolchain`'s

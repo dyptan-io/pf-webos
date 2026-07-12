@@ -59,10 +59,10 @@ pub enum LibraryError {
 impl std::fmt::Display for LibraryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LibraryError::NotPaired => f.write_str("Not paired — pair with the host first."),
-            LibraryError::PinMismatch => f.write_str("Host certificate changed — re-pair with a PIN."),
-            LibraryError::Http(code) => write!(f, "Management API returned HTTP {code}."),
-            LibraryError::Unreachable(why) => write!(f, "Couldn't reach the host's management API: {why}."),
+            Self::NotPaired => f.write_str("Not paired — pair with the host first."),
+            Self::PinMismatch => f.write_str("Host certificate changed — re-pair with a PIN."),
+            Self::Http(code) => write!(f, "Management API returned HTTP {code}."),
+            Self::Unreachable(why) => write!(f, "Couldn't reach the host's management API: {why}."),
         }
     }
 }
@@ -92,7 +92,9 @@ fn agent(identity: &(String, String), pin: Option<[u8; 32]>) -> Result<ureq::Age
         .map_err(|e| bad("client cert pem", &e))?;
     let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(identity.1.as_bytes())
         .map_err(|e| bad("client key pem", &e))?;
-    let cfg = builder.with_client_auth_cert(vec![cert], key).map_err(|e| bad("client auth", &e))?;
+    let cfg = builder
+        .with_client_auth_cert(vec![cert], key)
+        .map_err(|e| bad("client auth", &e))?;
     Ok(ureq::AgentBuilder::new()
         .tls_config(Arc::new(cfg))
         .timeout_connect(Duration::from_secs(5))
@@ -111,7 +113,9 @@ pub fn fetch_games(
     let agent = agent(identity, pin)?;
     let url = format!("{}/api/v1/library", base_url(addr, mgmt_port));
     let body = match agent.get(&url).call() {
-        Ok(resp) => resp.into_string().map_err(|e| LibraryError::Unreachable(format!("read body: {e}")))?,
+        Ok(resp) => resp
+            .into_string()
+            .map_err(|e| LibraryError::Unreachable(format!("read body: {e}")))?,
         Err(e) => return Err(classify(e)),
     };
     serde_json::from_str(&body).map_err(|e| LibraryError::Unreachable(format!("bad JSON: {e}")))
@@ -214,6 +218,8 @@ impl rustls::client::danger::ServerCertVerifier for PinVerify {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }

@@ -1,4 +1,4 @@
-//! Safe wrapper over webOS's NDL DirectMedia v2 API (`NDL_Direct*`, webOS 5+) — the
+//! Safe wrapper over webOS's NDL `DirectMedia` v2 API (`NDL_Direct*`, webOS 5+) — the
 //! system's hardware video decode path for native apps. Reverse-engineered but
 //! well-established (the same API `mariotaku/moonlight-tv`/aurora-tv use); headers
 //! confirmed against `libNDL_directmedia.so.1` live on an LG CX (webOS 5.6): every
@@ -56,20 +56,20 @@ pub enum NdlCodec {
 impl NdlCodec {
     fn ndl_type(self) -> c_int {
         match self {
-            NdlCodec::H264 => 1,
-            NdlCodec::H265 => 2,
-            NdlCodec::Av1 => 4,
+            Self::H264 => 1,
+            Self::H265 => 2,
+            Self::Av1 => 4,
         }
     }
 
     /// From a `punktfunk_core::quic::CODEC_*` wire bit (the resolved `Welcome::codec`).
     /// NDL has no VP9 use here (punktfunk never emits it) and AV1 support depends on
     /// the TV's silicon — the caller decides whether to even negotiate it.
-    pub fn from_wire(codec: u8) -> Option<NdlCodec> {
+    pub fn from_wire(codec: u8) -> Option<Self> {
         match codec {
-            punktfunk_core::quic::CODEC_H264 => Some(NdlCodec::H264),
-            punktfunk_core::quic::CODEC_HEVC => Some(NdlCodec::H265),
-            punktfunk_core::quic::CODEC_AV1 => Some(NdlCodec::Av1),
+            punktfunk_core::quic::CODEC_H264 => Some(Self::H264),
+            punktfunk_core::quic::CODEC_HEVC => Some(Self::H265),
+            punktfunk_core::quic::CODEC_AV1 => Some(Self::Av1),
             _ => None,
         }
     }
@@ -160,7 +160,7 @@ pub struct NdlVideo {
 impl NdlVideo {
     /// Loads NDL for a video stream of `codec` at `width`x`height`. Calls
     /// `NDL_DirectMediaInit` on first use. No audio is configured (see module docs).
-    pub fn load(app_id: &str, width: i32, height: i32, codec: NdlCodec) -> Result<NdlVideo> {
+    pub fn load(app_id: &str, width: i32, height: i32, codec: NdlCodec) -> Result<Self> {
         ensure_init(app_id)?;
         let mut info = NdlDataInfo {
             video: NdlVideoInfo {
@@ -179,7 +179,7 @@ impl NdlVideo {
         if ret != 0 {
             bail!("NDL_DirectMediaLoad failed: ret={ret} error={}", last_error());
         }
-        Ok(NdlVideo {
+        Ok(Self {
             load_instant: Instant::now(),
         })
     }
@@ -205,9 +205,7 @@ impl NdlVideo {
         // SAFETY: NDL_DirectVideoPlay only reads `size` bytes from `buffer` for the
         // duration of this call (it copies/consumes synchronously per the reference
         // implementation's usage) and does not retain the pointer afterward.
-        let ret = unsafe {
-            NDL_DirectVideoPlay(au.as_ptr() as *mut c_void, au.len() as c_uint, pts_ms)
-        };
+        let ret = unsafe { NDL_DirectVideoPlay(au.as_ptr() as *mut c_void, au.len() as c_uint, pts_ms) };
         if ret != 0 {
             bail!("NDL_DirectVideoPlay failed: ret={ret} error={}", last_error());
         }
@@ -229,21 +227,21 @@ impl NdlVideo {
         // order NDL's X0/Y0, X1/Y1, X2/Y2 fields expect (same SEI convention).
         let [g, b, r] = meta.display_primaries;
         let info = NdlHdrInfo {
-            display_primaries_x0: g[0] as c_int,
-            display_primaries_y0: g[1] as c_int,
-            display_primaries_x1: b[0] as c_int,
-            display_primaries_y1: b[1] as c_int,
-            display_primaries_x2: r[0] as c_int,
-            display_primaries_y2: r[1] as c_int,
-            white_point_x: meta.white_point[0] as c_int,
-            white_point_y: meta.white_point[1] as c_int,
+            display_primaries_x0: c_int::from(g[0]),
+            display_primaries_y0: c_int::from(g[1]),
+            display_primaries_x1: c_int::from(b[0]),
+            display_primaries_y1: c_int::from(b[1]),
+            display_primaries_x2: c_int::from(r[0]),
+            display_primaries_y2: c_int::from(r[1]),
+            white_point_x: c_int::from(meta.white_point[0]),
+            white_point_y: c_int::from(meta.white_point[1]),
             max_display_mastering_luminance: meta.max_display_mastering_luminance as c_int,
             min_display_mastering_luminance: meta.min_display_mastering_luminance as c_int,
-            max_content_light_level: meta.max_cll as c_int,
-            max_pic_average_light_level: meta.max_fall as c_int,
-            transfer_characteristics: color.transfer as c_int,
-            color_primaries: color.primaries as c_int,
-            matrix_coeffs: color.matrix as c_int,
+            max_content_light_level: c_int::from(meta.max_cll),
+            max_pic_average_light_level: c_int::from(meta.max_fall),
+            transfer_characteristics: c_int::from(color.transfer),
+            color_primaries: c_int::from(color.primaries),
+            matrix_coeffs: c_int::from(color.matrix),
             reserved: [0; 32],
         };
         // SAFETY: `info` is passed by value (matches the C signature exactly), no

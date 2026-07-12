@@ -6,7 +6,7 @@
 use punktfunk_core::input::{InputEvent, InputKind};
 use sdl2::mouse::MouseButton;
 
-/// GameStream's classic mouse-button numbering (1=left..5=X2) — the convention
+/// `GameStream`'s classic mouse-button numbering (1=left..5=X2) — the convention
 /// `punktfunk-host`'s injectors expect in `MouseButtonDown`/`MouseButtonUp`'s `code`
 /// (confirmed via `gs_button_to_evdev` in `punktfunk-host/src/inject.rs`).
 fn button_code(button: MouseButton) -> Option<u32> {
@@ -24,7 +24,11 @@ fn button_code(button: MouseButton) -> Option<u32> {
 /// the caller just drops the event.
 pub fn button_event(button: MouseButton, pressed: bool) -> Option<InputEvent> {
     Some(InputEvent {
-        kind: if pressed { InputKind::MouseButtonDown } else { InputKind::MouseButtonUp },
+        kind: if pressed {
+            InputKind::MouseButtonDown
+        } else {
+            InputKind::MouseButtonUp
+        },
         _pad: [0; 3],
         code: button_code(button)?,
         x: 0,

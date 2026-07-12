@@ -60,7 +60,15 @@ fn fetch_all(
         let (width, height) = rgba.dimensions();
         // A receiver drop (host switched again before this batch finished) just
         // ends the thread early — nothing left to deliver to.
-        if tx.send(ArtLoaded { game_id: game.id.clone(), width, height, rgba: rgba.into_raw() }).is_err() {
+        if tx
+            .send(ArtLoaded {
+                game_id: game.id.clone(),
+                width,
+                height,
+                rgba: rgba.into_raw(),
+            })
+            .is_err()
+        {
             return;
         }
     }
