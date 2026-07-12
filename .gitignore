@@ -1,10 +1,10 @@
-/target
-/dist/
+target
+dist/
 
 # webOS cross-toolchain (webosbrew/native-toolchain release tarball, ~140MB) —
 # fetched by `task toolchain`, not committed.
-/.toolchains/
+.toolchains/
 
 # Local machine-specific defaults for Task (e.g. TV_HOST for `task deploy`) —
 # see .env.example.
-/.env
+.env

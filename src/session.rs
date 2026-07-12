@@ -119,13 +119,24 @@ pub fn connect(
         resolved_mode.width, resolved_mode.height
     )?;
 
-    // transfer=16 is SMPTE ST.2084 (PQ) — the host only resolves this when it
-    // actually negotiated an HDR encode (our video_caps request above). Metadata
-    // isn't fetched here as a one-shot: the host can emit updated mastering info
-    // over the life of the session (e.g. different content), so `video_pump` polls
-    // continuously below instead — see the embedding guide's §9 ("apply the
-    // latest to your display").
-    let is_hdr = client.color.transfer == 16;
+    // `color.is_hdr()` (PQ or HLG transfer) only resolves true when the host actually
+    // negotiated an HDR encode (our video_caps request above).
+    let is_hdr = client.color.is_hdr();
+
+    // NDL never picks up the TV's HDR picture mode from the bitstream itself — only
+    // an explicit `NDL_DirectVideoSetHDRInfo` call flips it, and it needs to land
+    // before/at the first frames NDL renders, not whenever the host's per-content
+    // HdrMeta datagram (best-effort, "one near session start") happens to arrive.
+    // Waiting on that alone left the TV in SDR picture mode indefinitely whenever
+    // that one datagram was lost. So set a reasonable default immediately here —
+    // same mastering values already advertised in `Hello::display_hdr` — and let
+    // `video_pump`'s continuous poll below refine it once/if the host's real
+    // per-content metadata shows up.
+    if is_hdr {
+        if let Err(e) = ndl.set_hdr_info(&cx_display_hdr(), client.color) {
+            writeln!(log, "NDL set_hdr_info (initial) failed: {e:#}")?;
+        }
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     let video_client = client.clone();

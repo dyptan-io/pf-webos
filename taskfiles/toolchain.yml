@@ -197,18 +197,28 @@ tasks:
         cp packaging/appinfo.json packaging/icon.png packaging/icon_large.png packaging/splash.png "$STAGE_DIR/"
 
         # The checked-in appinfo.json version stays a fixed 0.0.1 always — webOS
-        # itself never sees a "real" version, only the Homebrew Channel manifest
-        # below does (its `version` is the only place the release tag lands).
-        # The .ipk filename is instead always traceable to an exact build via the
-        # HEAD commit's short sha (`{{.GIT_SHA}}`), release or not.
+        # itself never sees a "real" version. ares-package names the .ipk after
+        # that fixed version, so it's rewritten here: on a release build the
+        # release tag replaces "0.0.1" outright (the asset name webosbrew's
+        # Homebrew Channel and the manifest below expect is just
+        # "<id>_<version>_arm.ipk" — no git-sha suffix); otherwise the HEAD
+        # commit's short sha (`{{.GIT_SHA}}`) is appended so dev builds stay
+        # traceable to an exact commit.
         mkdir -p dist
         ares-package "$STAGE_DIR" -o dist --force-arch arm
 
+        {{if .RELEASE_TAG}}
+        for f in dist/*_0.0.1_arm.ipk; do
+          [ -e "$f" ] || continue
+          mv "$f" "${f%_0.0.1_arm.ipk}_{{.RELEASE_TAG}}_arm.ipk"
+        done
+        {{else}}
         for f in dist/*_arm.ipk; do
           [ -e "$f" ] || continue
           case "$f" in *"+git.{{.GIT_SHA}}"*) continue ;; esac
           mv "$f" "${f%_arm.ipk}+git.{{.GIT_SHA}}_arm.ipk"
         done
+        {{end}}
 
         {{if .RELEASE_TAG}}
         # Homebrew Channel manifest (see README's "Installing via Homebrew Channel"
