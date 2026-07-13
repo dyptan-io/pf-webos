@@ -102,6 +102,8 @@ pub struct App {
     /// selected (or restored from `store::load_selected_host` at startup).
     pub selected_host: Option<(String, u16)>,
     pub games: Vec<GameEntry>,
+    /// In-flight `library::fetch_games` call, if any — see `select_host`/`drain_games`.
+    games_rx: Option<std::sync::mpsc::Receiver<crate::library::GamesLoaded>>,
     /// Library loading/error message shown in the grid area in place of cards.
     pub home_status: Option<String>,
     /// Decoded cover art, keyed by `GameEntry::id` — a `tiny_skia::Pixmap` composited
@@ -141,6 +143,7 @@ impl App {
             home_focus: HomeFocus::Sidebar(0),
             selected_host: None,
             games: Vec::new(),
+            games_rx: None,
             home_status: None,
             art: std::collections::HashMap::new(),
             art_rx: None,
@@ -369,10 +372,16 @@ impl App {
         }
     }
 
-    /// Makes `(host, port)` the active sidebar selection and (re)fetches its game
-    /// library, same "blocking like the PIN ceremony" pattern as pairing — a fetch
-    /// failure (host too old, network hiccup) still lands with just "Desktop"
-    /// available, since it shouldn't block streaming over a library API quirk.
+    /// Makes `(host, port)` the active sidebar selection and kicks off an async
+    /// (re)fetch of its game library via `library::load_games_async` — see
+    /// `drain_games` for where the result lands. Used to call `fetch_games`
+    /// directly, right here, blocking: a real network round-trip (up to the
+    /// 5s connect / 10s total timeout `library::agent` sets) on the same thread
+    /// that pumps SDL events and renders, freezing all input — button presses,
+    /// pointer motion, everything — for as long as the host took to answer or
+    /// time out. `App::new` calls this synchronously-in-spirit-only at startup
+    /// too (restoring the last-selected host), so that froze every launch just
+    /// the same.
     fn select_host(&mut self, host: String, port: u16, mgmt_port: Option<u16>, log: &mut std::fs::File) {
         let _ = store::save_selected_host(&host, port);
         self.selected_host = Some((host.clone(), port));
@@ -389,9 +398,40 @@ impl App {
             .find(|h| h.host == host && h.port == port)
             .and_then(|h| h.fingerprint);
         let mgmt_port = mgmt_port.unwrap_or(crate::library::DEFAULT_MGMT_PORT);
-        match crate::library::fetch_games(&host, mgmt_port, &identity, fingerprint) {
+        let _ = writeln!(log, "library: fetching from {host}:{mgmt_port}…");
+        self.games_rx = Some(crate::library::load_games_async(
+            host,
+            port,
+            mgmt_port,
+            identity,
+            fingerprint,
+        ));
+    }
+
+    /// Drains a finished `select_host` library fetch, if any — called alongside
+    /// `drain_discovery`/`drain_art`/`tick_wake`. Returns whether anything changed.
+    /// Switching hosts again before a fetch finishes discards its result safely:
+    /// `select_host` already replaced `games_rx` with a fresh channel by the time
+    /// this could run, so there's nothing here to receive from for the stale one.
+    pub fn drain_games(&mut self, log: &mut std::fs::File) -> bool {
+        let Some(rx) = &self.games_rx else { return false };
+        let Ok(loaded) = rx.try_recv() else { return false };
+        self.games_rx = None;
+        let crate::library::GamesLoaded {
+            host,
+            port,
+            mgmt_port,
+            result,
+        } = loaded;
+        match result {
             Ok(games) => {
                 let _ = writeln!(log, "library: {} games from {host}:{mgmt_port}", games.len());
+                let identity = (self.identity.0.clone(), self.identity.1.clone());
+                let fingerprint = self
+                    .known_hosts
+                    .iter()
+                    .find(|h| h.host == host && h.port == port)
+                    .and_then(|h| h.fingerprint);
                 self.art_rx = Some(crate::art::load_art_async(
                     host,
                     mgmt_port,
@@ -422,6 +462,7 @@ impl App {
                 }
             }
         }
+        true
     }
 
     /// Enters the "host unreachable — wake it?" flow (see `WakeState`'s docs). With
@@ -824,48 +865,68 @@ impl App {
     }
 
     /// Updates focus/hover to whatever the Magic Remote's pointer is over.
-    pub fn handle_mouse_motion(&mut self, x: i32, y: i32, screen_w: u32, screen_h: u32) {
+    /// Returns whether that actually changed anything visible — Magic Remote
+    /// pointer mode fires a `MouseMotion` event continuously while the remote is
+    /// moving, and each one otherwise forced a full-frame redraw regardless of
+    /// whether the pointer was still over the same card (see `main.rs`'s dirty
+    /// tracking).
+    pub fn handle_mouse_motion(&mut self, x: i32, y: i32, screen_w: u32, screen_h: u32) -> bool {
         match self.screen {
             Screen::Home => {
                 if let Some(idx) = ui::hit_test_sidebar_row(x, y, self.sidebar_len()) {
+                    let changed = self.home_focus != HomeFocus::Sidebar(idx);
                     self.home_focus = HomeFocus::Sidebar(idx);
-                    return;
+                    return changed;
                 }
                 let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
                 let columns = ui::grid_columns(available_w);
                 if let Some(idx) =
                     ui::hit_test_grid_card(x, y, columns, self.grid_len(), ui::SIDEBAR_W as i32, available_w)
                 {
+                    let changed = self.home_focus != HomeFocus::Grid(idx);
                     self.home_focus = HomeFocus::Grid(idx);
+                    return changed;
                 }
+                false
             }
             Screen::Settings => {
                 let (card, content) = Self::settings_layout(screen_w, screen_h);
-                self.hover_close = ui::modal_close_rect(card).contains_point((x, y));
+                let mut changed = self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)));
                 if self.dropdown.is_none() && !self.hover_close {
                     for i in 0..ui::SETTINGS_ROW_COUNT {
                         let row_y = content.y() + i as i32 * (ui::SETTINGS_ROW_H as i32 + ui::SETTINGS_ROW_GAP);
                         let row_rect = Rect::new(content.x(), row_y, content.width(), ui::SETTINGS_ROW_H);
                         if row_rect.contains_point((x, y)) {
+                            changed |= self.settings_focused != i;
                             self.settings_focused = i;
                             break;
                         }
                     }
                 }
+                changed
             }
             Screen::Pairing => {
                 let card = Self::pairing_card_rect(screen_w, screen_h);
-                self.hover_close = ui::modal_close_rect(card).contains_point((x, y));
+                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
             }
             Screen::AddHost => {
                 let card = Self::add_host_card_rect(screen_w, screen_h);
-                self.hover_close = ui::modal_close_rect(card).contains_point((x, y));
+                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
             }
             Screen::Wake => {
                 let card = Self::wake_card_rect(screen_w, screen_h);
-                self.hover_close = ui::modal_close_rect(card).contains_point((x, y));
+                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
             }
         }
+    }
+
+    /// Updates `hover_close` and reports whether it actually changed — every modal
+    /// screen's close-button hover check in `handle_mouse_motion` follows this same
+    /// shape.
+    fn set_hover_close(&mut self, hover_close: bool) -> bool {
+        let changed = hover_close != self.hover_close;
+        self.hover_close = hover_close;
+        changed
     }
 
     /// A pointer click confirms whatever's currently hovered/focused, or triggers
@@ -1026,6 +1087,30 @@ impl App {
         Ok(())
     }
 
+    /// Shared modal chrome — dark backdrop, the rounded card, and its close (X)
+    /// button — every Settings/Pairing/AddHost/Wake screen draws exactly this
+    /// before its own content inside `card`.
+    fn draw_modal_shell(
+        &self,
+        painter: &mut Painter,
+        text_cache: &mut crate::ui::TextCache,
+        icon_font: &sdl2::ttf::Font,
+        screen_w: u32,
+        screen_h: u32,
+        card: Rect,
+    ) -> Result<()> {
+        ui::draw_modal_backdrop(painter, screen_w, screen_h);
+        ui::draw_modal_card(painter, card);
+        ui::draw_icon(
+            painter,
+            text_cache,
+            icon_font,
+            ui::modal_close_rect(card),
+            ui::ICON_CLOSE,
+            if self.hover_close { ui::WHITE } else { ui::MUTED },
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_pairing(
         &self,
@@ -1037,18 +1122,8 @@ impl App {
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
-        ui::draw_modal_backdrop(painter, screen_w, screen_h);
         let card = Self::pairing_card_rect(screen_w, screen_h);
-        ui::draw_modal_card(painter, card);
-        let close_rect = ui::modal_close_rect(card);
-        ui::draw_icon(
-            painter,
-            text_cache,
-            icon_font,
-            close_rect,
-            ui::ICON_CLOSE,
-            if self.hover_close { ui::WHITE } else { ui::MUTED },
-        )?;
+        self.draw_modal_shell(painter, text_cache, icon_font, screen_w, screen_h, card)?;
 
         ui::draw_text(
             painter,
@@ -1117,18 +1192,8 @@ impl App {
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
-        ui::draw_modal_backdrop(painter, screen_w, screen_h);
         let (card, content) = Self::settings_layout(screen_w, screen_h);
-        ui::draw_modal_card(painter, card);
-        let close_rect = ui::modal_close_rect(card);
-        ui::draw_icon(
-            painter,
-            text_cache,
-            icon_font,
-            close_rect,
-            ui::ICON_CLOSE,
-            if self.hover_close { ui::WHITE } else { ui::MUTED },
-        )?;
+        self.draw_modal_shell(painter, text_cache, icon_font, screen_w, screen_h, card)?;
         ui::draw_text(
             painter,
             text_cache,
@@ -1188,18 +1253,8 @@ impl App {
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
-        ui::draw_modal_backdrop(painter, screen_w, screen_h);
         let card = Self::add_host_card_rect(screen_w, screen_h);
-        ui::draw_modal_card(painter, card);
-        let close_rect = ui::modal_close_rect(card);
-        ui::draw_icon(
-            painter,
-            text_cache,
-            icon_font,
-            close_rect,
-            ui::ICON_CLOSE,
-            if self.hover_close { ui::WHITE } else { ui::MUTED },
-        )?;
+        self.draw_modal_shell(painter, text_cache, icon_font, screen_w, screen_h, card)?;
 
         ui::draw_text(
             painter,
@@ -1251,18 +1306,8 @@ impl App {
         screen_h: u32,
     ) -> Result<()> {
         let Some(wake) = &self.wake else { return Ok(()) };
-        ui::draw_modal_backdrop(painter, screen_w, screen_h);
         let card = Self::wake_card_rect(screen_w, screen_h);
-        ui::draw_modal_card(painter, card);
-        let close_rect = ui::modal_close_rect(card);
-        ui::draw_icon(
-            painter,
-            text_cache,
-            icon_font,
-            close_rect,
-            ui::ICON_CLOSE,
-            if self.hover_close { ui::WHITE } else { ui::MUTED },
-        )?;
+        self.draw_modal_shell(painter, text_cache, icon_font, screen_w, screen_h, card)?;
 
         ui::draw_text(
             painter,
