@@ -2,6 +2,8 @@
 //! (`_punktfunk._udp` advert, same TXT keys) but as our own direct `mdns-sd`
 //! dependency rather than depending on `pf-client-core` itself (see `session.rs`
 //! docs for why: its Cargo.toml would drag in FFmpeg/PipeWire for our target too).
+use std::io::Write as _;
+
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 
 #[derive(Clone, Debug)]
@@ -19,21 +21,40 @@ pub struct DiscoveredHost {
     pub mac: Vec<String>,
 }
 
-/// Browse continuously; the thread exits when the receiver is dropped.
-pub fn browse() -> std::sync::mpsc::Receiver<DiscoveredHost> {
+/// Browse continuously; the thread exits when the receiver is dropped. `log` is a
+/// second handle onto the app's own log file (see `main.rs::log_path`) — every
+/// failure/event point here is logged, since this previously failed completely
+/// silently: a `ServiceDaemon::new()`/`browse()` error, or every non-`ServiceResolved`
+/// event, was just dropped with no trace, making "no hosts showed up" undiagnosable
+/// from the log alone (was it a permissions/socket failure, wrong interface, or
+/// genuinely nothing advertising?).
+pub fn browse(mut log: std::fs::File) -> std::sync::mpsc::Receiver<DiscoveredHost> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("punktfunk-webos-mdns".into())
         .spawn(move || {
-            let Ok(daemon) = ServiceDaemon::new() else {
-                return;
+            let daemon = match ServiceDaemon::new() {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = writeln!(log, "mdns: ServiceDaemon::new failed: {e}");
+                    return;
+                }
             };
-            let Ok(receiver) = daemon.browse("_punktfunk._udp.local.") else {
-                return;
+            let receiver = match daemon.browse("_punktfunk._udp.local.") {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = writeln!(log, "mdns: browse(_punktfunk._udp.local.) failed: {e}");
+                    return;
+                }
             };
+            let _ = writeln!(log, "mdns: browsing _punktfunk._udp.local.");
             while let Ok(event) = receiver.recv() {
-                let ServiceEvent::ServiceResolved(info) = event else {
-                    continue;
+                let info = match event {
+                    ServiceEvent::ServiceResolved(info) => info,
+                    other => {
+                        let _ = writeln!(log, "mdns: {other:?}");
+                        continue;
+                    }
                 };
                 // IPv4 only, same policy as the other clients — the core dials
                 // `format!("{host}:{port}").parse::<SocketAddr>()` over IPv4.
@@ -43,6 +64,11 @@ pub fn browse() -> std::sync::mpsc::Receiver<DiscoveredHost> {
                     .next()
                     .map(std::string::ToString::to_string)
                 else {
+                    let _ = writeln!(
+                        log,
+                        "mdns: resolved {} with no IPv4 address, skipping",
+                        info.get_fullname()
+                    );
                     continue;
                 };
                 let props = info.get_properties();
@@ -59,10 +85,12 @@ pub fn browse() -> std::sync::mpsc::Receiver<DiscoveredHost> {
                         .filter(|s| !s.is_empty())
                         .collect(),
                 };
+                let _ = writeln!(log, "mdns: resolved {} at {}:{}", host.name, host.addr, host.port);
                 if tx.send(host).is_err() {
                     break; // receiver gone — stop browsing
                 }
             }
+            let _ = writeln!(log, "mdns: receiver loop ended, shutting down");
             let _ = daemon.shutdown();
         })
         .expect("spawn mdns thread");

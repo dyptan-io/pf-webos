@@ -135,10 +135,14 @@ impl App {
     pub fn new(identity: (String, String), log: &mut std::fs::File) -> Self {
         let known_hosts = store::load_known_hosts();
         let entries = known_hosts.iter().cloned().map(HostEntry::Known).collect();
+        // A second handle onto the same log file (both just append — see
+        // `main.rs::log_path`) for the mdns background thread to log through, since
+        // it can't share this `&mut File` across threads.
+        let discovery_log = log.try_clone().expect("clone log file handle for mdns thread");
         let mut app = Self {
             screen: Screen::Home,
             known_hosts,
-            discovered: crate::discovery::browse(),
+            discovered: crate::discovery::browse(discovery_log),
             entries,
             home_focus: HomeFocus::Sidebar(0),
             selected_host: None,
