@@ -6,9 +6,8 @@ a real **LG CX, webOS 5.6**, using root SSH access for logs/testing.
 
 ## Memory/performance pass (2026-07-12)
 
-Not yet verified on real hardware — reasoned from code + a native macOS/Linux build only; treat
-as "should help" until profiled on-device, same caveat as anything else in this file not yet
-crossed off.
+Verified on real hardware (LG CX) — see the soft-float finding below for the pass that actually
+moved the needle; the items here are real but each individually minor next to that one.
 
 - **`ui::TextCache`**: `ui::draw_text` used to rasterize (freetype) and upload a brand-new GPU
   texture on *every* call, with zero caching — and every draw function runs on every render tick
@@ -38,6 +37,17 @@ crossed off.
   client-cert auth) on every call, and `art.rs` calls it once per game — a 30-50 game library paid
   for that many redundant mutual-TLS handshakes to the *same* host. `library::agent` is now public
   so `art.rs` builds one per batch and reuses it across every game's fetch.
+- **`App::select_host` used to call `library::fetch_games` directly on the UI/render thread** —
+  a real network round-trip (up to `library::agent`'s 5s connect / 10s total timeout), blocking
+  *all* input and rendering for as long as the host took to answer or time out. Hit on every app
+  launch too (`App::new` restores the last-selected host via the same call). Surfaced as "some
+  button presses don't register for 1-2 seconds." Fixed the same way cover art already loads:
+  `library::load_games_async` spawns a thread and delivers a `GamesLoaded` over a channel,
+  drained each tick by `App::drain_games`. Switching hosts again before a fetch finishes is safe
+  — `select_host` replaces `games_rx` with a fresh channel, so the stale thread's send just fails
+  and it exits (same pattern `art::load_art_async` already relied on). The pairing PIN ceremony
+  (`App::handle_pairing_event`) still blocks the same way — not yet fixed, since it's a rare,
+  explicitly user-initiated action rather than something on the startup/host-switch hot path.
 
 ## Linting (`task lint`/`task native:lint`, format via `task fmt`)
 
@@ -67,6 +77,30 @@ state-machine loops with no natural seam, for a line-count threshold alone.
 - `.cargo/config.toml` wires the linker/CC/pkg-config env vars to `scripts/cc-shim.sh`/
   `cxx-shim.sh`, which pass `--sysroot` explicitly — this toolchain's baked-in default sysroot
   path is stale post-relocate.
+- **`armv7-unknown-linux-gnueabi` defaults to real software-emulated floating point, not just a
+  soft-float *calling convention*** — this was the actual root cause of a "the whole UI is
+  laggy" report that survived several rendering-side fixes (redraw-on-change, shadow/text
+  caching, a streaming texture) with zero effect, because none of those touched the real
+  bottleneck. Confirmed via `nm`/`objdump` on a release binary: even a near-empty frame (no host
+  selected, zero cards) spent ~300ms in `render()`, and disassembly showed basic f32/f64 add/mul
+  compiling to calls into `compiler_builtins`/`__aeabi_f*` — software emulation — instead of a
+  single VFP instruction. The vendor's own C toolchain targeting this exact chip
+  (`arm-webos-linux-gnueabi-gcc -v`) defaults to `-mfloat-abi=softfp -mfpu=neon-fp16
+  -mcpu=cortex-a9` — **softfp**, meaning real VFP3/NEON hardware instructions for computation,
+  base-AAPCS (integer-register) calling convention only at ABI boundaries — matching a real
+  Cortex-A9 FPU the sysroot's own libSDL2 etc. already use. Rust's built-in `gnueabi` (non-`hf`)
+  target spec instead bakes in LLVM's `soft-float` feature unconditionally, disabling hardware FP
+  codegen even though the platform (and every C object in the same binary) supports softfp fine.
+  Fix: `.cargo/config.toml`'s `[target.armv7-unknown-linux-gnueabi]` sets
+  `rustflags = ["-C", "target-feature=+neon,+vfp3,-soft-float", "-C", "target-cpu=cortex-a9"]` —
+  `-soft-float` only changes *codegen* (real VFP/NEON instructions for computation), not the
+  calling convention, so FFI calls into the sysroot's softfp-ABI libraries stay correct. Measured
+  effect on-device: ~300ms → ~30ms per render. (`rustc`/`cargo` emit a stable-but-harmless
+  "unstable feature" warning for `neon`/`vfp3`/`soft-float` on `-C target-feature=` — real,
+  doesn't fail `-D warnings` builds, safe to ignore.) rustup's prebuilt `std`/`core` for this
+  target were still built with the old default and can't be overridden without `-Z build-std`
+  (nightly) — some soft-float calls remain from there, but the hot rendering path is ours, not
+  std's, so this fix is the one that mattered.
 - **getauxval/gettid/sendmmsg shims required**: webOS's shipped glibc is ~2.12, predating
   `getauxval()` (2.16+), `gettid()` (2.30+), and `sendmmsg()` (2.14+) — all linked unconditionally
   by Rust std / punktfunk-core's UDP batching. Fixed via `src/glibc_compat_shim.c` (raw
@@ -163,12 +197,10 @@ the way the previous hand-rolled per-scanline canvas primitives worked. Cover ar
 and cached text (`ui::TextCache`) are both plain owned `Pixmap`s now too, composited straight
 into the frame buffer — no separate GPU-texture cache to keep in sync with them (the old
 `art_textures`-vs-`art_pixels` leak-prevention `retain()` dance in `main.rs` is gone; there's
-only one cache now). Cross-compiles and links cleanly (`task check`/`task lint`/`task build` all
-pass), but **not yet visually verified on real hardware or even a native Linux box** — this
-crate's SDL2/NDL-dependent modules only compile under `target_os = "linux"`, and this pass was
-authored on macOS, so the actual rendered look (AA quality, shadow softness, chevron/icon shapes)
-still needs a real on-device check before treating it as done — same caveat as the
-memory/performance pass above.
+only one cache now). Visually verified on a real LG CX — AA quality, shadow softness, and icon
+shapes all render as intended. Per-frame cost on real hardware turned out to be dominated by the
+soft-float toolchain issue above, not by anything in this rendering backend itself; see that
+entry before assuming a rendering change is needed to fix a performance complaint.
 
 Evaluated and deliberately **not** adopted: moonlight-tv's actual LVGL toolkit (its
 `src/app/lvgl` folder — a full retained-mode widget tree, cascading per-state/part styles, flex

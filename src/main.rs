@@ -190,37 +190,39 @@ mod real {
         let mut text_cache = crate::ui::TextCache::new();
         let mut back_prev = false;
         // Redraw-on-change: this screen has no time-based animation at all (no
-        // spinner/blink/marquee — confirmed by grepping the whole pre-stream UI for
-        // any `Instant`/frame-counter-driven visual state), so every pixel that can
-        // change only ever changes as a reaction to one of: an SDL event, a
-        // Discovery/art background result, or the raw scancode Back/Red edge below
-        // — anything else is a no-op tick. Without this, `app.render(...)` (and the
-        // `canvas.present()` vsync swap inside it) ran unconditionally every 16ms
-        // forever, even sitting on an untouched menu. Starts `true` so the first
-        // frame always draws.
+        // spinner/blink/marquee), so every pixel that can change only ever changes
+        // as a reaction to one of: an SDL event, a Discovery/art/library background
+        // result, or the raw scancode Back/Red edge below — anything else is a
+        // no-op tick. Without this, `app.render(...)` (and the `canvas.present()`
+        // vsync swap inside it) ran unconditionally every 16ms forever, even
+        // sitting on an untouched menu. Starts `true` so the first frame always
+        // draws.
         let mut dirty = true;
         let target = 'ui: loop {
             dirty |= app.drain_discovery(log);
             dirty |= app.drain_art();
+            dirty |= app.drain_games(log);
             dirty |= app.tick_wake(log);
             for event in events.poll_iter() {
                 use sdl2::event::Event;
-                // Any event might change what's on screen (focus/hover, a typed
-                // digit, a screen transition) — simplest to mark dirty for all of
-                // them rather than re-litigate that per event kind.
-                dirty = true;
                 if let Event::Quit { .. } = event {
                     writeln!(log, "quit during UI")?;
                     return Ok(None);
                 }
-                // The Magic Remote's pointer mode surfaces as plain SDL2 mouse
-                // events — hover updates focus, a click confirms whatever's
-                // focused (matches gamepad/remote Confirm behavior).
+                // The Magic Remote's pointer mode surfaces as a plain SDL2
+                // MouseMotion event fired continuously while the remote is
+                // moving — unlike every other event handled below, redraw only
+                // if the motion actually changed the focused/hovered element,
+                // not on every no-op tick.
+                if let Event::MouseMotion { x, y, .. } = event {
+                    dirty |= app.handle_mouse_motion(x, y, display_mode.w as u32, display_mode.h as u32);
+                    continue;
+                }
+                // Any other event might change what's on screen (focus/hover, a typed
+                // digit, a screen transition) — simplest to mark dirty for all of
+                // them rather than re-litigate that per event kind.
+                dirty = true;
                 match event {
-                    Event::MouseMotion { x, y, .. } => {
-                        app.handle_mouse_motion(x, y, display_mode.w as u32, display_mode.h as u32);
-                        continue;
-                    }
                     Event::MouseButtonDown {
                         mouse_btn: sdl2::mouse::MouseButton::Left,
                         ..
@@ -376,8 +378,13 @@ mod real {
         // buffer here and presents it — one texture/copy per frame, not one per
         // widget/art-cover/text-label the way the old canvas-primitives version did.
         let mut painter = crate::ui::Painter::new(display_mode.w as u32, display_mode.h as u32);
+        // STREAMING (not STATIC) — this texture's whole content is re-uploaded via
+        // `update()` every dirty tick, which is exactly the frequent-full-update
+        // case STREAMING is meant for; STATIC targets content that rarely changes
+        // and can be a slower path for a per-frame full-frame upload on some
+        // backends.
         let mut frame_texture = texture_creator
-            .create_texture_static(
+            .create_texture_streaming(
                 sdl2::pixels::PixelFormatEnum::RGBA32,
                 display_mode.w as u32,
                 display_mode.h as u32,

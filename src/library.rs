@@ -110,8 +110,10 @@ pub fn agent(identity: &(String, String), pin: Option<[u8; 32]>) -> Result<ureq:
 }
 
 /// Fetch the host's unified library. Errors are pre-classified for the UI (401/403 →
-/// `NotPaired`, a pin-verifier rejection → `PinMismatch`).
-pub fn fetch_games(
+/// `NotPaired`, a pin-verifier rejection → `PinMismatch`). Only called from
+/// `load_games_async` — `App` never calls this directly on the UI thread (see that
+/// function's docs on why).
+fn fetch_games(
     addr: &str,
     mgmt_port: u16,
     identity: &(String, String),
@@ -126,6 +128,50 @@ pub fn fetch_games(
         Err(e) => return Err(classify(e)),
     };
     serde_json::from_str(&body).map_err(|e| LibraryError::Unreachable(format!("bad JSON: {e}")))
+}
+
+/// One `fetch_games` call's result, delivered over `load_games_async`'s channel —
+/// carries `host`/`port`/`mgmt_port` back alongside the result since the receiving
+/// end (`App::drain_games`) needs them to start art loading on success, without
+/// having to keep its own copy in sync with whatever host is selected by the time
+/// the fetch completes.
+pub struct GamesLoaded {
+    pub host: String,
+    pub port: u16,
+    pub mgmt_port: u16,
+    pub result: Result<Vec<GameEntry>, LibraryError>,
+}
+
+/// Spawns one background thread to run `fetch_games` and deliver its result —
+/// `agent(...).get(...).call()` blocks on a real network round-trip (up to the
+/// 5s connect / 10s total timeout `agent` sets), so calling `fetch_games` directly
+/// from the UI thread (the old behavior) froze every input — button presses,
+/// pointer motion, rendering — for as long as the host took to answer or time out.
+/// Switching hosts again before this finishes is safe: `App::select_host` replaces
+/// `games_rx` with a fresh channel, dropping this one's receiver, so this thread's
+/// `tx.send` just fails and it exits — the same discard-on-drop pattern
+/// `art::load_art_async` already relies on.
+pub fn load_games_async(
+    host: String,
+    port: u16,
+    mgmt_port: u16,
+    identity: (String, String),
+    fingerprint: Option<[u8; 32]>,
+) -> std::sync::mpsc::Receiver<GamesLoaded> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("punktfunk-webos-library".into())
+        .spawn(move || {
+            let result = fetch_games(&host, mgmt_port, &identity, fingerprint);
+            let _ = tx.send(GamesLoaded {
+                host,
+                port,
+                mgmt_port,
+                result,
+            });
+        })
+        .expect("spawn library-fetch thread");
+    rx
 }
 
 /// Fetches one piece of cover art's raw bytes (JPEG/PNG, undecoded) from a

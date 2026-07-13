@@ -239,12 +239,28 @@ fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny
 /// version did.
 pub struct Painter {
     pixmap: Pixmap,
+    /// Rendered (padded, box-blurred) shadow shapes, keyed by the params that
+    /// fully determine their pixels — every card of a given size/style shares
+    /// one entry instead of re-running the blur every dirty frame. Small and
+    /// bounded: the UI only ever draws a handful of distinct card sizes
+    /// (poster cards, sidebar rows, modals).
+    shadow_cache: HashMap<ShadowKey, Pixmap>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ShadowKey {
+    w: u32,
+    h: u32,
+    radius: i32,
+    blur_bits: u32,
+    opacity: u8,
 }
 
 impl Painter {
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             pixmap: Pixmap::new(width.max(1), height.max(1)).expect("nonzero framebuffer size"),
+            shadow_cache: HashMap::new(),
         }
     }
 
@@ -315,8 +331,40 @@ impl Painter {
     /// A soft, real (box-blurred) drop shadow for a rounded-rect shape, offset by
     /// `(dx, dy)` — replaces the old flat single-offset hard-edged rect, which had
     /// no actual softness to sell "shadow" at TV viewing distance.
+    ///
+    /// The blurred shape only depends on `(rect.width(), rect.height(), radius,
+    /// blur, opacity)`, not position — every card of the same size/style (the
+    /// whole game grid, every sidebar row) reuses one cached shape instead of
+    /// re-running the box blur per card per frame.
     pub fn fill_shadow(&mut self, rect: Rect, radius: i32, dx: f32, dy: f32, blur: f32, opacity: u8) {
-        draw_soft_shadow(&mut self.pixmap, rect, radius, dx, dy, blur, opacity);
+        if rect.width() == 0 || rect.height() == 0 {
+            return;
+        }
+        let pad = blur.ceil().max(0.0) as i32 + 1;
+        let key = ShadowKey {
+            w: rect.width(),
+            h: rect.height(),
+            radius,
+            blur_bits: blur.to_bits(),
+            opacity,
+        };
+        let shape = match self.shadow_cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let Some(shape) = render_shadow_shape(rect.width(), rect.height(), radius, pad, blur, opacity) else {
+                    return;
+                };
+                e.insert(shape)
+            }
+        };
+        self.pixmap.draw_pixmap(
+            rect.x() - pad + dx.round() as i32,
+            rect.y() - pad + dy.round() as i32,
+            shape.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
     }
 
     pub fn draw_pixmap(&mut self, x: i32, y: i32, src: &Pixmap) {
@@ -347,28 +395,19 @@ impl Painter {
 /// constant (not derived from anything) picked to read as a soft TV-scale shadow.
 const SHADOW_BLUR: f32 = 14.0;
 
-/// Rasterizes `rect`'s rounded-rect shape into a small padded alpha buffer, box-blurs
-/// it (3 passes — a cheap approximation of a Gaussian blur, good enough at TV
-/// viewing distance for a drop shadow), then composites it as a black shadow offset
-/// by `(dx, dy)`.
-fn draw_soft_shadow(dst: &mut Pixmap, rect: Rect, radius: i32, dx: f32, dy: f32, blur: f32, opacity: u8) {
-    let pad = blur.ceil().max(0.0) as i32 + 1;
-    let (w, h) = (rect.width() as i32 + 2 * pad, rect.height() as i32 + 2 * pad);
-    if w <= 0 || h <= 0 {
-        return;
+/// Rasterizes a `(w, h)` rounded-rect shape into a small padded alpha buffer and
+/// box-blurs it (3 passes — a cheap approximation of a Gaussian blur, good enough
+/// at TV viewing distance for a drop shadow), returning the standalone shadow
+/// shape as a black, premultiplied `Pixmap` ready to be composited at any
+/// position — see `Painter::fill_shadow`'s cache, keyed on everything that
+/// determines these pixels (size/radius/blur/opacity, not position).
+fn render_shadow_shape(w: u32, h: u32, radius: i32, pad: i32, blur: f32, opacity: u8) -> Option<Pixmap> {
+    let (pw, ph) = (w as i32 + 2 * pad, h as i32 + 2 * pad);
+    if pw <= 0 || ph <= 0 {
+        return None;
     }
-    let Some(mut shape) = Pixmap::new(w as u32, h as u32) else {
-        return;
-    };
-    let Some(path) = rounded_rect_path(
-        pad as f32,
-        pad as f32,
-        rect.width() as f32,
-        rect.height() as f32,
-        radius as f32,
-    ) else {
-        return;
-    };
+    let mut shape = Pixmap::new(pw as u32, ph as u32)?;
+    let path = rounded_rect_path(pad as f32, pad as f32, w as f32, h as f32, radius as f32)?;
     let paint = solid_paint(Color::RGBA(0, 0, 0, opacity));
     shape.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
 
@@ -378,20 +417,13 @@ fn draw_soft_shadow(dst: &mut Pixmap, rect: Rect, radius: i32, dx: f32, dy: f32,
     let mut alpha: Vec<u8> = shape.data().iter().skip(3).step_by(4).copied().collect();
     let radius_px = (blur / 2.0).round().max(1.0) as usize;
     for _ in 0..3 {
-        box_blur(&mut alpha, w as usize, h as usize, radius_px);
+        box_blur(&mut alpha, pw as usize, ph as usize, radius_px);
     }
     for (i, a) in alpha.into_iter().enumerate() {
         shape.data_mut()[i * 4 + 3] = a; // R/G/B stay 0 (premultiplied black)
     }
 
-    dst.draw_pixmap(
-        rect.x() - pad + dx.round() as i32,
-        rect.y() - pad + dy.round() as i32,
-        shape.as_ref(),
-        &PixmapPaint::default(),
-        Transform::identity(),
-        None,
-    );
+    Some(shape)
 }
 
 /// Separable box blur (horizontal pass into `tmp`, then vertical back into
@@ -872,17 +904,6 @@ pub fn draw_sidebar(
         focused_index == Some(settings_row),
     )?;
 
-    if entries.is_empty() {
-        draw_text(
-            painter,
-            text_cache,
-            font_label,
-            "No hosts yet.",
-            SIDEBAR_PAD,
-            SIDEBAR_TOP_Y - 32,
-            MUTED,
-        )?;
-    }
     Ok(())
 }
 

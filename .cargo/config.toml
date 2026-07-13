@@ -2,6 +2,21 @@
 # scripts/cc-shim.sh for why the linker isn't the NDK's gcc directly).
 [target.armv7-unknown-linux-gnueabi]
 linker = "scripts/cc-shim.sh"
+# Rust's built-in `armv7-unknown-linux-gnueabi` target defaults to the `soft-float`
+# LLVM feature — real software floating-point emulation (every f32/f64 op becomes a
+# call into `compiler_builtins`/`__aeabi_f*`, confirmed via `nm` on a release build),
+# not just a soft-float *calling convention*. The vendor's own C toolchain targeting
+# this exact hardware uses `-mfloat-abi=softfp -mfpu=neon-fp16 -mcpu=cortex-a9`
+# (confirmed via `arm-webos-linux-gnueabi-gcc -v`) — softfp, not soft: real VFP3/NEON
+# hardware instructions for computation, base-AAPCS (integer-register) calling
+# convention only at ABI boundaries, matching the sysroot's own libSDL2 etc. Leaving
+# Rust on pure `soft-float` meant every tiny-skia draw call (path fills, blends,
+# blur, transforms — all f32-heavy) paid a software-emulation tax on top of an
+# already-weak CPU, observed as ~300ms per otherwise-trivial render on real hardware.
+# `-soft-float` here only removes that LLVM codegen feature (computation uses real
+# VFP/NEON instructions); it does not change the calling convention, so FFI calls
+# into the sysroot's softfp-ABI libraries stay correct.
+rustflags = ["-C", "target-feature=+neon,+vfp3,-soft-float", "-C", "target-cpu=cortex-a9"]
 
 [env]
 CC_armv7_unknown_linux_gnueabi = { value = "scripts/cc-shim.sh", relative = true }
