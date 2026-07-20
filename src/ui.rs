@@ -196,12 +196,18 @@ fn sk_color(c: Color) -> SkColor {
     SkColor::from_rgba8(c.r, c.g, c.b, c.a)
 }
 
-/// A flat-color, anti-aliased `Paint` — every fill/stroke in this module uses one
-/// of these and nothing fancier (no gradients/patterns needed for this UI).
+/// A flat-color `Paint` — every fill/stroke in this module uses one of these and
+/// nothing fancier (no gradients/patterns needed for this UI).
+///
+/// Anti-aliasing off: tiny-skia dispatches to a genuinely separate, cheaper
+/// scan-conversion path when `anti_alias` is off (`scan::path::fill_path`/
+/// `scan::fill_rect` vs. the `_aa` variants) — measured on real webOS hardware,
+/// worth a real (if modest, ~15-25%) chunk of render time on larger fills like the
+/// Settings modal card. See docs/NOTES.md's "UI performance, round 2" entry.
 fn solid_paint(color: Color) -> Paint<'static> {
     let mut paint = Paint::default();
     paint.set_color(sk_color(color));
-    paint.anti_alias = true;
+    paint.anti_alias = false;
     paint
 }
 
@@ -278,6 +284,27 @@ impl Painter {
     /// isn't covered by a widget just shows this color).
     pub fn clear(&mut self, color: Color) {
         self.pixmap.fill(sk_color(color));
+    }
+
+    /// Darkens the whole framebuffer by blending in flat black at `alpha` —
+    /// `draw_modal_backdrop`'s scrim behind every modal (Settings/Pairing/AddHost/
+    /// Wake). Used to be a plain `fill_rect` over the whole 1920x1080 frame with a
+    /// semi-transparent color, going through tiny-skia's general shader/blend
+    /// pipeline — measured on real webOS hardware, that one full-screen blend
+    /// (~2M pixels) was the dominant per-frame cost on every modal screen (a
+    /// "render split" log showed the modal's *entire* extra cost over Home,
+    /// ~300ms+, unaffected by anything else on screen). Since the source color is
+    /// always plain black, `SourceOver` onto a fully-opaque destination reduces to
+    /// `dst *= (255 - alpha) / 255` — implemented directly here as a raw pixel
+    /// loop (no shader/pipeline construction, no floats) instead of going through
+    /// `fill_rect`.
+    pub fn dim(&mut self, alpha: u8) {
+        let keep = u32::from(255 - alpha);
+        for px in self.pixmap.data_mut().chunks_exact_mut(4) {
+            px[0] = ((u32::from(px[0]) * keep) / 255) as u8;
+            px[1] = ((u32::from(px[1]) * keep) / 255) as u8;
+            px[2] = ((u32::from(px[2]) * keep) / 255) as u8;
+        }
     }
 
     pub fn fill_rect(&mut self, rect: Rect, color: Color) {
@@ -372,10 +399,28 @@ impl Painter {
             .draw_pixmap(x, y, src.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
     }
 
+    /// Stamps `other`'s whole framebuffer over this one — used to composite a
+    /// separately cached, less-frequently-rerendered layer (see `App::render`'s
+    /// `home_layer`) as this frame's backdrop. A raw buffer copy, not
+    /// `draw_pixmap`/`fill_rect`: measured on real webOS hardware, routing a
+    /// full-frame composite through tiny-skia's general shader/blend pipeline
+    /// (same root cause as `dim`'s docs) cost ~330-350ms on its own — *more* than
+    /// the `render_home` call this cache exists to avoid, making the cache a net
+    /// loss until this changed. Both `Painter`s are always the same screen size
+    /// in practice (both sized from the same display mode), so a straight
+    /// `copy_from_slice` is always valid here.
+    pub fn blit_layer(&mut self, other: &Self) {
+        self.pixmap.data_mut().copy_from_slice(other.pixmap.data());
+    }
+
     /// Composites `src` scaled to exactly fill `dst` — `image`-decoded cover art
-    /// (see `art.rs`) is already downscaled close to display size, so bilinear here
-    /// is just a small final-fit correction, not doing the heavy lifting of the
-    /// downscale.
+    /// (see `art.rs`) is already downscaled close to display size, so this is just
+    /// a small final-fit correction, not doing the heavy lifting of the downscale.
+    /// `FilterQuality::Nearest`, not `Bilinear`: tiny-skia's bilinear `Pattern`
+    /// pushes extra interpolation stages into its raster pipeline whenever the
+    /// transform scales (see `Pattern::push_stages`), which measured as a real
+    /// (if modest) per-call cost on real webOS hardware — see docs/NOTES.md's "UI
+    /// performance, round 2" entry.
     pub fn draw_pixmap_scaled(&mut self, dst: Rect, src: &Pixmap) {
         let (dw, dh) = (dst.width() as f32, dst.height() as f32);
         let (sw, sh) = (src.width() as f32, src.height() as f32);
@@ -384,7 +429,7 @@ impl Painter {
         }
         let transform = Transform::from_scale(dw / sw, dh / sh).post_translate(dst.x() as f32, dst.y() as f32);
         let paint = PixmapPaint {
-            quality: FilterQuality::Bilinear,
+            quality: FilterQuality::Nearest,
             ..PixmapPaint::default()
         };
         self.pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
@@ -658,10 +703,19 @@ fn inflate(rect: Rect, focused: bool) -> Rect {
     )
 }
 
+/// A soft, real drop shadow (see [`Painter::fill_shadow`]) — matches the reference's
+/// shadowed-card look.
+fn draw_card_shadow(painter: &mut Painter, rect: Rect, radius: i32) {
+    painter.fill_shadow(rect, radius, 3.0, 5.0, SHADOW_BLUR, 0x60);
+}
+
 /// moonlight-tv's focus cue is an outline ring offset outward from the tile, not a
 /// filled/background change — bright accent blue, invisible unless focused. Two
-/// passes at increasing offset/decreasing alpha approximate a soft glow.
-pub fn draw_focus_ring(painter: &mut Painter, rect: Rect, radius: i32) {
+/// passes at increasing offset/decreasing alpha approximate a soft glow. Only
+/// `draw_poster_card` (game/Desktop grid selection) uses this — sidebar/settings/
+/// digit-box cards (`draw_card`) rely on the zoom/inflate + text-color change alone,
+/// per an explicit request to drop the ring everywhere except game selection.
+fn draw_focus_ring(painter: &mut Painter, rect: Rect, radius: i32) {
     let passes = [(3, 0xff), (6, 0x60)];
     for (offset, alpha) in passes {
         let ring = Rect::new(
@@ -675,22 +729,14 @@ pub fn draw_focus_ring(painter: &mut Painter, rect: Rect, radius: i32) {
     }
 }
 
-/// A soft, real drop shadow (see [`Painter::fill_shadow`]) — matches the reference's
-/// shadowed-card look.
-fn draw_card_shadow(painter: &mut Painter, rect: Rect, radius: i32) {
-    painter.fill_shadow(rect, radius, 3.0, 5.0, SHADOW_BLUR, 0x60);
-}
-
 /// Draws a plain surface card (sidebar rows, settings rows, PIN/IP digit boxes) —
-/// shadow, `SIDEBAR_BG` fill, and a focus ring when focused. Returns the (possibly
-/// zoom-inflated) rect actually drawn, so callers can center content inside it.
+/// shadow and `SIDEBAR_BG` fill, zoom-inflated slightly when focused. Returns the
+/// (possibly zoom-inflated) rect actually drawn, so callers can center content
+/// inside it.
 pub fn draw_card(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
     let r = inflate(rect, focused);
     draw_card_shadow(painter, r, CARD_RADIUS);
     painter.fill_rounded_rect(r, CARD_RADIUS, SIDEBAR_BG);
-    if focused {
-        draw_focus_ring(painter, r, CARD_RADIUS);
-    }
     r
 }
 
@@ -1028,8 +1074,8 @@ pub fn hit_test_grid_card(
 
 /// Dims the already-rendered frame beneath a modal (Settings/Pairing/Add host all
 /// render on top of the current Home frame, then this, then their own card).
-pub fn draw_modal_backdrop(painter: &mut Painter, screen_w: u32, screen_h: u32) {
-    painter.fill_rect(Rect::new(0, 0, screen_w, screen_h), MODAL_SCRIM);
+pub fn draw_modal_backdrop(painter: &mut Painter) {
+    painter.dim(MODAL_SCRIM.a);
 }
 
 /// A centered glass card of `(width_frac * screen_w, height)`.
@@ -1486,7 +1532,11 @@ pub fn draw_switch(painter: &mut Painter, rect: Rect, on: bool) {
 }
 
 /// Renders a dropdown's options as an overlay list anchored just below the row that
-/// opened it, inside the settings modal card.
+/// opened it, inside the settings modal card. One shadow/background for the whole
+/// panel and contiguous, same-height rows — like a typical dropdown/picker list —
+/// rather than every row being its own floating `draw_card` (which used to stack a
+/// drop shadow under each option a few px apart from its neighbors, reading as a
+/// stray smear between rows instead of a clean list).
 pub fn draw_dropdown_overlay(
     painter: &mut Painter,
     text_cache: &mut TextCache,
@@ -1496,23 +1546,29 @@ pub fn draw_dropdown_overlay(
     rect: Rect,
 ) -> Result<()> {
     let row_h = 56u32;
-    let gap = 6i32;
-    let overlay_h = options.len() as i32 * (row_h as i32 + gap);
-    let bg_rect = Rect::new(rect.x(), rect.y(), rect.width(), overlay_h.max(0) as u32);
+    let bg_rect = Rect::new(rect.x(), rect.y(), rect.width(), options.len() as u32 * row_h);
+    draw_card_shadow(painter, bg_rect, CARD_RADIUS);
     painter.fill_rounded_rect(bg_rect, CARD_RADIUS, Color::RGBA(0x10, 0x10, 0x10, 0xf0));
     painter.stroke_rounded_rect(bg_rect, CARD_RADIUS, Color::RGBA(0xff, 0xff, 0xff, 0x20), 1.5);
     for (i, opt) in options.iter().enumerate() {
-        let y = rect.y() + i as i32 * (row_h as i32 + gap);
-        let row_rect = Rect::new(rect.x(), y, rect.width(), row_h);
+        let row_rect = Rect::new(rect.x(), rect.y() + i as i32 * row_h as i32, rect.width(), row_h);
         let focused = i == focused_index;
-        let drawn = draw_card(painter, row_rect, focused);
+        if focused {
+            let highlight = Rect::new(
+                row_rect.x() + 6,
+                row_rect.y() + 4,
+                row_rect.width().saturating_sub(12),
+                row_rect.height().saturating_sub(8),
+            );
+            painter.fill_rounded_rect(highlight, 8, Color::RGBA(ACCENT.r, ACCENT.g, ACCENT.b, 0x50));
+        }
         draw_text(
             painter,
             text_cache,
             font_value,
             opt,
-            drawn.x() + 20,
-            drawn.y() + (drawn.height() as i32 - font_value.height()) / 2,
+            row_rect.x() + 20,
+            row_rect.y() + (row_rect.height() as i32 - font_value.height()) / 2,
             if focused { WHITE } else { MUTED },
         )?;
     }

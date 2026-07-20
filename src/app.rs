@@ -129,6 +129,20 @@ pub struct App {
     /// close (X) button.
     pub hover_close: bool,
     identity: (String, String),
+    /// Cached last-rendered Home (sidebar+grid) background, reused while a modal
+    /// (Settings/Pairing/AddHost/Wake) is on top of it instead of redrawing Home
+    /// from scratch every frame — see `render`'s docs. Lazily sized on first use
+    /// since `App::new` doesn't know the screen dimensions yet.
+    home_layer: Option<Painter>,
+    /// Set whenever anything Home would draw differently might have changed
+    /// (`entries`/`games`/`art`/`selected_host`/`home_status`/`home_focus`) —
+    /// `render` redraws `home_layer` from `render_home` when this is true, then
+    /// clears it. Always `true` on a Home-screen frame (that frame draws Home
+    /// directly, not through the cache, so the cache must be treated as stale
+    /// until the next time it's actually needed) and set explicitly at every
+    /// other mutation site, since those can run while a modal is active (e.g. a
+    /// library fetch finishing while the user is in Settings).
+    home_dirty: bool,
 }
 
 impl App {
@@ -163,6 +177,8 @@ impl App {
             pairing_entry: 0,
             hover_close: false,
             identity,
+            home_layer: None,
+            home_dirty: true,
         };
         // Restore the last-active sidebar host (if it's still known and paired)
         // so relaunching the app lands back on its game grid.
@@ -236,6 +252,9 @@ impl App {
             self.select_host(host, port, mgmt_port, log);
             changed = true;
         }
+        if changed {
+            self.home_dirty = true;
+        }
         changed
     }
 
@@ -248,6 +267,9 @@ impl App {
         while let Ok(loaded) = rx.try_recv() {
             self.art.insert(loaded.game_id, loaded.pixmap);
             changed = true;
+        }
+        if changed {
+            self.home_dirty = true;
         }
         changed
     }
@@ -394,6 +416,7 @@ impl App {
         self.art.clear();
         self.art_rx = None;
         self.home_focus = HomeFocus::Grid(0);
+        self.home_dirty = true;
 
         let identity = (self.identity.0.clone(), self.identity.1.clone());
         let fingerprint = self
@@ -466,6 +489,7 @@ impl App {
                 }
             }
         }
+        self.home_dirty = true;
         true
     }
 
@@ -606,6 +630,7 @@ impl App {
                 *i = sidebar_len - 1;
             }
         }
+        self.home_dirty = true;
     }
 
     /// Handles one menu event on the pairing modal. Runs the (blocking) PIN
@@ -877,6 +902,16 @@ impl App {
     pub fn handle_mouse_motion(&mut self, x: i32, y: i32, screen_w: u32, screen_h: u32) -> bool {
         match self.screen {
             Screen::Home => {
+                // Home has no close button, but `hover_close` is only ever set by
+                // the modal branches below — without clearing it here, hovering a
+                // modal's close button and then backing out to Home left it stuck
+                // `true` forever (nothing on Home ever set it back to `false`), so
+                // `handle_mouse_click`'s `if self.hover_close { ...; return None }`
+                // silently swallowed *every* Home click afterward, no matter where
+                // it landed. Not folded into the returned "did anything visibly
+                // change" bool — Home never draws a close button, so this has no
+                // visual effect of its own.
+                self.hover_close = false;
                 if let Some(idx) = ui::hit_test_sidebar_row(x, y, self.sidebar_len()) {
                     let changed = self.home_focus != HomeFocus::Sidebar(idx);
                     self.home_focus = HomeFocus::Sidebar(idx);
@@ -935,7 +970,23 @@ impl App {
 
     /// A pointer click confirms whatever's currently hovered/focused, or triggers
     /// Back if the modal's close (X) button itself is what's hovered.
-    pub fn handle_mouse_click(&mut self, log: &mut std::fs::File) -> Option<ConnectTarget> {
+    pub fn handle_mouse_click(
+        &mut self,
+        x: i32,
+        y: i32,
+        screen_w: u32,
+        screen_h: u32,
+        log: &mut std::fs::File,
+    ) -> Option<ConnectTarget> {
+        // Re-sync focus/hover to the click's own position first — a MouseButtonDown
+        // can carry a slightly different (x, y) than the MouseMotion that last set
+        // focus (the physical button press can jostle the remote a little), so
+        // trusting only whatever the previous motion event left behind risked
+        // confirming stale focus — a click landing just off-target reads as "did
+        // nothing," exactly the "sometimes needs two clicks" symptom, and unlike
+        // D-pad Confirm (which always acts on the current persisted focus with no
+        // intervening motion event to race against).
+        self.handle_mouse_motion(x, y, screen_w, screen_h);
         if self.hover_close {
             match self.screen {
                 Screen::Settings => self.handle_settings_event(MenuEvent::Back),
@@ -947,10 +998,7 @@ impl App {
             return None;
         }
         match self.screen {
-            // screen_w isn't known here — mouse clicks confirm whatever
-            // `handle_mouse_motion` already focused, so the grid-column math
-            // `handle_home_event` needs isn't actually exercised by a Confirm.
-            Screen::Home => self.handle_home_event(MenuEvent::Confirm, u32::MAX, log),
+            Screen::Home => self.handle_home_event(MenuEvent::Confirm, screen_w, log),
             Screen::Settings => {
                 self.handle_settings_event(MenuEvent::Confirm);
                 None
@@ -965,9 +1013,16 @@ impl App {
 
     // --------------------------------------------------------------- render --
 
+    /// Renders the current screen. On a Home-screen frame, `render_home` draws
+    /// straight into `painter` exactly as it always has — no caching layer
+    /// involved, so this costs exactly what it used to. On any modal screen
+    /// (Settings/Pairing/AddHost/Wake), Home is only actually re-rendered (into
+    /// the cached `home_layer`) when `home_dirty` is set; every other modal-only
+    /// frame (hovering a row, opening a dropdown, navigating it) just blits the
+    /// cached layer instead of re-drawing the entire sidebar+grid from scratch.
     #[allow(clippy::too_many_arguments)]
     pub fn render(
-        &self,
+        &mut self,
         painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
         font_label: &sdl2::ttf::Font,
@@ -977,10 +1032,33 @@ impl App {
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
-        painter.clear(ui::BG);
-        self.render_home(
-            painter, text_cache, font_label, font_value, font_title, icon_font, screen_w, screen_h,
-        )?;
+        if matches!(self.screen, Screen::Home) {
+            // A Home frame proves what the *current* true state looks like, but
+            // that hasn't been captured into `home_layer` (this draw bypassed it
+            // entirely) — leave the cache marked stale so the first modal frame
+            // afterward re-renders it once before trusting it.
+            self.home_dirty = true;
+            painter.clear(ui::BG);
+            self.render_home(
+                painter, text_cache, font_label, font_value, font_title, icon_font, screen_w, screen_h,
+            )?;
+        } else {
+            let mut layer = self
+                .home_layer
+                .take()
+                .unwrap_or_else(|| Painter::new(screen_w, screen_h));
+            if self.home_dirty {
+                layer.clear(ui::BG);
+                self.render_home(
+                    &mut layer, text_cache, font_label, font_value, font_title, icon_font, screen_w, screen_h,
+                )?;
+                self.home_dirty = false;
+            }
+            // `blit_layer` below overwrites every pixel unconditionally, making a
+            // `clear()` here redundant work — skip it.
+            painter.blit_layer(&layer);
+            self.home_layer = Some(layer);
+        }
 
         match self.screen {
             Screen::Home => {}
@@ -1099,11 +1177,9 @@ impl App {
         painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
         icon_font: &sdl2::ttf::Font,
-        screen_w: u32,
-        screen_h: u32,
         card: Rect,
     ) -> Result<()> {
-        ui::draw_modal_backdrop(painter, screen_w, screen_h);
+        ui::draw_modal_backdrop(painter);
         ui::draw_modal_card(painter, card);
         ui::draw_icon(
             painter,
@@ -1127,7 +1203,7 @@ impl App {
         screen_h: u32,
     ) -> Result<()> {
         let card = Self::pairing_card_rect(screen_w, screen_h);
-        self.draw_modal_shell(painter, text_cache, icon_font, screen_w, screen_h, card)?;
+        self.draw_modal_shell(painter, text_cache, icon_font, card)?;
 
         ui::draw_text(
             painter,
@@ -1197,7 +1273,7 @@ impl App {
         screen_h: u32,
     ) -> Result<()> {
         let (card, content) = Self::settings_layout(screen_w, screen_h);
-        self.draw_modal_shell(painter, text_cache, icon_font, screen_w, screen_h, card)?;
+        self.draw_modal_shell(painter, text_cache, icon_font, card)?;
         ui::draw_text(
             painter,
             text_cache,
@@ -1258,7 +1334,7 @@ impl App {
         screen_h: u32,
     ) -> Result<()> {
         let card = Self::add_host_card_rect(screen_w, screen_h);
-        self.draw_modal_shell(painter, text_cache, icon_font, screen_w, screen_h, card)?;
+        self.draw_modal_shell(painter, text_cache, icon_font, card)?;
 
         ui::draw_text(
             painter,
@@ -1311,7 +1387,7 @@ impl App {
     ) -> Result<()> {
         let Some(wake) = &self.wake else { return Ok(()) };
         let card = Self::wake_card_rect(screen_w, screen_h);
-        self.draw_modal_shell(painter, text_cache, icon_font, screen_w, screen_h, card)?;
+        self.draw_modal_shell(painter, text_cache, icon_font, card)?;
 
         ui::draw_text(
             painter,

@@ -225,9 +225,13 @@ mod real {
                 match event {
                     Event::MouseButtonDown {
                         mouse_btn: sdl2::mouse::MouseButton::Left,
+                        x,
+                        y,
                         ..
                     } => {
-                        if let Some(target) = app.handle_mouse_click(log) {
+                        if let Some(target) =
+                            app.handle_mouse_click(x, y, display_mode.w as u32, display_mode.h as u32, log)
+                        {
                             break 'ui target;
                         }
                         continue;

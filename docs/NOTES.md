@@ -123,6 +123,50 @@ state-machine loops with no natural seam, for a line-count threshold alone.
   (≥3.31) refuses vendored libopus's old `cmake_minimum_required` — set
   `CMAKE_POLICY_VERSION_MINIMUM=3.5` (a plain, non-target-scoped env var) when building.
 
+## UI rendering performance, round 2 (2026-07-20)
+
+tiny-skia's general shader/blend pipeline (`fill_rect`/`draw_pixmap`) has a large, roughly fixed
+per-call cost on this hardware, independent of what's actually drawn — confirmed twice via on-device
+timing logs (same deploy-and-read-the-log loop as the soft-float fix above). `draw_modal_backdrop`'s
+full-screen semi-transparent fill cost ~300ms alone; a full-frame cache-layer blit cost ~330-350ms —
+*more* than the render it was meant to avoid. Both fixed by bypassing the pipeline entirely for
+full-buffer work: `Painter::dim` (a raw per-pixel darken loop) and `Painter::blit_layer`
+(`copy_from_slice`). **Never route a full-frame or large-area copy/fill through
+`draw_pixmap`/`fill_rect` on this target — use a raw `pixmap.data_mut()` loop or `copy_from_slice`,
+and verify with real timing logs rather than assuming a call is cheap.**
+
+Two smaller wins (~15-25% each, real but not dominant): `Painter::draw_pixmap_scaled` uses
+`FilterQuality::Nearest` instead of `Bilinear` (avoids `Pattern::push_stages`'s extra interpolation
+stages), and `ui::solid_paint` sets `anti_alias = false` (a genuinely separate, cheaper
+scan-conversion path in tiny-skia).
+
+`App::render` caches the Home (sidebar+grid) layer while a modal is on top of it
+(`home_layer`/`home_dirty`) instead of redrawing it every frame — Home alone cost ~170-190ms,
+previously repaid on every Settings frame even though Settings never touches Home's content. A
+Home-screen frame still draws straight into `painter` (zero extra cost there); every mutation site
+that can change Home's content (`select_host`, `drain_games`, `drain_discovery`, `drain_art`,
+`forget_host`) sets `home_dirty` explicitly, rather than inferring it from event types in `main.rs`
+(an earlier, inference-based version of this cache was fragile and got reverted).
+
+Two real bugs found alongside the perf work:
+- `hover_close` was only ever cleared by modal-screen code, never by `Screen::Home` — hovering or
+  clicking a modal's close button, then returning to Home, left it stuck `true` forever, silently
+  swallowing every subsequent Home click. Fixed in `handle_mouse_motion`'s `Screen::Home` arm.
+- `handle_mouse_click` now re-syncs focus to the click's own `(x, y)` first, rather than trusting
+  whatever the last `MouseMotion` left behind — a `MouseButtonDown` can carry a slightly different
+  position (the button press itself can jostle the remote), so confirming on stale hover state was a
+  real, if smaller, contributor to "sometimes needs two clicks."
+
+Cosmetic: `ui::draw_dropdown_overlay` now draws one shadow for the whole panel instead of every
+option row casting its own (used to bleed into the gaps between rows). The blue focus-ring outline
+(`ui::draw_focus_ring`) now only draws on game/Desktop grid selection, not sidebar/settings rows —
+narrowed per request, not removed outright.
+
+**Not yet done**: `rustup`'s prebuilt `std`/`core` still carry the old default `soft-float` codegen
+(the `.cargo/config.toml` fix only affects crates built fresh for this target) — nightly
+`-Z build-std` would close that gap but is a bigger toolchain change, worth it only if profiling
+still shows cost unexplained by the app's own draw calls.
+
 ## Runtime/deploy gotchas (LG CX specifics)
 
 - Homebrew apps install to `/media/developer/apps/usr/palm/applications/<appid>/`; the jailer
