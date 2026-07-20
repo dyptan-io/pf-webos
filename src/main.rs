@@ -67,6 +67,22 @@ mod real {
             .with_context(|| format!("open log file {}", log_path.display()))?;
         writeln!(log, "punktfunk-webos starting")?;
 
+        // Without this, punktfunk-core's own `tracing::info!`/`warn!` calls — including the
+        // startup link-capacity probe's measured throughput and the ABR ceiling it derives from
+        // it — are silent no-ops (nothing installs a subscriber by default). A fresh handle to
+        // the same file, not `log.try_clone()`, since this subscriber outlives `run_inner`'s
+        // `&mut log` borrow for the whole process.
+        let tracing_log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("open log file {} for tracing", log_path.display()))?;
+        tracing_subscriber::fmt()
+            .with_writer(std::sync::Mutex::new(tracing_log))
+            .with_ansi(false)
+            .with_target(false)
+            .init();
+
         // Errors from here on only ever reached stderr, which is invisible for a
         // webOS native app with no attached terminal.
         match run_inner(&mut log) {

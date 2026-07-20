@@ -100,6 +100,13 @@ pub struct App {
     pub screen: Screen,
     pub known_hosts: Vec<KnownHost>,
     pub discovered: std::sync::mpsc::Receiver<crate::discovery::DiscoveredHost>,
+    /// `None` if `discovery::browse` couldn't even start (`ServiceDaemon::new` failed —
+    /// `discovered` is then a permanently-empty channel, harmless for `drain_discovery`'s
+    /// `try_recv` loop). `Some` lets `Drop` shut the background mDNS thread down explicitly
+    /// instead of relying on `discovered` being dropped — dropping the receiver alone doesn't
+    /// reliably stop it (see `discovery::browse`'s docs), and it was confirmed still burning
+    /// CPU/network well into active game-streaming sessions, long after this `App` was gone.
+    discovery_daemon: Option<mdns_sd::ServiceDaemon>,
     pub entries: Vec<HostEntry>,
     pub home_focus: HomeFocus,
     /// The sidebar host whose games are shown in the grid — `None` until one is
@@ -157,6 +164,14 @@ pub struct App {
     home_dirty: bool,
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(daemon) = &self.discovery_daemon {
+            let _ = daemon.shutdown();
+        }
+    }
+}
+
 impl App {
     pub fn new(identity: (String, String), log: &mut std::fs::File) -> Self {
         let known_hosts = store::load_known_hosts();
@@ -165,10 +180,15 @@ impl App {
         // `main.rs::log_path`) for the mdns background thread to log through, since
         // it can't share this `&mut File` across threads.
         let discovery_log = log.try_clone().expect("clone log file handle for mdns thread");
+        let (discovered, discovery_daemon) = match crate::discovery::browse(discovery_log) {
+            Some((rx, daemon)) => (rx, Some(daemon)),
+            None => (std::sync::mpsc::channel().1, None),
+        };
         let mut app = Self {
             screen: Screen::Home,
             known_hosts,
-            discovered: crate::discovery::browse(discovery_log),
+            discovered,
+            discovery_daemon,
             entries,
             home_focus: HomeFocus::Sidebar(0),
             selected_host: None,
@@ -1307,7 +1327,15 @@ impl App {
         // as the gap this heading had to the subtitle beneath it, which is
         // what actually read as "misaligned" rather than just crowded.
         let title_y = card.y() + 36;
-        ui::draw_text(painter, text_cache, font_label, "Pair with host", card.x() + 32, title_y, ui::WHITE)?;
+        ui::draw_text(
+            painter,
+            text_cache,
+            font_label,
+            "Pair with host",
+            card.x() + 32,
+            title_y,
+            ui::WHITE,
+        )?;
 
         let subtitle_y = title_y + font_label.height() + 18;
         ui::draw_text(
@@ -1472,7 +1500,12 @@ impl App {
         // A blinkless text-cursor bar right after what's typed so far — there's
         // no fixed-width mask anymore to show *where* editing happens, so this
         // stands in for it.
-        let caret = Rect::new(text_x + text_w as i32 + 6, drawn.y() + 16, 3, drawn.height().saturating_sub(32));
+        let caret = Rect::new(
+            text_x + text_w as i32 + 6,
+            drawn.y() + 16,
+            3,
+            drawn.height().saturating_sub(32),
+        );
         painter.fill_rect(caret, ui::ACCENT_BRIGHT);
         Ok(())
     }
@@ -1554,7 +1587,11 @@ impl App {
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
-        let Some(name) = self.host_menu_index.and_then(|i| self.entries.get(i)).map(HostEntry::name) else {
+        let Some(name) = self
+            .host_menu_index
+            .and_then(|i| self.entries.get(i))
+            .map(HostEntry::name)
+        else {
             return Ok(());
         };
         let card = Self::forget_host_card_rect(screen_w, screen_h);

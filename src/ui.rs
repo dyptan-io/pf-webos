@@ -993,7 +993,11 @@ fn draw_utility_row(
     label: &str,
     focused: bool,
 ) -> Result<()> {
-    let glyph = if label.starts_with('+') { ICON_ADD } else { ICON_SETTINGS };
+    let glyph = if label.starts_with('+') {
+        ICON_ADD
+    } else {
+        ICON_SETTINGS
+    };
     let label = label.trim_start_matches('+').trim();
     draw_sidebar_row(painter, text_cache, font_label, icon_font, rect, glyph, label, focused)
 }
@@ -1111,6 +1115,13 @@ pub const REFRESH_RATES: [u32; 3] = [30, 60, 120];
 pub const BITRATE_MIN_KBPS: u32 = 10_000;
 pub const BITRATE_MAX_KBPS: u32 = 150_000;
 pub const BITRATE_STEP_KBPS: u32 = 5_000;
+/// Sentinel one notch below `BITRATE_MIN_KBPS` on the slider: `punktfunk_core::client::NativeClient`
+/// arms its own client-side AIMD bitrate controller (`punktfunk_core::abr`) precisely when it's
+/// asked to connect with `bitrate_kbps == 0` — it reacts to unrecoverable frames, heavy loss,
+/// one-way-delay rise, and (via `session.rs`'s `report_decode_us` call) decode latency, backing off
+/// or climbing every ~750ms. A fixed Mbps number, however carefully picked, never adapts to a link
+/// that degrades mid-session — this does.
+pub const BITRATE_AUTOMATIC: u32 = 0;
 /// Above this, aurora-tv's own moonlight-tv wiki notes stability drops off on
 /// typical Wi-Fi — shown as an amber caution, matching the reference's settings
 /// pane (not a hard cap, the slider still allows up to `BITRATE_MAX_KBPS`).
@@ -1152,8 +1163,11 @@ fn resolution_label(width: u32, height: u32) -> String {
 }
 
 pub fn settings_rows(settings: &Settings) -> Vec<SettingsRow> {
-    let bitrate_frac =
-        (settings.bitrate_kbps.saturating_sub(BITRATE_MIN_KBPS)) as f32 / (BITRATE_MAX_KBPS - BITRATE_MIN_KBPS) as f32;
+    let bitrate_frac = if settings.bitrate_kbps == BITRATE_AUTOMATIC {
+        0.0
+    } else {
+        (settings.bitrate_kbps.saturating_sub(BITRATE_MIN_KBPS)) as f32 / (BITRATE_MAX_KBPS - BITRATE_MIN_KBPS) as f32
+    };
     vec![
         SettingsRow {
             label: "Resolution".into(),
@@ -1169,7 +1183,11 @@ pub fn settings_rows(settings: &Settings) -> Vec<SettingsRow> {
         },
         SettingsRow {
             label: "Bitrate".into(),
-            value: format!("{} Mbps", settings.bitrate_kbps / 1000),
+            value: if settings.bitrate_kbps == BITRATE_AUTOMATIC {
+                "Automatic".into()
+            } else {
+                format!("{} Mbps", settings.bitrate_kbps / 1000)
+            },
             kind: RowKind::Slider,
             fraction: bitrate_frac,
         },
@@ -1242,10 +1260,19 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
             true
         }
         ROW_BITRATE => {
-            let delta = i64::from(BITRATE_STEP_KBPS) * if forward { 1 } else { -1 };
-            let next = (i64::from(settings.bitrate_kbps) + delta)
-                .clamp(i64::from(BITRATE_MIN_KBPS), i64::from(BITRATE_MAX_KBPS));
-            settings.bitrate_kbps = next as u32;
+            if settings.bitrate_kbps == BITRATE_AUTOMATIC {
+                if forward {
+                    settings.bitrate_kbps = BITRATE_MIN_KBPS;
+                }
+                // Already at the floor going backward from Automatic — nothing below it.
+            } else if !forward && settings.bitrate_kbps == BITRATE_MIN_KBPS {
+                settings.bitrate_kbps = BITRATE_AUTOMATIC;
+            } else {
+                let delta = i64::from(BITRATE_STEP_KBPS) * if forward { 1 } else { -1 };
+                let next = (i64::from(settings.bitrate_kbps) + delta)
+                    .clamp(i64::from(BITRATE_MIN_KBPS), i64::from(BITRATE_MAX_KBPS));
+                settings.bitrate_kbps = next as u32;
+            }
             true
         }
         ROW_HDR => {
