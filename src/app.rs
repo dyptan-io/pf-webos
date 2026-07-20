@@ -22,6 +22,10 @@ pub enum Screen {
     /// "This configured host is unreachable — send it a Wake-on-LAN signal?" — see
     /// `WakeState`'s docs.
     Wake,
+    /// "Forget this host?" — a centered Forget/Cancel confirmation, entered by
+    /// a long-press of OK on a sidebar host row (see `main.rs`'s hold-timer).
+    /// Which host is `App::host_menu_index`.
+    ForgetHost,
 }
 
 /// How often the magic packet is re-sent while a wake is in flight — see
@@ -114,6 +118,14 @@ pub struct App {
     pub settings: Settings,
     pub settings_focused: usize,
     pub dropdown: Option<DropdownState>,
+    /// The sidebar row `Screen::ForgetHost` is confirming forgetting — set
+    /// alongside `screen = Screen::ForgetHost` (see `App::open_forget_host`),
+    /// `None` otherwise.
+    pub host_menu_index: Option<usize>,
+    /// Which `Screen::ForgetHost` button has focus: `0` = "Forget", `1` =
+    /// "Cancel". Defaults to Cancel (see `open_forget_host`) — a destructive
+    /// action shouldn't be one more accidental OK press away.
+    pub host_menu_focused: usize,
     pub add_host: AddHostState,
     /// The active "host unreachable — wake it?" prompt/wait, if any — see `WakeState`.
     pub wake: Option<WakeState>,
@@ -168,6 +180,8 @@ impl App {
             settings: store::load_settings(),
             settings_focused: 0,
             dropdown: None,
+            host_menu_index: None,
+            host_menu_focused: 1,
             add_host: AddHostState::default(),
             wake: None,
             pin_digits: [0; 4],
@@ -300,6 +314,52 @@ impl App {
         }
     }
 
+    /// Whether the sidebar currently has focus on an actual host row (not
+    /// "+ Add host"/"Settings") — the only situation where `main.rs` holding
+    /// OK down means "open the Forget confirmation" rather than that button's
+    /// normal short-press action. Returns the focused row's index into
+    /// `entries`.
+    pub fn host_row_focused(&self) -> Option<usize> {
+        if !matches!(self.screen, Screen::Home) {
+            return None;
+        }
+        match self.home_focus {
+            HomeFocus::Sidebar(i) if i < self.entries.len() => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Enters `Screen::ForgetHost` for the sidebar row at `idx` — called from
+    /// `main.rs` once an OK hold on that row crosses `LONG_PRESS_CONFIRM`.
+    pub fn open_forget_host(&mut self, idx: usize) {
+        self.host_menu_index = Some(idx);
+        self.host_menu_focused = 1;
+        self.screen = Screen::ForgetHost;
+    }
+
+    /// Handles one menu event on the `Screen::ForgetHost` confirmation.
+    /// Left/Right toggle which button has focus; Confirm acts on it (forgets
+    /// the host, or just backs out for Cancel); Back is the same as Cancel.
+    pub fn handle_forget_host_event(&mut self, ev: MenuEvent) {
+        match ev {
+            MenuEvent::Left | MenuEvent::Right => self.host_menu_focused = 1 - self.host_menu_focused,
+            MenuEvent::Confirm => {
+                if self.host_menu_focused == 0 {
+                    if let Some(idx) = self.host_menu_index {
+                        self.forget_host(idx);
+                    }
+                }
+                self.host_menu_index = None;
+                self.screen = Screen::Home;
+            }
+            MenuEvent::Back => {
+                self.host_menu_index = None;
+                self.screen = Screen::Home;
+            }
+            MenuEvent::Up | MenuEvent::Down | MenuEvent::Secondary => {}
+        }
+    }
+
     /// Handles one menu event on the Home screen (sidebar + grid). Returns a
     /// `ConnectTarget` when a grid card is confirmed.
     pub fn handle_home_event(
@@ -379,6 +439,46 @@ impl App {
             MenuEvent::Back => {}
         }
         None
+    }
+
+    /// Applies a `Back` to whichever screen is current — the single shared
+    /// definition of "what Back means here" for every caller that needs it
+    /// pre-emptively rather than through the normal per-screen `MenuEvent`
+    /// dispatch: `main.rs`'s keyboard/gamepad Back shortcut on Home (straight
+    /// to Settings) and a modal's close (X) button click
+    /// (`handle_mouse_click`'s `hover_close` branch below).
+    pub fn back(&mut self, log: &mut std::fs::File) -> Option<ConnectTarget> {
+        match self.screen {
+            // Home has nothing to "back out" of (it's the root screen) — Back is a
+            // shortcut straight to Settings instead, since it's otherwise reachable
+            // only via the sidebar's trailing row.
+            Screen::Home => {
+                self.screen = Screen::Settings;
+                self.dropdown = None;
+                self.settings_focused = 0;
+                None
+            }
+            Screen::Pairing => {
+                self.handle_pairing_event(MenuEvent::Back, log);
+                None
+            }
+            Screen::Settings => {
+                self.handle_settings_event(MenuEvent::Back);
+                None
+            }
+            Screen::AddHost => {
+                self.handle_add_host_event(MenuEvent::Back);
+                None
+            }
+            Screen::Wake => {
+                self.handle_wake_event(MenuEvent::Back, log);
+                None
+            }
+            Screen::ForgetHost => {
+                self.handle_forget_host_event(MenuEvent::Back);
+                None
+            }
+        }
     }
 
     fn confirm_sidebar_host(&mut self, idx: usize, log: &mut std::fs::File) {
@@ -790,51 +890,33 @@ impl App {
         }
     }
 
-    /// Handles one menu event on the manual add-host modal (17 digit slots: four
-    /// 3-digit IP octets + a 5-digit port — see `ui::AddHostState`).
+    /// Handles one menu event on the manual add-host modal — a plain, growing
+    /// IP digit string with no port field (see `ui::AddHostState`'s docs).
+    /// Left/Right stand in for backspace/"next octet" (no dot key on the
+    /// remote); Confirm submits once four octets have been typed.
     pub fn handle_add_host_event(&mut self, ev: MenuEvent) {
         match ev {
-            MenuEvent::Left => {
-                let d = &mut self.add_host.digits[self.add_host.index];
-                *d = (*d + 9) % 10;
-                self.add_host.touch_current();
-            }
-            MenuEvent::Right => {
-                let d = &mut self.add_host.digits[self.add_host.index];
-                *d = (*d + 1) % 10;
-                self.add_host.touch_current();
-            }
-            MenuEvent::Up => {
-                if self.add_host.index > 0 {
-                    self.add_host.index -= 1;
-                }
-            }
-            MenuEvent::Down => {
-                if self.add_host.index + 1 < self.add_host.digits.len() {
-                    self.add_host.index += 1;
-                } else {
-                    self.confirm_add_host();
-                }
-            }
+            MenuEvent::Left => self.add_host.backspace(),
+            MenuEvent::Right => self.add_host.advance_octet(),
+            MenuEvent::Up | MenuEvent::Down | MenuEvent::Secondary => {}
             MenuEvent::Confirm => self.confirm_add_host(),
             MenuEvent::Back => self.screen = Screen::Home,
-            MenuEvent::Secondary => {}
         }
     }
 
     /// Direct digit entry (the Magic Remote's number buttons) on the add-host
     /// modal — same auto-advance idiom as `enter_pin_digit`.
     pub fn enter_add_host_digit(&mut self, digit: u8) {
-        self.add_host.digits[self.add_host.index] = digit;
-        self.add_host.touch_current();
-        if self.add_host.index + 1 < self.add_host.digits.len() {
-            self.add_host.index += 1;
-        } else {
-            self.confirm_add_host();
-        }
+        self.add_host.enter_digit(digit);
     }
 
+    /// No-op until all four octets have been typed (`ui::AddHostState::is_complete`)
+    /// — Confirm on a still-partial address just does nothing rather than
+    /// connecting to a truncated/zero-padded guess.
     fn confirm_add_host(&mut self) {
+        if !self.add_host.is_complete() {
+            return;
+        }
         let (host, port) = self.add_host.host_and_port();
         store::upsert_known_host(
             &mut self.known_hosts,
@@ -861,9 +943,14 @@ impl App {
     // ---------------------------------------------------------------- mouse --
 
     /// The pairing modal's card rect — shared by `render_pairing` and mouse
-    /// hit-testing so they can never disagree.
+    /// hit-testing so they can never disagree. Taller than a plain guess at
+    /// "title + subtitle + PIN boxes + status" would suggest: at this app's
+    /// actual 4K-panel font scale (`ui::load_font` scales off the real display
+    /// height, not the 720px design reference) the title/subtitle lines run
+    /// much taller than the old fixed 340px card had room for, which is what
+    /// read as misaligned/crowded text — see `render_pairing`'s spacing.
     fn pairing_card_rect(screen_w: u32, screen_h: u32) -> Rect {
-        ui::modal_card_rect(screen_w, screen_h, 0.36, 340)
+        ui::modal_card_rect(screen_w, screen_h, 0.36, 440)
     }
 
     /// The add-host modal's card rect — shared by `render_add_host` and mouse
@@ -875,6 +962,12 @@ impl App {
     /// The wake modal's card rect — shared by `render_wake` and mouse hit-testing.
     fn wake_card_rect(screen_w: u32, screen_h: u32) -> Rect {
         ui::modal_card_rect(screen_w, screen_h, 0.42, 420)
+    }
+
+    /// The "Forget this host?" confirmation's card rect — shared by
+    /// `render_forget_host` and mouse hit-testing.
+    fn forget_host_card_rect(screen_w: u32, screen_h: u32) -> Rect {
+        ui::modal_card_rect(screen_w, screen_h, 0.34, 260)
     }
 
     /// The settings modal's card/content rects — shared by `render` and mouse
@@ -912,7 +1005,7 @@ impl App {
                 // change" bool — Home never draws a close button, so this has no
                 // visual effect of its own.
                 self.hover_close = false;
-                if let Some(idx) = ui::hit_test_sidebar_row(x, y, self.sidebar_len()) {
+                if let Some(idx) = ui::hit_test_sidebar_row(x, y, self.sidebar_len(), screen_h) {
                     let changed = self.home_focus != HomeFocus::Sidebar(idx);
                     self.home_focus = HomeFocus::Sidebar(idx);
                     return changed;
@@ -944,16 +1037,18 @@ impl App {
                 }
                 changed
             }
-            Screen::Pairing => {
-                let card = Self::pairing_card_rect(screen_w, screen_h);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
-            }
-            Screen::AddHost => {
-                let card = Self::add_host_card_rect(screen_w, screen_h);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
-            }
-            Screen::Wake => {
-                let card = Self::wake_card_rect(screen_w, screen_h);
+            // Pairing/AddHost/Wake/ForgetHost are plain single-card modals with
+            // nothing but the close button to hover-test (unlike Settings
+            // above, which also tracks per-row hover) — same one-liner for
+            // all four, just a different card rect.
+            Screen::Pairing | Screen::AddHost | Screen::Wake | Screen::ForgetHost => {
+                let card = match self.screen {
+                    Screen::Pairing => Self::pairing_card_rect(screen_w, screen_h),
+                    Screen::AddHost => Self::add_host_card_rect(screen_w, screen_h),
+                    Screen::Wake => Self::wake_card_rect(screen_w, screen_h),
+                    Screen::ForgetHost => Self::forget_host_card_rect(screen_w, screen_h),
+                    Screen::Home | Screen::Settings => unreachable!(),
+                };
                 self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
             }
         }
@@ -988,14 +1083,8 @@ impl App {
         // intervening motion event to race against).
         self.handle_mouse_motion(x, y, screen_w, screen_h);
         if self.hover_close {
-            match self.screen {
-                Screen::Settings => self.handle_settings_event(MenuEvent::Back),
-                Screen::Pairing => self.handle_pairing_event(MenuEvent::Back, log),
-                Screen::AddHost => self.handle_add_host_event(MenuEvent::Back),
-                Screen::Wake => self.handle_wake_event(MenuEvent::Back, log),
-                Screen::Home => {}
-            }
-            return None;
+            // Same "what Back means here" as everywhere else — see `back`'s docs.
+            return self.back(log);
         }
         match self.screen {
             Screen::Home => self.handle_home_event(MenuEvent::Confirm, screen_w, log),
@@ -1006,6 +1095,10 @@ impl App {
             Screen::Pairing | Screen::AddHost => None,
             Screen::Wake => {
                 self.handle_wake_event(MenuEvent::Confirm, log);
+                None
+            }
+            Screen::ForgetHost => {
+                self.handle_forget_host_event(MenuEvent::Confirm);
                 None
             }
         }
@@ -1077,6 +1170,9 @@ impl App {
             )?,
             Screen::Wake => self.render_wake(
                 painter, text_cache, font_label, font_title, icon_font, screen_w, screen_h,
+            )?,
+            Screen::ForgetHost => self.render_forget_host(
+                painter, text_cache, font_label, font_value, icon_font, screen_w, screen_h,
             )?,
         }
         Ok(())
@@ -1205,33 +1301,37 @@ impl App {
         let card = Self::pairing_card_rect(screen_w, screen_h);
         self.draw_modal_shell(painter, text_cache, icon_font, card)?;
 
-        ui::draw_text(
-            painter,
-            text_cache,
-            font_title,
-            "Pair with host",
-            card.x() + 32,
-            card.y() + 28,
-            ui::WHITE,
-        )?;
+        // Title in `font_label`, matching the Settings/Add-host modals'
+        // heading size — `font_title` (also used for the PIN digits below, at
+        // a deliberately large display-style size) ran nearly twice as tall
+        // as the gap this heading had to the subtitle beneath it, which is
+        // what actually read as "misaligned" rather than just crowded.
+        let title_y = card.y() + 36;
+        ui::draw_text(painter, text_cache, font_label, "Pair with host", card.x() + 32, title_y, ui::WHITE)?;
+
+        let subtitle_y = title_y + font_label.height() + 18;
         ui::draw_text(
             painter,
             text_cache,
             font_label,
-            "Enter the PIN shown in the host's pairing dialog.",
+            "Enter the PIN from the host's pairing dialog.",
             card.x() + 32,
-            card.y() + 84,
+            subtitle_y,
             ui::MUTED,
         )?;
 
+        // A clear, generous gap below the subtitle — the PIN entry is this
+        // screen's whole point, and it read as cramped sitting right under
+        // the subtitle text.
+        let digit_h = 80u32;
+        let digit_y = subtitle_y + font_label.height() + 44;
         let digit_w = 64i32;
         let digit_gap = 14i32;
         let total_w = 4 * digit_w + 3 * digit_gap;
         let start_x = card.x() + (card.width() as i32 - total_w) / 2;
-        let digit_y = card.y() + 130;
         for (i, digit) in self.pin_digits.iter().enumerate() {
             let x = start_x + i as i32 * (digit_w + digit_gap);
-            let rect = Rect::new(x, digit_y, digit_w as u32, 80);
+            let rect = Rect::new(x, digit_y, digit_w as u32, digit_h);
             let focused = i == self.pin_digit_index;
             let drawn = ui::draw_card(painter, rect, focused);
             let text = digit.to_string();
@@ -1254,7 +1354,7 @@ impl App {
                 font_label,
                 status,
                 card.x() + 32,
-                digit_y + 100,
+                digit_y + digit_h as i32 + 32,
                 color,
             )?;
         }
@@ -1349,28 +1449,31 @@ impl App {
             painter,
             text_cache,
             font_value,
-            "Enter the host's IP address and port.",
+            "Enter the host's IP address.",
             card.x() + 32,
             card.y() + 74,
             ui::MUTED,
         )?;
 
-        let text = self.add_host.display_text();
-        let focus_char = self.add_host.focus_char_index();
         let field = Rect::new(card.x() + 32, card.y() + 120, card.width().saturating_sub(64), 80);
         let drawn = ui::draw_card(painter, field, true);
-        let text_w = font_title.size_of(&text).map_or(0, |(w, _)| w);
-        ui::draw_highlighted_text(
+        let text_x = drawn.x() + 24;
+        let typed = self.add_host.display_text();
+        let text_w = font_title.size_of(&typed).map_or(0, |(w, _)| w);
+        ui::draw_text(
             painter,
             text_cache,
             font_title,
-            &text,
-            focus_char,
-            drawn.x() + (drawn.width() as i32 - text_w as i32) / 2,
+            &typed,
+            text_x,
             drawn.y() + (drawn.height() as i32 - font_title.height()) / 2,
             ui::WHITE,
-            ui::ACCENT_BRIGHT,
         )?;
+        // A blinkless text-cursor bar right after what's typed so far — there's
+        // no fixed-width mask anymore to show *where* editing happens, so this
+        // stands in for it.
+        let caret = Rect::new(text_x + text_w as i32 + 6, drawn.y() + 16, 3, drawn.height().saturating_sub(32));
+        painter.fill_rect(caret, ui::ACCENT_BRIGHT);
         Ok(())
     }
 
@@ -1436,6 +1539,66 @@ impl App {
             send_label,
             wake.focused,
             self.settings.wol_auto_send,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_forget_host(
+        &self,
+        painter: &mut Painter,
+        text_cache: &mut crate::ui::TextCache,
+        font_label: &sdl2::ttf::Font,
+        font_value: &sdl2::ttf::Font,
+        icon_font: &sdl2::ttf::Font,
+        screen_w: u32,
+        screen_h: u32,
+    ) -> Result<()> {
+        let Some(name) = self.host_menu_index.and_then(|i| self.entries.get(i)).map(HostEntry::name) else {
+            return Ok(());
+        };
+        let card = Self::forget_host_card_rect(screen_w, screen_h);
+        self.draw_modal_shell(painter, text_cache, icon_font, card)?;
+
+        ui::draw_text(
+            painter,
+            text_cache,
+            font_label,
+            "Forget this host?",
+            card.x() + 32,
+            card.y() + 28,
+            ui::WHITE,
+        )?;
+        ui::draw_text(
+            painter,
+            text_cache,
+            font_value,
+            &format!("\"{name}\" will be removed from your host list."),
+            card.x() + 32,
+            card.y() + 74,
+            ui::MUTED,
+        )?;
+
+        let content = Rect::new(card.x() + 32, card.y() + 150, card.width().saturating_sub(64), 72);
+        ui::draw_confirm_buttons(
+            painter,
+            text_cache,
+            font_label,
+            icon_font,
+            content,
+            &[
+                ui::ConfirmButton {
+                    icon: Some(ui::ICON_DELETE),
+                    label: "Forget",
+                    color: ui::ERROR_RED,
+                },
+                ui::ConfirmButton {
+                    icon: None,
+                    label: "Cancel",
+                    color: ui::WHITE,
+                },
+            ],
+            self.host_menu_focused,
         )?;
         Ok(())
     }

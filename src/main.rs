@@ -90,23 +90,17 @@ mod real {
         }
     }
 
-    /// How long the *keyboard*/*gamepad* Back-equivalent must be held during a
+    /// How long the keyboard/gamepad Back-equivalent must be held during a
     /// stream before it disconnects and returns to the menu — long enough that a
     /// normal game-input tap of the same physical button (many games use
-    /// B/Back-ish buttons) never triggers it. The Magic Remote's own physical Back
-    /// (`ui::webos_back_button_down`)/Red (`webos_red_button_down`) keys need no
-    /// such hold: they're never forwarded to the host as game input, so an
-    /// immediate press is unambiguous.
+    /// B/Back-ish buttons) never triggers it.
     const LONG_PRESS_BACK: Duration = Duration::from_millis(1500);
 
-    /// How long the Magic Remote's real Back/Red must be held (continuously, checked
-    /// live during the hold rather than waiting for release) before quitting the app
-    /// outright, rather than just disconnecting to the menu — this app's own timer,
-    /// not the system's (see `run_inner`'s docs on why relying on webOS's own
-    /// long-press/Exit gesture turned out unreliable). Distinctly longer than
-    /// `LONG_PRESS_BACK` so it reads as a deliberate "hold much longer to quit", not
-    /// an accidental extension of a plain disconnect.
-    const HW_BACK_HOLD_QUITS: Duration = Duration::from_millis(2500);
+    /// How long OK must be held on a sidebar host row before it opens
+    /// `Screen::ForgetHost` instead of that row's normal short-press action
+    /// (connect/pair) — see `run_ui_flow`'s `confirm_held_since`. Short enough
+    /// not to feel unresponsive, long enough that a normal tap never triggers it.
+    const LONG_PRESS_CONFIRM: Duration = Duration::from_millis(500);
 
     enum StreamOutcome {
         /// The system asked the app to close (not just this stream) — exit fully.
@@ -114,42 +108,6 @@ mod real {
         /// The host ended the session, or the user held Back — go back to the
         /// host-list/settings UI instead of exiting the app.
         ReturnToMenu,
-    }
-
-    /// Applies a `Back` to whichever screen is current — shared by the normal
-    /// keyboard/gamepad dispatch and the raw scancode poll below (the real Back
-    /// button, `ui::webos_back_button_down`, plus Red as a secondary trigger,
-    /// `ui::webos_red_button_down` — kept since the access-policy hint that lets
-    /// Back reach the app isn't honored consistently across every firmware/model,
-    /// see `docs/NOTES.md`).
-    fn apply_back(app: &mut App, log: &mut std::fs::File) -> Option<crate::app::ConnectTarget> {
-        match app.screen {
-            // Home has nothing to "back out" of (it's the root screen) — Back is a
-            // shortcut straight to Settings instead, since it's otherwise reachable
-            // only via the sidebar's trailing row.
-            Screen::Home => {
-                app.screen = Screen::Settings;
-                app.dropdown = None;
-                app.settings_focused = 0;
-                None
-            }
-            Screen::Pairing => {
-                app.handle_pairing_event(MenuEvent::Back, log);
-                None
-            }
-            Screen::Settings => {
-                app.handle_settings_event(MenuEvent::Back);
-                None
-            }
-            Screen::AddHost => {
-                app.handle_add_host_event(MenuEvent::Back);
-                None
-            }
-            Screen::Wake => {
-                app.handle_wake_event(MenuEvent::Back, log);
-                None
-            }
-        }
     }
 
     /// Runs the UI (host list -> pairing -> settings) until the user confirms a
@@ -188,15 +146,28 @@ mod real {
         // already-rasterized+premultiplied `Pixmap` instead of re-rasterizing
         // freetype glyphs on every ~60fps tick.
         let mut text_cache = crate::ui::TextCache::new();
-        let mut back_prev = false;
+        // Tracks an in-progress OK hold on a sidebar host row — see
+        // `LONG_PRESS_CONFIRM`'s docs and the poll below. `None` whenever OK
+        // isn't currently down (or the down happened somewhere a hold has no
+        // special meaning, e.g. a grid card, so it was dispatched immediately
+        // instead of being intercepted here at all).
+        let mut confirm_held_since: Option<Instant> = None;
+        // Set once the hold has already crossed `LONG_PRESS_CONFIRM` and
+        // opened `Screen::ForgetHost`, so the matching key-up doesn't *also*
+        // fire that row's normal short-press action.
+        let mut confirm_long_fired = false;
+        // Whether a Back-mapped key/button is currently held, per the
+        // keyboard/gamepad event stream — edge-detected so a single physical
+        // press dispatches Back exactly once no matter how SDL reports (or
+        // misreports) repeats for it.
+        let mut menu_back_down = false;
         // Redraw-on-change: this screen has no time-based animation at all (no
         // spinner/blink/marquee), so every pixel that can change only ever changes
-        // as a reaction to one of: an SDL event, a Discovery/art/library background
-        // result, or the raw scancode Back/Red edge below — anything else is a
-        // no-op tick. Without this, `app.render(...)` (and the `canvas.present()`
-        // vsync swap inside it) ran unconditionally every 16ms forever, even
-        // sitting on an untouched menu. Starts `true` so the first frame always
-        // draws.
+        // as a reaction to one of: an SDL event or a Discovery/art/library
+        // background result — anything else is a no-op tick. Without this,
+        // `app.render(...)` (and the `canvas.present()` vsync swap inside it) ran
+        // unconditionally every 16ms forever, even sitting on an untouched menu.
+        // Starts `true` so the first frame always draws.
         let mut dirty = true;
         let target = 'ui: loop {
             dirty |= app.drain_discovery(log);
@@ -223,17 +194,105 @@ mod real {
                 // them rather than re-litigate that per event kind.
                 dirty = true;
                 match event {
+                    // Same hold-vs-tap split as the keyboard/gamepad arms below,
+                    // for the Magic Remote's pointer mode: it delivers OK as a
+                    // plain mouse click, not a key event, so a physical
+                    // press-and-hold here never reached the keyboard/gamepad
+                    // arms at all — re-sync focus to the click's own position
+                    // first (see `handle_mouse_click`'s docs on why), then only
+                    // hold-time it while actually hovering a host row.
                     Event::MouseButtonDown {
                         mouse_btn: sdl2::mouse::MouseButton::Left,
                         x,
                         y,
                         ..
                     } => {
+                        app.handle_mouse_motion(x, y, display_mode.w as u32, display_mode.h as u32);
+                        if app.host_row_focused().is_some() {
+                            confirm_held_since.get_or_insert_with(Instant::now);
+                            continue;
+                        }
                         if let Some(target) =
                             app.handle_mouse_click(x, y, display_mode.w as u32, display_mode.h as u32, log)
                         {
                             break 'ui target;
                         }
+                        continue;
+                    }
+                    Event::MouseButtonUp {
+                        mouse_btn: sdl2::mouse::MouseButton::Left,
+                        x,
+                        y,
+                        ..
+                    } => {
+                        let held = confirm_held_since.take().is_some();
+                        if held && !confirm_long_fired {
+                            if let Some(target) =
+                                app.handle_mouse_click(x, y, display_mode.w as u32, display_mode.h as u32, log)
+                            {
+                                break 'ui target;
+                            }
+                        }
+                        confirm_long_fired = false;
+                        continue;
+                    }
+                    // OK pressed down on a sidebar host row: don't dispatch its
+                    // normal short-press action (connect/pair) yet — start
+                    // timing the hold instead, so a long-enough press opens
+                    // `Screen::ForgetHost` (checked below) instead.
+                    // `get_or_insert_with` rather than an unconditional
+                    // `Some(Instant::now())`: a held key can resend `KeyDown`
+                    // as an OS repeat, which must not keep resetting the clock
+                    // back to zero.
+                    Event::KeyDown { keycode: Some(k), .. }
+                        if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Confirm)
+                            && app.host_row_focused().is_some() =>
+                    {
+                        confirm_held_since.get_or_insert_with(Instant::now);
+                        continue;
+                    }
+                    Event::ControllerButtonDown { button, .. }
+                        if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Confirm)
+                            && app.host_row_focused().is_some() =>
+                    {
+                        confirm_held_since.get_or_insert_with(Instant::now);
+                        continue;
+                    }
+                    // Released before crossing `LONG_PRESS_CONFIRM`: it was a
+                    // plain tap, so fire the short-press action now, on
+                    // release, instead of on the down this intercepted.
+                    // Already-long-fired (menu opened) or never intercepted in
+                    // the first place (`confirm_held_since` is `None`): do
+                    // nothing here, the normal dispatch below already handled
+                    // (or never needed to handle) it.
+                    Event::KeyUp { keycode: Some(k), .. }
+                        if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Confirm) =>
+                    {
+                        let held = confirm_held_since.take().is_some();
+                        // Re-checks `Screen::Home` rather than trusting the
+                        // hold was still valid: a background event (e.g. a
+                        // library fetch failing into the Wake prompt) could in
+                        // principle have changed screens while OK was down.
+                        if held && !confirm_long_fired && matches!(app.screen, Screen::Home) {
+                            if let Some(target) = app.handle_home_event(MenuEvent::Confirm, display_mode.w as u32, log)
+                            {
+                                break 'ui target;
+                            }
+                        }
+                        confirm_long_fired = false;
+                        continue;
+                    }
+                    Event::ControllerButtonUp { button, .. }
+                        if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Confirm) =>
+                    {
+                        let held = confirm_held_since.take().is_some();
+                        if held && !confirm_long_fired && matches!(app.screen, Screen::Home) {
+                            if let Some(target) = app.handle_home_event(MenuEvent::Confirm, display_mode.w as u32, log)
+                            {
+                                break 'ui target;
+                            }
+                        }
+                        confirm_long_fired = false;
                         continue;
                     }
                     // Direct digit entry via the remote's number buttons — PIN entry
@@ -253,8 +312,52 @@ mod real {
                     _ => {}
                 }
                 let menu_ev = match event {
-                    Event::KeyDown { keycode: Some(k), .. } => crate::ui::menu_event_for_key(k),
-                    Event::ControllerButtonDown { button, .. } => crate::ui::menu_event_for_button(button),
+                    // Back is edge-triggered off `menu_back_down` (our own
+                    // tracked press/release state) rather than SDL's `repeat`
+                    // flag: OS key-repeat re-sends `KeyDown` for a key that's
+                    // still held, and without this a *held* Back cascaded
+                    // through every level of navigation in one go (e.g.
+                    // closing a Settings dropdown, then — from the very next
+                    // repeat, milliseconds later — Settings itself exiting to
+                    // Home) instead of stopping at the first.
+                    Event::KeyDown { keycode: Some(k), .. } => {
+                        let ev = crate::ui::menu_event_for_key(k);
+                        if ev == Some(MenuEvent::Back) {
+                            if menu_back_down {
+                                None
+                            } else {
+                                menu_back_down = true;
+                                ev
+                            }
+                        } else {
+                            ev
+                        }
+                    }
+                    Event::KeyUp { keycode: Some(k), .. } => {
+                        if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) {
+                            menu_back_down = false;
+                        }
+                        None
+                    }
+                    Event::ControllerButtonDown { button, .. } => {
+                        let ev = crate::ui::menu_event_for_button(button);
+                        if ev == Some(MenuEvent::Back) {
+                            if menu_back_down {
+                                None
+                            } else {
+                                menu_back_down = true;
+                                ev
+                            }
+                        } else {
+                            ev
+                        }
+                    }
+                    Event::ControllerButtonUp { button, .. } => {
+                        if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back) {
+                            menu_back_down = false;
+                        }
+                        None
+                    }
                     Event::ControllerDeviceAdded { which, .. } => {
                         let _ = game_controller.open(which);
                         None
@@ -264,13 +367,14 @@ mod real {
                 let Some(menu_ev) = menu_ev else { continue };
                 match app.screen {
                     // A keyboard/gamepad Back is a bonus shortcut to Settings; the
-                    // sidebar's own Settings row (reachable via Up/Down + Confirm,
-                    // or the Red-button poll below) is the reliable primary path.
+                    // sidebar's own Settings row (reachable via Up/Down + Confirm)
+                    // is the reliable primary path. `App::back` (shared with the
+                    // close-button click path) is what actually decides that.
                     Screen::Home => {
                         if menu_ev == MenuEvent::Back {
-                            app.screen = Screen::Settings;
-                            app.dropdown = None;
-                            app.settings_focused = 0;
+                            if let Some(target) = app.back(log) {
+                                break 'ui target;
+                            }
                         } else if let Some(target) = app.handle_home_event(menu_ev, display_mode.w as u32, log) {
                             break 'ui target;
                         }
@@ -279,21 +383,24 @@ mod real {
                     Screen::Settings => app.handle_settings_event(menu_ev),
                     Screen::AddHost => app.handle_add_host_event(menu_ev),
                     Screen::Wake => app.handle_wake_event(menu_ev, log),
+                    Screen::ForgetHost => app.handle_forget_host_event(menu_ev),
                 }
             }
-            // Raw scancode poll (see `ui::webos_back_button_down`/`webos_red_button_down`
-            // docs) — done *after* draining `poll_iter()` above so
-            // `SDL_GetKeyboardState`'s snapshot reflects this tick's freshest pump, not
-            // the previous tick's. No hold-to-quit tier in the menu (see the streaming
-            // loop for that) — a plain Back here just navigates.
-            let back_now = crate::ui::webos_back_button_down() || crate::ui::webos_red_button_down();
-            if back_now && !back_prev {
-                if let Some(target) = apply_back(&mut app, log) {
-                    break 'ui target;
+            // Confirm hold-to-open-the-Forget-confirmation threshold (see
+            // `LONG_PRESS_CONFIRM`'s docs) — checked live each tick rather than
+            // waiting for release, so it appears the instant the hold is long
+            // enough instead of only once OK comes back up.
+            if !confirm_long_fired {
+                if let Some(since) = confirm_held_since {
+                    if since.elapsed() >= LONG_PRESS_CONFIRM {
+                        if let Some(idx) = app.host_row_focused() {
+                            app.open_forget_host(idx);
+                            dirty = true;
+                        }
+                        confirm_long_fired = true;
+                    }
                 }
-                dirty = true;
             }
-            back_prev = back_now;
             if !dirty {
                 std::thread::sleep(Duration::from_millis(16));
                 continue;
@@ -327,25 +434,6 @@ mod real {
     }
 
     fn run_inner(log: &mut std::fs::File) -> Result<()> {
-        // Without this, webOS's system launcher intercepts the Magic Remote's Back
-        // button before this app's event queue ever sees it — the app just gets
-        // backgrounded to the launcher's app grid instead of getting a key event to
-        // handle itself. `webosbrew/SDL-webOS` (confirmed via its source,
-        // `src/video/wayland/SDL_waylandwebos.c`) exposes exactly this as a hint,
-        // consumed via `wl_webos_shell_surface_set_property` when the window's shell
-        // surface is set up — must be set before `video.window(...).build()` below.
-        // Harmless no-op on a non-webOS SDL2 (an unrecognized hint name is just
-        // ignored), so this doesn't need a target cfg.
-        //
-        // Deliberately NOT also setting `SDL_WEBOS_ACCESS_POLICY_KEYS_EXIT`: live
-        // testing showed that once it's on, a plain short Back press stops arriving
-        // as its own event at all (the system seems to buffer/withhold it while
-        // deciding whether it's the start of a long-press, and apparently only ever
-        // delivers *one* outcome) — so this app times the hold itself instead, same
-        // proven mechanism already used for the keyboard/gamepad Back-equivalent (see
-        // `LONG_PRESS_BACK` below), just fed by the real Back scancode too now.
-        sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "1");
-
         let sdl = sdl2::init().map_err(|e| anyhow::anyhow!("SDL_Init: {e}"))?;
         let ttf = sdl2::ttf::init().map_err(|e| anyhow::anyhow!("SDL_ttf init: {e}"))?;
         let video = sdl.video().map_err(|e| anyhow::anyhow!("SDL video subsystem: {e}"))?;
@@ -498,8 +586,6 @@ mod real {
 
             let mut controller = None;
             let mut back_held_since: Option<Instant> = None;
-            let mut hw_back_held_since: Option<Instant> = None;
-            let mut hw_back_prev = false;
             let outcome = 'running: loop {
                 for event in events.poll_iter() {
                     use sdl2::event::Event;
@@ -576,31 +662,7 @@ mod real {
                         _ => {}
                     }
                 }
-                // Raw scancode poll (see `ui::webos_back_button_down`/`webos_red_button_down`
-                // docs for why neither arrives as an ordinary `Event::KeyDown`) — timed
-                // entirely by this app now (see `run_inner`'s docs on why the system's
-                // own long-press/Exit gesture turned out unreliable). Back/Red are never
-                // forwarded to the host as game input, so unlike the keyboard/gamepad
-                // path below there's no "was that a real game button" ambiguity to guard
-                // against — any press disconnects on release; only a *much* longer hold
-                // (`HW_BACK_HOLD_QUITS`) quits outright, checked live during the hold so
-                // it doesn't need to wait for release.
-                let hw_back_now = crate::ui::webos_back_button_down() || crate::ui::webos_red_button_down();
-                if hw_back_now && !hw_back_prev {
-                    hw_back_held_since = Some(Instant::now());
-                }
-                if hw_back_now && hw_back_held_since.is_some_and(|t| t.elapsed() >= HW_BACK_HOLD_QUITS) {
-                    writeln!(log, "remote Back held — quitting")?;
-                    connected.client.disconnect_quit();
-                    break 'running StreamOutcome::Quit;
-                }
-                let hw_back_released = !hw_back_now && hw_back_prev && hw_back_held_since.is_some();
-                hw_back_prev = hw_back_now;
-                if !hw_back_now {
-                    hw_back_held_since = None;
-                }
-
-                if hw_back_released || back_held_since.is_some_and(|t| t.elapsed() >= LONG_PRESS_BACK) {
+                if back_held_since.is_some_and(|t| t.elapsed() >= LONG_PRESS_BACK) {
                     writeln!(log, "back — disconnecting to menu")?;
                     // A deliberate user stop (not a network drop/backgrounding) — the
                     // host tears the virtual display down immediately instead of

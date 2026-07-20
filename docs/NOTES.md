@@ -294,34 +294,25 @@ not a working refresh-rate switch. The panel's actual scan-out rate is fixed at 
 (HDMI timing negotiated once, or user-toggled TV settings like TruMotion/Game Optimizer) — outside
 any homebrew app's reach. Kodi's webOS port has the same limitation.
 
-**The Magic Remote's hardware Back button *can* be claimed by a native app** — Back is intercepted
-by webOS's system launcher *by default* (still an open issue upstream, `mariotaku/moonlight-tv#179`),
-but there's a real fix neither that project nor an earlier version of this doc knew about:
-`webosbrew/SDL-webOS`'s `src/video/wayland/SDL_waylandwebos.c` sets a Wayland shell-surface
-property, `_WEBOS_ACCESS_POLICY_KEYS_BACK`, gated behind the SDL hint
-`SDL_WEBOS_ACCESS_POLICY_KEYS_BACK` (`include/SDL_hints.h`) — set it to `"true"` **before window
-creation** and the launcher stops intercepting that key, delivering it to the app instead as a
-normal key event. `main.rs`'s `run_inner` sets it via `sdl2::hint::set(...)` right after
-`sdl2::init()`. The key still doesn't arrive as a recognizable `Scancode`/`Keycode` through the
-safe event API even with the hint set (`SDL_SCANCODE_WEBOS_BACK = 482`, same unrepresentable-raw-
-scancode situation as the color buttons below) — `ui::webos_back_button_down()` polls it the same
-way `webos_red_button_down()` already did.
-
-Kept Red as a **fallback**, not removed: the hint isn't necessarily honored on every firmware/model
-(unverified across the full device matrix), so both scancodes feed the same trigger in `main.rs`.
-
-**Tried and reverted: `SDL_WEBOS_ACCESS_POLICY_KEYS_EXIT` (the matching hint for the remote's own
-long-press-Back gesture, surfaced as the distinct `SDL_SCANCODE_WEBOS_EXIT = 505`) — turned unreliable
-live.** With it set, a plain *short* Back press stopped arriving as its own event at all — the system
-appears to buffer/withhold it while deciding whether it's the start of a long-press, and only ever
-delivers one outcome. Reverted: this app no longer sets that hint, and instead times the hold itself
-off the plain Back scancode (`HW_BACK_HOLD_QUITS`, 2.5s, checked live during the hold — not waiting
-for release) — the same self-timed approach already proven for the keyboard/gamepad Back-equivalent
-(`LONG_PRESS_BACK`, 1.5s), just with a longer threshold since quitting outright is a bigger action
-than disconnecting to the menu. A *release* before that threshold disconnects to the menu instead —
-so Back(482)/Red(486) now support both: quick press → menu, hold 2.5s+ → quit. Neither needs the
-keyboard/gamepad path's game-input-conflict guard, since neither is ever forwarded to the host as
-game input.
+**Tried and abandoned: claiming the Magic Remote's hardware Back button via
+`SDL_WEBOS_ACCESS_POLICY_KEYS_BACK`.** `webosbrew/SDL-webOS`'s
+`src/video/wayland/SDL_waylandwebos.c` sets a Wayland shell-surface property,
+`_WEBOS_ACCESS_POLICY_KEYS_BACK`, gated behind this SDL hint — in theory, setting it (to `"true"`,
+before window creation) makes the launcher stop intercepting that key and deliver it to the app as
+a raw scancode instead (`SDL_SCANCODE_WEBOS_BACK = 482`, unrepresentable through the safe
+`Scancode`/`Keycode` API — same situation as the color buttons below — so it needs the raw
+keyboard-state array, same idiom as `ui::webos_red_button_down()`'s color-button read). On the
+actual CX this app ships to, it doesn't work: with the hint set (tried both `"1"` and `"true"`),
+the physical Back button still never reached the app in any form — not the raw scancode, not a
+`KeyDown` — and the system launcher fully killed the app instead (an `Event::Quit`, confirmed via
+on-device logging), exactly the default behavior the hint is supposed to prevent. Since
+`docs/NOTES.md`'s own prior note already flagged this hint as "not necessarily honored on every
+firmware/model," and it isn't on this one, the entire raw-scancode Back/Red mechanism (the hint,
+`ui::webos_back_button_down`/`webos_red_button_down`, and both loops' hold-to-quit/hold-to-disconnect
+timers built on top of it) was removed rather than kept as dead weight. The on-screen close (X)
+button (works, confirmed on-device) and the keyboard/gamepad Back mapping (`Escape`/`Backspace`/
+`AcBack`, or a controller's B button) are the only Back paths now — don't re-add the hint/scancode
+approach without new evidence it actually works on real hardware this time.
 
 **A hidden/unmapped window doesn't receive pointer input.** The stream-time window was `.hide()`n
 (since `set_opacity` isn't supported on this Wayland backend) so it wouldn't visually cover the NDL
