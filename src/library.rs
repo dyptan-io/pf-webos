@@ -4,11 +4,15 @@
 //! A trimmed port of `pf-client-core::library` (same wire shape, same mTLS pinning
 //! verifier) rather than a dependency on that crate — see `session.rs`'s module docs
 //! for why this client doesn't pull in `pf-client-core` at all.
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
+use ureq::unversioned::resolver::DefaultResolver;
+use ureq::unversioned::transport::{
+    Buffers, ConnectionDetails, Connector, Either, LazyBuffers, NextTimeout, TcpConnector, Transport, TransportAdapter,
+};
 
 /// The management API's default port — matches the host's `mgmt::DEFAULT_PORT`. A
 /// discovered host may advertise a different one via its mDNS `mgmt` TXT record
@@ -102,11 +106,18 @@ pub fn agent(identity: &(String, String), pin: Option<[u8; 32]>) -> Result<ureq:
     let cfg = builder
         .with_client_auth_cert(vec![cert], key)
         .map_err(|e| bad("client auth", &e))?;
-    Ok(ureq::AgentBuilder::new()
-        .tls_config(Arc::new(cfg))
-        .timeout_connect(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .build())
+
+    // ureq 3.x's own `TlsConfig`/`RustlsConnector` only build a `rustls::ClientConfig`
+    // from a fixed CA-chain/platform-verifier menu — no hook for `cfg`'s custom
+    // fingerprint-pinning `PinVerify` above. So we skip that layer entirely and hand
+    // `cfg` to our own minimal TLS-wrapping `Connector` (`PinnedTlsConnector` below,
+    // modeled on ureq's own `RustlsConnector`), chained onto the stock `TcpConnector`.
+    let connector = TcpConnector::default().chain(PinnedTlsConnector { config: Arc::new(cfg) });
+    let config = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(5)))
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build();
+    Ok(ureq::Agent::with_parts(config, connector, DefaultResolver::default()))
 }
 
 /// Fetch the host's unified library. Errors are pre-classified for the UI (401/403 →
@@ -121,9 +132,10 @@ fn fetch_games(
 ) -> Result<Vec<GameEntry>, LibraryError> {
     let agent = agent(identity, pin)?;
     let url = format!("{}/api/v1/library", base_url(addr, mgmt_port));
-    let body = match agent.get(&url).call() {
-        Ok(resp) => resp
-            .into_string()
+    let body = match agent.get(url.as_str()).call() {
+        Ok(mut resp) => resp
+            .body_mut()
+            .read_to_string()
             .map_err(|e| LibraryError::Unreachable(format!("read body: {e}")))?,
         Err(e) => return Err(classify(e)),
     };
@@ -181,29 +193,108 @@ pub fn load_games_async(
 /// handshake per call. Decoding happens in `art.rs`, off this module's REST concern.
 pub fn fetch_art(agent: &ureq::Agent, addr: &str, mgmt_port: u16, art_path: &str) -> Result<Vec<u8>, LibraryError> {
     let url = format!("{}{art_path}", base_url(addr, mgmt_port));
-    let mut buf = Vec::new();
-    match agent.get(&url).call() {
-        Ok(resp) => resp
-            .into_reader()
-            .read_to_end(&mut buf)
-            .map_err(|e| LibraryError::Unreachable(format!("read art body: {e}")))?,
-        Err(e) => return Err(classify(e)),
-    };
-    Ok(buf)
+    match agent.get(url.as_str()).call() {
+        Ok(mut resp) => resp
+            .body_mut()
+            .read_to_vec()
+            .map_err(|e| LibraryError::Unreachable(format!("read art body: {e}"))),
+        Err(e) => Err(classify(e)),
+    }
 }
 
 fn classify(e: ureq::Error) -> LibraryError {
     match e {
-        ureq::Error::Status(401 | 403, _) => LibraryError::NotPaired,
-        ureq::Error::Status(code, _) => LibraryError::Http(code),
-        ureq::Error::Transport(t) => {
-            let msg = t.to_string();
-            if msg.contains("ApplicationVerificationFailure") || msg.contains("InvalidCertificate") {
-                LibraryError::PinMismatch
-            } else {
-                LibraryError::Unreachable(msg)
-            }
+        ureq::Error::StatusCode(401 | 403) => LibraryError::NotPaired,
+        ureq::Error::StatusCode(code) => LibraryError::Http(code),
+        // The one rejection our own `PinVerify` (below) actually raises on a mismatch —
+        // matched on the typed `rustls::Error` ureq 3.x's `Error::Rustls` now carries,
+        // instead of the string-matching `Transport(t)` message-sniffing ureq 2.x forced.
+        ureq::Error::Rustls(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::ApplicationVerificationFailure,
+        )) => LibraryError::PinMismatch,
+        other => LibraryError::Unreachable(other.to_string()),
+    }
+}
+
+/// Wraps a chained (TCP) transport in TLS using a caller-supplied `rustls::ClientConfig`
+/// verbatim — modeled directly on ureq 3.x's own (crate-private) `RustlsConnector`
+/// (`ureq` crate, `src/tls/rustls.rs`), minus its `TlsConfig`-driven `build_config` step,
+/// since that step has no way to install `PinVerify`'s fingerprint-pinning verifier.
+struct PinnedTlsConnector {
+    config: Arc<rustls::ClientConfig>,
+}
+
+impl std::fmt::Debug for PinnedTlsConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedTlsConnector").finish()
+    }
+}
+
+impl<In: Transport> Connector<In> for PinnedTlsConnector {
+    type Out = Either<In, PinnedTlsTransport>;
+
+    fn connect(&self, details: &ConnectionDetails, chained: Option<In>) -> Result<Option<Self::Out>, ureq::Error> {
+        let Some(transport) = chained else {
+            panic!("PinnedTlsConnector requires a chained transport");
+        };
+        if !details.needs_tls() || transport.is_tls() {
+            return Ok(Some(Either::A(transport)));
         }
+
+        let name: rustls::pki_types::ServerName<'_> = details
+            .uri
+            .authority()
+            .expect("uri authority for tls")
+            .host()
+            .try_into()
+            .map_err(|_| ureq::Error::Tls("invalid DNS name"))?;
+        let conn = rustls::ClientConnection::new(self.config.clone(), name.to_owned())?;
+        let stream = rustls::StreamOwned {
+            conn,
+            sock: TransportAdapter::new(transport.boxed()),
+        };
+        let buffers = LazyBuffers::new(details.config.input_buffer_size(), details.config.output_buffer_size());
+        Ok(Some(Either::B(PinnedTlsTransport { buffers, stream })))
+    }
+}
+
+struct PinnedTlsTransport {
+    buffers: LazyBuffers,
+    stream: rustls::StreamOwned<rustls::ClientConnection, TransportAdapter>,
+}
+
+impl std::fmt::Debug for PinnedTlsTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedTlsTransport").finish()
+    }
+}
+
+impl Transport for PinnedTlsTransport {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        &mut self.buffers
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        self.stream.get_mut().set_timeout(timeout);
+        let output = &self.buffers.output()[..amount];
+        self.stream.write_all(output)?;
+        Ok(())
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        self.stream.get_mut().set_timeout(timeout);
+        let input = self.buffers.input_append_buf();
+        let amount = self.stream.read(input)?;
+        self.buffers.input_appended(amount);
+        Ok(amount > 0)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.stream.get_mut().get_mut().is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        true
     }
 }
 

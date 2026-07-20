@@ -40,9 +40,14 @@ suspicious_operation_groupings = "warn" # caught a real field-name mismatch risk
 anyhow = "1"
 # Pure Rust + libc (unix), portable — no FFmpeg/PipeWire/SDL3 baggage, unlike
 # pf-client-core's session::start() (see session.rs docs for why we don't use that).
-# Pinned to the punktfunk commit this client was developed/tested against — bump
-# deliberately, not automatically, since punktfunk-core's wire/ABI surface can move.
-punktfunk-core = { git = "https://git.unom.io/unom/punktfunk", rev = "76594f27c1da50676b33f5f3d96b67b0949ff952", features = [
+# Pinned to a tagged punktfunk release (not a branch tip) this client was
+# developed/tested against — bump deliberately, not automatically, since
+# punktfunk-core's wire/ABI surface can move. Currently v0.16.0 — WIRE_VERSION 2
+# (unchanged since this pin's previous v0.9.2-based commit; no protocol migration
+# needed here), ABI_VERSION 9 (irrelevant to us: we link the Rust `client` API
+# directly, not the C ABI in `abi.rs`, and that module's signatures are unchanged
+# across the whole v0.9.2..v0.16.0 range).
+punktfunk-core = { git = "https://git.unom.io/unom/punktfunk", tag = "v0.16.0", features = [
     "quic",
 ] }
 serde = { version = "1", features = ["derive"] }
@@ -72,7 +77,7 @@ opus = "0.3"
 # upstream repo's pf-client-core crate — see session.rs docs). `ring` cross-compiles
 # cleanly for this target (already proven transitively via punktfunk-core's `quic`
 # feature above).
-ureq = "2"
+ureq = { version = "3", features = ["rustls"], default-features = false }
 rustls = { version = "0.23", features = ["ring"] }
 # Decodes the management API's cover art (Steam CDN capsules/headers, custom-store
 # art) into raw RGBA for a `tiny_skia::Pixmap` (library.rs/art.rs) — pure Rust codecs,
