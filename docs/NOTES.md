@@ -209,6 +209,21 @@ still shows cost unexplained by the app's own draw calls.
   `video_pump` calls `client.note_frame_index()` on every frame (cheap, idempotent, fires a
   throttled RFI request internally on a forward gap) plus a throttled `request_keyframe()`
   backstop when `frames_dropped()` climbs.
+- **Freeze-until-reanchor, adapted for NDL**: `note_frame_index`'s forward-gap return and a
+  `frames_dropped` climb both arm a `holding` flag in `video_pump`; while held, frames are never
+  fed to `ndl.play` at all (so the panel just keeps showing its last rendered picture instead of
+  a concealed/corrupted one) until one arrives with `FLAG_SOF` (a real IDR) or
+  `USER_FLAG_RECOVERY_ANCHOR` (LTR-RFI's clean single-frame recovery) set. Upstream
+  `punktfunk_core::reanchor::ReanchorGate` (added in punktfunk v0.10.0) does the equivalent
+  decision assuming a decode/present split every other client has — Linux/Windows FFmpeg, Android
+  MediaCodec, Apple VideoToolbox — but `NDL_DirectVideoPlay` (checked against the webOS 5.6 SDK
+  sysroot's `NDL_directmedia_v2.h`, the latest API version webOS offers; there's no v3) decodes
+  and presents in one opaque call with no hook to decode without displaying, so this client can't
+  use `ReanchorGate` as designed and reimplements just the skip-until-reanchor subset directly.
+  One real gap versus the shared gate: a host's intra-refresh `USER_FLAG_RECOVERY_POINT` wave
+  can't be consumed this way (that healing needs every intervening frame actually decoded, which
+  holding skips) — hosts limited to that fallback instead heal via the `frames_dropped` keyframe
+  backstop forcing a real IDR, which takes longer than the two-mark intra-refresh path would.
 - HDR mastering metadata can change over a session (different content, different mastering
   values) — `video_pump` drains `next_hdr_meta` every frame (non-blocking) and applies whatever
   arrives to NDL, rather than fetching it once at connect time.

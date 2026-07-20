@@ -21,25 +21,33 @@ pub struct DiscoveredHost {
     pub mac: Vec<String>,
 }
 
-/// Browse continuously; the thread exits when the receiver is dropped. `log` is a
-/// second handle onto the app's own log file (see `main.rs::log_path`) — every
-/// failure/event point here is logged, since this previously failed completely
-/// silently: a `ServiceDaemon::new()`/`browse()` error, or every non-`ServiceResolved`
-/// event, was just dropped with no trace, making "no hosts showed up" undiagnosable
-/// from the log alone (was it a permissions/socket failure, wrong interface, or
-/// genuinely nothing advertising?).
-pub fn browse(mut log: std::fs::File) -> std::sync::mpsc::Receiver<DiscoveredHost> {
+/// Browse continuously. The spawned thread does NOT reliably exit just because the
+/// returned `Receiver<DiscoveredHost>` is dropped: only a `ServiceEvent::ServiceResolved`
+/// checks `tx.send(..).is_err()` to notice that and stop — every other event kind
+/// (in practice, an endless stream of `SearchStarted`) loops forever regardless,
+/// burning a thread's worth of CPU/network activity for the rest of the process's
+/// life. Confirmed live: `mdns: SearchStarted(...)` kept appearing throughout active
+/// game-streaming sessions, well after the menu (and its `App`) was long gone. The
+/// returned `ServiceDaemon` handle is `Clone` and lets a caller call `shutdown()`
+/// explicitly once discovery is no longer needed (see `App`'s `Drop` impl) — that
+/// unblocks the thread's `receiver.recv()` promptly instead of waiting on a lucky
+/// future resolution event. `log` is a second handle onto the app's own log file
+/// (see `main.rs::log_path`) — every failure/event point here is logged, since this
+/// previously failed completely silently: a `ServiceDaemon::new()`/`browse()` error,
+/// or every non-`ServiceResolved` event, was just dropped with no trace, making "no
+/// hosts showed up" undiagnosable from the log alone (was it a permissions/socket
+/// failure, wrong interface, or genuinely nothing advertising?).
+pub fn browse(mut log: std::fs::File) -> Option<(std::sync::mpsc::Receiver<DiscoveredHost>, ServiceDaemon)> {
     let (tx, rx) = std::sync::mpsc::channel();
+    let daemon = ServiceDaemon::new()
+        .inspect_err(|e| {
+            let _ = writeln!(log, "mdns: ServiceDaemon::new failed: {e}");
+        })
+        .ok()?;
+    let daemon_handle = daemon.clone();
     std::thread::Builder::new()
         .name("punktfunk-webos-mdns".into())
         .spawn(move || {
-            let daemon = match ServiceDaemon::new() {
-                Ok(d) => d,
-                Err(e) => {
-                    let _ = writeln!(log, "mdns: ServiceDaemon::new failed: {e}");
-                    return;
-                }
-            };
             let receiver = match daemon.browse("_punktfunk._udp.local.") {
                 Ok(r) => r,
                 Err(e) => {
@@ -94,5 +102,5 @@ pub fn browse(mut log: std::fs::File) -> std::sync::mpsc::Receiver<DiscoveredHos
             let _ = daemon.shutdown();
         })
         .expect("spawn mdns thread");
-    rx
+    Some((rx, daemon_handle))
 }

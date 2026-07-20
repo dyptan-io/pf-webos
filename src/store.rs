@@ -120,8 +120,9 @@ pub struct Settings {
     /// Nominal refresh rate (30/60/120) — the actual wire `Mode.refresh_hz` applies
     /// the aurora-tv NTSC floor-correction on top of this (see `main.rs`).
     pub refresh_hz: u32,
-    /// 10_000-150_000 (10-150 Mbps), adjusted via the settings slider — see
-    /// `ui::BITRATE_MIN_KBPS`/`BITRATE_MAX_KBPS`.
+    /// `0` (Automatic — `punktfunk_core`'s own client-side AIMD bitrate controller, see
+    /// `ui::BITRATE_AUTOMATIC`) or 10_000-150_000 (10-150 Mbps) fixed, adjusted via the settings
+    /// slider — see `ui::BITRATE_MIN_KBPS`/`BITRATE_MAX_KBPS`.
     pub bitrate_kbps: u32,
     pub hdr_enabled: bool,
     /// Whether a Wake-on-LAN magic packet is sent automatically (no prompt) when a
@@ -140,9 +141,11 @@ impl Default for Settings {
             width: 3840,
             height: 2160,
             refresh_hz: 60,
-            // aurora-tv's own moonlight-tv wiki calls ~35-40 Mbps the practical sweet
-            // spot for this decode path — a sane default within the 10-150 slider range.
-            bitrate_kbps: 40_000,
+            // Automatic: a fixed number, however carefully picked (aurora-tv's own
+            // moonlight-tv wiki calls ~35-40 Mbps the practical sweet spot for this decode
+            // path), never adapts to a link that degrades mid-session the way punktfunk's
+            // own client-side AIMD controller does — see `ui::BITRATE_AUTOMATIC`.
+            bitrate_kbps: 0,
             hdr_enabled: true,
             wol_auto_send: false,
         }

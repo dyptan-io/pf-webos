@@ -38,6 +38,14 @@ suspicious_operation_groupings = "warn" # caught a real field-name mismatch risk
 
 [dependencies]
 anyhow = "1"
+# Surfaces punktfunk-core's own internal `tracing` diagnostics (ABR/probe decisions, RFI
+# recovery internals — see main.rs's subscriber setup) into our log file. Without this, every
+# `tracing::info!`/`warn!` call inside punktfunk-core is silently dropped (no-op absent a
+# subscriber) — the exact link-capacity-probe/ABR-ceiling messages needed to tell "the network
+# genuinely can't sustain more" apart from "something else is capping quality" were invisible
+# for this whole client until this was added.
+tracing = "0.1"
+tracing-subscriber = "0.3"
 # Pure Rust + libc (unix), portable — no FFmpeg/PipeWire/SDL3 baggage, unlike
 # pf-client-core's session::start() (see session.rs docs for why we don't use that).
 # Pinned to a tagged punktfunk release (not a branch tip) this client was
@@ -91,3 +99,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # already-decoded buffers (SDL2_ttf glyph surfaces, `image`-decoded covers), never
 # loads a `.png` through tiny-skia itself.
 tiny-skia = { version = "0.12", default-features = false, features = ["std"] }
+# `setpriority` for the video pump's scheduling-priority boost (session.rs) — already a
+# transitive dependency (punktfunk-core itself uses `libc::gettid` for its hot-thread
+# registry), pulled in directly since we call our own libc function against those ids.
+libc = "0.2"
