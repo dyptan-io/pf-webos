@@ -69,6 +69,7 @@ pub const ICON_SIGNAL: &str = "\u{E202}";
 pub const ICON_SUN: &str = "\u{E430}";
 pub const ICON_CHEVRON_DOWN: &str = "\u{E5C5}";
 pub const ICON_POWER: &str = "\u{E8AC}";
+pub const ICON_DELETE: &str = "\u{E872}";
 
 // -------------------------------------------------------------------- input map --
 
@@ -138,53 +139,6 @@ pub fn digit_key_value(keycode: sdl2::keyboard::Keycode) -> Option<u8> {
     })
 }
 
-/// Raw SDL2 scancode values the `webosbrew/SDL-webOS` fork (the one this client
-/// already links against for its Wayland shell-integration protocol — see Cargo.toml
-/// docs) assigns to Magic Remote keys with no vanilla-SDL2 equivalent
-/// (`include/SDL_scancode.h`). Vanilla SDL2 doesn't define these, and rust-sdl2's
-/// `Scancode` enum only covers vanilla SDL2's scancode set — so they're
-/// unrepresentable as a `Scancode` value and don't arrive as `Event::KeyDown`/
-/// `KeyUp` at all through the safe event API. Reading them requires the raw
-/// keyboard-state array instead (see `scancode_down`).
-const SCANCODE_WEBOS_BACK: usize = 482;
-/// Translated from the X11 keycode 406 sourced from `/usr/share/X11/xkb/keycodes/lg`.
-const SCANCODE_WEBOS_RED: usize = 486;
-
-/// Polls the current (level, not edge) state of a raw webOS scancode directly from
-/// SDL2's keyboard-state array, bypassing rust-sdl2's `Scancode` enum entirely (see
-/// `SCANCODE_WEBOS_BACK`/`SCANCODE_WEBOS_RED` docs for why). The caller
-/// edge-detects a press from consecutive polls.
-fn scancode_down(scancode: usize) -> bool {
-    unsafe {
-        let mut numkeys = 0;
-        let ptr = sdl2::sys::SDL_GetKeyboardState(&mut numkeys);
-        if ptr.is_null() {
-            return false;
-        }
-        let state = std::slice::from_raw_parts(ptr, numkeys as usize);
-        state.get(scancode).copied().unwrap_or(0) != 0
-    }
-}
-
-/// The Magic Remote's actual Back button — reaches the app at all only because
-/// `main.rs` sets the `SDL_WEBOS_ACCESS_POLICY_KEYS_BACK` hint before window
-/// creation (otherwise webOS's system launcher intercepts it first, backgrounding
-/// the app instead of delivering a key event). Even with that hint set, the key
-/// arrives as this raw scancode, not a `Scancode`/`Keycode` the safe event API
-/// recognizes (see `SCANCODE_WEBOS_BACK`'s docs) — same situation as the color
-/// buttons below.
-pub fn webos_back_button_down() -> bool {
-    scancode_down(SCANCODE_WEBOS_BACK)
-}
-
-/// Polls the current (level, not edge) state of the Magic Remote's Red button —
-/// kept as a secondary Back/disconnect trigger alongside the real Back button
-/// (`webos_back_button_down`) since the access-policy hint isn't honored
-/// consistently across every firmware/model (see `docs/NOTES.md`).
-pub fn webos_red_button_down() -> bool {
-    scancode_down(SCANCODE_WEBOS_RED)
-}
-
 // --------------------------------------------------------------------- painter --
 // The AA rendering backend: a `tiny_skia::Pixmap` framebuffer plus the handful of
 // primitive ops every higher-level `draw_*` function below is built from. Nothing
@@ -196,12 +150,18 @@ fn sk_color(c: Color) -> SkColor {
     SkColor::from_rgba8(c.r, c.g, c.b, c.a)
 }
 
-/// A flat-color, anti-aliased `Paint` — every fill/stroke in this module uses one
-/// of these and nothing fancier (no gradients/patterns needed for this UI).
+/// A flat-color `Paint` — every fill/stroke in this module uses one of these and
+/// nothing fancier (no gradients/patterns needed for this UI).
+///
+/// Anti-aliasing off: tiny-skia dispatches to a genuinely separate, cheaper
+/// scan-conversion path when `anti_alias` is off (`scan::path::fill_path`/
+/// `scan::fill_rect` vs. the `_aa` variants) — measured on real webOS hardware,
+/// worth a real (if modest, ~15-25%) chunk of render time on larger fills like the
+/// Settings modal card. See docs/NOTES.md's "UI performance, round 2" entry.
 fn solid_paint(color: Color) -> Paint<'static> {
     let mut paint = Paint::default();
     paint.set_color(sk_color(color));
-    paint.anti_alias = true;
+    paint.anti_alias = false;
     paint
 }
 
@@ -278,6 +238,27 @@ impl Painter {
     /// isn't covered by a widget just shows this color).
     pub fn clear(&mut self, color: Color) {
         self.pixmap.fill(sk_color(color));
+    }
+
+    /// Darkens the whole framebuffer by blending in flat black at `alpha` —
+    /// `draw_modal_backdrop`'s scrim behind every modal (Settings/Pairing/AddHost/
+    /// Wake). Used to be a plain `fill_rect` over the whole 1920x1080 frame with a
+    /// semi-transparent color, going through tiny-skia's general shader/blend
+    /// pipeline — measured on real webOS hardware, that one full-screen blend
+    /// (~2M pixels) was the dominant per-frame cost on every modal screen (a
+    /// "render split" log showed the modal's *entire* extra cost over Home,
+    /// ~300ms+, unaffected by anything else on screen). Since the source color is
+    /// always plain black, `SourceOver` onto a fully-opaque destination reduces to
+    /// `dst *= (255 - alpha) / 255` — implemented directly here as a raw pixel
+    /// loop (no shader/pipeline construction, no floats) instead of going through
+    /// `fill_rect`.
+    pub fn dim(&mut self, alpha: u8) {
+        let keep = u32::from(255 - alpha);
+        for px in self.pixmap.data_mut().chunks_exact_mut(4) {
+            px[0] = ((u32::from(px[0]) * keep) / 255) as u8;
+            px[1] = ((u32::from(px[1]) * keep) / 255) as u8;
+            px[2] = ((u32::from(px[2]) * keep) / 255) as u8;
+        }
     }
 
     pub fn fill_rect(&mut self, rect: Rect, color: Color) {
@@ -372,10 +353,28 @@ impl Painter {
             .draw_pixmap(x, y, src.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
     }
 
+    /// Stamps `other`'s whole framebuffer over this one — used to composite a
+    /// separately cached, less-frequently-rerendered layer (see `App::render`'s
+    /// `home_layer`) as this frame's backdrop. A raw buffer copy, not
+    /// `draw_pixmap`/`fill_rect`: measured on real webOS hardware, routing a
+    /// full-frame composite through tiny-skia's general shader/blend pipeline
+    /// (same root cause as `dim`'s docs) cost ~330-350ms on its own — *more* than
+    /// the `render_home` call this cache exists to avoid, making the cache a net
+    /// loss until this changed. Both `Painter`s are always the same screen size
+    /// in practice (both sized from the same display mode), so a straight
+    /// `copy_from_slice` is always valid here.
+    pub fn blit_layer(&mut self, other: &Self) {
+        self.pixmap.data_mut().copy_from_slice(other.pixmap.data());
+    }
+
     /// Composites `src` scaled to exactly fill `dst` — `image`-decoded cover art
-    /// (see `art.rs`) is already downscaled close to display size, so bilinear here
-    /// is just a small final-fit correction, not doing the heavy lifting of the
-    /// downscale.
+    /// (see `art.rs`) is already downscaled close to display size, so this is just
+    /// a small final-fit correction, not doing the heavy lifting of the downscale.
+    /// `FilterQuality::Nearest`, not `Bilinear`: tiny-skia's bilinear `Pattern`
+    /// pushes extra interpolation stages into its raster pipeline whenever the
+    /// transform scales (see `Pattern::push_stages`), which measured as a real
+    /// (if modest) per-call cost on real webOS hardware — see docs/NOTES.md's "UI
+    /// performance, round 2" entry.
     pub fn draw_pixmap_scaled(&mut self, dst: Rect, src: &Pixmap) {
         let (dw, dh) = (dst.width() as f32, dst.height() as f32);
         let (sw, sh) = (src.width() as f32, src.height() as f32);
@@ -384,7 +383,7 @@ impl Painter {
         }
         let transform = Transform::from_scale(dw / sw, dh / sh).post_translate(dst.x() as f32, dst.y() as f32);
         let paint = PixmapPaint {
-            quality: FilterQuality::Bilinear,
+            quality: FilterQuality::Nearest,
             ..PixmapPaint::default()
         };
         self.pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
@@ -658,10 +657,19 @@ fn inflate(rect: Rect, focused: bool) -> Rect {
     )
 }
 
+/// A soft, real drop shadow (see [`Painter::fill_shadow`]) — matches the reference's
+/// shadowed-card look.
+fn draw_card_shadow(painter: &mut Painter, rect: Rect, radius: i32) {
+    painter.fill_shadow(rect, radius, 3.0, 5.0, SHADOW_BLUR, 0x60);
+}
+
 /// moonlight-tv's focus cue is an outline ring offset outward from the tile, not a
 /// filled/background change — bright accent blue, invisible unless focused. Two
-/// passes at increasing offset/decreasing alpha approximate a soft glow.
-pub fn draw_focus_ring(painter: &mut Painter, rect: Rect, radius: i32) {
+/// passes at increasing offset/decreasing alpha approximate a soft glow. Only
+/// `draw_poster_card` (game/Desktop grid selection) uses this — sidebar/settings/
+/// digit-box cards (`draw_card`) rely on the zoom/inflate + text-color change alone,
+/// per an explicit request to drop the ring everywhere except game selection.
+fn draw_focus_ring(painter: &mut Painter, rect: Rect, radius: i32) {
     let passes = [(3, 0xff), (6, 0x60)];
     for (offset, alpha) in passes {
         let ring = Rect::new(
@@ -675,22 +683,14 @@ pub fn draw_focus_ring(painter: &mut Painter, rect: Rect, radius: i32) {
     }
 }
 
-/// A soft, real drop shadow (see [`Painter::fill_shadow`]) — matches the reference's
-/// shadowed-card look.
-fn draw_card_shadow(painter: &mut Painter, rect: Rect, radius: i32) {
-    painter.fill_shadow(rect, radius, 3.0, 5.0, SHADOW_BLUR, 0x60);
-}
-
 /// Draws a plain surface card (sidebar rows, settings rows, PIN/IP digit boxes) —
-/// shadow, `SIDEBAR_BG` fill, and a focus ring when focused. Returns the (possibly
-/// zoom-inflated) rect actually drawn, so callers can center content inside it.
+/// shadow and `SIDEBAR_BG` fill, zoom-inflated slightly when focused. Returns the
+/// (possibly zoom-inflated) rect actually drawn, so callers can center content
+/// inside it.
 pub fn draw_card(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
     let r = inflate(rect, focused);
     draw_card_shadow(painter, r, CARD_RADIUS);
     painter.fill_rounded_rect(r, CARD_RADIUS, SIDEBAR_BG);
-    if focused {
-        draw_focus_ring(painter, r, CARD_RADIUS);
-    }
     r
 }
 
@@ -797,14 +797,28 @@ pub fn sidebar_row_rect(index: usize) -> Rect {
     Rect::new(SIDEBAR_PAD, y, SIDEBAR_W - 2 * SIDEBAR_PAD as u32, SIDEBAR_ROW_H)
 }
 
+/// The "Settings" row's rect — pinned to the bottom of the sidebar panel instead
+/// of following the host list/"+ Add host" row sequentially (`sidebar_row_rect`),
+/// so it stays in the same place regardless of how many hosts are known.
+pub fn settings_row_rect(screen_h: u32) -> Rect {
+    let y = screen_h as i32 - SIDEBAR_PAD - SIDEBAR_ROW_H as i32;
+    Rect::new(SIDEBAR_PAD, y, SIDEBAR_W - 2 * SIDEBAR_PAD as u32, SIDEBAR_ROW_H)
+}
+
 /// `None` when `(x, y)` falls outside the sidebar's horizontal band at all — lets
 /// mouse-motion handling distinguish "not hovering the sidebar" from "hovering the
-/// sidebar but between rows."
-pub fn hit_test_sidebar_row(x: i32, y: i32, row_count: usize) -> Option<usize> {
-    if x < 0 || x as u32 > SIDEBAR_W {
+/// sidebar but between rows." The last nav position (`row_count - 1`, "Settings")
+/// is pinned to the bottom of the panel (see `settings_row_rect`) rather than
+/// following on from the sequential rows above it.
+pub fn hit_test_sidebar_row(x: i32, y: i32, row_count: usize, screen_h: u32) -> Option<usize> {
+    if x < 0 || x as u32 > SIDEBAR_W || row_count == 0 {
         return None;
     }
-    (0..row_count).find(|&i| sidebar_row_rect(i).contains_point((x, y)))
+    let settings_index = row_count - 1;
+    if settings_row_rect(screen_h).contains_point((x, y)) {
+        return Some(settings_index);
+    }
+    (0..settings_index).find(|&i| sidebar_row_rect(i).contains_point((x, y)))
 }
 
 /// One entry in the sidebar's host list — either a fully known/paired host or a
@@ -854,9 +868,12 @@ impl HostEntry {
 }
 
 /// Draws the whole sidebar: a flat `SIDEBAR_BG` panel, a "punktfunk" wordmark at
-/// the top, one row per host (icon reflects paired/not-paired), then trailing
-/// "+ Add host"/"Settings" utility rows. `focused_index` is `Some` only when
-/// sidebar itself has focus (see `app.rs`'s `HomeFocus`).
+/// the top, one row per host (icon reflects paired/not-paired), a trailing
+/// "+ Add host" row, and "Settings" pinned to the very bottom of the panel (see
+/// `settings_row_rect`) rather than following on from the host list — it stays
+/// put regardless of how many hosts are known, instead of drifting down the
+/// screen as the list grows. `focused_index` is `Some` only when the sidebar
+/// itself has focus (see `app.rs`'s `HomeFocus`).
 #[allow(clippy::too_many_arguments)]
 pub fn draw_sidebar(
     painter: &mut Painter,
@@ -879,7 +896,7 @@ pub fn draw_sidebar(
             text_cache,
             font_label,
             icon_font,
-            i,
+            sidebar_row_rect(i),
             entry.name(),
             entry.is_paired(),
             focused_index == Some(i),
@@ -890,20 +907,65 @@ pub fn draw_sidebar(
         text_cache,
         font_label,
         icon_font,
-        add_row,
+        sidebar_row_rect(add_row),
         "+ Add host",
         focused_index == Some(add_row),
     )?;
+
+    let settings_rect = settings_row_rect(screen_h);
+    painter.fill_rect(
+        Rect::new(settings_rect.x(), settings_rect.y() - 14, settings_rect.width(), 1),
+        Color::RGBA(0xff, 0xff, 0xff, 0x1a),
+    );
     draw_utility_row(
         painter,
         text_cache,
         font_label,
         icon_font,
-        settings_row,
+        settings_rect,
         "Settings",
         focused_index == Some(settings_row),
     )?;
 
+    Ok(())
+}
+
+/// Shared layout for every sidebar row (host rows and the "+ Add host"/
+/// "Settings" utility rows alike): a card, a left-aligned icon, and a label,
+/// both colored by focus — host rows and utility rows used to each carry
+/// their own near-identical copy of this (differing only by accident of
+/// drift, in icon size/padding, not by design).
+#[allow(clippy::too_many_arguments)]
+fn draw_sidebar_row(
+    painter: &mut Painter,
+    text_cache: &mut TextCache,
+    font_label: &Font,
+    icon_font: &Font,
+    rect: Rect,
+    glyph: &str,
+    label: &str,
+    focused: bool,
+) -> Result<()> {
+    let drawn = draw_card(painter, rect, focused);
+    let icon_size = 30u32;
+    let icon_pad = 20;
+    let icon_rect = Rect::new(
+        drawn.x() + icon_pad,
+        drawn.y() + (drawn.height() as i32 - icon_size as i32) / 2,
+        icon_size,
+        icon_size,
+    );
+    let color = if focused { WHITE } else { MUTED };
+    draw_icon(painter, text_cache, icon_font, icon_rect, glyph, color)?;
+    draw_text(
+        painter,
+        text_cache,
+        font_label,
+        label,
+        drawn.x() + icon_pad + icon_size as i32 + 16,
+        drawn.y() + (drawn.height() as i32 - font_label.height()) / 2,
+        color,
+    )?;
     Ok(())
 }
 
@@ -913,33 +975,13 @@ fn draw_host_row(
     text_cache: &mut TextCache,
     font_label: &Font,
     icon_font: &Font,
-    index: usize,
+    rect: Rect,
     name: &str,
     paired: bool,
     focused: bool,
 ) -> Result<()> {
-    let rect = sidebar_row_rect(index);
-    let drawn = draw_card(painter, rect, focused);
-    let icon_size = 32u32;
-    let icon_rect = Rect::new(
-        drawn.x() + 18,
-        drawn.y() + (drawn.height() as i32 - icon_size as i32) / 2,
-        icon_size,
-        icon_size,
-    );
-    let icon_color = if focused { WHITE } else { MUTED };
     let glyph = if paired { ICON_TV } else { ICON_LOCK };
-    draw_icon(painter, text_cache, icon_font, icon_rect, glyph, icon_color)?;
-    draw_text(
-        painter,
-        text_cache,
-        font_label,
-        name,
-        drawn.x() + 18 + icon_size as i32 + 16,
-        drawn.y() + (drawn.height() as i32 - font_label.height()) / 2,
-        if focused { WHITE } else { MUTED },
-    )?;
-    Ok(())
+    draw_sidebar_row(painter, text_cache, font_label, icon_font, rect, glyph, name, focused)
 }
 
 fn draw_utility_row(
@@ -947,36 +989,13 @@ fn draw_utility_row(
     text_cache: &mut TextCache,
     font_label: &Font,
     icon_font: &Font,
-    index: usize,
+    rect: Rect,
     label: &str,
     focused: bool,
 ) -> Result<()> {
-    let rect = sidebar_row_rect(index);
-    let drawn = draw_card(painter, rect, focused);
-    let icon_size = 28u32;
-    let icon_rect = Rect::new(
-        drawn.x() + 20,
-        drawn.y() + (drawn.height() as i32 - icon_size as i32) / 2,
-        icon_size,
-        icon_size,
-    );
-    let icon_color = if focused { WHITE } else { MUTED };
-    let glyph = if label.starts_with('+') {
-        ICON_ADD
-    } else {
-        ICON_SETTINGS
-    };
-    draw_icon(painter, text_cache, icon_font, icon_rect, glyph, icon_color)?;
-    draw_text(
-        painter,
-        text_cache,
-        font_label,
-        label.trim_start_matches('+').trim(),
-        drawn.x() + 20 + icon_size as i32 + 16,
-        drawn.y() + (drawn.height() as i32 - font_label.height()) / 2,
-        if focused { WHITE } else { MUTED },
-    )?;
-    Ok(())
+    let glyph = if label.starts_with('+') { ICON_ADD } else { ICON_SETTINGS };
+    let label = label.trim_start_matches('+').trim();
+    draw_sidebar_row(painter, text_cache, font_label, icon_font, rect, glyph, label, focused)
 }
 
 // ------------------------------------------------------------------------ grid --
@@ -1028,8 +1047,8 @@ pub fn hit_test_grid_card(
 
 /// Dims the already-rendered frame beneath a modal (Settings/Pairing/Add host all
 /// render on top of the current Home frame, then this, then their own card).
-pub fn draw_modal_backdrop(painter: &mut Painter, screen_w: u32, screen_h: u32) {
-    painter.fill_rect(Rect::new(0, 0, screen_w, screen_h), MODAL_SCRIM);
+pub fn draw_modal_backdrop(painter: &mut Painter) {
+    painter.dim(MODAL_SCRIM.a);
 }
 
 /// A centered glass card of `(width_frac * screen_w, height)`.
@@ -1486,7 +1505,11 @@ pub fn draw_switch(painter: &mut Painter, rect: Rect, on: bool) {
 }
 
 /// Renders a dropdown's options as an overlay list anchored just below the row that
-/// opened it, inside the settings modal card.
+/// opened it, inside the settings modal card. One shadow/background for the whole
+/// panel and contiguous, same-height rows — like a typical dropdown/picker list —
+/// rather than every row being its own floating `draw_card` (which used to stack a
+/// drop shadow under each option a few px apart from its neighbors, reading as a
+/// stray smear between rows instead of a clean list).
 pub fn draw_dropdown_overlay(
     painter: &mut Painter,
     text_cache: &mut TextCache,
@@ -1496,24 +1519,105 @@ pub fn draw_dropdown_overlay(
     rect: Rect,
 ) -> Result<()> {
     let row_h = 56u32;
-    let gap = 6i32;
-    let overlay_h = options.len() as i32 * (row_h as i32 + gap);
-    let bg_rect = Rect::new(rect.x(), rect.y(), rect.width(), overlay_h.max(0) as u32);
-    painter.fill_rounded_rect(bg_rect, CARD_RADIUS, Color::RGBA(0x10, 0x10, 0x10, 0xf0));
-    painter.stroke_rounded_rect(bg_rect, CARD_RADIUS, Color::RGBA(0xff, 0xff, 0xff, 0x20), 1.5);
+    let bg_rect = Rect::new(rect.x(), rect.y(), rect.width(), options.len() as u32 * row_h);
+    draw_popup_panel(painter, bg_rect, Color::RGBA(0xff, 0xff, 0xff, 0x20));
     for (i, opt) in options.iter().enumerate() {
-        let y = rect.y() + i as i32 * (row_h as i32 + gap);
-        let row_rect = Rect::new(rect.x(), y, rect.width(), row_h);
+        let row_rect = Rect::new(rect.x(), rect.y() + i as i32 * row_h as i32, rect.width(), row_h);
         let focused = i == focused_index;
-        let drawn = draw_card(painter, row_rect, focused);
+        if focused {
+            let highlight = Rect::new(
+                row_rect.x() + 6,
+                row_rect.y() + 4,
+                row_rect.width().saturating_sub(12),
+                row_rect.height().saturating_sub(8),
+            );
+            painter.fill_rounded_rect(highlight, 8, Color::RGBA(ACCENT.r, ACCENT.g, ACCENT.b, 0x50));
+        }
         draw_text(
             painter,
             text_cache,
             font_value,
             opt,
-            drawn.x() + 20,
-            drawn.y() + (drawn.height() as i32 - font_value.height()) / 2,
+            row_rect.x() + 20,
+            row_rect.y() + (row_rect.height() as i32 - font_value.height()) / 2,
             if focused { WHITE } else { MUTED },
+        )?;
+    }
+    Ok(())
+}
+
+/// The floating-panel chrome shared by every popup menu drawn over Home/the
+/// modals — a shadowed, near-black rounded panel with a colored border.
+/// Extracted from [`draw_dropdown_overlay`], which used to carry its own copy
+/// of this same triple (shadow, fill, stroke).
+fn draw_popup_panel(painter: &mut Painter, rect: Rect, border_color: Color) {
+    draw_card_shadow(painter, rect, CARD_RADIUS);
+    painter.fill_rounded_rect(rect, CARD_RADIUS, Color::RGBA(0x10, 0x10, 0x10, 0xf0));
+    painter.stroke_rounded_rect(rect, CARD_RADIUS, border_color, 1.5);
+}
+
+/// One button in a [`draw_confirm_buttons`] row — `color` is that button's own
+/// identity color, shown at full strength only while it has focus (unfocused
+/// buttons dim to [`MUTED`], the same "unfocused = muted" convention every
+/// other focusable row in this UI already uses).
+pub struct ConfirmButton<'a> {
+    pub icon: Option<&'a str>,
+    pub label: &'a str,
+    pub color: Color,
+}
+
+/// A row of side-by-side buttons for a Yes/No-style confirmation (currently
+/// just the "Forget this host?" dialog's Forget/Cancel pair, but not written
+/// specifically for that) — each its own focusable [`draw_card`], optional
+/// leading icon, and a label colored by that button's own identity when
+/// focused or [`MUTED`] otherwise. `focused_index` picks which of `buttons`
+/// currently has focus.
+pub fn draw_confirm_buttons(
+    painter: &mut Painter,
+    text_cache: &mut TextCache,
+    font_label: &Font,
+    icon_font: &Font,
+    content: Rect,
+    buttons: &[ConfirmButton; 2],
+    focused_index: usize,
+) -> Result<()> {
+    let gap = 20i32;
+    let btn_w = content.width().saturating_sub(gap as u32) / 2;
+    for (i, button) in buttons.iter().enumerate() {
+        let rect = Rect::new(
+            content.x() + i as i32 * (btn_w as i32 + gap),
+            content.y(),
+            btn_w,
+            content.height(),
+        );
+        let focused = i == focused_index;
+        let drawn = draw_card(painter, rect, focused);
+        let color = if focused { button.color } else { MUTED };
+
+        let label_w = font_label.size_of(button.label).map_or(0, |(w, _)| w);
+        let text_x = match button.icon {
+            Some(icon) => {
+                let icon_size = 26u32;
+                let icon_rect = Rect::new(
+                    drawn.x() + 20,
+                    drawn.y() + (drawn.height() as i32 - icon_size as i32) / 2,
+                    icon_size,
+                    icon_size,
+                );
+                draw_icon(painter, text_cache, icon_font, icon_rect, icon, color)?;
+                icon_rect.x() + icon_size as i32 + 12
+            }
+            // No icon: center the label instead of left-aligning it after one.
+            None => drawn.x() + (drawn.width() as i32 - label_w as i32) / 2,
+        };
+        draw_text(
+            painter,
+            text_cache,
+            font_label,
+            button.label,
+            text_x,
+            drawn.y() + (drawn.height() as i32 - font_label.height()) / 2,
+            color,
         )?;
     }
     Ok(())
@@ -1521,130 +1625,94 @@ pub fn draw_dropdown_overlay(
 
 // -------------------------------------------------------------------- add host --
 
-/// Digit-entry state for manually adding a host by IP:port — the same "type digits,
-/// auto-advance" idiom the Pairing screen's PIN entry already uses (see
-/// `digit_key_value`), extended to 17 slots: four 3-digit IP octets + a 5-digit port.
-pub struct AddHostState {
-    pub digits: [u8; 17],
-    pub index: usize,
-    /// Which slots the user has actually entered (typed a digit, or
-    /// left/right-adjusted one) — untouched IP-octet slots render as a blank
-    /// placeholder (`_`) rather than a misleading literal `0`. The port slots
-    /// start touched since `9777` is a real, usable default, not a placeholder.
-    touched: [bool; 17],
-}
+/// punktfunk's conventional host port (see `store::dev_override_connect`'s
+/// fallback) — fixed and not user-editable, so the add-host screen only ever
+/// has to ask for an IP address.
+pub const FIXED_HOST_PORT: u16 = 9777;
 
-impl Default for AddHostState {
-    fn default() -> Self {
-        // Prefills punktfunk's conventional default port (9777 — see
-        // `store::dev_override_connect`'s fallback) so the user only has to dial in
-        // the IP address.
-        let mut touched = [false; 17];
-        touched[12..17].fill(true);
-        Self {
-            digits: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 7, 7, 7],
-            index: 0,
-            touched,
-        }
-    }
+/// Manual "add host by IP" entry state: a plain, naturally-growing digit
+/// string rather than a fixed-width masked grid — no `_` placeholders, no
+/// per-octet box, no port field (that's always [`FIXED_HOST_PORT`]). Dots are
+/// inserted automatically once an octet is complete (three digits, or a
+/// fourth that would push its value past 255), so the Magic Remote's number
+/// pad (`digit_key_value`) — the only realistic input this screen gets — is
+/// enough on its own, with Left/Right (see `app.rs`'s `handle_add_host_event`)
+/// standing in for backspace/"next octet" on a remote with no dot key.
+#[derive(Default)]
+pub struct AddHostState {
+    /// Completed octets so far (0-3 of them once a further one is being typed).
+    octets: Vec<u8>,
+    /// Digits typed into the octet currently being entered, not yet finalized
+    /// into `octets` — kept as text (not a parsed `u8`) so it can grow one
+    /// digit at a time and still show a partial value like "2" or "25".
+    current: String,
 }
 
 impl AddHostState {
-    fn octet(&self, i: usize) -> u8 {
-        let d = &self.digits[i * 3..i * 3 + 3];
-        (u32::from(d[0]) * 100 + u32::from(d[1]) * 10 + u32::from(d[2])).min(255) as u8
-    }
-
-    fn port_value(&self) -> u16 {
-        let v = self.digits[12..17]
-            .iter()
-            .fold(0u32, |acc, &digit| acc * 10 + u32::from(digit));
-        v.min(u32::from(u16::MAX)) as u16
+    /// Whether exactly four octets' worth of digits have been typed — the
+    /// point at which `host_and_port()` names a real, connectable address.
+    pub fn is_complete(&self) -> bool {
+        (self.octets.len() == 4 && self.current.is_empty()) || (self.octets.len() == 3 && !self.current.is_empty())
     }
 
     pub fn host_and_port(&self) -> (String, u16) {
-        (
-            format!(
-                "{}.{}.{}.{}",
-                self.octet(0),
-                self.octet(1),
-                self.octet(2),
-                self.octet(3)
-            ),
-            self.port_value(),
-        )
-    }
-
-    /// Marks the currently-indexed slot as entered — called whenever a digit
-    /// key or Left/Right actually sets a value, not on plain Up/Down navigation.
-    pub fn touch_current(&mut self) {
-        self.touched[self.index] = true;
-    }
-
-    /// Maps `index` (0-16) to the character position in `display_text()`'s rendered
-    /// string, so the UI can highlight the digit currently being edited — each
-    /// 3-digit group is followed by one separator character (`.` x3, then `:`).
-    pub fn focus_char_index(&self) -> usize {
-        if self.index < 12 {
-            (self.index / 3) * 4 + (self.index % 3)
-        } else {
-            16 + (self.index - 12)
+        let mut parts: Vec<String> = self.octets.iter().map(u8::to_string).collect();
+        if !self.current.is_empty() {
+            parts.push(self.current.clone());
         }
+        (parts.join("."), FIXED_HOST_PORT)
     }
 
-    fn ch(&self, i: usize) -> char {
-        if self.touched[i] {
-            (b'0' + self.digits[i]) as char
-        } else {
-            '_'
-        }
-    }
-
+    /// What's actually been typed so far, exactly as typed — no mask, no
+    /// placeholders, no port.
     pub fn display_text(&self) -> String {
-        format!(
-            "{}{}{}.{}{}{}.{}{}{}.{}{}{}:{}{}{}{}{}",
-            self.ch(0),
-            self.ch(1),
-            self.ch(2),
-            self.ch(3),
-            self.ch(4),
-            self.ch(5),
-            self.ch(6),
-            self.ch(7),
-            self.ch(8),
-            self.ch(9),
-            self.ch(10),
-            self.ch(11),
-            self.ch(12),
-            self.ch(13),
-            self.ch(14),
-            self.ch(15),
-            self.ch(16),
-        )
+        self.host_and_port().0
     }
-}
 
-/// Draws `text` left-aligned at `(x, y)`, rendering the character at `focus_char` in
-/// `focus_color` and every other character in `base_color` — used by the add-host
-/// screen to show which digit Left/Right/number-keys currently edit.
-#[allow(clippy::too_many_arguments)]
-pub fn draw_highlighted_text(
-    painter: &mut Painter,
-    text_cache: &mut TextCache,
-    font: &Font,
-    text: &str,
-    focus_char: usize,
-    x: i32,
-    y: i32,
-    base_color: Color,
-    focus_color: Color,
-) -> Result<()> {
-    let mut cursor_x = x;
-    for (i, ch) in text.chars().enumerate() {
-        let s = ch.to_string();
-        let color = if i == focus_char { focus_color } else { base_color };
-        let w = draw_text(painter, text_cache, font, &s, cursor_x, y, color)?;
-        cursor_x += w as i32;
+    /// Types one digit (0-9) into the octet currently being entered, finishing
+    /// it automatically (a dot appears) once it hits three digits or a fourth
+    /// digit would push its value past 255 — the same auto-advance idiom as a
+    /// phone's IP-entry field, needed since the remote has no dot key of its own.
+    pub fn enter_digit(&mut self, digit: u8) {
+        if self.octets.len() >= 4 {
+            return;
+        }
+        let mut candidate = self.current.clone();
+        candidate.push((b'0' + digit) as char);
+        let value: u32 = candidate.parse().unwrap_or(0);
+        if value > 255 || candidate.len() > 3 {
+            self.advance_octet();
+            if self.octets.len() < 4 {
+                self.current.push((b'0' + digit) as char);
+            }
+            return;
+        }
+        self.current = candidate;
+        if self.current.len() == 3 {
+            self.advance_octet();
+        }
     }
-    Ok(())
+
+    /// Deletes the last typed character — a digit from the in-progress octet,
+    /// or (once that's empty) undoes the last completed octet back into it for
+    /// editing. Left on the d-pad.
+    pub fn backspace(&mut self) {
+        if !self.current.is_empty() {
+            self.current.pop();
+        } else if let Some(last) = self.octets.pop() {
+            self.current = last.to_string();
+        }
+    }
+
+    /// Manually finishes the octet in progress — so e.g. "8" can become
+    /// "8.8.8.8" without waiting for three digits or an overflow. Right on the
+    /// d-pad, standing in for the "." key a real keyboard would have.
+    pub fn advance_octet(&mut self) {
+        if self.current.is_empty() || self.octets.len() >= 4 {
+            return;
+        }
+        let value: u8 = self.current.parse().unwrap_or(0);
+        self.octets.push(value);
+        self.current.clear();
+    }
 }
