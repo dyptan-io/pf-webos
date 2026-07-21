@@ -90,11 +90,21 @@ pub fn connect(
     display_h: i32,
     log: &mut std::fs::File,
 ) -> Result<Connected> {
-    let video_caps = if hdr_enabled {
-        quic::VIDEO_CAP_10BIT | quic::VIDEO_CAP_HDR
-    } else {
-        0
-    };
+    // `VIDEO_CAP_CHACHA20` is advertised unconditionally: this armv7 target has no
+    // hardware AES (RustCrypto aes-gcm resolves to fixsliced software AES + software
+    // GHASH here), and the bit is support-plus-request — a ≥0.17.2 host answers with a
+    // ChaCha20-Poly1305 session key in its Welcome (unless its PUNKTFUNK_CHACHA20
+    // kill-switch says no), while an older host simply ignores the unknown bit and the
+    // session runs AES exactly as before. Negotiation is fail-closed in punktfunk-core
+    // (no silent wrong-cipher fallback), and the *grant* isn't client-observable —
+    // `NativeClient` doesn't expose `Welcome::cipher` — so the host's session-start log
+    // is where the resolved cipher shows up.
+    let video_caps = quic::VIDEO_CAP_CHACHA20
+        | if hdr_enabled {
+            quic::VIDEO_CAP_10BIT | quic::VIDEO_CAP_HDR
+        } else {
+            0
+        };
     let display_hdr = hdr_enabled.then(cx_display_hdr);
     let client = NativeClient::connect(
         host,
@@ -122,7 +132,7 @@ pub fn connect(
     writeln!(
         log,
         "connected: codec={} compositor={:?} audio_channels={} color={:?} resolved_bitrate_kbps={} \
-         wants_decode_latency={} fingerprint={fp_hex}",
+         wants_decode_latency={} advertised_caps=0x{video_caps:02x} fingerprint={fp_hex}",
         client.codec,
         client.resolved_compositor,
         client.audio_channels,
@@ -444,7 +454,14 @@ pub fn pump_audio_once(client: &NativeClient, audio: &mut crate::audio::AudioPla
     static PACKET_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     while let Ok(packet) = client.next_audio(Duration::ZERO) {
         match audio.play(&packet.data) {
-            Ok(peak) => {
+            Ok((peak, resnapped)) => {
+                if resnapped {
+                    let _ = writeln!(
+                        log,
+                        "audio queue over {}ms behind (post-stall burst or clock drift) — cleared to resnap",
+                        crate::audio::MAX_QUEUED_LAG_MS
+                    );
+                }
                 let n = PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
                 if n % 200 == 0 {
                     let _ = writeln!(log, "audio decode peak amplitude: {peak:.4}");

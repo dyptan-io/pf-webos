@@ -729,7 +729,13 @@ mod real {
                     break 'running StreamOutcome::ReturnToMenu;
                 }
 
-                std::thread::sleep(Duration::from_millis(8));
+                // This tick bounds how stale a forwarded input event or a queued audio
+                // packet can get (video has its own thread and never waits on this loop).
+                // 8ms here meant up to 8ms added to every remote/gamepad event and to the
+                // audio drain cadence; at 2ms an idle poll_iter + try-recv round is a few
+                // microseconds of work, so ~500 wakeups/s is noise even on this SoC while
+                // keeping the added input latency near zero.
+                std::thread::sleep(Duration::from_millis(2));
             };
 
             // `disconnect_quit()` was already called above for every deliberate-stop path;

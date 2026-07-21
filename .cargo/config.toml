@@ -16,7 +16,17 @@ linker = "scripts/cc-shim.sh"
 # `-soft-float` here only removes that LLVM codegen feature (computation uses real
 # VFP/NEON instructions); it does not change the calling convention, so FFI calls
 # into the sysroot's softfp-ABI libraries stay correct.
-rustflags = ["-C", "target-feature=+neon,+vfp3,-soft-float", "-C", "target-cpu=cortex-a9"]
+#
+# `target-cpu=cortex-a53`, not the vendor toolchain's `-mcpu=cortex-a9`: that vendor
+# default is a lowest-common-denominator for webOS generations back to genuinely
+# ARMv7 silicon, but this client targets webOS 5.x+ (see README), where every LG SoC
+# (α5/α7/α9 gen 3+, and the MTK-based budget models) is an ARMv8-A core running
+# 32-bit userland. Tuning for the A53 (the conservative in-order baseline — fine on
+# the bigger A73-class cores too) additionally unlocks ARMv8's A32 instruction set:
+# hardware integer divide (cortex-a9 codegen calls `__aeabi_idiv` instead) and
+# VFPv4 fused multiply-add. ABI is unchanged (still softfp, as above). If a
+# pre-ARMv8 webOS device ever needs supporting, revert this one value to cortex-a9.
+rustflags = ["-C", "target-feature=+neon,+vfp3,-soft-float", "-C", "target-cpu=cortex-a53"]
 
 [env]
 CC_armv7_unknown_linux_gnueabi = { value = "scripts/cc-shim.sh", relative = true }
