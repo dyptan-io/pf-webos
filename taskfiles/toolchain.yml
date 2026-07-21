@@ -111,26 +111,6 @@ tasks:
       # Needs a fairly recent stable Rust (its source uses let-chains).
       - cargo install --git https://github.com/webosbrew/ares-cli-rs ares-package
 
-  fetch-device-libs:
-    desc: >-
-      Fallback only (normally unneeded — the NDK ships a link-time stub already):
-      pull libNDL_directmedia.so.1 off a real TV. Usage:
-      task toolchain:fetch-device-libs TV_HOST=user@host
-    deps: [ndk]
-    status:
-      - test -e {{.SYSROOT}}/usr/lib/libNDL_directmedia.so.1
-    cmds:
-      - |
-        set -eu
-        : "${TV_HOST:?pass TV_HOST=user@host (a webOS 5+ TV in Developer Mode with root SSH)}"
-        LIB=libNDL_directmedia.so.1.0.0
-        TMP="$(mktemp -d)"
-        trap 'rm -rf "$TMP"' EXIT
-        scp -o ConnectTimeout=8 "$TV_HOST:/usr/lib/$LIB" "$TMP/$LIB"
-        cp "$TMP/$LIB" {{.SYSROOT}}/usr/lib/$LIB
-        ln -sf $LIB {{.SYSROOT}}/usr/lib/libNDL_directmedia.so.1
-        echo "NDL DirectMedia build-time stub fetched from $TV_HOST"
-
   deploy:
     internal: true
     requires:
@@ -248,9 +228,9 @@ tasks:
       - >-
         docker run --rm --platform linux/arm64 {{.DOCKER_MOUNTS}} {{.RUST_IMAGE}}
         sh -c '
-          apt-get update &&
-          apt-get install -y --no-install-recommends cmake curl ca-certificates git pkg-config build-essential xz-utils &&
-          curl -sL https://taskfile.dev/install.sh | sh -s -- -d -b /opt/pf-webos-tools/bin &&
+          apt-get update -qq &&
+          apt-get install -y -qq --no-install-recommends cmake curl ca-certificates git pkg-config build-essential xz-utils > /dev/null &&
+          curl -sL https://taskfile.dev/install.sh | sh -s -- -d -b /opt/pf-webos-tools/bin > /dev/null &&
           task {{.TARGET_TASK}}
         '
 

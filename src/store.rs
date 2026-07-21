@@ -111,14 +111,12 @@ pub fn save_selected_host(host: &str, port: u16) -> Result<()> {
     std::fs::write(selected_host_path(), json).context("write selected-host.json")
 }
 
-/// Stream settings: resolution/framerate/bitrate/HDR. See `main.rs`'s NTSC-correction
-/// docs for why `refresh_hz` here is the nominal (60/120), not the wire value.
+/// Stream settings: resolution/framerate/bitrate/HDR.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Settings {
     pub width: u32,
     pub height: u32,
-    /// Nominal refresh rate (30/60/120) — the actual wire `Mode.refresh_hz` applies
-    /// the aurora-tv NTSC floor-correction on top of this (see `main.rs`).
+    /// Refresh rate (30/60/120) — sent to the host as the exact wire `Mode.refresh_hz`.
     pub refresh_hz: u32,
     /// `0` (Automatic — `punktfunk_core`'s own client-side AIMD bitrate controller, see
     /// `ui::BITRATE_AUTOMATIC`) or 10_000-150_000 (10-150 Mbps) fixed, adjusted via the settings

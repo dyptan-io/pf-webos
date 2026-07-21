@@ -309,25 +309,31 @@ not a working refresh-rate switch. The panel's actual scan-out rate is fixed at 
 (HDMI timing negotiated once, or user-toggled TV settings like TruMotion/Game Optimizer) — outside
 any homebrew app's reach. Kodi's webOS port has the same limitation.
 
-**Tried and abandoned: claiming the Magic Remote's hardware Back button via
-`SDL_WEBOS_ACCESS_POLICY_KEYS_BACK`.** `webosbrew/SDL-webOS`'s
-`src/video/wayland/SDL_waylandwebos.c` sets a Wayland shell-surface property,
-`_WEBOS_ACCESS_POLICY_KEYS_BACK`, gated behind this SDL hint — in theory, setting it (to `"true"`,
-before window creation) makes the launcher stop intercepting that key and deliver it to the app as
-a raw scancode instead (`SDL_SCANCODE_WEBOS_BACK = 482`, unrepresentable through the safe
-`Scancode`/`Keycode` API — same situation as the color buttons below — so it needs the raw
-keyboard-state array, same idiom as `ui::webos_red_button_down()`'s color-button read). On the
-actual CX this app ships to, it doesn't work: with the hint set (tried both `"1"` and `"true"`),
-the physical Back button still never reached the app in any form — not the raw scancode, not a
-`KeyDown` — and the system launcher fully killed the app instead (an `Event::Quit`, confirmed via
-on-device logging), exactly the default behavior the hint is supposed to prevent. Since
-`docs/NOTES.md`'s own prior note already flagged this hint as "not necessarily honored on every
-firmware/model," and it isn't on this one, the entire raw-scancode Back/Red mechanism (the hint,
-`ui::webos_back_button_down`/`webos_red_button_down`, and both loops' hold-to-quit/hold-to-disconnect
-timers built on top of it) was removed rather than kept as dead weight. The on-screen close (X)
-button (works, confirmed on-device) and the keyboard/gamepad Back mapping (`Escape`/`Backspace`/
-`AcBack`, or a controller's B button) are the only Back paths now — don't re-add the hint/scancode
-approach without new evidence it actually works on real hardware this time.
+**`SDL_WEBOS_ACCESS_POLICY_KEYS_BACK` stops the launcher from opening, but the Magic
+Remote's Back/Red buttons still never reach the app as a usable scancode.** `webosbrew/
+SDL-webOS`'s `src/video/wayland/SDL_waylandwebos.c` sets a Wayland shell-surface property,
+`_WEBOS_ACCESS_POLICY_KEYS_BACK`, gated behind this SDL hint — setting it to `"true"` before
+window creation (`run_inner`, via `sdl2::hint::set`) is kept because it's confirmed on-device to
+do what it's documented to do: the system launcher no longer opens/kills the app when Back is
+pressed (a real, working improvement over the old default). But that's as far as it goes: polling
+`SDL_GetKeyboardState`'s raw byte array (the only place `SDL_SCANCODE_WEBOS_BACK = 482` would be
+visible at all, since `sdl2`'s vendored `Scancode`/`Keycode` bindings only name scancodes up to
+290) shows every other key's scancode changing normally, but Back and Red specifically never flip
+— confirmed twice on-device, once via a single-scancode check and once via a full-array scan
+logging every changed index. Likely cause (unconfirmed): `Wayland_get_scancode_from_key` in
+`SDL_waylandevents.c` only calls the webOS scancode fallback (`SDL_GetWebOSScancode`, the thing
+that actually maps the LG remote's raw IR keycodes to `SDL_SCANCODE_WEBOS_*`) from one specific
+branch, gated on `!input->keyboard_is_virtual`; if this compositor's remote input reports as a
+virtual keyboard, that branch — and the webOS fallback with it — is skipped entirely, and these
+two LG-specific keycodes have no xkb keysym either, so SDL drops the whole key event before it's
+visible in any form (no scancode, no `Event::KeyDown`, nothing — confirmed via a catch-all logger
+on every otherwise-unhandled SDL event too, which also logged nothing for these two keys).
+Whatever the exact mechanism, don't re-attempt reading Back/Red via `SDL_GetKeyboardState`,
+`Keycode`, or `Scancode` without new evidence — the on-screen close (X) button, keyboard/gamepad
+Back mapping (`Escape`/`Backspace`/`AcBack`, or a controller's B button), and the in-stream
+long-press-to-disconnect are the only working Back paths. The access-policy hint itself is safe
+to leave set (confirmed harmless, and it does genuinely stop the launcher takeover) even though
+nothing currently consumes the scancode it was meant to unlock.
 
 **A hidden/unmapped window doesn't receive pointer input.** The stream-time window was `.hide()`n
 (since `set_opacity` isn't supported on this Wayland backend) so it wouldn't visually cover the NDL

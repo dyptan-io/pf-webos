@@ -32,6 +32,7 @@ mod wol;
 mod real {
     use std::io::Write as _;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use anyhow::{Context, Result};
@@ -48,6 +49,32 @@ mod real {
     /// fresh TOFU connect), and an optional library entry id to launch into.
     type ConnectOutcome = (String, u16, Option<[u8; 32]>, Option<String>);
 
+    /// Set by [`handle_term_signal`], read by both event loops below as an extra
+    /// "should we quit" condition alongside SDL's own `Event::Quit`. webOS can ask a
+    /// backgrounded/closing app to exit via SIGTERM before ever reaching SIGKILL —
+    /// without catching that, a stream in progress gets killed with no chance to
+    /// tell the host anything (see `session::Connected::shutdown`'s docs).
+    static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    /// Async-signal-safe by construction (a lone atomic store) — real cleanup
+    /// happens later, wherever `QUIT_REQUESTED` is next polled.
+    extern "C" fn handle_term_signal(_signum: libc::c_int) {
+        QUIT_REQUESTED.store(true, Ordering::Relaxed);
+    }
+
+    /// `SIGTERM` (webOS's/systemd's normal "please exit") and `SIGINT` (Ctrl-C, for
+    /// off-device smoke-testing). Best-effort: a failure just leaves the OS default
+    /// (immediate kill) in place.
+    fn install_signal_handlers() {
+        // SAFETY: `libc::signal` with a function pointer of the correct
+        // `extern "C" fn(c_int)` signature and no other arguments is exactly its
+        // documented safe-to-call shape.
+        unsafe {
+            libc::signal(libc::SIGTERM, handle_term_signal as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGINT, handle_term_signal as *const () as libc::sighandler_t);
+        }
+    }
+
     /// webOS native apps run with no attached terminal; `dev-manager-desktop`'s log
     /// viewer reads this file. `/media/developer/apps/usr/palm/applications/<appid>/`
     /// is the app's own writable directory (falls back to `/tmp` off-device, e.g. when
@@ -59,6 +86,7 @@ mod real {
     }
 
     pub fn run() -> Result<()> {
+        install_signal_handlers();
         let log_path = log_path();
         let mut log = std::fs::OpenOptions::new()
             .create(true)
@@ -91,18 +119,6 @@ mod real {
                 let _ = writeln!(log, "error: {e:#}");
                 Err(e)
             }
-        }
-    }
-
-    /// aurora-tv's confirmed webOS NTSC correction (`app_settings.c`,
-    /// `settings_ntsc_refresh_rate_x100_for_fps`): real LG panels run 1000/1001 ×
-    /// the nominal rate (30/60/120/240 only), floored to a whole Hz for the wire
-    /// value since punktfunk's `Mode.refresh_hz` has no centihertz field like
-    /// Limelight's `clientRefreshRateX100`. 60 → 59, 120 → 119.
-    fn ntsc_correct(nominal_hz: u32) -> u32 {
-        match nominal_hz {
-            30 | 60 | 120 | 240 => ((u64::from(nominal_hz) * 1000 / 1001) as u32).max(1),
-            other => other,
         }
     }
 
@@ -186,6 +202,10 @@ mod real {
         // Starts `true` so the first frame always draws.
         let mut dirty = true;
         let target = 'ui: loop {
+            if QUIT_REQUESTED.load(Ordering::Relaxed) {
+                writeln!(log, "SIGTERM/SIGINT received during UI")?;
+                return Ok(None);
+            }
             dirty |= app.drain_discovery(log);
             dirty |= app.drain_art();
             dirty |= app.drain_games(log);
@@ -214,17 +234,16 @@ mod real {
                     // for the Magic Remote's pointer mode: it delivers OK as a
                     // plain mouse click, not a key event, so a physical
                     // press-and-hold here never reached the keyboard/gamepad
-                    // arms at all — re-sync focus to the click's own position
-                    // first (see `handle_mouse_click`'s docs on why), then only
-                    // hold-time it while actually hovering a host row.
+                    // arms at all — hit-test+focus the press's own position
+                    // fresh (see `App::focus_host_row_at`'s docs on why), then
+                    // only hold-time it while actually landing on a host row.
                     Event::MouseButtonDown {
                         mouse_btn: sdl2::mouse::MouseButton::Left,
                         x,
                         y,
                         ..
                     } => {
-                        app.handle_mouse_motion(x, y, display_mode.w as u32, display_mode.h as u32);
-                        if app.host_row_focused().is_some() {
+                        if app.focus_host_row_at(x, y, display_mode.h as u32).is_some() {
                             confirm_held_since.get_or_insert_with(Instant::now);
                             continue;
                         }
@@ -450,6 +469,13 @@ mod real {
     }
 
     fn run_inner(log: &mut std::fs::File) -> Result<()> {
+        // Without this, webOS's system launcher intercepts the Magic Remote's Back
+        // key before the app ever sees it (confirmed on-device — see
+        // docs/NOTES.md's "Tried and abandoned" note on this exact hint, previously
+        // removed after it appeared not to help; re-trying it here). Must be set
+        // before the window is created — `SDL_waylandwebos.c` only applies it at
+        // window-creation time (plus a runtime hint-watcher for later changes).
+        sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
         let sdl = sdl2::init().map_err(|e| anyhow::anyhow!("SDL_Init: {e}"))?;
         let ttf = sdl2::ttf::init().map_err(|e| anyhow::anyhow!("SDL_ttf init: {e}"))?;
         let video = sdl.video().map_err(|e| anyhow::anyhow!("SDL video subsystem: {e}"))?;
@@ -558,18 +584,16 @@ mod real {
             // SDL2/Wayland reports refresh_rate=0 in some launch contexts (confirmed:
             // the host's virtual-display driver rejected a literal "0 Hz" mode request
             // with "the parameter is incorrect") — the settings' own nominal rate (never
-            // 0; see store::Settings::default) is what actually drives the wire value,
-            // through the aurora-tv NTSC correction (see `ntsc_correct` docs).
-            let wire_refresh_hz = ntsc_correct(settings.refresh_hz);
+            // 0; see store::Settings::default) is what drives the wire value directly.
             writeln!(
                 log,
-                "requesting {}x{}@{} (wire refresh {wire_refresh_hz}, NTSC-corrected)",
+                "requesting {}x{}@{}",
                 settings.width, settings.height, settings.refresh_hz
             )?;
             let mode = Mode {
                 width: settings.width,
                 height: settings.height,
-                refresh_hz: wire_refresh_hz,
+                refresh_hz: settings.refresh_hz,
             };
             let connected = session::connect(
                 &host,
@@ -603,10 +627,20 @@ mod real {
             let mut controller = None;
             let mut back_held_since: Option<Instant> = None;
             let outcome = 'running: loop {
+                if QUIT_REQUESTED.load(Ordering::Relaxed) {
+                    writeln!(log, "SIGTERM/SIGINT received — disconnecting before exit")?;
+                    connected.client.disconnect_quit();
+                    break 'running StreamOutcome::Quit;
+                }
                 for event in events.poll_iter() {
                     use sdl2::event::Event;
                     match event {
-                        Event::Quit { .. } => break 'running StreamOutcome::Quit,
+                        Event::Quit { .. } => {
+                            // As deliberate a stop as long-press-Back below — tear the
+                            // virtual display down now instead of lingering for a reconnect.
+                            connected.client.disconnect_quit();
+                            break 'running StreamOutcome::Quit;
+                        }
                         Event::ControllerDeviceAdded { which, .. } if controller.is_none() => {
                             match game_controller.open(which) {
                                 Ok(c) => {
@@ -698,7 +732,10 @@ mod real {
                 std::thread::sleep(Duration::from_millis(8));
             };
 
-            connected.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            // `disconnect_quit()` was already called above for every deliberate-stop path;
+            // `shutdown()` joins the video thread and drops `client` so the QUIC close
+            // frame actually gets sent before this function returns (see its docs).
+            connected.shutdown();
             crate::ndl::quit();
             sdl.mouse().show_cursor(true);
             match outcome {
