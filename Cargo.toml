@@ -50,12 +50,17 @@ tracing-subscriber = "0.3"
 # pf-client-core's session::start() (see session.rs docs for why we don't use that).
 # Pinned to a tagged punktfunk release (not a branch tip) this client was
 # developed/tested against — bump deliberately, not automatically, since
-# punktfunk-core's wire/ABI surface can move. Currently v0.16.0 — WIRE_VERSION 2
-# (unchanged since this pin's previous v0.9.2-based commit; no protocol migration
-# needed here), ABI_VERSION 9 (irrelevant to us: we link the Rust `client` API
-# directly, not the C ABI in `abi.rs`, and that module's signatures are unchanged
-# across the whole v0.9.2..v0.16.0 range).
-punktfunk-core = { git = "https://git.unom.io/unom/punktfunk", tag = "v0.16.0", features = [
+# punktfunk-core's wire/ABI surface can move. Currently v0.17.0 (bumped from
+# v0.16.0) — WIRE_VERSION unchanged, and `client::NativeClient`'s public surface is
+# identical, so this is a behavior-only bump. Pulled in for `VIDEO_CAP_STREAMED_AU`
+# (added post-v0.16.0): the host's Linux direct-NVENC encoder can now stream a
+# multi-slice frame's tail overlapped with packetize/FEC/pacing instead of waiting
+# for the whole frame to encode first, cutting large-frame pipeline latency —
+# helps most exactly where bigger (higher-bitrate) frames used to fall behind.
+# No client code change needed: this crate already OR's the cap bit into every
+# `Hello` unconditionally, it was just a no-op against an older host/core. The
+# host machine's punktfunk-host needs to be on v0.17.0+ too, or it ignores the bit.
+punktfunk-core = { git = "https://git.unom.io/unom/punktfunk", tag = "v0.17.0", features = [
     "quic",
 ] }
 serde = { version = "1", features = ["derive"] }

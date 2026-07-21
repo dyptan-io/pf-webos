@@ -476,7 +476,7 @@ dependencies = [
 [[package]]
 name = "fec-rs"
 version = "0.1.0"
-source = "git+https://git.unom.io/unom/punktfunk?tag=v0.16.0#191c9a4e188dffabc17b99fb4110f0e9666f4510"
+source = "git+https://git.unom.io/unom/punktfunk?tag=v0.17.0#7c0313a7cbbdb3b42265a89c6ec003b1b5744dd2"
 
 [[package]]
 name = "fiat-crypto"
@@ -1040,8 +1040,8 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-core"
-version = "0.16.0"
-source = "git+https://git.unom.io/unom/punktfunk?tag=v0.16.0#191c9a4e188dffabc17b99fb4110f0e9666f4510"
+version = "0.17.0"
+source = "git+https://git.unom.io/unom/punktfunk?tag=v0.17.0#7c0313a7cbbdb3b42265a89c6ec003b1b5744dd2"
 dependencies = [
  "aes-gcm",
  "bytes",
