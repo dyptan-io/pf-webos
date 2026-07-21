@@ -210,6 +210,10 @@ mod real {
             dirty |= app.drain_art();
             dirty |= app.drain_games(log);
             dirty |= app.tick_wake(log);
+            dirty |= app.drain_launch_check(log);
+            if let Some(target) = app.take_ready_launch() {
+                break 'ui target;
+            }
             for event in events.poll_iter() {
                 use sdl2::event::Event;
                 if let Event::Quit { .. } = event {
@@ -279,16 +283,30 @@ mod real {
                     // `Some(Instant::now())`: a held key can resend `KeyDown`
                     // as an OS repeat, which must not keep resetting the clock
                     // back to zero.
+                    //
+                    // `confirm_held_since.is_some()` alone (not just
+                    // `host_row_focused()`) also keeps intercepting *once a hold is
+                    // already tracked* — needed because the moment the hold crosses
+                    // `LONG_PRESS_CONFIRM` and opens `Screen::ForgetHost`, the screen
+                    // is no longer `Home`, so `host_row_focused()` goes back to
+                    // `None` while the physical key is still down. Without this, the
+                    // very next OS repeat `KeyDown` for that same still-held key fell
+                    // through all the way to the generic dispatch below, which read
+                    // it as a fresh Confirm on `Screen::ForgetHost` — landing on
+                    // "Cancel" (the default focus) and dismissing the just-opened
+                    // dialog before the user ever released the button. A held mouse
+                    // button has no equivalent repeat (`MouseButtonDown` fires once),
+                    // which is why this only ever showed up with keyboard/remote.
                     Event::KeyDown { keycode: Some(k), .. }
                         if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Confirm)
-                            && app.host_row_focused().is_some() =>
+                            && (confirm_held_since.is_some() || app.host_row_focused().is_some()) =>
                     {
                         confirm_held_since.get_or_insert_with(Instant::now);
                         continue;
                     }
                     Event::ControllerButtonDown { button, .. }
                         if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Confirm)
-                            && app.host_row_focused().is_some() =>
+                            && (confirm_held_since.is_some() || app.host_row_focused().is_some()) =>
                     {
                         confirm_held_since.get_or_insert_with(Instant::now);
                         continue;
