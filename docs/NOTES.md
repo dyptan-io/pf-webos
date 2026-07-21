@@ -211,7 +211,15 @@ around `Aes128Gcm`; `chacha20poly1305` is the same crate family with the same tr
 the in-crate change is close to a type swap. The real work is the wire-visible part: needs a
 capability/version negotiation (every client and host must agree, so not a silent swap), and
 the key grows from 16 to 32 bytes. This is a `punktfunk-core`/`punktfunk-host` change — affects
-every client, not just this one — intentionally deferred, not part of this pass.
+every client, not just this one.
+
+**Status (2026-07-21): the punktfunk maintainer has confirmed ChaCha20-Poly1305 is coming to
+the protocol.** Nothing to do in pf-webos yet — this client has no cipher-specific code of its
+own (it never touches `SessionCrypto`/`Aes128Gcm` directly; all of it is internal to
+`punktfunk-core`, invisible behind the `NativeClient` API this client consumes). Once
+punktfunk-core ships it and pf-webos bumps its pin, wire it in as the **sole** cipher — no
+client-side setting/toggle for encryption algorithm, same way codec/HDR/bitrate capability bits
+are just sent, not exposed as a user choice between wire-level options.
 
 ## Runtime/deploy gotchas (LG CX specifics)
 

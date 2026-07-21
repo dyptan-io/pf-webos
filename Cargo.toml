@@ -60,6 +60,13 @@ tracing-subscriber = "0.3"
 # No client code change needed: this crate already OR's the cap bit into every
 # `Hello` unconditionally, it was just a no-op against an older host/core. The
 # host machine's punktfunk-host needs to be on v0.17.0+ too, or it ignores the bit.
+#
+# Pending bump: the maintainer is adding ChaCha20-Poly1305 to the wire protocol (see
+# docs/NOTES.md's high-bitrate decode entry — the CX's Cortex-A9 has no AES hardware,
+# so software AES-GCM is a real decode-choppiness contributor at high bitrate). This
+# client has no cipher-specific code of its own (crypto is internal to this crate,
+# behind `NativeClient`) — when that lands, just bump the tag; do NOT add a
+# client-side setting/toggle for it, it's the one cipher this client speaks.
 punktfunk-core = { git = "https://git.unom.io/unom/punktfunk", tag = "v0.17.0", features = [
     "quic",
 ] }
