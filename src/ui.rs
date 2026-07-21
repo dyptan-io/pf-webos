@@ -138,9 +138,8 @@ impl StickMenuNav {
         use sdl2::controller::Axis;
         match axis {
             Axis::LeftX => Self::edge(&mut self.x, value, MenuEvent::Left, MenuEvent::Right),
-            // Positive Y is up on SDL2's GameController axis (see `gamepad.rs`'s
-            // `axis_event` docs), so a positive tilt maps to `Up`, not `Down`.
-            Axis::LeftY => Self::edge(&mut self.y, value, MenuEvent::Down, MenuEvent::Up),
+            // Negative is up (see `gamepad.rs`'s `axis_event` docs for why).
+            Axis::LeftY => Self::edge(&mut self.y, value, MenuEvent::Up, MenuEvent::Down),
             _ => None,
         }
     }

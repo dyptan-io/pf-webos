@@ -521,6 +521,13 @@ mod real {
         // before the window is created — `SDL_waylandwebos.c` only applies it at
         // window-creation time (plus a runtime hint-watcher for later changes).
         sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
+        // SDL2 disables "extended" HID reports for PS4/PS5 pads over Bluetooth by
+        // default — and rumble is only carried in the extended report, so a
+        // Bluetooth DualSense/DualShock4 otherwise never vibrates no matter what
+        // `GameController::set_rumble` is called with. Must be set before the game
+        // controller subsystem opens the pad (SDL reads these at HIDAPI driver init).
+        sdl2::hint::set("SDL_JOYSTICK_HIDAPI_PS5_RUMBLE", "1");
+        sdl2::hint::set("SDL_JOYSTICK_HIDAPI_PS4_RUMBLE", "1");
         let sdl = sdl2::init().map_err(|e| anyhow::anyhow!("SDL_Init: {e}"))?;
         let ttf = sdl2::ttf::init().map_err(|e| anyhow::anyhow!("SDL_ttf init: {e}"))?;
         let video = sdl.video().map_err(|e| anyhow::anyhow!("SDL video subsystem: {e}"))?;
@@ -806,6 +813,7 @@ mod real {
                     ok_promoted = true;
                 }
                 session::pump_audio_once(&connected.client, &mut audio_player, log);
+                session::pump_rumble_once(&connected.client, &mut controller, log);
                 if connected.client.is_session_ended() {
                     writeln!(log, "host ended the session")?;
                     break 'running StreamOutcome::ReturnToMenu;

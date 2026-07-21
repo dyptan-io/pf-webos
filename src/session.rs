@@ -23,6 +23,7 @@ use punktfunk_core::config::{CompositorPref, Mode};
 use punktfunk_core::input::InputEvent;
 use punktfunk_core::packet::{FLAG_SOF, USER_FLAG_RECOVERY_ANCHOR};
 use punktfunk_core::quic;
+use sdl2::controller::GameController;
 
 use crate::ndl::{NdlCodec, NdlVideo};
 
@@ -452,6 +453,21 @@ pub fn pump_audio_once(client: &NativeClient, audio: &mut crate::audio::AudioPla
             }
             Err(e) => {
                 let _ = writeln!(log, "audio play error (seq {}): {e:#}", packet.seq);
+            }
+        }
+    }
+}
+
+/// Drains every pending rumble command from the shared policy engine (non-blocking,
+/// like `pump_audio_once`) and applies it to the currently open controller. A single
+/// pad is all this client tracks (see `gamepad.rs`), so `cmd.pad` is ignored rather
+/// than matched against one; a command that arrives with no controller open is just
+/// dropped.
+pub fn pump_rumble_once(client: &NativeClient, controller: &mut Option<GameController>, log: &mut std::fs::File) {
+    while let Ok(cmd) = client.next_rumble_command(Duration::ZERO) {
+        if let Some(c) = controller {
+            if let Err(e) = c.set_rumble(cmd.low, cmd.high, cmd.backstop_ms) {
+                let _ = writeln!(log, "controller rumble failed: {e}");
             }
         }
     }
