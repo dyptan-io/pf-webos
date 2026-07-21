@@ -167,10 +167,9 @@ pub fn connect(
     let video_client = client.clone();
     let video_stop = stop.clone();
     let mut video_log = log.try_clone().context("clone log for video thread")?;
-    let refresh_hz = resolved_mode.refresh_hz;
     let video_thread = std::thread::Builder::new()
         .name("punktfunk-webos-video".into())
-        .spawn(move || video_pump(video_client, ndl, video_stop, is_hdr, refresh_hz, &mut video_log))
+        .spawn(move || video_pump(video_client, ndl, video_stop, is_hdr, &mut video_log))
         .context("spawn video thread")?;
 
     Ok(Connected {
@@ -200,14 +199,7 @@ const HOLD_GIVE_UP: Duration = Duration::from_secs(2);
 /// happens; it's diagnostic signal for telling decoder-side stalls apart from network loss.
 const NDL_FEED_BACKPRESSURE_WARN: Duration = Duration::from_millis(20);
 
-fn video_pump(
-    client: Arc<NativeClient>,
-    ndl: NdlVideo,
-    stop: Arc<AtomicBool>,
-    is_hdr: bool,
-    refresh_hz: u32,
-    log: &mut std::fs::File,
-) {
+fn video_pump(client: Arc<NativeClient>, ndl: NdlVideo, stop: Arc<AtomicBool>, is_hdr: bool, log: &mut std::fs::File) {
     // Register this thread alongside punktfunk-core's own internal data-plane pump thread
     // (UDP receive + FEC reassembly — already auto-registered) in the shared hot-thread
     // registry, then boost both with a best-effort `nice` priority bump. `hot_thread_ids` is
@@ -260,21 +252,6 @@ fn video_pump(
     // other log line to show it).
     let mut frames_received: u64 = 0;
     let mut last_heartbeat = Instant::now();
-    // Frame pacing: absorb bursty host send timing into an even output cadence instead of
-    // feeding NDL the instant each frame arrives — NDL couples decode+present with no jitter
-    // buffer of its own. Held-back frames just sit in punktfunk-core's pre-decode queue, whose
-    // own sizing docs call a small jitter buffer (~100ms@60fps) expected. `None` = present
-    // immediately (right after connect, and right after a freeze lifts).
-    let frame_interval = Duration::from_secs_f64(1.0 / f64::from(refresh_hz.max(1)));
-    // Cap how far the pacing schedule may drift ahead of real time: without feedback against
-    // the queue depth, a host cadence running even slightly faster than `refresh_hz` would let
-    // our schedule drift further and further ahead while punktfunk-core's pre-decode queue
-    // quietly grows behind it (that queue never self-corrects once behind). Past `QUEUE_HIGH`
-    // punktfunk-core treats that as a standing backlog and flushes it — the strongest signal
-    // its Automatic-bitrate controller has, triggering an immediate severe cut. One extra
-    // frame interval of drift (~2 frames held back) stays comfortably under that threshold.
-    let max_pace_ahead = frame_interval;
-    let mut next_present_at: Option<Instant> = None;
 
     while !stop.load(Ordering::Relaxed) {
         match client.next_frame(Duration::from_millis(500)) {
@@ -339,7 +316,6 @@ fn video_pump(
                     // Concealed/reference-broken frame — never feed it to NDL; the panel keeps
                     // showing the last good picture instead of the decoder's concealment output.
                 } else {
-                    let was_holding = holding;
                     if holding {
                         let _ = writeln!(
                             log,
@@ -352,24 +328,8 @@ fn video_pump(
                     holding = false;
                     hold_started = None;
 
-                    // Skip pacing on the frame that just lifted a freeze — get it on screen
-                    // immediately and let it resync the pacing clock afterward.
-                    if !was_holding {
-                        if let Some(target) = next_present_at {
-                            if let Some(remaining) = target.checked_duration_since(Instant::now()) {
-                                std::thread::sleep(remaining);
-                            }
-                        }
-                    }
-
                     let feed_start = Instant::now();
                     let play_result = ndl.play(&frame.data);
-                    next_present_at = Some(match next_present_at {
-                        Some(prev) if !was_holding => {
-                            (prev + frame_interval).max(feed_start).min(feed_start + max_pace_ahead)
-                        }
-                        _ => feed_start + frame_interval,
-                    });
                     let feed_elapsed = feed_start.elapsed();
                     if feed_elapsed >= NDL_FEED_BACKPRESSURE_WARN {
                         let _ = writeln!(
