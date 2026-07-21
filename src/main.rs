@@ -14,6 +14,8 @@ mod discovery;
 #[cfg(target_os = "linux")]
 mod gamepad;
 #[cfg(target_os = "linux")]
+mod keyboard;
+#[cfg(target_os = "linux")]
 mod library;
 #[cfg(target_os = "linux")]
 mod mouse;
@@ -37,9 +39,11 @@ mod real {
 
     use anyhow::{Context, Result};
     use punktfunk_core::config::Mode;
+    use sdl2::mouse::MouseButton;
 
     use crate::app::{App, Screen};
     use crate::gamepad;
+    use crate::keyboard;
     use crate::mouse;
     use crate::session;
     use crate::store;
@@ -127,6 +131,10 @@ mod real {
     /// normal game-input tap of the same physical button (many games use
     /// B/Back-ish buttons) never triggers it.
     const LONG_PRESS_BACK: Duration = Duration::from_millis(1500);
+    /// How long the Magic Remote's OK button (the pointer's left click) must be held
+    /// before it's promoted to a right click — long enough that a normal click never
+    /// trips it, short enough to feel deliberate rather than sluggish.
+    const LONG_PRESS_OK: Duration = Duration::from_millis(500);
 
     /// How long OK must be held on a sidebar host row before it opens
     /// `Screen::ForgetHost` instead of that row's normal short-press action
@@ -644,6 +652,9 @@ mod real {
 
             let mut controller = None;
             let mut back_held_since: Option<Instant> = None;
+            let mut ok_held_since: Option<Instant> = None;
+            let mut ok_promoted = false;
+            let mut scroll_acc = mouse::ScrollAccumulator::default();
             let outcome = 'running: loop {
                 if QUIT_REQUESTED.load(Ordering::Relaxed) {
                     writeln!(log, "SIGTERM/SIGINT received — disconnecting before exit")?;
@@ -671,15 +682,21 @@ mod real {
                         Event::ControllerDeviceRemoved { .. } => {
                             controller = None;
                         }
-                        Event::KeyDown { keycode: Some(k), .. }
-                            if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) =>
-                        {
-                            back_held_since.get_or_insert_with(Instant::now);
+                        Event::KeyDown { keycode: Some(k), .. } => {
+                            if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) {
+                                back_held_since.get_or_insert_with(Instant::now);
+                            }
+                            if let Some(ev) = keyboard::key_event(k, true) {
+                                let _ = session::send_input(&connected.client, &ev);
+                            }
                         }
-                        Event::KeyUp { keycode: Some(k), .. }
-                            if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) =>
-                        {
-                            back_held_since = None;
+                        Event::KeyUp { keycode: Some(k), .. } => {
+                            if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) {
+                                back_held_since = None;
+                            }
+                            if let Some(ev) = keyboard::key_event(k, false) {
+                                let _ = session::send_input(&connected.client, &ev);
+                            }
                         }
                         Event::ControllerButtonDown { button, .. } => {
                             if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back) {
@@ -708,23 +725,38 @@ mod real {
                             let _ = session::send_input(&connected.client, &ev);
                         }
                         Event::MouseButtonDown { mouse_btn, .. } => {
+                            if mouse_btn == MouseButton::Left {
+                                ok_held_since = Some(Instant::now());
+                                ok_promoted = false;
+                            }
                             if let Some(ev) = mouse::button_event(mouse_btn, true) {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
                         }
                         Event::MouseButtonUp { mouse_btn, .. } => {
-                            if let Some(ev) = mouse::button_event(mouse_btn, false) {
+                            let released = if mouse_btn == MouseButton::Left && ok_promoted {
+                                MouseButton::Right
+                            } else {
+                                mouse_btn
+                            };
+                            if mouse_btn == MouseButton::Left {
+                                ok_held_since = None;
+                                ok_promoted = false;
+                            }
+                            if let Some(ev) = mouse::button_event(released, false) {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
                         }
                         Event::MouseWheel { x, y, .. } => {
                             if y != 0 {
-                                let ev = mouse::scroll_event(y, false);
-                                let _ = session::send_input(&connected.client, &ev);
+                                if let Some(ev) = scroll_acc.scroll_event(y, false) {
+                                    let _ = session::send_input(&connected.client, &ev);
+                                }
                             }
                             if x != 0 {
-                                let ev = mouse::scroll_event(x, true);
-                                let _ = session::send_input(&connected.client, &ev);
+                                if let Some(ev) = scroll_acc.scroll_event(x, true) {
+                                    let _ = session::send_input(&connected.client, &ev);
+                                }
                             }
                         }
                         _ => {}
@@ -740,6 +772,16 @@ mod real {
                     // client, which closes with the "may reconnect" code instead.
                     connected.client.disconnect_quit();
                     break 'running StreamOutcome::ReturnToMenu;
+                }
+                if !ok_promoted && ok_held_since.is_some_and(|t| t.elapsed() >= LONG_PRESS_OK) {
+                    // Release left before pressing right so the host never sees both held.
+                    if let Some(ev) = mouse::button_event(MouseButton::Left, false) {
+                        let _ = session::send_input(&connected.client, &ev);
+                    }
+                    if let Some(ev) = mouse::button_event(MouseButton::Right, true) {
+                        let _ = session::send_input(&connected.client, &ev);
+                    }
+                    ok_promoted = true;
                 }
                 session::pump_audio_once(&connected.client, &mut audio_player, log);
                 if connected.client.is_session_ended() {

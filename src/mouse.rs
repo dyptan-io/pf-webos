@@ -66,16 +66,34 @@ pub fn move_event(x: i32, y: i32, client_w: u32, client_h: u32) -> InputEvent {
     }
 }
 
-/// `code` distinguishes the scroll axis (`0` = vertical, `1` = horizontal — see
-/// `punktfunk-host`'s `SCROLL_HORIZONTAL`); `delta` is the signed scroll amount,
-/// SDL2's `MouseWheelEvent.y`/`.x` passed straight through.
-pub fn scroll_event(delta: i32, horizontal: bool) -> InputEvent {
-    InputEvent {
-        kind: InputKind::MouseScroll,
-        _pad: [0; 3],
-        code: u32::from(horizontal),
-        x: delta,
-        y: 0,
-        flags: 0,
+/// Rescales SDL2's ~±1-per-notch wheel delta to the wire's `GameStream`
+/// `WHEEL_DELTA(120)`-per-notch convention (confirmed via `punktfunk-host`'s
+/// `pf-inject` `sendinput.rs`/`wlr.rs`), carrying the fractional remainder across
+/// calls so a run of small deltas doesn't round away to nothing.
+#[derive(Default)]
+pub struct ScrollAccumulator {
+    x: f64,
+    y: f64,
+}
+
+impl ScrollAccumulator {
+    /// `code` distinguishes the scroll axis (`0` = vertical, `1` = horizontal).
+    /// `None` while the accumulated remainder hasn't reached a whole wire unit.
+    pub fn scroll_event(&mut self, delta: i32, horizontal: bool) -> Option<InputEvent> {
+        let acc = if horizontal { &mut self.x } else { &mut self.y };
+        *acc += f64::from(delta) * 120.0;
+        let notches = acc.trunc() as i32;
+        if notches == 0 {
+            return None;
+        }
+        *acc -= f64::from(notches);
+        Some(InputEvent {
+            kind: InputKind::MouseScroll,
+            _pad: [0; 3],
+            code: u32::from(horizontal),
+            x: notches,
+            y: 0,
+            flags: 0,
+        })
     }
 }
