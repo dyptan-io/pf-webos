@@ -39,6 +39,7 @@ mod real {
 
     use anyhow::{Context, Result};
     use punktfunk_core::config::Mode;
+    use sdl2::controller::GameController;
     use sdl2::mouse::MouseButton;
 
     use crate::app::{App, Screen};
@@ -142,6 +143,39 @@ mod real {
     /// not to feel unresponsive, long enough that a normal tap never triggers it.
     const LONG_PRESS_CONFIRM: Duration = Duration::from_millis(500);
 
+    /// Edge-triggers Back off `held`: a repeat/OS-resent press while already held
+    /// produces nothing, so a single physical press dispatches Back exactly once no
+    /// matter how SDL reports (or misreports) repeats for it — e.g. a *held* Back
+    /// would otherwise cascade through every level of menu navigation in one go
+    /// (closing a dropdown, then the very next repeat exiting the screen it was on)
+    /// instead of stopping at the first. Shared by the menu loop's keyboard and
+    /// controller arms, which debounce identically.
+    fn edge_trigger_back(ev: Option<MenuEvent>, held: &mut bool) -> Option<MenuEvent> {
+        if ev != Some(MenuEvent::Back) {
+            return ev;
+        }
+        if *held {
+            None
+        } else {
+            *held = true;
+            ev
+        }
+    }
+
+    /// Starts/clears the streaming loop's Back long-press timer (see
+    /// `LONG_PRESS_BACK`) — shared by the keyboard and controller arms, which
+    /// otherwise repeat this identically.
+    fn track_back_hold(is_back: bool, pressed: bool, held_since: &mut Option<Instant>) {
+        if !is_back {
+            return;
+        }
+        if pressed {
+            held_since.get_or_insert_with(Instant::now);
+        } else {
+            *held_since = None;
+        }
+    }
+
     enum StreamOutcome {
         /// The system asked the app to close (not just this stream) — exit fully.
         Quit,
@@ -162,6 +196,7 @@ mod real {
         painter: &mut crate::ui::Painter,
         events: &mut sdl2::EventPump,
         game_controller: &sdl2::GameControllerSubsystem,
+        controller: &mut Option<GameController>,
         identity: &(String, String),
         display_mode: sdl2::video::DisplayMode,
         font_label: &sdl2::ttf::Font,
@@ -201,6 +236,7 @@ mod real {
         // press dispatches Back exactly once no matter how SDL reports (or
         // misreports) repeats for it.
         let mut menu_back_down = false;
+        let mut stick_nav = crate::ui::StickMenuNav::default();
         // Redraw-on-change: this screen has no time-based animation at all (no
         // spinner/blink/marquee), so every pixel that can change only ever changes
         // as a reaction to one of: an SDL event or a Discovery/art/library
@@ -373,26 +409,8 @@ mod real {
                     _ => {}
                 }
                 let menu_ev = match event {
-                    // Back is edge-triggered off `menu_back_down` (our own
-                    // tracked press/release state) rather than SDL's `repeat`
-                    // flag: OS key-repeat re-sends `KeyDown` for a key that's
-                    // still held, and without this a *held* Back cascaded
-                    // through every level of navigation in one go (e.g.
-                    // closing a Settings dropdown, then — from the very next
-                    // repeat, milliseconds later — Settings itself exiting to
-                    // Home) instead of stopping at the first.
                     Event::KeyDown { keycode: Some(k), .. } => {
-                        let ev = crate::ui::menu_event_for_key(k);
-                        if ev == Some(MenuEvent::Back) {
-                            if menu_back_down {
-                                None
-                            } else {
-                                menu_back_down = true;
-                                ev
-                            }
-                        } else {
-                            ev
-                        }
+                        edge_trigger_back(crate::ui::menu_event_for_key(k), &mut menu_back_down)
                     }
                     Event::KeyUp { keycode: Some(k), .. } => {
                         if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) {
@@ -401,17 +419,7 @@ mod real {
                         None
                     }
                     Event::ControllerButtonDown { button, .. } => {
-                        let ev = crate::ui::menu_event_for_button(button);
-                        if ev == Some(MenuEvent::Back) {
-                            if menu_back_down {
-                                None
-                            } else {
-                                menu_back_down = true;
-                                ev
-                            }
-                        } else {
-                            ev
-                        }
+                        edge_trigger_back(crate::ui::menu_event_for_button(button), &mut menu_back_down)
                     }
                     Event::ControllerButtonUp { button, .. } => {
                         if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back) {
@@ -419,10 +427,21 @@ mod real {
                         }
                         None
                     }
-                    Event::ControllerDeviceAdded { which, .. } => {
-                        let _ = game_controller.open(which);
+                    Event::ControllerDeviceAdded { which, .. } if controller.is_none() => {
+                        match game_controller.open(which) {
+                            Ok(c) => {
+                                writeln!(log, "controller connected: {}", c.name())?;
+                                *controller = Some(c);
+                            }
+                            Err(e) => writeln!(log, "controller open failed: {e}")?,
+                        }
                         None
                     }
+                    Event::ControllerDeviceRemoved { .. } => {
+                        *controller = None;
+                        None
+                    }
+                    Event::ControllerAxisMotion { axis, value, .. } => stick_nav.axis_event(axis, value),
                     _ => None,
                 };
                 let Some(menu_ev) = menu_ev else { continue };
@@ -561,6 +580,13 @@ mod real {
         let font_title = crate::ui::load_font(&ttf, display_mode.h as u32, 40)?;
         let icon_font = crate::ui::load_icon_font(&ttf)?;
 
+        // Owned here, at the top of the menu/stream cycle, rather than re-declared in
+        // each: `ControllerDeviceAdded` only fires once per physical (re)connection, so
+        // a pad already open from the menu (or a previous stream) needs to carry
+        // straight through a screen transition instead of waiting for a replug neither
+        // side will ever see.
+        let mut controller: Option<GameController> = None;
+
         loop {
             let Some((host, port, fp, launch)) = run_ui_flow(
                 &mut canvas,
@@ -568,6 +594,7 @@ mod real {
                 &mut painter,
                 &mut events,
                 &game_controller,
+                &mut controller,
                 &identity,
                 display_mode,
                 &font_label,
@@ -650,7 +677,6 @@ mod real {
                 audio_player.spec()
             )?;
 
-            let mut controller = None;
             let mut back_held_since: Option<Instant> = None;
             let mut ok_held_since: Option<Instant> = None;
             let mut ok_promoted = false;
@@ -683,32 +709,28 @@ mod real {
                             controller = None;
                         }
                         Event::KeyDown { keycode: Some(k), .. } => {
-                            if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) {
-                                back_held_since.get_or_insert_with(Instant::now);
-                            }
+                            let is_back = crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back);
+                            track_back_hold(is_back, true, &mut back_held_since);
                             if let Some(ev) = keyboard::key_event(k, true) {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
                         }
                         Event::KeyUp { keycode: Some(k), .. } => {
-                            if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) {
-                                back_held_since = None;
-                            }
+                            let is_back = crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back);
+                            track_back_hold(is_back, false, &mut back_held_since);
                             if let Some(ev) = keyboard::key_event(k, false) {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
                         }
                         Event::ControllerButtonDown { button, .. } => {
-                            if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back) {
-                                back_held_since.get_or_insert_with(Instant::now);
-                            }
+                            let is_back = crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back);
+                            track_back_hold(is_back, true, &mut back_held_since);
                             let ev = gamepad::button_event(button, true, 0);
                             let _ = session::send_input(&connected.client, &ev);
                         }
                         Event::ControllerButtonUp { button, .. } => {
-                            if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back) {
-                                back_held_since = None;
-                            }
+                            let is_back = crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back);
+                            track_back_hold(is_back, false, &mut back_held_since);
                             let ev = gamepad::button_event(button, false, 0);
                             let _ = session::send_input(&connected.client, &ev);
                         }

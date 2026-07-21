@@ -43,18 +43,6 @@ pub fn button_event(button: MouseButton, pressed: bool) -> Option<InputEvent> {
 /// it before mapping into the output region (see `InputKind::MouseMoveAbs` docs) —
 /// the same absolute-pointer path the pre-stream menu's hover/click already rides,
 /// just forwarded to the host instead of used for local UI focus.
-///
-/// A previous attempt applied a fixed `SENSITIVITY` scale here (<1.0, centered on
-/// the reported client size) to make the host cursor feel "slower." Symptom: the
-/// cursor got stuck around the middle of the screen, never reaching anywhere near
-/// the edges — much more restricted than the scale factor alone should produce.
-/// Likely cause: the remote's own pointer already has *some* system-level gain
-/// applied before these coordinates ever reach SDL2 (i.e. `x`/`y` may not actually
-/// span the full `0..client_w`/`0..client_h` range even when physically pointing at
-/// the panel's true edges) — layering an *additional* scale on top of an
-/// already-restricted range compounds instead of just slowing things down. Reverted
-/// to plain passthrough until the real range is confirmed; re-derive any
-/// "sensitivity" adjustment from that, not from an assumed full-range span.
 pub fn move_event(x: i32, y: i32, client_w: u32, client_h: u32) -> InputEvent {
     InputEvent {
         kind: InputKind::MouseMoveAbs,
