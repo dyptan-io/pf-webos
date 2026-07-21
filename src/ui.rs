@@ -634,6 +634,55 @@ pub fn ellipsize(font: &Font, text: &str, max_w: u32) -> String {
     "…".to_string()
 }
 
+/// Greedily word-wraps `text` into lines no wider than `max_w` px in `font` — for modal
+/// copy that's a full sentence or two (status/explanation text), unlike `ellipsize`'s
+/// single-line truncation for card titles.
+pub fn wrap_text(font: &Font, text: &str, max_w: u32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
+        if current.is_empty() || font.size_of(&candidate).map_or(0, |(w, _)| w) <= max_w {
+            current = candidate;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Draws `text` word-wrapped to `max_w` (see [`wrap_text`]), one line per
+/// `font.height() + line_gap`, starting at `(x, y)`. Returns the y position just past
+/// the last line, so callers can stack more content beneath it without having to guess
+/// how many lines it wrapped to.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_text_wrapped(
+    painter: &mut Painter,
+    text_cache: &mut TextCache,
+    font: &Font,
+    text: &str,
+    x: i32,
+    y: i32,
+    max_w: u32,
+    color: Color,
+    line_gap: i32,
+) -> Result<i32> {
+    let mut cursor_y = y;
+    for line in wrap_text(font, text, max_w) {
+        draw_text(painter, text_cache, font, &line, x, cursor_y, color)?;
+        cursor_y += font.height() + line_gap;
+    }
+    Ok(cursor_y)
+}
+
 // -------------------------------------------------------------------- focus/cards --
 
 /// A slight softening of moonlight-tv's near-square (~2px) tile radius.
