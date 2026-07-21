@@ -59,13 +59,17 @@ pub fn button_event(button: Button, pressed: bool, pad: u8) -> InputEvent {
     }
 }
 
-/// SDL2 sticks are already i16 (−32768..32767, **+y = up** for Y per SDL2's own
-/// convention matching the wire's), so `value` passes straight through unchanged.
-/// Triggers arrive as SDL2's 0..32767 range — punktfunk wants 0..255, so those are
-/// rescaled.
+/// SDL2 sticks are already i16 (−32768..32767) matching the wire's range, so X passes
+/// straight through. Y does not: confirmed on-device (`DualSense` over Bluetooth, this
+/// webOS/Linux SDL2 build) that pushing a stick up/forward reports a *negative* raw
+/// value — the opposite of the wire's XInput/Moonlight "+y = up" convention — so both
+/// sticks' Y axes are negated before sending (`saturating_neg` since raw `i16::MIN`
+/// has no positive counterpart in range). Triggers arrive as SDL2's 0..32767 range —
+/// punktfunk wants 0..255, so those are rescaled.
 pub fn axis_event(axis: Axis, value: i16, pad: u8) -> InputEvent {
     let scaled = match axis {
         Axis::TriggerLeft | Axis::TriggerRight => (i32::from(value) * 255) / 32767,
+        Axis::LeftY | Axis::RightY => i32::from(value.saturating_neg()),
         _ => i32::from(value),
     };
     InputEvent {
