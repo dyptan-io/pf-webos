@@ -349,6 +349,22 @@ impl App {
         }
     }
 
+    /// If `(x, y)` lands on a sidebar host row, focuses it and returns its index;
+    /// `None` otherwise, leaving `home_focus` untouched. `main.rs`'s
+    /// `MouseButtonDown` handler uses this to decide whether to start the
+    /// hold-timer for the Forget-host gesture.
+    pub fn focus_host_row_at(&mut self, x: i32, y: i32, screen_h: u32) -> Option<usize> {
+        if !matches!(self.screen, Screen::Home) {
+            return None;
+        }
+        let idx = ui::hit_test_sidebar_row(x, y, self.sidebar_len(), screen_h)?;
+        if idx >= self.entries.len() {
+            return None;
+        }
+        self.home_focus = HomeFocus::Sidebar(idx);
+        Some(idx)
+    }
+
     /// Enters `Screen::ForgetHost` for the sidebar row at `idx` — called from
     /// `main.rs` once an OK hold on that row crosses `LONG_PRESS_CONFIRM`.
     pub fn open_forget_host(&mut self, idx: usize) {
@@ -1012,6 +1028,12 @@ impl App {
     /// moving, and each one otherwise forced a full-frame redraw regardless of
     /// whether the pointer was still over the same card (see `main.rs`'s dirty
     /// tracking).
+    /// Deliberately does NOT move `home_focus`/`settings_focused` — that's the
+    /// outline+zoom "focused element" state, and moving it on every hover (the
+    /// previous behavior) popped rows/cards in and out of that treatment just from
+    /// the pointer drifting across the screen. Only keyboard/remote navigation or a
+    /// click (`handle_mouse_click` below) moves it now. Hover still drives the
+    /// close (X) button's highlight, a conventional affordance this excludes.
     pub fn handle_mouse_motion(&mut self, x: i32, y: i32, screen_w: u32, screen_h: u32) -> bool {
         match self.screen {
             Screen::Home => {
@@ -1025,37 +1047,11 @@ impl App {
                 // change" bool — Home never draws a close button, so this has no
                 // visual effect of its own.
                 self.hover_close = false;
-                if let Some(idx) = ui::hit_test_sidebar_row(x, y, self.sidebar_len(), screen_h) {
-                    let changed = self.home_focus != HomeFocus::Sidebar(idx);
-                    self.home_focus = HomeFocus::Sidebar(idx);
-                    return changed;
-                }
-                let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
-                let columns = ui::grid_columns(available_w);
-                if let Some(idx) =
-                    ui::hit_test_grid_card(x, y, columns, self.grid_len(), ui::SIDEBAR_W as i32, available_w)
-                {
-                    let changed = self.home_focus != HomeFocus::Grid(idx);
-                    self.home_focus = HomeFocus::Grid(idx);
-                    return changed;
-                }
                 false
             }
             Screen::Settings => {
-                let (card, content) = Self::settings_layout(screen_w, screen_h);
-                let mut changed = self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)));
-                if self.dropdown.is_none() && !self.hover_close {
-                    for i in 0..ui::SETTINGS_ROW_COUNT {
-                        let row_y = content.y() + i as i32 * (ui::SETTINGS_ROW_H as i32 + ui::SETTINGS_ROW_GAP);
-                        let row_rect = Rect::new(content.x(), row_y, content.width(), ui::SETTINGS_ROW_H);
-                        if row_rect.contains_point((x, y)) {
-                            changed |= self.settings_focused != i;
-                            self.settings_focused = i;
-                            break;
-                        }
-                    }
-                }
-                changed
+                let (card, _content) = Self::settings_layout(screen_w, screen_h);
+                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
             }
             // Pairing/AddHost/Wake/ForgetHost are plain single-card modals with
             // nothing but the close button to hover-test (unlike Settings
@@ -1093,22 +1089,45 @@ impl App {
         screen_h: u32,
         log: &mut std::fs::File,
     ) -> Option<ConnectTarget> {
-        // Re-sync focus/hover to the click's own position first — a MouseButtonDown
-        // can carry a slightly different (x, y) than the MouseMotion that last set
-        // focus (the physical button press can jostle the remote a little), so
-        // trusting only whatever the previous motion event left behind risked
-        // confirming stale focus — a click landing just off-target reads as "did
-        // nothing," exactly the "sometimes needs two clicks" symptom, and unlike
-        // D-pad Confirm (which always acts on the current persisted focus with no
-        // intervening motion event to race against).
+        // Re-sync the close-button hover to the click's own position first — a
+        // MouseButtonDown can carry a slightly different (x, y) than the last
+        // MouseMotion (the physical button press can jostle the remote a little).
         self.handle_mouse_motion(x, y, screen_w, screen_h);
         if self.hover_close {
             // Same "what Back means here" as everywhere else — see `back`'s docs.
             return self.back(log);
         }
+        // Unlike hover, a click DOES move `home_focus`/`settings_focused` — fresh at
+        // the click's own position, so it confirms what was actually clicked rather
+        // than whatever the keyboard/remote last focused elsewhere.
         match self.screen {
-            Screen::Home => self.handle_home_event(MenuEvent::Confirm, screen_w, log),
+            Screen::Home => {
+                if let Some(idx) = ui::hit_test_sidebar_row(x, y, self.sidebar_len(), screen_h) {
+                    self.home_focus = HomeFocus::Sidebar(idx);
+                } else {
+                    let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
+                    let columns = ui::grid_columns(available_w);
+                    // Clicked empty space (`?`'s early `None`) — nothing to focus or confirm.
+                    let idx =
+                        ui::hit_test_grid_card(x, y, columns, self.grid_len(), ui::SIDEBAR_W as i32, available_w)?;
+                    self.home_focus = HomeFocus::Grid(idx);
+                }
+                self.handle_home_event(MenuEvent::Confirm, screen_w, log)
+            }
             Screen::Settings => {
+                // An open dropdown has no row grid of its own here — Confirm picks
+                // whatever option `dd.focused` (moved by keyboard/remote only, same
+                // as everywhere else) already points at; unaffected by this change.
+                if self.dropdown.is_none() {
+                    let (_, content) = Self::settings_layout(screen_w, screen_h);
+                    // Clicked empty space within the card (`?`'s early `None`) — nothing to
+                    // focus or confirm.
+                    let i = (0..ui::SETTINGS_ROW_COUNT).find(|&i| {
+                        let row_y = content.y() + i as i32 * (ui::SETTINGS_ROW_H as i32 + ui::SETTINGS_ROW_GAP);
+                        Rect::new(content.x(), row_y, content.width(), ui::SETTINGS_ROW_H).contains_point((x, y))
+                    })?;
+                    self.settings_focused = i;
+                }
                 self.handle_settings_event(MenuEvent::Confirm);
                 None
             }

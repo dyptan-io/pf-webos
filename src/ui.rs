@@ -666,9 +666,10 @@ fn draw_card_shadow(painter: &mut Painter, rect: Rect, radius: i32) {
 /// moonlight-tv's focus cue is an outline ring offset outward from the tile, not a
 /// filled/background change — bright accent blue, invisible unless focused. Two
 /// passes at increasing offset/decreasing alpha approximate a soft glow. Only
-/// `draw_poster_card` (game/Desktop grid selection) uses this — sidebar/settings/
-/// digit-box cards (`draw_card`) rely on the zoom/inflate + text-color change alone,
-/// per an explicit request to drop the ring everywhere except game selection.
+/// `draw_poster_card` (game/Desktop grid selection) uses this — every other
+/// selectable row/button relies on [`draw_selectable`]'s zoom, focus-only card,
+/// and text-color change instead, per an explicit request to drop rings
+/// everywhere except game selection.
 fn draw_focus_ring(painter: &mut Painter, rect: Rect, radius: i32) {
     let passes = [(3, 0xff), (6, 0x60)];
     for (offset, alpha) in passes {
@@ -683,14 +684,28 @@ fn draw_focus_ring(painter: &mut Painter, rect: Rect, radius: i32) {
     }
 }
 
-/// Draws a plain surface card (sidebar rows, settings rows, PIN/IP digit boxes) —
-/// shadow and `SIDEBAR_BG` fill, zoom-inflated slightly when focused. Returns the
-/// (possibly zoom-inflated) rect actually drawn, so callers can center content
-/// inside it.
+/// Draws a plain surface card for a text-entry field (PIN/IP digit boxes) — always
+/// visible, so every slot reads as "a box you can fill in", not just the current
+/// one — shadow and `SIDEBAR_BG` fill, zoom-inflated slightly when focused. Returns
+/// the (possibly zoom-inflated) rect actually drawn, so callers can center content
+/// inside it. Selectable rows/buttons use [`draw_selectable`] instead, which only
+/// paints the box when focused.
 pub fn draw_card(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
     let r = inflate(rect, focused);
     draw_card_shadow(painter, r, CARD_RADIUS);
     painter.fill_rounded_rect(r, CARD_RADIUS, SIDEBAR_BG);
+    r
+}
+
+/// Same card as [`draw_card`], but only painted when focused — an unfocused
+/// row/button has no background at all. Used by every selectable row/button
+/// (sidebar, settings, Wake, confirm).
+fn draw_selectable(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
+    let r = inflate(rect, focused);
+    if focused {
+        draw_card_shadow(painter, r, CARD_RADIUS);
+        painter.fill_rounded_rect(r, CARD_RADIUS, SIDEBAR_BG);
+    }
     r
 }
 
@@ -931,10 +946,12 @@ pub fn draw_sidebar(
 }
 
 /// Shared layout for every sidebar row (host rows and the "+ Add host"/
-/// "Settings" utility rows alike): a card, a left-aligned icon, and a label,
-/// both colored by focus — host rows and utility rows used to each carry
-/// their own near-identical copy of this (differing only by accident of
-/// drift, in icon size/padding, not by design).
+/// "Settings" utility rows alike): a left-aligned icon and a label, both
+/// colored by focus, plus the [`draw_selectable`] card that only appears
+/// (zoomed in, see [`inflate`]) once focused — an unfocused row has no
+/// background at all. Host rows and utility rows used to each carry their own
+/// near-identical copy of this (differing only by accident of drift, in icon
+/// size/padding, not by design).
 #[allow(clippy::too_many_arguments)]
 fn draw_sidebar_row(
     painter: &mut Painter,
@@ -946,7 +963,7 @@ fn draw_sidebar_row(
     label: &str,
     focused: bool,
 ) -> Result<()> {
-    let drawn = draw_card(painter, rect, focused);
+    let drawn = draw_selectable(painter, rect, focused);
     let icon_size = 30u32;
     let icon_pad = 20;
     let icon_rect = Rect::new(
@@ -1107,8 +1124,7 @@ pub const RESOLUTIONS: [(u32, u32, &str); 3] = [
     (3840, 2160, "3840 x 2160"),
 ];
 
-/// Framerate presets. The wire value gets the aurora-tv NTSC floor-correction
-/// applied on top of these nominal numbers — see `main.rs`.
+/// Framerate presets — sent to the host as the exact wire refresh rate.
 pub const REFRESH_RATES: [u32; 3] = [30, 60, 120];
 
 /// Bitrate slider range/step, in kbps — the user's explicit ask ("10-150 Mbps max").
@@ -1292,8 +1308,9 @@ const SETTINGS_ICON_SIZE: u32 = 30;
 
 /// Draws the settings modal's row list inside `content_rect` (the modal card's
 /// interior, below its title/divider) — icon + label on the left, a dropdown
-/// pill / slider / modern switch on the right. Each row is its own card with a
-/// focus ring, matching this client's sidebar/grid visual language.
+/// pill / slider / modern switch on the right. Only the focused row gets a
+/// background card (see [`draw_selectable`]), zoomed in slightly, with brighter
+/// icon/label/value color; an unfocused row is bare.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_settings_rows(
     painter: &mut Painter,
@@ -1309,7 +1326,7 @@ pub fn draw_settings_rows(
         let y = content_rect.y() + i as i32 * (SETTINGS_ROW_H as i32 + SETTINGS_ROW_GAP);
         let focused = i == focused_index;
         let row_rect = Rect::new(content_rect.x(), y, content_rect.width(), SETTINGS_ROW_H);
-        let drawn = draw_card(painter, row_rect, focused);
+        let drawn = draw_selectable(painter, row_rect, focused);
 
         let icon_pad = 24;
         let icon_rect = Rect::new(
@@ -1411,7 +1428,7 @@ pub fn draw_wake_rows(
             SETTINGS_ROW_H,
         );
         let focused = i == focused_index;
-        let drawn = draw_card(painter, row_rect, focused);
+        let drawn = draw_selectable(painter, row_rect, focused);
         let color = if focused { WHITE } else { MUTED };
         let icon_rect = Rect::new(
             drawn.x() + icon_pad,
@@ -1595,10 +1612,10 @@ pub struct ConfirmButton<'a> {
 
 /// A row of side-by-side buttons for a Yes/No-style confirmation (currently
 /// just the "Forget this host?" dialog's Forget/Cancel pair, but not written
-/// specifically for that) — each its own focusable [`draw_card`], optional
-/// leading icon, and a label colored by that button's own identity when
-/// focused or [`MUTED`] otherwise. `focused_index` picks which of `buttons`
-/// currently has focus.
+/// specifically for that) — an optional leading icon and a label colored by
+/// that button's own identity when focused, or [`MUTED`] otherwise. The focused
+/// button (only) gets a background card, zoomed in slightly (see
+/// [`draw_selectable`]). `focused_index` picks which of `buttons` has focus.
 pub fn draw_confirm_buttons(
     painter: &mut Painter,
     text_cache: &mut TextCache,
@@ -1618,7 +1635,7 @@ pub fn draw_confirm_buttons(
             content.height(),
         );
         let focused = i == focused_index;
-        let drawn = draw_card(painter, rect, focused);
+        let drawn = draw_selectable(painter, rect, focused);
         let color = if focused { button.color } else { MUTED };
 
         let label_w = font_label.size_of(button.label).map_or(0, |(w, _)| w);
