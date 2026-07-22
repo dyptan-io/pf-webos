@@ -1099,8 +1099,10 @@ impl App {
     /// height, not the 720px design reference) the title/subtitle lines run
     /// much taller than the old fixed 340px card had room for, which is what
     /// read as misaligned/crowded text — see `render_pairing`'s spacing.
+    /// Bumped again on top of that for a wrapped, up-to-two-line pairing-failure
+    /// status (whatever the underlying error's own text is) below the PIN boxes.
     fn pairing_card_rect(screen_w: u32, screen_h: u32) -> Rect {
-        ui::modal_card_rect(screen_w, screen_h, 0.36, 440)
+        ui::modal_card_rect(screen_w, screen_h, 0.36, 480)
     }
 
     /// The add-host modal's card rect — shared by `render_add_host` and mouse
@@ -1121,9 +1123,13 @@ impl App {
     }
 
     /// The "Forget this host?" confirmation's card rect — shared by
-    /// `render_forget_host` and mouse hit-testing.
+    /// `render_forget_host` and mouse hit-testing. Sized generously for a
+    /// wrapped, up-to-two-line subtitle (a long host name) below a title/gap
+    /// computed from real font metrics — see `render_forget_host`'s layout and
+    /// `wake_card_rect`'s docs for why a fixed pixel guess undersizes this at
+    /// this app's real TV font scale.
     fn forget_host_card_rect(screen_w: u32, screen_h: u32) -> Rect {
-        ui::modal_card_rect(screen_w, screen_h, 0.34, 260)
+        ui::modal_card_rect(screen_w, screen_h, 0.34, 340)
     }
 
     /// The settings modal's card/content rects — shared by `render` and mouse
@@ -1486,22 +1492,25 @@ impl App {
             ui::WHITE,
         )?;
 
+        let text_max_w = card.width().saturating_sub(64);
         let subtitle_y = title_y + font_label.height() + 18;
-        ui::draw_text(
+        let after_subtitle_y = ui::draw_text_wrapped(
             painter,
             text_cache,
             font_label,
             "Enter the PIN from the host's pairing dialog.",
             card.x() + 32,
             subtitle_y,
+            text_max_w,
             ui::MUTED,
+            6,
         )?;
 
         // A clear, generous gap below the subtitle — the PIN entry is this
         // screen's whole point, and it read as cramped sitting right under
         // the subtitle text.
         let digit_h = 80u32;
-        let digit_y = subtitle_y + font_label.height() + 44;
+        let digit_y = after_subtitle_y + 38;
         let digit_w = 64i32;
         let digit_gap = 14i32;
         let total_w = 4 * digit_w + 3 * digit_gap;
@@ -1525,14 +1534,19 @@ impl App {
         }
         if let Some(status) = &self.pairing_status {
             let color = if self.pairing_busy { ui::MUTED } else { ui::ERROR_RED };
-            ui::draw_text(
+            // Wrapped, not a single `draw_text` line — a pairing failure's message
+            // (whatever the host/network error's own text is) can run longer than a
+            // fixed short label and would otherwise overflow the card edge.
+            ui::draw_text_wrapped(
                 painter,
                 text_cache,
                 font_label,
                 status,
                 card.x() + 32,
                 digit_y + digit_h as i32 + 32,
+                text_max_w,
                 color,
+                6,
             )?;
         }
         Ok(())
@@ -1744,26 +1758,30 @@ impl App {
         let card = Self::forget_host_card_rect(screen_w, screen_h);
         self.draw_modal_shell(painter, text_cache, icon_font, card)?;
 
-        ui::draw_text(
-            painter,
-            text_cache,
-            font_label,
-            "Forget this host?",
-            card.x() + 32,
-            card.y() + 28,
-            ui::WHITE,
-        )?;
-        ui::draw_text(
+        let text_x = card.x() + 32;
+        let text_max_w = card.width().saturating_sub(64);
+
+        let title_y = card.y() + 28;
+        ui::draw_text(painter, text_cache, font_label, "Forget this host?", text_x, title_y, ui::WHITE)?;
+
+        // Gap from the title's real (scaled) line height, and the subtitle itself
+        // word-wrapped — same layout pattern as `render_wake`/`render_pairing`: a
+        // fixed pixel gap/single line here doesn't scale with this app's real TV
+        // font size, and a long host name could otherwise run past the card edge.
+        let subtitle_y = title_y + font_label.height() + 18;
+        let after_subtitle_y = ui::draw_text_wrapped(
             painter,
             text_cache,
             font_value,
             &format!("\"{name}\" will be removed from your host list."),
-            card.x() + 32,
-            card.y() + 74,
+            text_x,
+            subtitle_y,
+            text_max_w,
             ui::MUTED,
+            6,
         )?;
 
-        let content = Rect::new(card.x() + 32, card.y() + 150, card.width().saturating_sub(64), 72);
+        let content = Rect::new(text_x, after_subtitle_y + 32, text_max_w, 72);
         ui::draw_confirm_buttons(
             painter,
             text_cache,
