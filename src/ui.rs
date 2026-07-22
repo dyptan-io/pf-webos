@@ -119,6 +119,47 @@ pub fn menu_event_for_button(button: sdl2::controller::Button) -> Option<MenuEve
     })
 }
 
+/// Left-stick tilt past this fraction of full deflection (of i16's ±32768) counts as
+/// a directional press — well past center-rest noise.
+const STICK_MENU_DEADZONE: i16 = 16_000;
+
+/// Edge-detects the left stick's X/Y axes into `MenuEvent`s, per-axis, so a hold
+/// fires once on crossing the deadzone and doesn't repeat until the stick passes back
+/// through center — the same one-shot-per-press behavior a D-pad button already has
+/// (SDL2 doesn't auto-repeat `ControllerButtonDown` while held).
+#[derive(Default)]
+pub struct StickMenuNav {
+    x: Option<MenuEvent>,
+    y: Option<MenuEvent>,
+}
+
+impl StickMenuNav {
+    pub fn axis_event(&mut self, axis: sdl2::controller::Axis, value: i16) -> Option<MenuEvent> {
+        use sdl2::controller::Axis;
+        match axis {
+            Axis::LeftX => Self::edge(&mut self.x, value, MenuEvent::Left, MenuEvent::Right),
+            // Negative is up (see `gamepad.rs`'s `axis_event` docs for why).
+            Axis::LeftY => Self::edge(&mut self.y, value, MenuEvent::Up, MenuEvent::Down),
+            _ => None,
+        }
+    }
+
+    fn edge(state: &mut Option<MenuEvent>, value: i16, neg: MenuEvent, pos: MenuEvent) -> Option<MenuEvent> {
+        let dir = if value <= -STICK_MENU_DEADZONE {
+            Some(neg)
+        } else if value >= STICK_MENU_DEADZONE {
+            Some(pos)
+        } else {
+            None
+        };
+        if dir == *state {
+            return None;
+        }
+        *state = dir;
+        dir
+    }
+}
+
 /// The Magic Remote's number buttons (0-9) surface as plain keyboard digit keys —
 /// used for direct PIN entry (type a digit, auto-advance) instead of cycling each
 /// digit with left/right.
@@ -632,6 +673,55 @@ pub fn ellipsize(font: &Font, text: &str, max_w: u32) -> String {
         }
     }
     "…".to_string()
+}
+
+/// Greedily word-wraps `text` into lines no wider than `max_w` px in `font` — for modal
+/// copy that's a full sentence or two (status/explanation text), unlike `ellipsize`'s
+/// single-line truncation for card titles.
+pub fn wrap_text(font: &Font, text: &str, max_w: u32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
+        if current.is_empty() || font.size_of(&candidate).map_or(0, |(w, _)| w) <= max_w {
+            current = candidate;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Draws `text` word-wrapped to `max_w` (see [`wrap_text`]), one line per
+/// `font.height() + line_gap`, starting at `(x, y)`. Returns the y position just past
+/// the last line, so callers can stack more content beneath it without having to guess
+/// how many lines it wrapped to.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_text_wrapped(
+    painter: &mut Painter,
+    text_cache: &mut TextCache,
+    font: &Font,
+    text: &str,
+    x: i32,
+    y: i32,
+    max_w: u32,
+    color: Color,
+    line_gap: i32,
+) -> Result<i32> {
+    let mut cursor_y = y;
+    for line in wrap_text(font, text, max_w) {
+        draw_text(painter, text_cache, font, &line, x, cursor_y, color)?;
+        cursor_y += font.height() + line_gap;
+    }
+    Ok(cursor_y)
 }
 
 // -------------------------------------------------------------------- focus/cards --

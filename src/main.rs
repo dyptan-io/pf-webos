@@ -14,6 +14,8 @@ mod discovery;
 #[cfg(target_os = "linux")]
 mod gamepad;
 #[cfg(target_os = "linux")]
+mod keyboard;
+#[cfg(target_os = "linux")]
 mod library;
 #[cfg(target_os = "linux")]
 mod mouse;
@@ -37,9 +39,12 @@ mod real {
 
     use anyhow::{Context, Result};
     use punktfunk_core::config::Mode;
+    use sdl2::controller::GameController;
+    use sdl2::mouse::MouseButton;
 
     use crate::app::{App, Screen};
     use crate::gamepad;
+    use crate::keyboard;
     use crate::mouse;
     use crate::session;
     use crate::store;
@@ -127,12 +132,49 @@ mod real {
     /// normal game-input tap of the same physical button (many games use
     /// B/Back-ish buttons) never triggers it.
     const LONG_PRESS_BACK: Duration = Duration::from_millis(1500);
+    /// How long the Magic Remote's OK button (the pointer's left click) must be held
+    /// before it's promoted to a right click — long enough that a normal click never
+    /// trips it, short enough to feel deliberate rather than sluggish.
+    const LONG_PRESS_OK: Duration = Duration::from_millis(500);
 
     /// How long OK must be held on a sidebar host row before it opens
     /// `Screen::ForgetHost` instead of that row's normal short-press action
     /// (connect/pair) — see `run_ui_flow`'s `confirm_held_since`. Short enough
     /// not to feel unresponsive, long enough that a normal tap never triggers it.
     const LONG_PRESS_CONFIRM: Duration = Duration::from_millis(500);
+
+    /// Edge-triggers Back off `held`: a repeat/OS-resent press while already held
+    /// produces nothing, so a single physical press dispatches Back exactly once no
+    /// matter how SDL reports (or misreports) repeats for it — e.g. a *held* Back
+    /// would otherwise cascade through every level of menu navigation in one go
+    /// (closing a dropdown, then the very next repeat exiting the screen it was on)
+    /// instead of stopping at the first. Shared by the menu loop's keyboard and
+    /// controller arms, which debounce identically.
+    fn edge_trigger_back(ev: Option<MenuEvent>, held: &mut bool) -> Option<MenuEvent> {
+        if ev != Some(MenuEvent::Back) {
+            return ev;
+        }
+        if *held {
+            None
+        } else {
+            *held = true;
+            ev
+        }
+    }
+
+    /// Starts/clears the streaming loop's Back long-press timer (see
+    /// `LONG_PRESS_BACK`) — shared by the keyboard and controller arms, which
+    /// otherwise repeat this identically.
+    fn track_back_hold(is_back: bool, pressed: bool, held_since: &mut Option<Instant>) {
+        if !is_back {
+            return;
+        }
+        if pressed {
+            held_since.get_or_insert_with(Instant::now);
+        } else {
+            *held_since = None;
+        }
+    }
 
     enum StreamOutcome {
         /// The system asked the app to close (not just this stream) — exit fully.
@@ -154,6 +196,7 @@ mod real {
         painter: &mut crate::ui::Painter,
         events: &mut sdl2::EventPump,
         game_controller: &sdl2::GameControllerSubsystem,
+        controller: &mut Option<GameController>,
         identity: &(String, String),
         display_mode: sdl2::video::DisplayMode,
         font_label: &sdl2::ttf::Font,
@@ -193,6 +236,7 @@ mod real {
         // press dispatches Back exactly once no matter how SDL reports (or
         // misreports) repeats for it.
         let mut menu_back_down = false;
+        let mut stick_nav = crate::ui::StickMenuNav::default();
         // Redraw-on-change: this screen has no time-based animation at all (no
         // spinner/blink/marquee), so every pixel that can change only ever changes
         // as a reaction to one of: an SDL event or a Discovery/art/library
@@ -210,6 +254,10 @@ mod real {
             dirty |= app.drain_art();
             dirty |= app.drain_games(log);
             dirty |= app.tick_wake(log);
+            dirty |= app.drain_launch_check(log);
+            if let Some(target) = app.take_ready_launch() {
+                break 'ui target;
+            }
             for event in events.poll_iter() {
                 use sdl2::event::Event;
                 if let Event::Quit { .. } = event {
@@ -279,16 +327,30 @@ mod real {
                     // `Some(Instant::now())`: a held key can resend `KeyDown`
                     // as an OS repeat, which must not keep resetting the clock
                     // back to zero.
+                    //
+                    // `confirm_held_since.is_some()` alone (not just
+                    // `host_row_focused()`) also keeps intercepting *once a hold is
+                    // already tracked* — needed because the moment the hold crosses
+                    // `LONG_PRESS_CONFIRM` and opens `Screen::ForgetHost`, the screen
+                    // is no longer `Home`, so `host_row_focused()` goes back to
+                    // `None` while the physical key is still down. Without this, the
+                    // very next OS repeat `KeyDown` for that same still-held key fell
+                    // through all the way to the generic dispatch below, which read
+                    // it as a fresh Confirm on `Screen::ForgetHost` — landing on
+                    // "Cancel" (the default focus) and dismissing the just-opened
+                    // dialog before the user ever released the button. A held mouse
+                    // button has no equivalent repeat (`MouseButtonDown` fires once),
+                    // which is why this only ever showed up with keyboard/remote.
                     Event::KeyDown { keycode: Some(k), .. }
                         if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Confirm)
-                            && app.host_row_focused().is_some() =>
+                            && (confirm_held_since.is_some() || app.host_row_focused().is_some()) =>
                     {
                         confirm_held_since.get_or_insert_with(Instant::now);
                         continue;
                     }
                     Event::ControllerButtonDown { button, .. }
                         if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Confirm)
-                            && app.host_row_focused().is_some() =>
+                            && (confirm_held_since.is_some() || app.host_row_focused().is_some()) =>
                     {
                         confirm_held_since.get_or_insert_with(Instant::now);
                         continue;
@@ -347,26 +409,8 @@ mod real {
                     _ => {}
                 }
                 let menu_ev = match event {
-                    // Back is edge-triggered off `menu_back_down` (our own
-                    // tracked press/release state) rather than SDL's `repeat`
-                    // flag: OS key-repeat re-sends `KeyDown` for a key that's
-                    // still held, and without this a *held* Back cascaded
-                    // through every level of navigation in one go (e.g.
-                    // closing a Settings dropdown, then — from the very next
-                    // repeat, milliseconds later — Settings itself exiting to
-                    // Home) instead of stopping at the first.
                     Event::KeyDown { keycode: Some(k), .. } => {
-                        let ev = crate::ui::menu_event_for_key(k);
-                        if ev == Some(MenuEvent::Back) {
-                            if menu_back_down {
-                                None
-                            } else {
-                                menu_back_down = true;
-                                ev
-                            }
-                        } else {
-                            ev
-                        }
+                        edge_trigger_back(crate::ui::menu_event_for_key(k), &mut menu_back_down)
                     }
                     Event::KeyUp { keycode: Some(k), .. } => {
                         if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) {
@@ -375,17 +419,7 @@ mod real {
                         None
                     }
                     Event::ControllerButtonDown { button, .. } => {
-                        let ev = crate::ui::menu_event_for_button(button);
-                        if ev == Some(MenuEvent::Back) {
-                            if menu_back_down {
-                                None
-                            } else {
-                                menu_back_down = true;
-                                ev
-                            }
-                        } else {
-                            ev
-                        }
+                        edge_trigger_back(crate::ui::menu_event_for_button(button), &mut menu_back_down)
                     }
                     Event::ControllerButtonUp { button, .. } => {
                         if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back) {
@@ -393,10 +427,21 @@ mod real {
                         }
                         None
                     }
-                    Event::ControllerDeviceAdded { which, .. } => {
-                        let _ = game_controller.open(which);
+                    Event::ControllerDeviceAdded { which, .. } if controller.is_none() => {
+                        match game_controller.open(which) {
+                            Ok(c) => {
+                                writeln!(log, "controller connected: {}", c.name())?;
+                                *controller = Some(c);
+                            }
+                            Err(e) => writeln!(log, "controller open failed: {e}")?,
+                        }
                         None
                     }
+                    Event::ControllerDeviceRemoved { .. } => {
+                        *controller = None;
+                        None
+                    }
+                    Event::ControllerAxisMotion { axis, value, .. } => stick_nav.axis_event(axis, value),
                     _ => None,
                 };
                 let Some(menu_ev) = menu_ev else { continue };
@@ -476,6 +521,13 @@ mod real {
         // before the window is created — `SDL_waylandwebos.c` only applies it at
         // window-creation time (plus a runtime hint-watcher for later changes).
         sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
+        // SDL2 disables "extended" HID reports for PS4/PS5 pads over Bluetooth by
+        // default — and rumble is only carried in the extended report, so a
+        // Bluetooth DualSense/DualShock4 otherwise never vibrates no matter what
+        // `GameController::set_rumble` is called with. Must be set before the game
+        // controller subsystem opens the pad (SDL reads these at HIDAPI driver init).
+        sdl2::hint::set("SDL_JOYSTICK_HIDAPI_PS5_RUMBLE", "1");
+        sdl2::hint::set("SDL_JOYSTICK_HIDAPI_PS4_RUMBLE", "1");
         let sdl = sdl2::init().map_err(|e| anyhow::anyhow!("SDL_Init: {e}"))?;
         let ttf = sdl2::ttf::init().map_err(|e| anyhow::anyhow!("SDL_ttf init: {e}"))?;
         let video = sdl.video().map_err(|e| anyhow::anyhow!("SDL video subsystem: {e}"))?;
@@ -535,6 +587,13 @@ mod real {
         let font_title = crate::ui::load_font(&ttf, display_mode.h as u32, 40)?;
         let icon_font = crate::ui::load_icon_font(&ttf)?;
 
+        // Owned here, at the top of the menu/stream cycle, rather than re-declared in
+        // each: `ControllerDeviceAdded` only fires once per physical (re)connection, so
+        // a pad already open from the menu (or a previous stream) needs to carry
+        // straight through a screen transition instead of waiting for a replug neither
+        // side will ever see.
+        let mut controller: Option<GameController> = None;
+
         loop {
             let Some((host, port, fp, launch)) = run_ui_flow(
                 &mut canvas,
@@ -542,6 +601,7 @@ mod real {
                 &mut painter,
                 &mut events,
                 &game_controller,
+                &mut controller,
                 &identity,
                 display_mode,
                 &font_label,
@@ -624,8 +684,10 @@ mod real {
                 audio_player.spec()
             )?;
 
-            let mut controller = None;
             let mut back_held_since: Option<Instant> = None;
+            let mut ok_held_since: Option<Instant> = None;
+            let mut ok_promoted = false;
+            let mut scroll_acc = mouse::ScrollAccumulator::default();
             let outcome = 'running: loop {
                 if QUIT_REQUESTED.load(Ordering::Relaxed) {
                     writeln!(log, "SIGTERM/SIGINT received — disconnecting before exit")?;
@@ -653,27 +715,29 @@ mod real {
                         Event::ControllerDeviceRemoved { .. } => {
                             controller = None;
                         }
-                        Event::KeyDown { keycode: Some(k), .. }
-                            if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) =>
-                        {
-                            back_held_since.get_or_insert_with(Instant::now);
+                        Event::KeyDown { keycode: Some(k), .. } => {
+                            let is_back = crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back);
+                            track_back_hold(is_back, true, &mut back_held_since);
+                            if let Some(ev) = keyboard::key_event(k, true) {
+                                let _ = session::send_input(&connected.client, &ev);
+                            }
                         }
-                        Event::KeyUp { keycode: Some(k), .. }
-                            if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) =>
-                        {
-                            back_held_since = None;
+                        Event::KeyUp { keycode: Some(k), .. } => {
+                            let is_back = crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back);
+                            track_back_hold(is_back, false, &mut back_held_since);
+                            if let Some(ev) = keyboard::key_event(k, false) {
+                                let _ = session::send_input(&connected.client, &ev);
+                            }
                         }
                         Event::ControllerButtonDown { button, .. } => {
-                            if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back) {
-                                back_held_since.get_or_insert_with(Instant::now);
-                            }
+                            let is_back = crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back);
+                            track_back_hold(is_back, true, &mut back_held_since);
                             let ev = gamepad::button_event(button, true, 0);
                             let _ = session::send_input(&connected.client, &ev);
                         }
                         Event::ControllerButtonUp { button, .. } => {
-                            if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back) {
-                                back_held_since = None;
-                            }
+                            let is_back = crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back);
+                            track_back_hold(is_back, false, &mut back_held_since);
                             let ev = gamepad::button_event(button, false, 0);
                             let _ = session::send_input(&connected.client, &ev);
                         }
@@ -690,23 +754,38 @@ mod real {
                             let _ = session::send_input(&connected.client, &ev);
                         }
                         Event::MouseButtonDown { mouse_btn, .. } => {
+                            if mouse_btn == MouseButton::Left {
+                                ok_held_since = Some(Instant::now());
+                                ok_promoted = false;
+                            }
                             if let Some(ev) = mouse::button_event(mouse_btn, true) {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
                         }
                         Event::MouseButtonUp { mouse_btn, .. } => {
-                            if let Some(ev) = mouse::button_event(mouse_btn, false) {
+                            let released = if mouse_btn == MouseButton::Left && ok_promoted {
+                                MouseButton::Right
+                            } else {
+                                mouse_btn
+                            };
+                            if mouse_btn == MouseButton::Left {
+                                ok_held_since = None;
+                                ok_promoted = false;
+                            }
+                            if let Some(ev) = mouse::button_event(released, false) {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
                         }
                         Event::MouseWheel { x, y, .. } => {
                             if y != 0 {
-                                let ev = mouse::scroll_event(y, false);
-                                let _ = session::send_input(&connected.client, &ev);
+                                if let Some(ev) = scroll_acc.scroll_event(y, false) {
+                                    let _ = session::send_input(&connected.client, &ev);
+                                }
                             }
                             if x != 0 {
-                                let ev = mouse::scroll_event(x, true);
-                                let _ = session::send_input(&connected.client, &ev);
+                                if let Some(ev) = scroll_acc.scroll_event(x, true) {
+                                    let _ = session::send_input(&connected.client, &ev);
+                                }
                             }
                         }
                         _ => {}
@@ -723,7 +802,18 @@ mod real {
                     connected.client.disconnect_quit();
                     break 'running StreamOutcome::ReturnToMenu;
                 }
+                if !ok_promoted && ok_held_since.is_some_and(|t| t.elapsed() >= LONG_PRESS_OK) {
+                    // Release left before pressing right so the host never sees both held.
+                    if let Some(ev) = mouse::button_event(MouseButton::Left, false) {
+                        let _ = session::send_input(&connected.client, &ev);
+                    }
+                    if let Some(ev) = mouse::button_event(MouseButton::Right, true) {
+                        let _ = session::send_input(&connected.client, &ev);
+                    }
+                    ok_promoted = true;
+                }
                 session::pump_audio_once(&connected.client, &mut audio_player, log);
+                session::pump_rumble_once(&connected.client, &mut controller, log);
                 if connected.client.is_session_ended() {
                     writeln!(log, "host ended the session")?;
                     break 'running StreamOutcome::ReturnToMenu;
