@@ -167,6 +167,60 @@ narrowed per request, not removed outright.
 `-Z build-std` would close that gap but is a bigger toolchain change, worth it only if profiling
 still shows cost unexplained by the app's own draw calls.
 
+## High-bitrate video decode choppiness (2026-07-21)
+
+Symptom: decode visibly lags the stream and framerate gets choppy above ~80 Mbps, unusable
+above ~100 Mbps — despite the CX's hardware decoder being confirmed capable of 150+ Mbps
+butter-smooth by aurora-tv, over the *same host*, via its GameStream-compatibility protocol
+path. Root-caused by reading aurora-tv's source/history and the `punktfunk-core`/
+`punktfunk-host` source directly, not just this client.
+
+Two real, fixed contributors:
+- **Frame pacer regression (85b6ef5)**: `video_pump` slept to a fixed `next_present_at`
+  schedule before every `ndl.play()`, withholding an already-available frame from the decoder
+  until a scheduled instant. `NDL_DirectVideoPlay` couples decode+present with no decode-ahead
+  of its own, so this shrank exactly the head start large (high-bitrate) frames need. Removed —
+  feed NDL immediately on every frame, same as before that commit.
+- **`punktfunk-core` was pinned to v0.16.0, missing `VIDEO_CAP_STREAMED_AU`** (added
+  post-v0.16.0, default-on for the host's Linux direct-NVENC encoder as of v0.17.0): lets the
+  host stream a multi-slice frame's tail overlapped with packetize/FEC/pacing instead of
+  waiting for the whole frame to finish encoding — upstream's own gate numbers show p99
+  encode-to-send latency 8527→5363µs on large frames. Bumped the pin to v0.17.0;
+  `NativeClient`'s public API is unchanged, so no client code changes were needed — this crate
+  already sent the capability bit unconditionally, it was just a no-op against an older
+  host/core. Requires the host machine's own `punktfunk-host` rebuilt to v0.17.0+ too, or it
+  ignores the bit.
+
+Confirmed on-device: 100 Mbps went from choppy/unusable to usable and mostly stable.
+
+**Known remaining gap, not yet fixed — the likely dominant remaining cost**: punktfunk's
+*native* protocol (what this client speaks) negotiates AES-128-GCM on every video datagram
+(`punktfunk-host/src/native.rs`), decrypted client-side per packet. The CX's SoC is
+Cortex-A9/ARMv7-A — the ARM Crypto Extensions (dedicated AES instructions) only exist on
+ARMv8+, so this runs as constant-time software AES-GCM on a single core, an O(bytes) cost that
+scales with bitrate. aurora-tv's GameStream-compatibility path is explicitly plaintext
+(`punktfunk-host/src/gamestream/video.rs`: "AES-GCM video encryption is negotiated off for
+now") — zero decrypt cost, part of why it sustains 150+ Mbps.
+
+The fix is **not** disabling encryption: swap to **ChaCha20-Poly1305** (RFC 8439, same
+security tier as AES-GCM, a standard TLS 1.3 AEAD). Its core is 32-bit add/rotate/xor — no
+S-box lookups, no GHASH carry-less multiply — so it stays fast in pure software on a CPU with
+no crypto instructions at all (why Google/BoringSSL default to it on ARM devices without an
+AES-NI equivalent). `punktfunk-core/src/crypto.rs` already builds on RustCrypto's `aead` traits
+around `Aes128Gcm`; `chacha20poly1305` is the same crate family with the same trait shape, so
+the in-crate change is close to a type swap. The real work is the wire-visible part: needs a
+capability/version negotiation (every client and host must agree, so not a silent swap), and
+the key grows from 16 to 32 bytes. This is a `punktfunk-core`/`punktfunk-host` change — affects
+every client, not just this one.
+
+**Status (2026-07-21): the punktfunk maintainer has confirmed ChaCha20-Poly1305 is coming to
+the protocol.** Nothing to do in pf-webos yet — this client has no cipher-specific code of its
+own (it never touches `SessionCrypto`/`Aes128Gcm` directly; all of it is internal to
+`punktfunk-core`, invisible behind the `NativeClient` API this client consumes). Once
+punktfunk-core ships it and pf-webos bumps its pin, wire it in as the **sole** cipher — no
+client-side setting/toggle for encryption algorithm, same way codec/HDR/bitrate capability bits
+are just sent, not exposed as a user choice between wire-level options.
+
 ## Runtime/deploy gotchas (LG CX specifics)
 
 - Homebrew apps install to `/media/developer/apps/usr/palm/applications/<appid>/`; the jailer
