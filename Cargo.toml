@@ -50,24 +50,14 @@ tracing-subscriber = "0.3"
 # pf-client-core's session::start() (see session.rs docs for why we don't use that).
 # Pinned to a tagged punktfunk release (not a branch tip) this client was
 # developed/tested against — bump deliberately, not automatically, since
-# punktfunk-core's wire/ABI surface can move. Currently v0.17.0 (bumped from
-# v0.16.0) — WIRE_VERSION unchanged, and `client::NativeClient`'s public surface is
-# identical, so this is a behavior-only bump. Pulled in for `VIDEO_CAP_STREAMED_AU`
-# (added post-v0.16.0): the host's Linux direct-NVENC encoder can now stream a
-# multi-slice frame's tail overlapped with packetize/FEC/pacing instead of waiting
-# for the whole frame to encode first, cutting large-frame pipeline latency —
-# helps most exactly where bigger (higher-bitrate) frames used to fall behind.
-# No client code change needed: this crate already OR's the cap bit into every
-# `Hello` unconditionally, it was just a no-op against an older host/core. The
-# host machine's punktfunk-host needs to be on v0.17.0+ too, or it ignores the bit.
-#
-# Pending bump: the maintainer is adding ChaCha20-Poly1305 to the wire protocol (see
-# docs/NOTES.md's high-bitrate decode entry — the CX's Cortex-A9 has no AES hardware,
-# so software AES-GCM is a real decode-choppiness contributor at high bitrate). This
-# client has no cipher-specific code of its own (crypto is internal to this crate,
-# behind `NativeClient`) — when that lands, just bump the tag; do NOT add a
-# client-side setting/toggle for it, it's the one cipher this client speaks.
-punktfunk-core = { git = "https://git.unom.io/unom/punktfunk", tag = "v0.17.0", features = [
+# punktfunk-core's wire/ABI surface can move. Currently v0.17.2 — bumped from
+# v0.16.0 for the ChaCha20-Poly1305 session cipher (session.rs advertises
+# `VIDEO_CAP_CHACHA20`; lifts the soft-AES decrypt ceiling on this armv7 target).
+# WIRE_VERSION 2 (verified unchanged across v0.16.0..v0.17.2 — the cipher rides a
+# new Welcome tail field, fail-closed, no protocol migration), and the C ABI in
+# `abi.rs` stays irrelevant to us (we link the Rust `client` API directly;
+# `NativeClient::connect`'s signature is unchanged across the bump).
+punktfunk-core = { git = "https://git.unom.io/unom/punktfunk", tag = "v0.17.2", features = [
     "quic",
 ] }
 serde = { version = "1", features = ["derive"] }
@@ -115,3 +105,15 @@ tiny-skia = { version = "0.12", default-features = false, features = ["std"] }
 # transitive dependency (punktfunk-core itself uses `libc::gettid` for its hot-thread
 # registry), pulled in directly since we call our own libc function against those ids.
 libc = "0.2"
+
+[profile.release]
+# The per-packet hot loops this client actually burns CPU in — AEAD decrypt, FEC
+# reassembly, QUIC/packet parsing — all live in punktfunk-core and its deps, not this
+# crate, so cargo's defaults (no cross-crate LTO, 16 codegen units) leave the
+# optimizer unable to inline across exactly the boundaries that matter on this
+# hardware. Fat LTO + one codegen unit costs build time (the deploy loop already runs
+# in Docker; drop to lto = "thin" if it ever gets painful) in exchange for the best
+# codegen the pinned toolchain can produce — this directly cheapens today's software
+# AES path and the ChaCha20-Poly1305 one planned to replace it.
+lto = "fat"
+codegen-units = 1
