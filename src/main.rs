@@ -319,28 +319,18 @@ mod real {
                         confirm_long_fired = false;
                         continue;
                     }
-                    // OK pressed down on a sidebar host row: don't dispatch its
-                    // normal short-press action (connect/pair) yet — start
-                    // timing the hold instead, so a long-enough press opens
-                    // `Screen::ForgetHost` (checked below) instead.
-                    // `get_or_insert_with` rather than an unconditional
-                    // `Some(Instant::now())`: a held key can resend `KeyDown`
-                    // as an OS repeat, which must not keep resetting the clock
-                    // back to zero.
-                    //
-                    // `confirm_held_since.is_some()` alone (not just
-                    // `host_row_focused()`) also keeps intercepting *once a hold is
-                    // already tracked* — needed because the moment the hold crosses
-                    // `LONG_PRESS_CONFIRM` and opens `Screen::ForgetHost`, the screen
-                    // is no longer `Home`, so `host_row_focused()` goes back to
-                    // `None` while the physical key is still down. Without this, the
-                    // very next OS repeat `KeyDown` for that same still-held key fell
-                    // through all the way to the generic dispatch below, which read
-                    // it as a fresh Confirm on `Screen::ForgetHost` — landing on
-                    // "Cancel" (the default focus) and dismissing the just-opened
-                    // dialog before the user ever released the button. A held mouse
-                    // button has no equivalent repeat (`MouseButtonDown` fires once),
-                    // which is why this only ever showed up with keyboard/remote.
+                    // OK pressed down on a sidebar host row: start timing the hold
+                    // instead of dispatching connect/pair immediately, so a
+                    // long-enough press opens `Screen::ForgetHost` (checked below).
+                    // `get_or_insert_with`, not `Some(Instant::now())`, since a held
+                    // key resends `KeyDown` as an OS repeat and that must not keep
+                    // resetting the clock. `confirm_held_since.is_some()` keeps
+                    // intercepting those repeats even after `Screen::ForgetHost`
+                    // opens (when `host_row_focused()` alone would go back to `None`)
+                    // — otherwise the next repeat fell through to the generic
+                    // dispatch below as a fresh Confirm and dismissed the dialog via
+                    // its default-focused "Cancel" before the button was released.
+                    // Mouse has no equivalent bug: `MouseButtonDown` never repeats.
                     Event::KeyDown { keycode: Some(k), .. }
                         if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Confirm)
                             && (confirm_held_since.is_some() || app.host_row_focused().is_some()) =>

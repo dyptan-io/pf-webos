@@ -724,6 +724,33 @@ pub fn draw_text_wrapped(
     Ok(cursor_y)
 }
 
+/// The title + wrapped subtitle every Pairing/Add-host/Wake/Forget-host modal draws
+/// before its own content, on top of `draw_modal_card`'s chrome — pulled out once these
+/// four had each grown (then separately re-fixed) the same bug: a subtitle positioned a
+/// further fixed pixel gap below the title, and drawn as a single unwrapped line, which
+/// undersized badly at this app's real TV font scale and let long content run past the
+/// card edge. Settings has no subtitle (a divider instead) and doesn't call this. Returns
+/// the y just past the wrapped subtitle, for the caller's own content below it.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_modal_header(
+    painter: &mut Painter,
+    text_cache: &mut TextCache,
+    title_font: &Font,
+    subtitle_font: &Font,
+    card: Rect,
+    title: &str,
+    title_color: Color,
+    subtitle: &str,
+    subtitle_color: Color,
+) -> Result<i32> {
+    let text_x = card.x() + 32;
+    let title_y = card.y() + 28;
+    draw_text(painter, text_cache, title_font, title, text_x, title_y, title_color)?;
+    let subtitle_y = title_y + title_font.height() + 18;
+    let max_w = card.width().saturating_sub(64);
+    draw_text_wrapped(painter, text_cache, subtitle_font, subtitle, text_x, subtitle_y, max_w, subtitle_color, 6)
+}
+
 // -------------------------------------------------------------------- focus/cards --
 
 /// A slight softening of moonlight-tv's near-square (~2px) tile radius.

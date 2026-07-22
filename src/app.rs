@@ -36,14 +36,16 @@ const WAKE_RESEND_INTERVAL: Duration = Duration::from_secs(15);
 /// staying quiet and surfacing the wake prompt anyway — see `App::tick_wake`.
 const WAKE_ESCALATE_AFTER: Duration = Duration::from_secs(60);
 
+/// How often `App::tick_wake` actively re-checks reachability, independent of the WOL
+/// timers above and of whether a MAC is even on record.
+const WAKE_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+
 /// State for the "configured host is unreachable — wake it?" flow: both the interactive
 /// prompt (`Screen::Wake`) and the silent background wait behind an auto-send live here,
 /// distinguished by `silent`. Entered from `App::start_wake` whenever a known/paired
-/// host's library fetch fails as genuinely unreachable — replacing the old plain-error
-/// grid message in every case, not just when a Wake-on-LAN MAC is on record: a host
-/// with no MAC yet (never seen advertising one — see `App::drain_discovery`) still gets
-/// this modal, just without the send/auto-send controls (see `render_wake`), since
-/// there's nothing to send them to yet but the explanation is still worth showing.
+/// host's library fetch fails as genuinely unreachable, replacing the old plain grid
+/// error message in every case — even with no MAC on record, where `render_wake` just
+/// hides the send/auto-send controls instead.
 pub struct WakeState {
     host: String,
     port: u16,
@@ -67,6 +69,10 @@ pub struct WakeState {
     /// `WAKE_ESCALATE_AFTER` passes with the host still unreachable, so the user gets a
     /// chance to turn auto-send back off instead of it failing forever in silence.
     silent: bool,
+    /// When the last active reachability probe went out — see `App::tick_wake`.
+    last_probe: Option<Instant>,
+    /// An in-flight reachability probe, if one is currently out.
+    probe_rx: Option<std::sync::mpsc::Receiver<crate::library::GamesLoaded>>,
 }
 
 /// Which pane of Home currently has focus, and where within it.
@@ -134,14 +140,10 @@ pub struct App {
     /// GPU-texture-building step is needed here.
     pub art: std::collections::HashMap<String, Pixmap>,
     art_rx: Option<std::sync::mpsc::Receiver<crate::art::ArtLoaded>>,
-    /// A grid-card confirm that's still waiting on its pre-flight reachability
-    /// check, if any — see `confirm_grid_card`/`drain_launch_check`.
     pending_launch: Option<PendingLaunch>,
-    /// Set by `drain_launch_check` once that check actually succeeds — `main.rs`'s
-    /// UI loop picks this up via `take_ready_launch` and breaks out to start the
-    /// stream. Kept separate from `pending_launch` itself since the latter is
-    /// cleared (its receiver consumed) the instant a result arrives, one tick
-    /// before `main.rs` gets a chance to act on it.
+    /// Set by `drain_launch_check` on success — `main.rs` picks it up via
+    /// `take_ready_launch` and starts the stream. Separate from `pending_launch`
+    /// since that's cleared as soon as a result arrives, before `main.rs` can act.
     launch_ready: Option<ConnectTarget>,
     pub settings: Settings,
     pub settings_focused: usize,
@@ -303,16 +305,23 @@ impl App {
             let _ = store::save_known_hosts(&self.known_hosts);
         }
         if let Some((host, port, mgmt_port)) = woke {
-            let _ = writeln!(log, "wake succeeded: {host}:{port} back on mDNS");
-            self.wake = None;
-            self.screen = Screen::Home;
-            self.select_host(host, port, mgmt_port, log);
+            self.wake_succeeded(host, port, mgmt_port, "mDNS", log);
             changed = true;
         }
         if changed {
             self.home_dirty = true;
         }
         changed
+    }
+
+    /// Ends an in-flight wake because the host is actually back — whether that was
+    /// noticed passively (`drain_discovery` seeing a fresh mDNS resolve) or actively
+    /// (`tick_wake`'s reachability probe succeeding). `source` is just for the log line.
+    fn wake_succeeded(&mut self, host: String, port: u16, mgmt_port: Option<u16>, source: &str, log: &mut std::fs::File) {
+        let _ = writeln!(log, "wake succeeded: {host}:{port} back ({source})");
+        self.wake = None;
+        self.screen = Screen::Home;
+        self.select_host(host, port, mgmt_port, log);
     }
 
     /// Drains any cover art that's finished decoding since the last tick — called
@@ -637,15 +646,11 @@ impl App {
         true
     }
 
-    /// Shared handling for a failed library fetch/reachability check — used by both
-    /// `drain_games` (populating the grid) and `drain_launch_check` (the pre-flight
-    /// check `confirm_grid_card` runs before actually starting a stream). A genuinely
-    /// unreachable host (no route/refused/timed out) always goes to the Wake dialog now
-    /// — replacing what used to be a plain grid-pane error message — since that's more
-    /// useful than a dead end even when no Wake-on-LAN MAC is on record yet (`start_wake`/
-    /// `render_wake` handle that case by hiding the send controls, not by falling back to
-    /// text). `NotPaired`/`PinMismatch`/`Http` all mean the host answered, so Wake-on-LAN
-    /// wouldn't be the fix — those stay a plain status line.
+    /// Shared handling for a failed library fetch/reachability check, used by both
+    /// `drain_games` and `drain_launch_check`. `Unreachable` opens the Wake dialog
+    /// (even with no MAC on record — `start_wake`/`render_wake` just hide the send
+    /// controls then); `NotPaired`/`PinMismatch`/`Http` mean the host answered, so
+    /// Wake-on-LAN wouldn't help — those stay a plain status line.
     fn handle_library_error(&mut self, host: String, port: u16, e: crate::library::LibraryError, log: &mut std::fs::File) {
         let reason = format!("{e} (Desktop is still available.)");
         if matches!(e, crate::library::LibraryError::Unreachable(_)) {
@@ -687,6 +692,10 @@ impl App {
             since: None,
             last_attempt: None,
             silent: auto,
+            // Baseline for `WAKE_PROBE_INTERVAL` — the first active probe fires
+            // `WAKE_PROBE_INTERVAL` from now, not immediately.
+            last_probe: Some(Instant::now()),
+            probe_rx: None,
         };
         if auto {
             Self::send_wake(&mut wake, log);
@@ -707,34 +716,51 @@ impl App {
         wake.last_attempt = Some(now);
     }
 
-    /// Advances an in-flight wake: resends the packet every `WAKE_RESEND_INTERVAL`, and
-    /// — for a silent auto-send that still hasn't gotten the host back after
-    /// `WAKE_ESCALATE_AFTER` — surfaces the prompt so the user can turn `wol_auto_send`
-    /// back off. "The host is back" itself is noticed in `drain_discovery` (a fresh
-    /// mDNS resolve matching this host), not here; this only owns the resend/escalate
-    /// timers. Called every UI tick regardless of which screen is up, same as
-    /// `drain_discovery`/`drain_art`, since a silent wait runs with no modal open at
-    /// all. Returns whether anything visible changed (same "skip a redraw" contract as
-    /// those).
+    /// Advances an in-flight wake: resends the WOL packet every `WAKE_RESEND_INTERVAL`
+    /// (once a MAC is on record — see `WakeState::mac`'s docs), escalates a silent
+    /// auto-send to the visible prompt after `WAKE_ESCALATE_AFTER`, and — regardless of
+    /// either — actively re-checks reachability every `WAKE_PROBE_INTERVAL` via
+    /// `wake_probe`, ending the wake via `wake_succeeded` on success. This runs whether
+    /// or not `Screen::Wake` is actually showing (same as the WOL timers), since a
+    /// silent auto-send wait has no modal open at all; `drain_discovery`'s passive mDNS
+    /// check can also end a wake independently, whichever notices first. Called every UI
+    /// tick; returns whether anything visibly changed (same contract as
+    /// `drain_discovery`/`drain_art`).
     pub fn tick_wake(&mut self, log: &mut std::fs::File) -> bool {
         let Some(wake) = &mut self.wake else { return false };
-        if wake.mac.is_empty() {
-            return false; // nothing to (re)send — Back is the only meaningful action here
-        }
         let now = Instant::now();
         let mut changed = false;
 
-        // `wake.sent` is required here — without it, this fired the *first* send on
-        // the very next tick after `start_wake` regardless of `Settings::wol_auto_send`
-        // (`last_attempt: None` reads as "due" below), sending a packet even when the
-        // user hadn't pressed "Send Wake-on-LAN now" and auto-send was off. This must
-        // only ever *resend* an already-in-flight wake; the first send is either
-        // `start_wake`'s own immediate call (auto-send on) or the user's explicit
-        // Confirm on the "Send" row (`handle_wake_event`).
-        let due = wake.sent && wake.last_attempt.is_some_and(|t| now.duration_since(t) >= WAKE_RESEND_INTERVAL);
-        if due {
-            Self::send_wake(wake, log);
-            changed = true;
+        if let Some(rx) = &wake.probe_rx {
+            if let Ok(loaded) = rx.try_recv() {
+                wake.probe_rx = None;
+                changed = true;
+                if loaded.result.is_ok() {
+                    let (host, port) = (wake.host.clone(), wake.port);
+                    let mgmt_port = self
+                        .known_hosts
+                        .iter()
+                        .find(|h| h.host == host && h.port == port)
+                        .and_then(|h| h.mgmt_port);
+                    self.wake_succeeded(host, port, mgmt_port, "reachability probe", log);
+                    return true;
+                }
+                wake.last_probe = Some(now);
+            }
+        }
+        let Some(wake) = &mut self.wake else { return changed };
+
+        // Only ever *resend*, gated on `wake.sent` — without it, this fired the first
+        // WOL packet on the very next tick after `start_wake` regardless of
+        // `Settings::wol_auto_send` (`last_attempt: None` reads as "due"). The first
+        // send is either `start_wake`'s own immediate call (auto-send on) or the user's
+        // explicit Confirm on "Send" (`handle_wake_event`).
+        if !wake.mac.is_empty() {
+            let due = wake.sent && wake.last_attempt.is_some_and(|t| now.duration_since(t) >= WAKE_RESEND_INTERVAL);
+            if due {
+                Self::send_wake(wake, log);
+                changed = true;
+            }
         }
 
         if wake.silent && wake.since.is_some_and(|t| now.duration_since(t) >= WAKE_ESCALATE_AFTER) {
@@ -743,7 +769,29 @@ impl App {
             self.screen = Screen::Wake;
             changed = true;
         }
+
+        if wake.probe_rx.is_none() && wake.last_probe.is_some_and(|t| now.duration_since(t) >= WAKE_PROBE_INTERVAL) {
+            let (host, port) = (wake.host.clone(), wake.port);
+            wake.probe_rx = Some(Self::wake_probe(&self.known_hosts, &self.identity, &host, port));
+            wake.last_probe = Some(now);
+        }
         changed
+    }
+
+    /// Kicks off one reachability probe for `(host, port)` — the same mTLS library
+    /// fetch `confirm_grid_card`'s pre-flight check uses, reused here as `tick_wake`'s
+    /// active "is it back yet" signal. A plain associated function (not `&self`) so it
+    /// can be called while `tick_wake` already holds `&mut self.wake`.
+    fn wake_probe(
+        known_hosts: &[KnownHost],
+        identity: &(String, String),
+        host: &str,
+        port: u16,
+    ) -> std::sync::mpsc::Receiver<crate::library::GamesLoaded> {
+        let known = known_hosts.iter().find(|h| h.host == host && h.port == port);
+        let mgmt_port = known.and_then(|h| h.mgmt_port).unwrap_or(crate::library::DEFAULT_MGMT_PORT);
+        let fingerprint = known.and_then(|h| h.fingerprint);
+        crate::library::load_games_async(host.to_string(), port, mgmt_port, identity.clone(), fingerprint)
     }
 
     /// Handles one menu event on the Wake modal: Up/Down move focus between the two
@@ -773,17 +821,13 @@ impl App {
         }
     }
 
-    /// Confirms a grid card ("Desktop" at `idx == 0`, or a game). Rather than handing a
-    /// `ConnectTarget` straight back the way this used to, it kicks off a fresh
-    /// reachability check first: the grid being populated at all only proves the host
-    /// answered *once*, whenever its library was last fetched — it could have gone
-    /// offline any time since, and letting a dead host ride all the way into
-    /// `session::connect`'s 185s QUIC handshake (whose failure currently propagates
-    /// uncaught out of `run_inner`, taking the whole process down — see `main.rs`'s
-    /// docs) is exactly the "started a stream on an unavailable host" case this exists
-    /// to head off. `main.rs`'s tick loop drains the result via
-    /// `drain_launch_check`/`take_ready_launch`. A no-op if a check is already in
-    /// flight, guarding a double-press from spawning a second one.
+    /// Confirms a grid card ("Desktop" at `idx == 0`, or a game). Kicks off a fresh
+    /// reachability check first rather than handing back a `ConnectTarget` directly —
+    /// the grid being populated only proves the host answered once, when its library
+    /// was last fetched, and it could have gone offline since (`session::connect`'s
+    /// failure currently propagates uncaught, taking the whole process down — see
+    /// `main.rs`'s docs). `main.rs`'s tick loop drains the result via
+    /// `drain_launch_check`/`take_ready_launch`. No-ops if a check is already in flight.
     fn confirm_grid_card(&mut self, idx: usize, log: &mut std::fs::File) {
         if self.pending_launch.is_some() {
             return;
@@ -814,14 +858,10 @@ impl App {
         });
     }
 
-    /// Drains an in-flight pre-flight reachability check (`confirm_grid_card`), if its
-    /// result has arrived. On success, stashes the `ConnectTarget` in `launch_ready` for
-    /// `main.rs` to pick up via `take_ready_launch` and actually start the stream — unless
-    /// the sidebar selection has since moved to a different host, in which case the
-    /// now-stale result is just dropped. On failure, routes through the same
-    /// unreachable-vs-plain-error handling `drain_games` uses (`handle_library_error`).
-    /// Returns whether anything changed, same "skip a redraw" contract as
-    /// `drain_discovery`/`drain_art`/`drain_games`/`tick_wake`.
+    /// Drains `confirm_grid_card`'s pre-flight reachability check, if it's finished. On
+    /// success, stashes the result in `launch_ready` for `main.rs` to pick up via
+    /// `take_ready_launch` (dropped instead if the selection has since moved to a
+    /// different host). On failure, defers to `handle_library_error`.
     pub fn drain_launch_check(&mut self, log: &mut std::fs::File) -> bool {
         let Some(pending) = &self.pending_launch else { return false };
         let Ok(loaded) = pending.rx.try_recv() else { return false };
@@ -1093,14 +1133,10 @@ impl App {
     // ---------------------------------------------------------------- mouse --
 
     /// The pairing modal's card rect — shared by `render_pairing` and mouse
-    /// hit-testing so they can never disagree. Taller than a plain guess at
-    /// "title + subtitle + PIN boxes + status" would suggest: at this app's
-    /// actual 4K-panel font scale (`ui::load_font` scales off the real display
-    /// height, not the 720px design reference) the title/subtitle lines run
-    /// much taller than the old fixed 340px card had room for, which is what
-    /// read as misaligned/crowded text — see `render_pairing`'s spacing.
+    /// hit-testing. Sized generously for `ui::draw_modal_header`'s layout (see its
+    /// docs) plus the PIN boxes and an up-to-two-line pairing-failure status below.
     fn pairing_card_rect(screen_w: u32, screen_h: u32) -> Rect {
-        ui::modal_card_rect(screen_w, screen_h, 0.36, 440)
+        ui::modal_card_rect(screen_w, screen_h, 0.36, 480)
     }
 
     /// The add-host modal's card rect — shared by `render_add_host` and mouse
@@ -1110,20 +1146,17 @@ impl App {
     }
 
     /// The wake modal's card rect — shared by `render_wake` and mouse hit-testing.
-    /// Tall enough for the title (`font_title`) plus a two-line wrapped status plus
-    /// the two action rows without clipping — see `render_wake`'s layout, which
-    /// places everything top-down from real font metrics rather than fixed offsets
-    /// (the old fixed 420 + hardcoded 84/150 pixel gaps badly undersized the
-    /// title-to-status gap at this app's real TV font scale — the same class of bug
-    /// `pairing_card_rect`'s docs describe and fix for the pairing modal).
+    /// Sized generously for `ui::draw_modal_header`'s layout (its title uses the
+    /// large `font_title`) plus the two action rows below.
     fn wake_card_rect(screen_w: u32, screen_h: u32) -> Rect {
         ui::modal_card_rect(screen_w, screen_h, 0.42, 520)
     }
 
     /// The "Forget this host?" confirmation's card rect — shared by
-    /// `render_forget_host` and mouse hit-testing.
+    /// `render_forget_host` and mouse hit-testing. Sized generously for
+    /// `ui::draw_modal_header`'s layout plus an up-to-two-line host-name subtitle.
     fn forget_host_card_rect(screen_w: u32, screen_h: u32) -> Rect {
-        ui::modal_card_rect(screen_w, screen_h, 0.34, 260)
+        ui::modal_card_rect(screen_w, screen_h, 0.34, 340)
     }
 
     /// The settings modal's card/content rects — shared by `render` and mouse
@@ -1470,30 +1503,17 @@ impl App {
         let card = Self::pairing_card_rect(screen_w, screen_h);
         self.draw_modal_shell(painter, text_cache, icon_font, card)?;
 
-        // Title in `font_label`, matching the Settings/Add-host modals'
-        // heading size — `font_title` (also used for the PIN digits below, at
-        // a deliberately large display-style size) ran nearly twice as tall
-        // as the gap this heading had to the subtitle beneath it, which is
-        // what actually read as "misaligned" rather than just crowded.
-        let title_y = card.y() + 36;
-        ui::draw_text(
+        // Title in `font_label`, matching the other modals — `font_title` is used
+        // below for the PIN digits themselves, at a deliberately large display style.
+        let after_subtitle_y = ui::draw_modal_header(
             painter,
             text_cache,
             font_label,
+            font_label,
+            card,
             "Pair with host",
-            card.x() + 32,
-            title_y,
             ui::WHITE,
-        )?;
-
-        let subtitle_y = title_y + font_label.height() + 18;
-        ui::draw_text(
-            painter,
-            text_cache,
-            font_label,
             "Enter the PIN from the host's pairing dialog.",
-            card.x() + 32,
-            subtitle_y,
             ui::MUTED,
         )?;
 
@@ -1501,7 +1521,7 @@ impl App {
         // screen's whole point, and it read as cramped sitting right under
         // the subtitle text.
         let digit_h = 80u32;
-        let digit_y = subtitle_y + font_label.height() + 44;
+        let digit_y = after_subtitle_y + 38;
         let digit_w = 64i32;
         let digit_gap = 14i32;
         let total_w = 4 * digit_w + 3 * digit_gap;
@@ -1525,14 +1545,19 @@ impl App {
         }
         if let Some(status) = &self.pairing_status {
             let color = if self.pairing_busy { ui::MUTED } else { ui::ERROR_RED };
-            ui::draw_text(
+            // Wrapped, not a single `draw_text` line — a pairing failure's message
+            // (whatever the host/network error's own text is) can run longer than a
+            // fixed short label and would otherwise overflow the card edge.
+            ui::draw_text_wrapped(
                 painter,
                 text_cache,
                 font_label,
                 status,
                 card.x() + 32,
                 digit_y + digit_h as i32 + 32,
+                card.width().saturating_sub(64),
                 color,
+                6,
             )?;
         }
         Ok(())
@@ -1613,26 +1638,24 @@ impl App {
         let card = Self::add_host_card_rect(screen_w, screen_h);
         self.draw_modal_shell(painter, text_cache, icon_font, card)?;
 
-        ui::draw_text(
+        let after_subtitle_y = ui::draw_modal_header(
             painter,
             text_cache,
             font_label,
-            "Add host",
-            card.x() + 32,
-            card.y() + 28,
-            ui::WHITE,
-        )?;
-        ui::draw_text(
-            painter,
-            text_cache,
             font_value,
+            card,
+            "Add host",
+            ui::WHITE,
             "Enter the host's IP address.",
-            card.x() + 32,
-            card.y() + 74,
             ui::MUTED,
         )?;
 
-        let field = Rect::new(card.x() + 32, card.y() + 120, card.width().saturating_sub(64), 80);
+        let field = Rect::new(
+            card.x() + 32,
+            after_subtitle_y + 20,
+            card.width().saturating_sub(64),
+            80,
+        );
         let drawn = ui::draw_card(painter, field, true);
         let text_x = drawn.x() + 24;
         let typed = self.add_host.display_text();
@@ -1674,16 +1697,6 @@ impl App {
         let card = Self::wake_card_rect(screen_w, screen_h);
         self.draw_modal_shell(painter, text_cache, icon_font, card)?;
 
-        let text_x = card.x() + 32;
-        let text_max_w = card.width().saturating_sub(64);
-
-        let title_y = card.y() + 28;
-        ui::draw_text(painter, text_cache, font_title, "Host unreachable", text_x, title_y, ui::WHITE)?;
-
-        // Gap computed from `font_title`'s real (scaled) line height rather than a
-        // fixed pixel offset — a fixed gap here undersizes badly at this app's actual
-        // TV font scale, the same class of bug `pairing_card_rect`'s docs describe.
-        let status_y = title_y + font_title.height() + 18;
         let status = if wake.mac.is_empty() {
             format!(
                 "Couldn't reach {} — it may be powered off, asleep, or off the network. No \
@@ -1699,15 +1712,21 @@ impl App {
         } else {
             format!("Couldn't reach {} — it may be powered off or asleep.", wake.name)
         };
-        let after_status_y =
-            ui::draw_text_wrapped(painter, text_cache, font_label, &status, text_x, status_y, text_max_w, ui::MUTED, 6)?;
+        let after_status_y = ui::draw_modal_header(
+            painter, text_cache, font_title, font_label, card, "Host unreachable", ui::WHITE, &status, ui::MUTED,
+        )?;
 
         // No MAC on record — nothing to send or automate, so there's no row to draw
         // (see `handle_wake_event`'s matching guard); the status text above already
         // explains why, and `App::drain_discovery` still reconnects automatically the
         // moment this host reappears on mDNS.
         if !wake.mac.is_empty() {
-            let content = Rect::new(text_x, after_status_y + 28, text_max_w, ui::SETTINGS_ROW_H);
+            let content = Rect::new(
+                card.x() + 32,
+                after_status_y + 28,
+                card.width().saturating_sub(64),
+                ui::SETTINGS_ROW_H,
+            );
             let send_label = if wake.sent { "Send again" } else { "Send Wake-on-LAN now" };
             ui::draw_wake_rows(
                 painter,
@@ -1744,26 +1763,19 @@ impl App {
         let card = Self::forget_host_card_rect(screen_w, screen_h);
         self.draw_modal_shell(painter, text_cache, icon_font, card)?;
 
-        ui::draw_text(
+        let after_subtitle_y = ui::draw_modal_header(
             painter,
             text_cache,
             font_label,
-            "Forget this host?",
-            card.x() + 32,
-            card.y() + 28,
-            ui::WHITE,
-        )?;
-        ui::draw_text(
-            painter,
-            text_cache,
             font_value,
+            card,
+            "Forget this host?",
+            ui::WHITE,
             &format!("\"{name}\" will be removed from your host list."),
-            card.x() + 32,
-            card.y() + 74,
             ui::MUTED,
         )?;
 
-        let content = Rect::new(card.x() + 32, card.y() + 150, card.width().saturating_sub(64), 72);
+        let content = Rect::new(card.x() + 32, after_subtitle_y + 32, card.width().saturating_sub(64), 72);
         ui::draw_confirm_buttons(
             painter,
             text_cache,
