@@ -29,7 +29,7 @@ use tiny_skia::{
 };
 
 use crate::discovery::DiscoveredHost;
-use crate::store::{KnownHost, Settings};
+use crate::store::{KnownHost, Settings, VideoBackend};
 
 // ---------------------------------------------------------------------- palette --
 // moonlight-tv has no dedicated colors header — these are the literals its views
@@ -1266,7 +1266,8 @@ pub const ROW_RESOLUTION: usize = 0;
 pub const ROW_FRAMERATE: usize = 1;
 pub const ROW_BITRATE: usize = 2;
 pub const ROW_HDR: usize = 3;
-pub const SETTINGS_ROW_COUNT: usize = 4;
+pub const ROW_VIDEO_BACKEND: usize = 4;
+pub const SETTINGS_ROW_COUNT: usize = 5;
 
 /// Cycles `current` to the next/previous value in a preset slice, wrapping.
 pub fn cycle<T: Copy + PartialEq>(options: &[T], current: T, forward: bool) -> T {
@@ -1334,6 +1335,15 @@ pub fn settings_rows(settings: &Settings) -> Vec<SettingsRow> {
             kind: RowKind::Toggle,
             fraction: 0.0,
         },
+        SettingsRow {
+            label: "Video backend".into(),
+            value: match settings.video_backend {
+                VideoBackend::Ndl => "NDL".into(),
+                VideoBackend::Starfish => "Starfish".into(),
+            },
+            kind: RowKind::Dropdown,
+            fraction: 0.0,
+        },
     ]
 }
 
@@ -1342,6 +1352,7 @@ pub fn dropdown_options(row_index: usize) -> Vec<String> {
     match row_index {
         ROW_RESOLUTION => RESOLUTIONS.iter().map(|(w, h, _)| resolution_label(*w, *h)).collect(),
         ROW_FRAMERATE => REFRESH_RATES.iter().map(|hz| format!("{hz} Hz")).collect(),
+        ROW_VIDEO_BACKEND => vec!["NDL".into(), "Starfish".into()],
         _ => Vec::new(),
     }
 }
@@ -1357,6 +1368,10 @@ pub fn dropdown_current_index(settings: &Settings, row_index: usize) -> usize {
             .iter()
             .position(|hz| *hz == settings.refresh_hz)
             .unwrap_or(0),
+        ROW_VIDEO_BACKEND => match settings.video_backend {
+            VideoBackend::Ndl => 0,
+            VideoBackend::Starfish => 1,
+        },
         _ => 0,
     }
 }
@@ -1373,6 +1388,12 @@ pub fn apply_dropdown_choice(settings: &mut Settings, row_index: usize, choice_i
             if let Some(hz) = REFRESH_RATES.get(choice_index) {
                 settings.refresh_hz = *hz;
             }
+        }
+        ROW_VIDEO_BACKEND => {
+            settings.video_backend = match choice_index {
+                1 => VideoBackend::Starfish,
+                _ => VideoBackend::Ndl,
+            };
         }
         _ => {}
     }
@@ -1410,6 +1431,12 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
         }
         ROW_HDR => {
             settings.hdr_enabled = !settings.hdr_enabled;
+            true
+        }
+        ROW_VIDEO_BACKEND => {
+            let idx = dropdown_current_index(settings, ROW_VIDEO_BACKEND);
+            let next = cycle_index(idx, 2, forward);
+            apply_dropdown_choice(settings, ROW_VIDEO_BACKEND, next);
             true
         }
         _ => false,
@@ -1455,6 +1482,7 @@ pub fn draw_settings_rows(
         let icon_color = if focused { WHITE } else { MUTED };
         let glyph = match row.kind {
             RowKind::Dropdown if i == ROW_RESOLUTION => ICON_MONITOR,
+            RowKind::Dropdown if i == ROW_VIDEO_BACKEND => ICON_TV,
             RowKind::Dropdown => ICON_SCHEDULE,
             RowKind::Slider => ICON_SIGNAL,
             RowKind::Toggle => ICON_SUN,

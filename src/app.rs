@@ -1062,7 +1062,7 @@ impl App {
                 }
             }
             MenuEvent::Confirm => match self.settings_focused {
-                ui::ROW_RESOLUTION | ui::ROW_FRAMERATE => {
+                ui::ROW_RESOLUTION | ui::ROW_FRAMERATE | ui::ROW_VIDEO_BACKEND => {
                     let focused = ui::dropdown_current_index(&self.settings, self.settings_focused);
                     self.dropdown = Some(DropdownState {
                         row: self.settings_focused,

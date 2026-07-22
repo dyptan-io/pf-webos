@@ -111,7 +111,19 @@ pub fn save_selected_host(host: &str, port: u16) -> Result<()> {
     std::fs::write(selected_host_path(), json).context("write selected-host.json")
 }
 
-/// Stream settings: resolution/framerate/bitrate/HDR.
+/// Video decode backend selectable in Settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoBackend {
+    /// NDL DirectMedia v2 — stable baseline, no `pauseAtDecodeTime`.
+    #[default]
+    Ndl,
+    /// Starfish/SMP (`libplayerAPIs_C.so`) — `pauseAtDecodeTime` + smooth PTS pacing
+    /// + `maxFrameRate`; better above 1080p, requires the bundled wrapper .so.
+    Starfish,
+}
+
+/// Stream settings: resolution/framerate/bitrate/HDR/video-backend.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Settings {
     pub width: u32,
@@ -131,6 +143,11 @@ pub struct Settings {
     /// actually get the host back within a minute (see `app.rs`'s `tick_wake` docs).
     #[serde(default)]
     pub wol_auto_send: bool,
+    /// Which hardware decode pipeline to use. Defaults to `Ndl` (stable baseline);
+    /// switch to `Starfish` to test `pauseAtDecodeTime` + smooth-pacing above 1080p.
+    /// Persisted across restarts; takes effect on the next stream.
+    #[serde(default)]
+    pub video_backend: VideoBackend,
 }
 
 impl Default for Settings {
@@ -146,6 +163,7 @@ impl Default for Settings {
             bitrate_kbps: 0,
             hdr_enabled: true,
             wol_auto_send: false,
+            video_backend: VideoBackend::Ndl,
         }
     }
 }
