@@ -10,6 +10,8 @@ mod art;
 #[cfg(target_os = "linux")]
 mod audio;
 #[cfg(target_os = "linux")]
+mod compositor;
+#[cfg(target_os = "linux")]
 mod discovery;
 #[cfg(target_os = "linux")]
 mod gamepad;
@@ -45,6 +47,7 @@ mod real {
     use sdl2::mouse::MouseButton;
 
     use crate::app::{App, Screen};
+    use crate::compositor::{Compositor, DrawCmd, Tile};
     use crate::gamepad;
     use crate::keyboard;
     use crate::mouse;
@@ -95,9 +98,13 @@ mod real {
     pub fn run() -> Result<()> {
         install_signal_handlers();
         let log_path = log_path();
+        // Truncate (not append) — this file previously grew unbounded across every
+        // launch for the life of the install; each run's log now starts fresh, and
+        // `task deploy:log` tails it live anyway.
         let mut log = std::fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(&log_path)
             .with_context(|| format!("open log file {}", log_path.display()))?;
         writeln!(log, "punktfunk-webos starting")?;
@@ -194,8 +201,8 @@ mod real {
     #[allow(clippy::too_many_arguments)]
     fn run_ui_flow(
         canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
-        frame_texture: &mut sdl2::render::Texture,
-        painter: &mut crate::ui::Painter,
+        compositor: &mut Compositor,
+        texture_creator: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
         events: &mut sdl2::EventPump,
         game_controller: &sdl2::GameControllerSubsystem,
         controller: &mut Option<GameController>,
@@ -205,6 +212,7 @@ mod real {
         font_value: &sdl2::ttf::Font,
         font_title: &sdl2::ttf::Font,
         icon_font: &sdl2::ttf::Font,
+        initial_status: Option<String>,
         log: &mut std::fs::File,
     ) -> Result<Option<ConnectOutcome>> {
         // Test/dev override: skip the UI entirely if a connect.conf was dropped
@@ -217,6 +225,12 @@ mod real {
 
         canvas.window_mut().show();
         let mut app = App::new(identity.clone(), log);
+        // E.g. "the last connect attempt failed, and here's why" — shown on the
+        // Home screen the user just got dropped back onto (see `run_inner`'s
+        // connect-error path).
+        if initial_status.is_some() {
+            app.home_status = initial_status;
+        }
         // Rasterized-text cache (see `ui::TextCache` docs) — created once here and
         // threaded down through every render call for the rest of this UI-flow's
         // lifetime so repeat draws of the same (font, text, color) reuse an
@@ -255,6 +269,7 @@ mod real {
             dirty |= app.drain_discovery(log);
             dirty |= app.drain_art();
             dirty |= app.drain_games(log);
+            dirty |= app.drain_pairing(log);
             dirty |= app.tick_wake(log);
             dirty |= app.drain_launch_check(log);
             if let Some(target) = app.take_ready_launch() {
@@ -273,6 +288,23 @@ mod real {
                 // not on every no-op tick.
                 if let Event::MouseMotion { x, y, .. } = event {
                     dirty |= app.handle_mouse_motion(x, y, display_mode.w as u32, display_mode.h as u32);
+                    continue;
+                }
+                // The Magic Remote's scroll wheel — scrolls the game grid on Home
+                // (wheel y > 0 = "scroll up" = content moves down). Like motion
+                // above, only redraws when the offset actually moved (a wheel tick
+                // at either clamp edge is a no-op).
+                if let Event::MouseWheel { y: wheel_y, .. } = event {
+                    if matches!(app.screen, Screen::Home) {
+                        /// Grid px scrolled per wheel detent — about a third of a
+                        /// card row, so a few ticks walk one row.
+                        const WHEEL_STEP: i32 = 120;
+                        dirty |= app.scroll_grid_by(
+                            -wheel_y * WHEEL_STEP,
+                            display_mode.w as u32,
+                            display_mode.h as u32,
+                        );
+                    }
                     continue;
                 }
                 // Any other event might change what's on screen (focus/hover, a typed
@@ -363,7 +395,7 @@ mod real {
                         // library fetch failing into the Wake prompt) could in
                         // principle have changed screens while OK was down.
                         if held && !confirm_long_fired && matches!(app.screen, Screen::Home) {
-                            if let Some(target) = app.handle_home_event(MenuEvent::Confirm, display_mode.w as u32, log)
+                            if let Some(target) = app.handle_home_event(MenuEvent::Confirm, display_mode.w as u32, display_mode.h as u32, log)
                             {
                                 break 'ui target;
                             }
@@ -376,7 +408,7 @@ mod real {
                     {
                         let held = confirm_held_since.take().is_some();
                         if held && !confirm_long_fired && matches!(app.screen, Screen::Home) {
-                            if let Some(target) = app.handle_home_event(MenuEvent::Confirm, display_mode.w as u32, log)
+                            if let Some(target) = app.handle_home_event(MenuEvent::Confirm, display_mode.w as u32, display_mode.h as u32, log)
                             {
                                 break 'ui target;
                             }
@@ -438,16 +470,14 @@ mod real {
                 };
                 let Some(menu_ev) = menu_ev else { continue };
                 match app.screen {
-                    // A keyboard/gamepad Back is a bonus shortcut to Settings; the
-                    // sidebar's own Settings row (reachable via Up/Down + Confirm)
-                    // is the reliable primary path. `App::back` (shared with the
-                    // close-button click path) is what actually decides that.
+                    // Back on Home is a no-op (root screen — `App::back` decides);
+                    // routed through `back` anyway so the policy lives in one place.
                     Screen::Home => {
                         if menu_ev == MenuEvent::Back {
                             if let Some(target) = app.back(log) {
                                 break 'ui target;
                             }
-                        } else if let Some(target) = app.handle_home_event(menu_ev, display_mode.w as u32, log) {
+                        } else if let Some(target) = app.handle_home_event(menu_ev, display_mode.w as u32, display_mode.h as u32, log) {
                             break 'ui target;
                         }
                     }
@@ -473,13 +503,17 @@ mod real {
                     }
                 }
             }
-            if !dirty {
+            // Animations advance every 16ms tick and keep frames flowing on their
+            // own; `dirty` (an event/drain changed actual content) additionally
+            // forces stale tiles to re-rasterize.
+            let animating = app.tick_animations();
+            if !dirty && !animating {
                 std::thread::sleep(Duration::from_millis(16));
                 continue;
             }
+            let content_dirty = dirty;
             dirty = false;
-            app.render(
-                painter,
+            let updated = app.prepare_tiles(
                 &mut text_cache,
                 font_label,
                 font_value,
@@ -487,13 +521,18 @@ mod real {
                 icon_font,
                 display_mode.w as u32,
                 display_mode.h as u32,
+                content_dirty,
             )?;
-            frame_texture
-                .update(None, painter.data(), (display_mode.w as usize) * 4)
-                .map_err(|e| anyhow::anyhow!("update frame texture: {e}"))?;
-            canvas
-                .copy(frame_texture, None, None)
-                .map_err(|e| anyhow::anyhow!("copy frame texture: {e}"))?;
+            for tile in updated {
+                if let Some(pm) = app.tile_pixmap(tile) {
+                    compositor.upload(texture_creator, tile, pm)?;
+                }
+            }
+            let cmds = app.draw_list(display_mode.w as u32, display_mode.h as u32);
+            canvas.set_blend_mode(sdl2::render::BlendMode::None);
+            canvas.set_draw_color(crate::ui::BG);
+            canvas.clear();
+            compositor.execute(canvas, &cmds)?;
             canvas.present();
             std::thread::sleep(Duration::from_millis(16));
         };
@@ -513,6 +552,9 @@ mod real {
         // before the window is created — `SDL_waylandwebos.c` only applies it at
         // window-creation time (plus a runtime hint-watcher for later changes).
         sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
+        // Linear texture filtering (SDL defaults to nearest) — the focus pop
+        // scales card textures slightly, which shimmers without it.
+        sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "1");
         let sdl = sdl2::init().map_err(|e| anyhow::anyhow!("SDL_Init: {e}"))?;
         let ttf = sdl2::ttf::init().map_err(|e| anyhow::anyhow!("SDL_ttf init: {e}"))?;
         let video = sdl.video().map_err(|e| anyhow::anyhow!("SDL video subsystem: {e}"))?;
@@ -541,35 +583,22 @@ mod real {
             .build()
             .map_err(|e| anyhow::anyhow!("create canvas: {e}"))?;
         let texture_creator = canvas.texture_creator();
-        writeln!(log, "window + canvas created")?;
+        writeln!(log, "window + canvas created (renderer: {})", canvas.info().name)?;
 
-        // The pre-stream UI's whole rendering backend (see `ui.rs`'s module docs):
-        // `App::render` draws every screen into this one `Painter` (a software
-        // framebuffer) each dirty tick; `run_ui_flow` then uploads the finished
-        // buffer here and presents it — one texture/copy per frame, not one per
-        // widget/art-cover/text-label the way the old canvas-primitives version did.
-        let mut painter = crate::ui::Painter::new(display_mode.w as u32, display_mode.h as u32);
-        // STREAMING (not STATIC) — this texture's whole content is re-uploaded via
-        // `update()` every dirty tick, which is exactly the frequent-full-update
-        // case STREAMING is meant for; STATIC targets content that rarely changes
-        // and can be a slower path for a per-frame full-frame upload on some
-        // backends.
-        let mut frame_texture = texture_creator
-            .create_texture_streaming(
-                sdl2::pixels::PixelFormatEnum::RGBA32,
-                display_mode.w as u32,
-                display_mode.h as u32,
-            )
-            .map_err(|e| anyhow::anyhow!("create frame texture: {e}"))?;
+        // The pre-stream UI's rendering backend: tiny-skia rasterizes cached
+        // widget tiles (see `ui.rs`'s `render_*_tile` helpers), and the GPU
+        // (`opengles2`, confirmed live on-device) composites them each frame via
+        // this compositor — see `compositor.rs`'s module docs.
+        let mut compositor = Compositor::new();
 
         let mut events = sdl.event_pump().map_err(|e| anyhow::anyhow!("event pump: {e}"))?;
 
         let identity = store::load_or_create_identity().context("load_or_create_identity")?;
 
         // Sized for a 10-foot TV viewing distance — see ui.rs's ROW_H/ROW_MAX_W docs.
-        let font_label = crate::ui::load_font(&ttf, display_mode.h as u32, 22)?;
-        let font_value = crate::ui::load_font(&ttf, display_mode.h as u32, 20)?;
-        let font_title = crate::ui::load_font(&ttf, display_mode.h as u32, 40)?;
+        let font_label = crate::ui::load_font(&ttf, display_mode.h as u32, 22, crate::ui::FontWeight::Medium)?;
+        let font_value = crate::ui::load_font(&ttf, display_mode.h as u32, 20, crate::ui::FontWeight::Regular)?;
+        let font_title = crate::ui::load_font(&ttf, display_mode.h as u32, 40, crate::ui::FontWeight::SemiBold)?;
         let icon_font = crate::ui::load_icon_font(&ttf)?;
 
         // Owned here, at the top of the menu/stream cycle, rather than re-declared in
@@ -578,12 +607,16 @@ mod real {
         // straight through a screen transition instead of waiting for a replug neither
         // side will ever see.
         let mut controller: Option<GameController> = None;
+        // Carried across the loop: why the *last* stream attempt bounced back to
+        // the menu (connect/audio failure), surfaced as the fresh Home screen's
+        // status line.
+        let mut menu_status: Option<String> = None;
 
         loop {
             let Some((host, port, fp, launch)) = run_ui_flow(
                 &mut canvas,
-                &mut frame_texture,
-                &mut painter,
+                &mut compositor,
+                &texture_creator,
                 &mut events,
                 &game_controller,
                 &mut controller,
@@ -593,6 +626,7 @@ mod real {
                 &font_value,
                 &font_title,
                 &icon_font,
+                menu_status.take(),
                 log,
             )?
             else {
@@ -640,7 +674,7 @@ mod real {
                 height: settings.height,
                 refresh_hz: settings.refresh_hz,
             };
-            let connected = session::connect(
+            let connected = match session::connect(
                 &host,
                 port,
                 mode,
@@ -657,12 +691,37 @@ mod real {
                 display_mode.h,
                 settings.video_backend,
                 log,
-            )
-            .context("session connect")?;
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    // A failed connect (host went down in the race, codec/launch
+                    // rejection, handshake error) used to `?` out of `run_inner`
+                    // and take the whole app down — return to the menu with the
+                    // reason on screen instead.
+                    writeln!(log, "session connect failed: {e:#}")?;
+                    sdl.mouse().show_cursor(true);
+                    menu_status = Some(format!("Couldn't connect: {e:#}"));
+                    continue;
+                }
+            };
             writeln!(log, "session connected, entering event loop")?;
 
-            let mut audio_player = crate::audio::AudioPlayer::new(&sdl_audio, connected.client.audio_channels)
-                .context("audio player init")?;
+            let mut audio_player = match crate::audio::AudioPlayer::new(&sdl_audio, connected.client.audio_channels)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    // Same no-crash policy as the connect above — including the
+                    // video-side teardown the normal stream exit does, since the
+                    // connect succeeded and loaded a decoder.
+                    writeln!(log, "audio player init failed: {e:#}")?;
+                    connected.client.disconnect_quit();
+                    connected.shutdown();
+                    crate::ndl::quit();
+                    sdl.mouse().show_cursor(true);
+                    menu_status = Some(format!("Couldn't start audio: {e:#}"));
+                    continue;
+                }
+            };
             writeln!(
                 log,
                 "SDL audio driver: {}, spec: {:?}",
@@ -674,6 +733,16 @@ mod real {
             let mut ok_held_since: Option<Instant> = None;
             let mut ok_promoted = false;
             let mut scroll_acc = mouse::ScrollAccumulator::default();
+            // In-stream stats overlay (Settings toggle): refreshed at ~2Hz onto the
+            // otherwise-transparent stream window. Drawing composites OVER the
+            // punch-through video plane via the surface's per-pixel alpha — the same
+            // mechanism that lets the video show through the transparent clear. The
+            // window is never shown/hidden here (that's what crashed the old overlay
+            // attempt — see docs/NOTES.md).
+            let stats_enabled = settings.stats_overlay;
+            let mut overlay_last: Option<Instant> = None;
+            let mut overlay_prev_frames: u64 = 0;
+            let mut overlay_prev_at = Instant::now();
             let outcome = 'running: loop {
                 if QUIT_REQUESTED.load(Ordering::Relaxed) {
                     writeln!(log, "SIGTERM/SIGINT received — disconnecting before exit")?;
@@ -799,6 +868,57 @@ mod real {
                     ok_promoted = true;
                 }
                 session::pump_audio_once(&connected.client, &mut audio_player, log);
+                if stats_enabled && overlay_last.is_none_or(|t| t.elapsed() >= Duration::from_millis(500)) {
+                    overlay_last = Some(Instant::now());
+                    let frames = connected.stats.frames.load(Ordering::Relaxed);
+                    let dt = overlay_prev_at.elapsed().as_secs_f32().max(0.001);
+                    let fps = (frames.saturating_sub(overlay_prev_frames)) as f32 / dt;
+                    overlay_prev_frames = frames;
+                    overlay_prev_at = Instant::now();
+                    let mode = connected.client.mode();
+                    let feed_ms =
+                        connected.stats.feed_us.load(Ordering::Relaxed) as f32 / 1000.0;
+                    let holding = connected.stats.holding.load(Ordering::Relaxed);
+                    let lines = vec![
+                        format!(
+                            "{}x{}@{} {}{}",
+                            mode.width,
+                            mode.height,
+                            mode.refresh_hz,
+                            session::codec_name(connected.client.codec),
+                            if connected.client.color.is_hdr() { " HDR" } else { "" },
+                        ),
+                        format!("Video {fps:.1} fps · {frames} frames"),
+                        format!(
+                            "Dropped {} · hold {}",
+                            connected.client.frames_dropped(),
+                            if holding { "yes" } else { "no" },
+                        ),
+                        format!(
+                            "Feed {feed_ms:.1} ms · start {} Mbps",
+                            connected.client.resolved_bitrate_kbps / 1000,
+                        ),
+                    ];
+                    match crate::ui::render_stats_overlay_tile(&font_value, &lines) {
+                        Ok(tile) => {
+                            let (tw, th) = (tile.width(), tile.height());
+                            compositor.upload(&texture_creator, Tile::StatsOverlay, &tile)?;
+                            canvas.set_blend_mode(sdl2::render::BlendMode::None);
+                            canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
+                            canvas.clear();
+                            compositor.execute(
+                                &mut canvas,
+                                &[DrawCmd::Tex {
+                                    tile: Tile::StatsOverlay,
+                                    dst: sdl2::rect::Rect::new(display_mode.w - tw as i32 - 24, 24, tw, th),
+                                    alpha: 0xff,
+                                }],
+                            )?;
+                            canvas.present();
+                        }
+                        Err(e) => writeln!(log, "stats overlay render failed: {e:#}")?,
+                    }
+                }
                 if connected.client.is_session_ended() {
                     writeln!(log, "host ended the session")?;
                     break 'running StreamOutcome::ReturnToMenu;

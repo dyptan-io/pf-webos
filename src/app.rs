@@ -11,9 +11,11 @@ use sdl2::rect::Rect;
 use tiny_skia::Pixmap;
 
 use crate::library::GameEntry;
+use crate::compositor::{DrawCmd, Tile};
 use crate::store::{self, KnownHost, Settings};
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Home,
     Pairing,
@@ -27,6 +29,22 @@ pub enum Screen {
     /// Which host is `App::host_menu_index`.
     ForgetHost,
 }
+
+/// What the pairing modal's input is aimed at: the PIN digit row, or the
+/// "Request access" (no-PIN, approve-on-host) button below it. The digit row
+/// consumes all four arrows (Left/Right move between digits, Up/Down spin the
+/// value), so the button is reached by tabbing Right past the last digit, by the
+/// Magic Remote pointer, or by the Secondary shortcut — see `handle_pairing_event`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PairingFocus {
+    Pin,
+    RequestAccess,
+}
+
+/// How long the grid focus pop (card scaling in) runs.
+const FOCUS_POP: Duration = Duration::from_millis(140);
+/// How long a modal's fade/slide-in runs.
+const MODAL_FADE: Duration = Duration::from_millis(170);
 
 /// How often the magic packet is re-sent while a wake is in flight — see
 /// `App::tick_wake`.
@@ -162,6 +180,8 @@ pub struct App {
     /// PIN entry: 4 digits, each 0-9, edited one at a time.
     pub pin_digits: [u8; 4],
     pub pin_digit_index: usize,
+    /// Whether the pairing modal's input is on the PIN row or the Request-access button.
+    pub pairing_focus: PairingFocus,
     pub pairing_status: Option<String>,
     pub pairing_busy: bool,
     /// Index into `entries` currently being paired — captured when entering
@@ -171,20 +191,69 @@ pub struct App {
     /// close (X) button.
     pub hover_close: bool,
     identity: (String, String),
-    /// Cached last-rendered Home (sidebar+grid) background, reused while a modal
-    /// (Settings/Pairing/AddHost/Wake) is on top of it instead of redrawing Home
-    /// from scratch every frame — see `render`'s docs. Lazily sized on first use
-    /// since `App::new` doesn't know the screen dimensions yet.
-    home_layer: Option<Painter>,
-    /// Set whenever anything Home would draw differently might have changed
-    /// (`entries`/`games`/`art`/`selected_host`/`home_status`/`home_focus`) —
-    /// `render` redraws `home_layer` from `render_home` when this is true, then
-    /// clears it. Always `true` on a Home-screen frame (that frame draws Home
-    /// directly, not through the cache, so the cache must be treated as stale
-    /// until the next time it's actually needed) and set explicitly at every
-    /// other mutation site, since those can run while a modal is active (e.g. a
-    /// library fetch finishing while the user is in Settings).
-    home_dirty: bool,
+    // ------------------------------------------------------------- GPU tiles --
+    // Rasterized-once tile sources for the GPU compositor (`compositor.rs`):
+    // `prepare_tiles` rebuilds whichever are stale and reports them for upload;
+    // `draw_list` then composes each frame from their textures. Focus movement,
+    // scrolling, and animations never re-rasterize anything.
+    /// Focus-free sidebar strip (`SIDEBAR_W` × screen height): panel, brand
+    /// mark + wordmark, every row unfocused. Stale when row content changes
+    /// (`sidebar_dirty`), never on focus movement.
+    sidebar_layer: Option<Painter>,
+    sidebar_dirty: bool,
+    /// Per-card tiles (shadow baked in, transparent padding), index-aligned
+    /// with the grid. `None` = not yet rasterized (or invalidated).
+    card_tiles: Vec<Option<Painter>>,
+    /// All card tiles stale (games list / host changed).
+    grid_dirty: bool,
+    /// Individual card tiles stale (cover art arrived) — cheaper than
+    /// `grid_dirty` when the layout is unchanged.
+    grid_cards_dirty: Vec<usize>,
+    /// The shared focus-ring glow tile (one per card size).
+    ring_tile: Option<Painter>,
+    /// The focused sidebar row's tile, keyed by row index.
+    focused_row_tile: Option<(usize, Painter)>,
+    /// The active modal rasterized full-screen (transparent surroundings);
+    /// rebuilt on content changes, composited with fade/slide by the GPU.
+    modal_tile: Option<Painter>,
+    /// Home's status line block, keyed by its text.
+    status_tile: Option<(String, Painter)>,
+    /// The static "No host selected" hint line.
+    nohost_tile: Option<Painter>,
+    // ------------------------------------------------------------ animations --
+    /// Grid scroll offset actually rendered this frame (px; 0 = row 0 at
+    /// `GRID_TOP_Y`) — eases toward `grid_scroll_target` each tick.
+    pub grid_scroll: i32,
+    grid_scroll_target: i32,
+    /// When the current grid-focus pop started (card scales in over
+    /// `FOCUS_POP` — set on every d-pad focus move).
+    focus_anim: Option<Instant>,
+    /// When the open modal's fade/slide-in started (`MODAL_FADE`).
+    modal_anim: Option<Instant>,
+    /// Last screen `prepare_tiles` saw — a change triggers the modal-open
+    /// animation and a modal re-rasterize without every transition site
+    /// needing to remember to.
+    last_screen: Screen,
+    /// In-flight PIN-pairing / request-access ceremony, delivering its outcome
+    /// from a background thread — the ceremony blocks for up to minutes
+    /// (request-access parks until a human approves it on the host), which used
+    /// to freeze the whole UI when run inline on this thread. Drained by
+    /// `drain_pairing` each tick; dropping the receiver (Back while busy)
+    /// cancels: the worker's send fails and it exits.
+    pairing_rx: Option<std::sync::mpsc::Receiver<PairingOutcome>>,
+}
+
+/// What a finished background pairing/request-access ceremony reports back —
+/// everything needed to persist the host on success (captured going in, so the
+/// worker doesn't need `App` access).
+struct PairingOutcome {
+    host: String,
+    port: u16,
+    name: String,
+    mgmt_port: Option<u16>,
+    mac: Vec<String>,
+    /// The host's now-verified fingerprint, or a user-displayable error.
+    result: Result<[u8; 32], String>,
 }
 
 impl Drop for App {
@@ -231,13 +300,28 @@ impl App {
             wake: None,
             pin_digits: [0; 4],
             pin_digit_index: 0,
+            pairing_focus: PairingFocus::Pin,
             pairing_status: None,
             pairing_busy: false,
             pairing_entry: 0,
             hover_close: false,
             identity,
-            home_layer: None,
-            home_dirty: true,
+            sidebar_layer: None,
+            sidebar_dirty: true,
+            card_tiles: Vec::new(),
+            grid_dirty: true,
+            grid_cards_dirty: Vec::new(),
+            ring_tile: None,
+            focused_row_tile: None,
+            modal_tile: None,
+            status_tile: None,
+            nohost_tile: None,
+            grid_scroll: 0,
+            grid_scroll_target: 0,
+            focus_anim: None,
+            modal_anim: None,
+            last_screen: Screen::Home,
+            pairing_rx: None,
         };
         // Restore the last-active sidebar host (if it's still known and paired)
         // so relaunching the app lands back on its game grid.
@@ -309,7 +393,7 @@ impl App {
             changed = true;
         }
         if changed {
-            self.home_dirty = true;
+            self.sidebar_dirty = true;
         }
         changed
     }
@@ -331,11 +415,13 @@ impl App {
         let Some(rx) = &self.art_rx else { return false };
         let mut changed = false;
         while let Ok(loaded) = rx.try_recv() {
+            // Layout is unchanged by art arriving — queue a repaint of just that
+            // card's tile (see `grid_cards_dirty`) rather than a full layer rebuild.
+            if let Some(i) = self.games.iter().position(|g| g.id == loaded.game_id) {
+                self.grid_cards_dirty.push(i + 1); // +1: card 0 is Desktop
+            }
             self.art.insert(loaded.game_id, loaded.pixmap);
             changed = true;
-        }
-        if changed {
-            self.home_dirty = true;
         }
         changed
     }
@@ -434,6 +520,7 @@ impl App {
         &mut self,
         ev: MenuEvent,
         screen_w: u32,
+        screen_h: u32,
         log: &mut std::fs::File,
     ) -> Option<ConnectTarget> {
         let sidebar_len = self.sidebar_len();
@@ -447,6 +534,8 @@ impl App {
                 HomeFocus::Grid(i) => {
                     if *i >= columns {
                         *i -= columns;
+                        let i = *i;
+                        self.ensure_grid_visible(i, columns, screen_w, screen_h);
                     }
                 }
             },
@@ -456,6 +545,7 @@ impl App {
                     let next = *i + columns;
                     if next < grid_len {
                         *i = next;
+                        self.ensure_grid_visible(next, columns, screen_w, screen_h);
                     }
                 }
             },
@@ -465,6 +555,7 @@ impl App {
                         self.home_focus = HomeFocus::Sidebar(self.sidebar_index_for_selected());
                     } else {
                         self.home_focus = HomeFocus::Grid(i - 1);
+                        self.ensure_grid_visible(i - 1, columns, screen_w, screen_h);
                     }
                 }
             }
@@ -472,11 +563,13 @@ impl App {
                 HomeFocus::Sidebar(_) => {
                     if grid_len > 0 {
                         self.home_focus = HomeFocus::Grid(0);
+                        self.ensure_grid_visible(0, columns, screen_w, screen_h);
                     }
                 }
                 HomeFocus::Grid(i) => {
                     if (i + 1) % columns != 0 && i + 1 < grid_len {
                         self.home_focus = HomeFocus::Grid(i + 1);
+                        self.ensure_grid_visible(i + 1, columns, screen_w, screen_h);
                     }
                 }
             },
@@ -518,14 +611,10 @@ impl App {
     pub fn back(&mut self, log: &mut std::fs::File) -> Option<ConnectTarget> {
         match self.screen {
             // Home has nothing to "back out" of (it's the root screen) — Back is a
-            // shortcut straight to Settings instead, since it's otherwise reachable
-            // only via the sidebar's trailing row.
-            Screen::Home => {
-                self.screen = Screen::Settings;
-                self.dropdown = None;
-                self.settings_focused = 0;
-                None
-            }
+            // no-op. (It used to be a shortcut straight to Settings, but that made
+            // Back in Settings feel broken: close Settings, press Back again, and
+            // Settings popped right back up.)
+            Screen::Home => None,
             Screen::Pairing => {
                 self.handle_pairing_event(MenuEvent::Back, log);
                 None
@@ -549,6 +638,97 @@ impl App {
         }
     }
 
+    /// The largest useful `grid_scroll` for the current library/layout — 0 when
+    /// everything already fits on screen.
+    fn max_grid_scroll(&self, columns: usize, available_w: u32, screen_h: u32) -> i32 {
+        let viewport_h = screen_h as i32 - ui::GRID_PAD - ui::GRID_TOP_Y;
+        (ui::grid_layer_height(self.grid_len(), columns, available_w) as i32
+            - 2 * ui::GRID_LAYER_PAD
+            - viewport_h)
+            .max(0)
+    }
+
+    /// Scrolls the grid (via `grid_scroll_target` — the rendered offset eases
+    /// toward it, see `tick_animations`) just far enough that focused card `idx`,
+    /// including its focus-ring halo, will be fully on screen; also starts the
+    /// focus pop, since this is called on exactly the moves that change grid
+    /// focus. Clamped to the grid's real extent.
+    fn ensure_grid_visible(&mut self, idx: usize, columns: usize, screen_w: u32, screen_h: u32) {
+        /// Focus ring + `inflate` overhang around a focused card, plus a little
+        /// breathing room.
+        const FOCUS_MARGIN: i32 = 16;
+        self.focus_anim = Some(Instant::now());
+        let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
+        let r = ui::grid_card_rect(idx, columns, ui::SIDEBAR_W as i32, available_w);
+        let viewport_top = ui::GRID_TOP_Y;
+        let viewport_bottom = screen_h as i32 - ui::GRID_PAD;
+        let max_scroll = self.max_grid_scroll(columns, available_w, screen_h);
+        let card_top = r.y() - FOCUS_MARGIN;
+        let card_bottom = r.y() + r.height() as i32 + FOCUS_MARGIN;
+        let mut target = self.grid_scroll_target;
+        if card_top - target < viewport_top {
+            target = card_top - viewport_top;
+        } else if card_bottom - target > viewport_bottom {
+            target = card_bottom - viewport_bottom;
+        }
+        self.grid_scroll_target = target.clamp(0, max_scroll);
+    }
+
+    /// Scrolls the grid by `dy_px` (positive = content moves up), clamped — the
+    /// Magic Remote's scroll wheel on the Home screen. Returns whether the target
+    /// actually moved (drives redraw; the eased offset follows in
+    /// `tick_animations`).
+    pub fn scroll_grid_by(&mut self, dy_px: i32, screen_w: u32, screen_h: u32) -> bool {
+        if self.selected_host.is_none() {
+            return false;
+        }
+        let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
+        let columns = ui::grid_columns(available_w);
+        let max_scroll = self.max_grid_scroll(columns, available_w, screen_h);
+        let next = (self.grid_scroll_target + dy_px).clamp(0, max_scroll);
+        let changed = next != self.grid_scroll_target;
+        self.grid_scroll_target = next;
+        changed
+    }
+
+    /// Advances every live animation one tick — the eased scroll, the focus pop,
+    /// the modal fade — and reports whether anything is still moving (the main
+    /// loop keeps rendering while true). Expired animations report one final
+    /// `true` so their end state gets drawn.
+    pub fn tick_animations(&mut self) -> bool {
+        let mut animating = false;
+        let d = self.grid_scroll_target - self.grid_scroll;
+        if d != 0 {
+            // Exponential ease-out: cover ~35% of the remaining distance per
+            // tick, snapping when close so it terminates.
+            let step = if d.abs() <= 3 {
+                d
+            } else {
+                let s = (f64::from(d) * 0.35) as i32;
+                if s == 0 {
+                    d.signum()
+                } else {
+                    s
+                }
+            };
+            self.grid_scroll += step;
+            animating = true;
+        }
+        if let Some(t) = self.focus_anim {
+            if t.elapsed() >= FOCUS_POP {
+                self.focus_anim = None;
+            }
+            animating = true;
+        }
+        if let Some(t) = self.modal_anim {
+            if t.elapsed() >= MODAL_FADE {
+                self.modal_anim = None;
+            }
+            animating = true;
+        }
+        animating
+    }
+
     fn confirm_sidebar_host(&mut self, idx: usize, log: &mut std::fs::File) {
         let entry = self.entries[idx].clone();
         match entry {
@@ -560,6 +740,7 @@ impl App {
                 self.pairing_entry = idx;
                 self.pin_digits = [0; 4];
                 self.pin_digit_index = 0;
+                self.pairing_focus = PairingFocus::Pin;
                 self.pairing_status = None;
                 self.screen = Screen::Pairing;
             }
@@ -584,7 +765,10 @@ impl App {
         self.art.clear();
         self.art_rx = None;
         self.home_focus = HomeFocus::Grid(0);
-        self.home_dirty = true;
+        self.sidebar_dirty = true;
+        self.grid_dirty = true;
+        self.grid_scroll = 0;
+        self.grid_scroll_target = 0;
 
         let identity = (self.identity.0.clone(), self.identity.1.clone());
         let fingerprint = self
@@ -642,7 +826,7 @@ impl App {
                 self.handle_library_error(host, port, e, log);
             }
         }
-        self.home_dirty = true;
+        self.grid_dirty = true;
         true
     }
 
@@ -709,10 +893,18 @@ impl App {
     /// timer — shared by the modal's explicit "Send" action and `tick_wake`'s periodic
     /// resend.
     fn send_wake(wake: &mut WakeState, log: &mut std::fs::File) {
-        crate::wol::wake_and_log(&wake.mac, wake.host.parse().ok(), &wake.name, log);
+        // Only claim "sent" if a magic packet actually went out — `wake_and_log`
+        // returns false on an unparseable MAC / no usable interface, and showing
+        // "Sent a wake signal… waiting" for a packet that never left would leave
+        // the user waiting on nothing.
+        let sent = crate::wol::wake_and_log(&wake.mac, wake.host.parse().ok(), &wake.name, log);
         let now = Instant::now();
-        wake.sent = true;
-        wake.since.get_or_insert(now);
+        if sent {
+            wake.sent = true;
+            wake.since.get_or_insert(now);
+        } else {
+            wake.reason = "Couldn't send a wake signal (no usable MAC/interface).".into();
+        }
         wake.last_attempt = Some(now);
     }
 
@@ -847,7 +1039,6 @@ impl App {
         let identity = (self.identity.0.clone(), self.identity.1.clone());
         let _ = writeln!(log, "launch: checking {host}:{port} is still reachable before connecting…");
         self.home_status = Some("Checking connection…".into());
-        self.home_dirty = true;
         let rx = crate::library::load_games_async(host.clone(), port, mgmt_port, identity, Some(fingerprint));
         self.pending_launch = Some(PendingLaunch {
             host,
@@ -889,7 +1080,8 @@ impl App {
                 self.handle_library_error(host, port, e, log);
             }
         }
-        self.home_dirty = true;
+        self.sidebar_dirty = true;
+        self.grid_dirty = true;
         true
     }
 
@@ -920,38 +1112,149 @@ impl App {
                 *i = sidebar_len - 1;
             }
         }
-        self.home_dirty = true;
+        self.sidebar_dirty = true;
+        self.grid_dirty = true;
     }
 
-    /// Handles one menu event on the pairing modal. Runs the (blocking) PIN
-    /// pairing ceremony on `Confirm` over the "Pair" action.
+    /// Handles one menu event on the pairing modal. Two focus zones (`PairingFocus`):
+    /// the PIN digit row (blocking SPAKE2 ceremony on `Confirm`) and the "Request
+    /// access" button (blocking no-PIN, park-until-approved connect on `Confirm`).
     pub fn handle_pairing_event(&mut self, ev: MenuEvent, log: &mut std::fs::File) {
         if self.pairing_busy {
-            return; // ignore input mid-ceremony
+            // Mid-ceremony, Back cancels (dropping the receiver orphans the
+            // worker — its send fails and it exits); everything else is ignored.
+            if ev == MenuEvent::Back {
+                self.pairing_rx = None;
+                self.pairing_busy = false;
+                self.pairing_status = None;
+                self.screen = Screen::Home;
+            }
+            return;
         }
+        // Back always leaves the modal; Secondary is the "switch pairing method"
+        // shortcut — both work from either focus zone.
         match ev {
-            MenuEvent::Left => {
-                self.pin_digits[self.pin_digit_index] = (self.pin_digits[self.pin_digit_index] + 9) % 10;
+            MenuEvent::Back => {
+                self.screen = Screen::Home;
+                return;
             }
-            MenuEvent::Right => {
-                self.pin_digits[self.pin_digit_index] = (self.pin_digits[self.pin_digit_index] + 1) % 10;
+            MenuEvent::Secondary => {
+                self.pairing_focus = match self.pairing_focus {
+                    PairingFocus::Pin => PairingFocus::RequestAccess,
+                    PairingFocus::RequestAccess => PairingFocus::Pin,
+                };
+                return;
             }
-            MenuEvent::Up => {
-                if self.pin_digit_index > 0 {
-                    self.pin_digit_index -= 1;
-                }
-            }
-            MenuEvent::Down => {
-                if self.pin_digit_index + 1 < self.pin_digits.len() {
-                    self.pin_digit_index += 1;
-                } else {
-                    self.try_pair(log);
-                }
-            }
-            MenuEvent::Confirm => self.try_pair(log),
-            MenuEvent::Back => self.screen = Screen::Home,
-            MenuEvent::Secondary => {}
+            _ => {}
         }
+        match self.pairing_focus {
+            // The digits sit in a horizontal row: Left/Right move *between* them and
+            // Up/Down spin the focused digit's *value* (odometer-style: Up = +1, Down =
+            // −1, wrapping 0..=9). Tabbing Right off the last digit drops focus onto the
+            // "Request access" button below; `Confirm` submits the PIN.
+            PairingFocus::Pin => match ev {
+                MenuEvent::Up => {
+                    self.pin_digits[self.pin_digit_index] = (self.pin_digits[self.pin_digit_index] + 1) % 10;
+                }
+                MenuEvent::Down => {
+                    self.pin_digits[self.pin_digit_index] = (self.pin_digits[self.pin_digit_index] + 9) % 10;
+                }
+                MenuEvent::Left => {
+                    if self.pin_digit_index > 0 {
+                        self.pin_digit_index -= 1;
+                    }
+                }
+                MenuEvent::Right => {
+                    if self.pin_digit_index + 1 < self.pin_digits.len() {
+                        self.pin_digit_index += 1;
+                    } else {
+                        self.pairing_focus = PairingFocus::RequestAccess;
+                    }
+                }
+                MenuEvent::Confirm => self.try_pair(log),
+                MenuEvent::Back | MenuEvent::Secondary => {} // handled above
+            },
+            // Left tabs back onto the PIN row; Confirm sends the access request.
+            PairingFocus::RequestAccess => match ev {
+                MenuEvent::Left => self.pairing_focus = PairingFocus::Pin,
+                MenuEvent::Confirm => self.try_request_access(log),
+                // Up/Down/Right are no-ops here; Back/Secondary were handled above.
+                MenuEvent::Up | MenuEvent::Down | MenuEvent::Right | MenuEvent::Back | MenuEvent::Secondary => {}
+            },
+        }
+    }
+
+    /// The no-PIN pairing path: connect trust-on-first-use (presenting our identity so
+    /// the host operator sees this device), which the host PARKS until the operator
+    /// approves it in the host UI, then pin the now-verified fingerprint and land on the
+    /// host's game grid — the same success path as `try_pair`, and likewise run on a
+    /// background thread (this one can block for MINUTES waiting on the approval, so
+    /// freezing the UI for it is not an option). The 185s budget matches `run_inner`'s
+    /// pending-approval wait, long enough for a human to notice and click.
+    fn try_request_access(&mut self, log: &mut std::fs::File) {
+        let entry = &self.entries[self.pairing_entry];
+        let host = entry.host().to_string();
+        let port = entry.port();
+        let name = entry.name().to_string();
+        let mgmt_port = entry.mgmt_port();
+        let mac = entry.mac().to_vec();
+        self.pairing_busy = true;
+        self.pairing_status = Some("Requesting access… approve this device on the host".into());
+        let _ = writeln!(log, "requesting access to {host}:{port}");
+
+        let identity = (self.identity.0.clone(), self.identity.1.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pairing_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result =
+                crate::session::request_access(&host, port, identity, std::time::Duration::from_secs(185))
+                    .map_err(|e| format!("Request failed: {e}"));
+            let _ = tx.send(PairingOutcome {
+                host,
+                port,
+                name,
+                mgmt_port,
+                mac,
+                result,
+            });
+        });
+    }
+
+    /// Drains a finished background pairing/request-access ceremony, if any —
+    /// called each tick from `run_ui_flow` like the other `drain_*`s. Success
+    /// persists the host and lands on its game grid; failure re-arms the pairing
+    /// modal with the error text.
+    pub fn drain_pairing(&mut self, log: &mut std::fs::File) -> bool {
+        let Some(rx) = &self.pairing_rx else { return false };
+        let Ok(outcome) = rx.try_recv() else { return false };
+        self.pairing_rx = None;
+        self.pairing_busy = false;
+        match outcome.result {
+            Ok(fingerprint) => {
+                let _ = writeln!(log, "paired ok ({}:{}), fingerprint set", outcome.host, outcome.port);
+                store::upsert_known_host(
+                    &mut self.known_hosts,
+                    KnownHost {
+                        name: outcome.name,
+                        host: outcome.host.clone(),
+                        port: outcome.port,
+                        fingerprint: Some(fingerprint),
+                        mgmt_port: outcome.mgmt_port,
+                        mac: outcome.mac,
+                    },
+                );
+                let _ = store::save_known_hosts(&self.known_hosts);
+                self.entries = self.known_hosts.iter().cloned().map(HostEntry::Known).collect();
+                self.sidebar_dirty = true;
+                self.screen = Screen::Home;
+                self.select_host(outcome.host, outcome.port, outcome.mgmt_port, log);
+            }
+            Err(e) => {
+                let _ = writeln!(log, "pairing/request failed: {e}");
+                self.pairing_status = Some(e);
+            }
+        }
+        true
     }
 
     /// Direct digit entry (the Magic Remote's number buttons) — types `digit` into
@@ -961,6 +1264,10 @@ impl App {
         if self.pairing_busy {
             return;
         }
+        // A typed digit is unambiguously PIN input — pull focus back off the
+        // Request-access button so it lands in the digit row (and can't
+        // accidentally auto-submit the no-PIN path instead).
+        self.pairing_focus = PairingFocus::Pin;
         self.pin_digits[self.pin_digit_index] = digit;
         if self.pin_digit_index + 1 < self.pin_digits.len() {
             self.pin_digit_index += 1;
@@ -969,6 +1276,8 @@ impl App {
         }
     }
 
+    /// Starts the PIN pairing ceremony on a background thread (see
+    /// `pairing_rx`'s docs — the ceremony blocks, the UI must not).
     fn try_pair(&mut self, log: &mut std::fs::File) {
         let entry = &self.entries[self.pairing_entry];
         let host = entry.host().to_string();
@@ -981,40 +1290,30 @@ impl App {
         self.pairing_status = Some("Pairing… confirm the PIN on the host".into());
         let _ = writeln!(log, "pairing with {host}:{port} (pin len {})", pin.len());
 
-        let identity = (self.identity.0.as_str(), self.identity.1.as_str());
-        match punktfunk_core::client::NativeClient::pair(
-            &host,
-            port,
-            identity,
-            &pin,
-            "webOS TV",
-            std::time::Duration::from_secs(30),
-        ) {
-            Ok(fingerprint) => {
-                let _ = writeln!(log, "paired ok, fingerprint set");
-                let paired_host = host.clone();
-                store::upsert_known_host(
-                    &mut self.known_hosts,
-                    KnownHost {
-                        name,
-                        host,
-                        port,
-                        fingerprint: Some(fingerprint),
-                        mgmt_port,
-                        mac,
-                    },
-                );
-                let _ = store::save_known_hosts(&self.known_hosts);
-                self.entries = self.known_hosts.iter().cloned().map(HostEntry::Known).collect();
-                self.screen = Screen::Home;
-                self.select_host(paired_host, port, mgmt_port, log);
-            }
-            Err(e) => {
-                let _ = writeln!(log, "pairing failed: {e:#}");
-                self.pairing_status = Some(format!("Pairing failed: {e}"));
-            }
-        }
-        self.pairing_busy = false;
+        let identity = (self.identity.0.clone(), self.identity.1.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pairing_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = punktfunk_core::client::NativeClient::pair(
+                &host,
+                port,
+                (&identity.0, &identity.1),
+                &pin,
+                "webOS TV",
+                std::time::Duration::from_secs(30),
+            )
+            .map_err(|e| format!("Pairing failed: {e}"));
+            // Send failing just means the user backed out and the receiver is
+            // gone — nothing to deliver to.
+            let _ = tx.send(PairingOutcome {
+                host,
+                port,
+                name,
+                mgmt_port,
+                mac,
+                result,
+            });
+        });
     }
 
     /// Handles one menu event on the settings modal.
@@ -1139,6 +1438,16 @@ impl App {
         ui::modal_card_rect(screen_w, screen_h, 0.36, 480)
     }
 
+    /// The "Request access" button's rect — anchored to the card bottom (not to the
+    /// dynamic PIN-row position) so `render_pairing` and `handle_mouse_click` compute
+    /// the exact same rect without threading the header's measured height between them.
+    fn pairing_request_button_rect(card: Rect) -> Rect {
+        let margin = 40i32;
+        let h = 52u32;
+        let y = card.y() + card.height() as i32 - h as i32 - 26;
+        Rect::new(card.x() + margin, y, card.width().saturating_sub(margin as u32 * 2), h)
+    }
+
     /// The add-host modal's card rect — shared by `render_add_host` and mouse
     /// hit-testing.
     fn add_host_card_rect(screen_w: u32, screen_h: u32) -> Rect {
@@ -1261,11 +1570,18 @@ impl App {
                     let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
                     let columns = ui::grid_columns(available_w);
                     // Clicked empty space (`?`'s early `None`) — nothing to focus or confirm.
-                    let idx =
-                        ui::hit_test_grid_card(x, y, columns, self.grid_len(), ui::SIDEBAR_W as i32, available_w)?;
+                    let idx = ui::hit_test_grid_card(
+                        x,
+                        y,
+                        columns,
+                        self.grid_len(),
+                        ui::SIDEBAR_W as i32,
+                        available_w,
+                        self.grid_scroll,
+                    )?;
                     self.home_focus = HomeFocus::Grid(idx);
                 }
-                self.handle_home_event(MenuEvent::Confirm, screen_w, log)
+                self.handle_home_event(MenuEvent::Confirm, screen_w, screen_h, log)
             }
             Screen::Settings => {
                 // An open dropdown has no row grid of its own here — Confirm picks
@@ -1284,7 +1600,17 @@ impl App {
                 self.handle_settings_event(MenuEvent::Confirm);
                 None
             }
-            Screen::Pairing | Screen::AddHost => None,
+            Screen::Pairing => {
+                // The Magic Remote pointer is the most reliable input on this TV, so the
+                // "Request access" button is clickable directly: focus it and confirm.
+                let card = Self::pairing_card_rect(screen_w, screen_h);
+                if Self::pairing_request_button_rect(card).contains_point((x, y)) {
+                    self.pairing_focus = PairingFocus::RequestAccess;
+                    self.handle_pairing_event(MenuEvent::Confirm, log);
+                }
+                None
+            }
+            Screen::AddHost => None,
             Screen::Wake => {
                 self.handle_wake_event(MenuEvent::Confirm, log);
                 None
@@ -1298,82 +1624,39 @@ impl App {
 
     // --------------------------------------------------------------- render --
 
-    /// Renders the current screen. On a Home-screen frame, `render_home` draws
-    /// straight into `painter` exactly as it always has — no caching layer
-    /// involved, so this costs exactly what it used to. On any modal screen
-    /// (Settings/Pairing/AddHost/Wake), Home is only actually re-rendered (into
-    /// the cached `home_layer`) when `home_dirty` is set; every other modal-only
-    /// frame (hovering a row, opening a dropdown, navigating it) just blits the
-    /// cached layer instead of re-drawing the entire sidebar+grid from scratch.
-    #[allow(clippy::too_many_arguments)]
-    pub fn render(
-        &mut self,
-        painter: &mut Painter,
-        text_cache: &mut crate::ui::TextCache,
-        font_label: &sdl2::ttf::Font,
-        font_value: &sdl2::ttf::Font,
-        font_title: &sdl2::ttf::Font,
-        icon_font: &sdl2::ttf::Font,
-        screen_w: u32,
-        screen_h: u32,
-    ) -> Result<()> {
-        if matches!(self.screen, Screen::Home) {
-            // A Home frame proves what the *current* true state looks like, but
-            // that hasn't been captured into `home_layer` (this draw bypassed it
-            // entirely) — leave the cache marked stale so the first modal frame
-            // afterward re-renders it once before trusting it.
-            self.home_dirty = true;
-            painter.clear(ui::BG);
-            self.render_home(
-                painter, text_cache, font_label, font_value, font_title, icon_font, screen_w, screen_h,
-            )?;
+    /// The title of grid card `idx` (0 = the fixed "Desktop" card) and its cover
+    /// art, if fetched.
+    fn grid_card_content(&self, idx: usize) -> (&str, Option<&Pixmap>) {
+        if idx == 0 {
+            ("Desktop", None)
         } else {
-            let mut layer = self
-                .home_layer
-                .take()
-                .unwrap_or_else(|| Painter::new(screen_w, screen_h));
-            if self.home_dirty {
-                layer.clear(ui::BG);
-                self.render_home(
-                    &mut layer, text_cache, font_label, font_value, font_title, icon_font, screen_w, screen_h,
-                )?;
-                self.home_dirty = false;
-            }
-            // `blit_layer` below overwrites every pixel unconditionally, making a
-            // `clear()` here redundant work — skip it.
-            painter.blit_layer(&layer);
-            self.home_layer = Some(layer);
+            let game = &self.games[idx - 1];
+            (game.title.as_str(), self.art.get(&game.id))
         }
-
-        match self.screen {
-            Screen::Home => {}
-            Screen::Pairing => {
-                self.render_pairing(
-                    painter, text_cache, font_label, font_title, icon_font, screen_w, screen_h,
-                )?;
-            }
-            Screen::Settings => {
-                self.render_settings(
-                    painter, text_cache, font_label, font_value, icon_font, screen_w, screen_h,
-                )?;
-            }
-            Screen::AddHost => self.render_add_host(
-                painter, text_cache, font_label, font_value, font_title, icon_font, screen_w, screen_h,
-            )?,
-            Screen::Wake => self.render_wake(
-                painter, text_cache, font_label, font_title, icon_font, screen_w, screen_h,
-            )?,
-            Screen::ForgetHost => self.render_forget_host(
-                painter, text_cache, font_label, font_value, icon_font, screen_w, screen_h,
-            )?,
-        }
-        Ok(())
     }
 
+    /// Cubic ease-out for the animation fractions below.
+    fn ease(f: f32) -> f32 {
+        1.0 - (1.0 - f).powi(3)
+    }
+
+    /// Eased 0..=1 progress of an animation started at `t`; 1.0 when done/absent.
+    fn anim_frac(anim: Option<Instant>, dur: Duration) -> f32 {
+        match anim {
+            Some(t) => Self::ease((t.elapsed().as_secs_f32() / dur.as_secs_f32()).min(1.0)),
+            None => 1.0,
+        }
+    }
+
+    /// Rasterizes every stale tile (tiny-skia, CPU — the only place rasterization
+    /// happens) and returns which tiles need their GPU texture re-uploaded.
+    /// `content_dirty` is the main loop's "an event/drain changed something this
+    /// tick" flag — it forces the open modal's tile to re-rasterize, since modal
+    /// content has no finer dirty tracking of its own. Pure animation frames pass
+    /// `false` and rasterize nothing at all.
     #[allow(clippy::too_many_arguments)]
-    fn render_home(
-        &self,
-        painter: &mut Painter,
+    pub fn prepare_tiles(
+        &mut self,
         text_cache: &mut crate::ui::TextCache,
         font_label: &sdl2::ttf::Font,
         font_value: &sdl2::ttf::Font,
@@ -1381,90 +1664,263 @@ impl App {
         icon_font: &sdl2::ttf::Font,
         screen_w: u32,
         screen_h: u32,
-    ) -> Result<()> {
-        let sidebar_focus = match self.home_focus {
-            HomeFocus::Sidebar(i) => Some(i),
-            HomeFocus::Grid(_) => None,
-        };
-        ui::draw_sidebar(
-            painter,
-            text_cache,
-            font_label,
-            font_title,
-            icon_font,
-            &self.entries,
-            sidebar_focus,
-            screen_h,
-        )?;
-
-        let grid_x = ui::SIDEBAR_W as i32;
+        content_dirty: bool,
+    ) -> Result<Vec<Tile>> {
+        let mut updated = Vec::new();
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
-        if self.selected_host.is_none() {
-            ui::draw_text(
-                painter,
+        let columns = ui::grid_columns(available_w);
+        let (card_w, card_h) = ui::grid_card_size(available_w, columns);
+
+        // Screen transitions are detected centrally here (rather than at every
+        // `self.screen = ...` site): opening a modal starts its fade-in and
+        // forces its first rasterize.
+        let screen_changed = self.screen != self.last_screen;
+        if screen_changed {
+            self.last_screen = self.screen;
+            if !matches!(self.screen, Screen::Home) {
+                self.modal_anim = Some(Instant::now());
+            }
+        }
+
+        if self.sidebar_dirty || self.sidebar_layer.is_none() {
+            let mut layer = match self.sidebar_layer.take() {
+                Some(l) => l,
+                None => Painter::new(ui::SIDEBAR_W, screen_h),
+            };
+            ui::draw_sidebar(
+                &mut layer,
+                text_cache,
+                font_label,
+                font_value,
+                icon_font,
+                &self.entries,
+                None,
+                screen_h,
+            )?;
+            self.sidebar_layer = Some(layer);
+            self.sidebar_dirty = false;
+            self.focused_row_tile = None; // row content may have changed under it
+            updated.push(Tile::Sidebar);
+        }
+        if let HomeFocus::Sidebar(i) = self.home_focus {
+            let stale = !matches!(&self.focused_row_tile, Some((idx, _)) if *idx == i);
+            if stale {
+                let tile = ui::render_focused_row_tile(text_cache, font_label, icon_font, &self.entries, i)?;
+                self.focused_row_tile = Some((i, tile));
+                updated.push(Tile::FocusRow);
+            }
+        }
+
+        if self.selected_host.is_some() {
+            let count = self.grid_len();
+            if self.grid_dirty || self.card_tiles.len() != count {
+                self.card_tiles = std::iter::repeat_with(|| None).take(count).collect();
+                self.grid_dirty = false;
+                self.grid_cards_dirty.clear();
+            } else {
+                for idx in std::mem::take(&mut self.grid_cards_dirty) {
+                    if idx < count {
+                        self.card_tiles[idx] = None;
+                    }
+                }
+            }
+            for idx in 0..count {
+                if self.card_tiles[idx].is_none() {
+                    let tile = {
+                        let (title, art) = self.grid_card_content(idx);
+                        ui::render_card_tile(text_cache, font_title, font_value, card_w, card_h, title, art)?
+                    };
+                    self.card_tiles[idx] = Some(tile);
+                    updated.push(Tile::Card(idx));
+                }
+            }
+            let ring_w = card_w + 2 * ui::FOCUS_RING_PAD as u32;
+            if !matches!(&self.ring_tile, Some(p) if p.width() == ring_w) {
+                self.ring_tile = Some(ui::render_focus_ring_tile(card_w, card_h));
+                updated.push(Tile::Ring);
+            }
+            match &self.home_status {
+                Some(s) => {
+                    let stale = !matches!(&self.status_tile, Some((t, _)) if t == s);
+                    if stale {
+                        let max_w = available_w.saturating_sub(2 * ui::GRID_PAD as u32);
+                        let tile = ui::render_wrapped_text_tile(text_cache, font_label, s, max_w, ui::MUTED, 6)?;
+                        self.status_tile = Some((s.clone(), tile));
+                        updated.push(Tile::Status);
+                    }
+                }
+                None => self.status_tile = None,
+            }
+        } else if self.nohost_tile.is_none() {
+            self.nohost_tile = Some(ui::render_text_tile(
                 text_cache,
                 font_label,
                 "No host selected — pick one from the list, or add one.",
-                grid_x + ui::GRID_PAD,
-                ui::GRID_TOP_Y,
                 ui::MUTED,
-            )?;
-            return Ok(());
+            )?);
+            updated.push(Tile::NoHost);
         }
-        if let Some(status) = &self.home_status {
-            // Pinned to the bottom of the panel, not `GRID_TOP_Y` — that sat right on
-            // top of the "Desktop" card (`grid_card_rect(0, ...)` starts at the same
-            // y), so a connection status/error overlapped the grid instead of sitting
-            // clear of it.
-            let max_w = available_w.saturating_sub(2 * ui::GRID_PAD as u32);
-            let line_h = font_label.height() + 6;
-            let line_count = ui::wrap_text(font_label, status, max_w).len() as i32;
-            let block_y = screen_h as i32 - ui::GRID_PAD - line_h * line_count;
-            ui::draw_text_wrapped(
-                painter,
-                text_cache,
-                font_label,
-                status,
-                grid_x + ui::GRID_PAD,
-                block_y,
-                max_w,
-                ui::MUTED,
-                6,
-            )?;
+
+        let modal_open = !matches!(self.screen, Screen::Home);
+        if modal_open && (screen_changed || content_dirty || self.modal_tile.is_none()) {
+            let mut p = match self.modal_tile.take() {
+                Some(p) => p,
+                None => Painter::new(screen_w, screen_h),
+            };
+            p.clear_transparent();
+            match self.screen {
+                Screen::Home => unreachable!("modal_open checked above"),
+                Screen::Pairing => {
+                    self.render_pairing(&mut p, text_cache, font_label, font_title, icon_font, screen_w, screen_h)?;
+                }
+                Screen::Settings => {
+                    self.render_settings(&mut p, text_cache, font_label, font_value, icon_font, screen_w, screen_h)?;
+                }
+                Screen::AddHost => self.render_add_host(
+                    &mut p, text_cache, font_label, font_value, font_title, icon_font, screen_w, screen_h,
+                )?,
+                Screen::Wake => {
+                    self.render_wake(&mut p, text_cache, font_label, font_title, icon_font, screen_w, screen_h)?;
+                }
+                Screen::ForgetHost => {
+                    self.render_forget_host(&mut p, text_cache, font_label, font_value, icon_font, screen_w, screen_h)?;
+                }
+            }
+            self.modal_tile = Some(p);
+            updated.push(Tile::Modal);
         }
+        Ok(updated)
+    }
+
+    /// The pixmap behind `tile`, for the compositor to upload.
+    pub fn tile_pixmap(&self, tile: Tile) -> Option<&Painter> {
+        match tile {
+            Tile::Sidebar => self.sidebar_layer.as_ref(),
+            Tile::FocusRow => self.focused_row_tile.as_ref().map(|(_, p)| p),
+            Tile::Card(i) => self.card_tiles.get(i).and_then(|t| t.as_ref()),
+            Tile::Ring => self.ring_tile.as_ref(),
+            Tile::Modal => self.modal_tile.as_ref(),
+            Tile::Status => self.status_tile.as_ref().map(|(_, p)| p),
+            Tile::NoHost => self.nohost_tile.as_ref(),
+            // Stream-side only (uploaded directly by `run_inner`'s overlay
+            // refresh) — never one of App's menu tiles.
+            Tile::StatsOverlay => None,
+        }
+    }
+
+    /// Builds this frame's draw list (paint order) from the current state and
+    /// animation clocks — pure bookkeeping, no rasterization. The GPU executes it
+    /// (`Compositor::execute`).
+    pub fn draw_list(&self, screen_w: u32, screen_h: u32) -> Vec<DrawCmd> {
+        let mut cmds = Vec::new();
+        let grid_x = ui::SIDEBAR_W as i32;
+        let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
         let columns = ui::grid_columns(available_w);
-        let grid_focus = match self.home_focus {
-            HomeFocus::Grid(i) => Some(i),
-            HomeFocus::Sidebar(_) => None,
-        };
-        // Card 0 is always "Desktop" (a plain session, no game launch) — never has
-        // fetched art of its own.
-        let desktop_rect = ui::grid_card_rect(0, columns, grid_x, available_w);
-        ui::draw_poster_card(
-            painter,
-            text_cache,
-            font_title,
-            font_value,
-            desktop_rect,
-            "Desktop",
-            None,
-            grid_focus == Some(0),
-        )?;
-        for (i, game) in self.games.iter().enumerate() {
-            let idx = i + 1;
-            let rect = ui::grid_card_rect(idx, columns, grid_x, available_w);
-            ui::draw_poster_card(
-                painter,
-                text_cache,
-                font_title,
-                font_value,
-                rect,
-                &game.title,
-                self.art.get(&game.id),
-                grid_focus == Some(idx),
-            )?;
+
+        cmds.push(DrawCmd::Tex {
+            tile: Tile::Sidebar,
+            dst: Rect::new(0, 0, ui::SIDEBAR_W, screen_h),
+            alpha: 0xff,
+        });
+
+        if self.selected_host.is_none() {
+            if let Some(p) = &self.nohost_tile {
+                cmds.push(DrawCmd::Tex {
+                    tile: Tile::NoHost,
+                    dst: Rect::new(grid_x + ui::GRID_PAD, ui::GRID_TOP_Y, p.width(), p.height()),
+                    alpha: 0xff,
+                });
+            }
+        } else {
+            let count = self.grid_len();
+            let focused = match self.home_focus {
+                HomeFocus::Grid(i) if i < count => Some(i),
+                HomeFocus::Grid(_) | HomeFocus::Sidebar(_) => None,
+            };
+            let pad = ui::CARD_TILE_PAD;
+            for idx in 0..count {
+                if Some(idx) == focused {
+                    continue; // drawn last, on top of its neighbors
+                }
+                let r = ui::grid_card_rect(idx, columns, grid_x, available_w);
+                let y = r.y() - self.grid_scroll;
+                if y + r.height() as i32 + pad < 0 || y - pad > screen_h as i32 {
+                    continue; // culled — fully off-screen at this scroll offset
+                }
+                cmds.push(DrawCmd::Tex {
+                    tile: Tile::Card(idx),
+                    dst: Rect::new(r.x() - pad, y - pad, r.width() + 2 * pad as u32, r.height() + 2 * pad as u32),
+                    alpha: 0xff,
+                });
+            }
+            if let Some(idx) = focused {
+                // The focus pop: the GPU scales the (unfocused) card tile up
+                // around its center as the pop progresses, with the shared ring
+                // tile fading in over it at the same scale.
+                let f = Self::anim_frac(self.focus_anim, FOCUS_POP);
+                let scale = 1.0 + 0.028 * f;
+                let r = ui::grid_card_rect(idx, columns, grid_x, available_w);
+                let y = r.y() - self.grid_scroll;
+                let cx = r.x() as f32 + r.width() as f32 / 2.0;
+                let cy = y as f32 + r.height() as f32 / 2.0;
+                let tw = (r.width() + 2 * pad as u32) as f32 * scale;
+                let th = (r.height() + 2 * pad as u32) as f32 * scale;
+                cmds.push(DrawCmd::Tex {
+                    tile: Tile::Card(idx),
+                    dst: Rect::new((cx - tw / 2.0) as i32, (cy - th / 2.0) as i32, tw as u32, th as u32),
+                    alpha: 0xff,
+                });
+                let rp = ui::FOCUS_RING_PAD;
+                let rw = (r.width() + 2 * rp as u32) as f32 * scale;
+                let rh = (r.height() + 2 * rp as u32) as f32 * scale;
+                cmds.push(DrawCmd::Tex {
+                    tile: Tile::Ring,
+                    dst: Rect::new((cx - rw / 2.0) as i32, (cy - rh / 2.0) as i32, rw as u32, rh as u32),
+                    alpha: (255.0 * f) as u8,
+                });
+            }
+            if self.home_status.is_some() {
+                if let Some((_, p)) = &self.status_tile {
+                    let y = screen_h as i32 - ui::GRID_PAD - p.height() as i32;
+                    cmds.push(DrawCmd::Tex {
+                        tile: Tile::Status,
+                        dst: Rect::new(grid_x + ui::GRID_PAD, y, p.width(), p.height()),
+                        alpha: 0xff,
+                    });
+                }
+            }
         }
-        Ok(())
+
+        if let HomeFocus::Sidebar(i) = self.home_focus {
+            let rect = if i == self.entries.len() + 1 {
+                ui::settings_row_rect(screen_h)
+            } else {
+                ui::sidebar_row_rect(i)
+            };
+            let pad = ui::ROW_TILE_PAD;
+            cmds.push(DrawCmd::Tex {
+                tile: Tile::FocusRow,
+                dst: Rect::new(rect.x() - pad, rect.y() - pad, rect.width() + 2 * pad as u32, rect.height() + 2 * pad as u32),
+                alpha: 0xff,
+            });
+        }
+
+        if !matches!(self.screen, Screen::Home) {
+            // Modal open: the scrim fades in and the modal slides up its last
+            // ~26px while fading — both pure GPU parameters.
+            let m = Self::anim_frac(self.modal_anim, MODAL_FADE);
+            cmds.push(DrawCmd::Fill {
+                rect: Rect::new(0, 0, screen_w, screen_h),
+                color: sdl2::pixels::Color::RGBA(0, 0, 0, (f32::from(ui::MODAL_SCRIM.a) * m) as u8),
+            });
+            let dy = ((1.0 - m) * 26.0) as i32;
+            cmds.push(DrawCmd::Tex {
+                tile: Tile::Modal,
+                dst: Rect::new(0, dy, screen_w, screen_h),
+                alpha: (255.0 * m) as u8,
+            });
+        }
+        cmds
     }
 
     /// Shared modal chrome — dark backdrop, the rounded card, and its close (X)
@@ -1477,7 +1933,9 @@ impl App {
         icon_font: &sdl2::ttf::Font,
         card: Rect,
     ) -> Result<()> {
-        ui::draw_modal_backdrop(painter);
+        // No backdrop here: the scrim behind the modal is a GPU fill in
+        // `draw_list` (it fades in with the modal), and this painter is the
+        // modal's own transparent tile, not the composed frame.
         ui::draw_modal_card(painter, card);
         ui::draw_icon(
             painter,
@@ -1513,7 +1971,7 @@ impl App {
             card,
             "Pair with host",
             ui::WHITE,
-            "Enter the PIN from the host's pairing dialog.",
+            "Enter the host's PIN, or request access and approve on the host.",
             ui::MUTED,
         )?;
 
@@ -1529,7 +1987,9 @@ impl App {
         for (i, digit) in self.pin_digits.iter().enumerate() {
             let x = start_x + i as i32 * (digit_w + digit_gap);
             let rect = Rect::new(x, digit_y, digit_w as u32, digit_h);
-            let focused = i == self.pin_digit_index;
+            // Only highlight a digit while the PIN row actually has focus — when focus is
+            // on the Request-access button, no digit should read as selected.
+            let focused = i == self.pin_digit_index && self.pairing_focus == PairingFocus::Pin;
             let drawn = ui::draw_card(painter, rect, focused);
             let text = digit.to_string();
             let tw = font_title.size_of(&text).map_or(0, |(w, _)| w);
@@ -1554,12 +2014,28 @@ impl App {
                 font_label,
                 status,
                 card.x() + 32,
-                digit_y + digit_h as i32 + 32,
+                digit_y + digit_h as i32 + 24,
                 card.width().saturating_sub(64),
                 color,
                 6,
             )?;
         }
+
+        // The no-PIN "Request access" button, anchored to the card bottom.
+        let btn = Self::pairing_request_button_rect(card);
+        let btn_focused = self.pairing_focus == PairingFocus::RequestAccess;
+        let drawn = ui::draw_card(painter, btn, btn_focused);
+        let label = "Request access";
+        let lw = font_label.size_of(label).map_or(0, |(w, _)| w);
+        ui::draw_text(
+            painter,
+            text_cache,
+            font_label,
+            label,
+            drawn.x() + (drawn.width() as i32 - lw as i32) / 2,
+            drawn.y() + (drawn.height() as i32 - font_label.height()) / 2,
+            if btn_focused { ui::WHITE } else { ui::MUTED },
+        )?;
         Ok(())
     }
 

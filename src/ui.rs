@@ -15,9 +15,9 @@
 //! buffer to a single SDL2 texture and presents it — one texture/copy per frame,
 //! not one per widget.
 //!
-//! Icons are glyphs from a small bundled, subsetted icon font (see the icons
-//! section below and `assets/icons/NOTICE.md`) — the system font covers ASCII
-//! only (see `SYSTEM_FONT_PATH`'s docs), so real icon glyphs need one of their own.
+//! Text renders in punktfunk's brand font, Geist (bundled — see `load_font`);
+//! icons are glyphs from a small bundled, subsetted icon font (see the icons
+//! section below and `assets/icons/NOTICE.md`).
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
@@ -32,28 +32,35 @@ use crate::discovery::DiscoveredHost;
 use crate::store::{KnownHost, Settings, VideoBackend};
 
 // ---------------------------------------------------------------------- palette --
-// moonlight-tv has no dedicated colors header — these are the literals its views
-// use at each call site (theme file only wires fonts/layout, not color constants).
+// The punktfunk brand palette, sampled from `packaging/icon_large.png` (the
+// canonical mark): brand-dark `#1c1530` surfaces, primary purple `#6c5bf3`,
+// lavender `#a79ff8`, pale-lavender overlap highlight `#d2c9fb`.
 
-pub const BG: Color = Color::RGB(0x1e, 0x1e, 0x1e);
-pub const SIDEBAR_BG: Color = Color::RGB(0x2a, 0x2d, 0x31);
-pub const ACCENT: Color = Color::RGB(0x21, 0x96, 0xf3);
-pub const ACCENT_BRIGHT: Color = Color::RGB(0x5f, 0xb4, 0xf7);
+/// App background — a step darker than the brand dark, so panels/cards read as
+/// elevated surfaces on top of it.
+pub const BG: Color = Color::RGB(0x14, 0x10, 0x1f);
+/// Panel/modal surface — the brand dark (`iconColor` in appinfo.json).
+pub const SIDEBAR_BG: Color = Color::RGB(0x1c, 0x15, 0x30);
+/// Elevated interactive surface (focused rows, PIN/IP entry boxes, dropdown
+/// panel) — a purple step lighter than `SIDEBAR_BG` so focus reads on it.
+pub const SURFACE: Color = Color::RGB(0x2b, 0x21, 0x48);
+/// Brand purple — the icon's primary circle.
+pub const ACCENT: Color = Color::RGB(0x6c, 0x5b, 0xf3);
+/// Brand lavender — the icon's secondary circle; focus-ring glow, slider fills.
+pub const ACCENT_BRIGHT: Color = Color::RGB(0xa7, 0x9f, 0xf8);
 pub const WARNING: Color = Color::RGB(0xff, 0xc1, 0x07);
 pub const ERROR_RED: Color = Color::RGB(0xff, 0x6b, 0x6b);
 pub const WHITE: Color = Color::RGB(0xf5, 0xf5, 0xf5);
-pub const MUTED: Color = Color::RGB(0x9e, 0x9e, 0x9e);
+/// Secondary text — lavender-grey rather than neutral grey, staying in family.
+pub const MUTED: Color = Color::RGB(0x9b, 0x94, 0xb8);
 pub const MODAL_SCRIM: Color = Color::RGBA(0x00, 0x00, 0x00, 0x80);
-
-/// LG's own system UI font — already on-device, no bundling needed (see Cargo.toml).
-pub const SYSTEM_FONT_PATH: &str = "/usr/share/fonts/LG_Smart_UI-Regular.ttf";
 
 // ------------------------------------------------------------------------ icons --
 // Every icon in this UI is a glyph from a bundled, subsetted copy of Google's
 // Material Icons font (`assets/icons/MaterialIcons-subset.ttf`, Apache 2.0 — see
 // `assets/icons/NOTICE.md` for provenance/license and how to regenerate the subset)
-// rather than a vector-drawn shape: the system font covers ASCII only (see
-// `load_font`'s docs), so real icon glyphs need a font of their own, and a real
+// rather than a vector-drawn shape: a text font's icon coverage is unreliable,
+// so real icon glyphs need a font of their own, and a real
 // icon font draws a cleaner tv/lock/gear/etc. than hand-rolled path math ever did.
 // Rendered the same way as any other text (`draw_icon` reuses `TextCache`/`Font`),
 // just scaled to fit the icon's rect afterward — see `draw_icon`.
@@ -88,6 +95,15 @@ pub enum MenuEvent {
     Secondary,
 }
 
+/// The raw SDL keycode the LG Magic Remote's physical Back button delivers on this TV —
+/// identified via on-device input logging. It is NOT Escape/Backspace/AcBack and has no
+/// named rust-sdl2 `Keycode` variant, so it must be matched by raw value. This is the
+/// only usable hardware Back the remote gives the app: the Home button instead SIGTERMs
+/// the process (webOS closes the app), so it can't act as an in-app "back". See
+/// `docs/NOTES.md`'s note on Back never arriving as a scancode — it arrives as this
+/// keycode via the event API instead.
+pub const WEBOS_BACK_KEYCODE: i32 = 2_097_155;
+
 pub fn menu_event_for_key(keycode: sdl2::keyboard::Keycode) -> Option<MenuEvent> {
     use sdl2::keyboard::Keycode;
     Some(match keycode {
@@ -101,6 +117,8 @@ pub fn menu_event_for_key(keycode: sdl2::keyboard::Keycode) -> Option<MenuEvent>
         // regardless of which one this remote actually sends.
         Keycode::Backspace | Keycode::Escape | Keycode::AcBack => MenuEvent::Back,
         Keycode::Delete => MenuEvent::Secondary,
+        // The Magic Remote's Back button (see `WEBOS_BACK_KEYCODE`).
+        k if k.into_i32() == WEBOS_BACK_KEYCODE => MenuEvent::Back,
         _ => return None,
     })
 }
@@ -113,7 +131,13 @@ pub fn menu_event_for_button(button: sdl2::controller::Button) -> Option<MenuEve
         Button::DPadLeft => MenuEvent::Left,
         Button::DPadRight => MenuEvent::Right,
         Button::A => MenuEvent::Confirm,
-        Button::B => MenuEvent::Back,
+        // `Back` (SDL's dedicated back/select button) in addition to `B`: on this TV
+        // the Magic Remote surfaces as a game controller ("Smart Remote RCU Input"),
+        // and its physical Back button does *not* arrive as `B` — the temporary input
+        // logging in `main.rs` is what pins down which button it actually is. Mapping
+        // `Back` here is the low-risk best guess (no game relies on Select as a 1.5s
+        // hold, which is all it can trigger in-stream); widen this once the log says.
+        Button::B | Button::Back => MenuEvent::Back,
         Button::Y => MenuEvent::Secondary,
         _ => return None,
     })
@@ -274,32 +298,18 @@ impl Painter {
         self.pixmap.data()
     }
 
-    /// Fills the whole frame — always the first call of a frame, matching the old
-    /// canvas's `clear()` (this UI has no transparent regions of its own; whatever
-    /// isn't covered by a widget just shows this color).
-    pub fn clear(&mut self, color: Color) {
-        self.pixmap.fill(sk_color(color));
+    pub fn width(&self) -> u32 {
+        self.pixmap.width()
     }
 
-    /// Darkens the whole framebuffer by blending in flat black at `alpha` —
-    /// `draw_modal_backdrop`'s scrim behind every modal (Settings/Pairing/AddHost/
-    /// Wake). Used to be a plain `fill_rect` over the whole 1920x1080 frame with a
-    /// semi-transparent color, going through tiny-skia's general shader/blend
-    /// pipeline — measured on real webOS hardware, that one full-screen blend
-    /// (~2M pixels) was the dominant per-frame cost on every modal screen (a
-    /// "render split" log showed the modal's *entire* extra cost over Home,
-    /// ~300ms+, unaffected by anything else on screen). Since the source color is
-    /// always plain black, `SourceOver` onto a fully-opaque destination reduces to
-    /// `dst *= (255 - alpha) / 255` — implemented directly here as a raw pixel
-    /// loop (no shader/pipeline construction, no floats) instead of going through
-    /// `fill_rect`.
-    pub fn dim(&mut self, alpha: u8) {
-        let keep = u32::from(255 - alpha);
-        for px in self.pixmap.data_mut().chunks_exact_mut(4) {
-            px[0] = ((u32::from(px[0]) * keep) / 255) as u8;
-            px[1] = ((u32::from(px[1]) * keep) / 255) as u8;
-            px[2] = ((u32::from(px[2]) * keep) / 255) as u8;
-        }
+    pub fn height(&self) -> u32 {
+        self.pixmap.height()
+    }
+
+    /// Zeroes the buffer to fully transparent — tile painters start from this
+    /// (their surroundings must stay see-through for GPU alpha compositing).
+    pub fn clear_transparent(&mut self) {
+        self.pixmap.data_mut().fill(0);
     }
 
     pub fn fill_rect(&mut self, rect: Rect, color: Color) {
@@ -392,20 +402,6 @@ impl Painter {
     pub fn draw_pixmap(&mut self, x: i32, y: i32, src: &Pixmap) {
         self.pixmap
             .draw_pixmap(x, y, src.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
-    }
-
-    /// Stamps `other`'s whole framebuffer over this one — used to composite a
-    /// separately cached, less-frequently-rerendered layer (see `App::render`'s
-    /// `home_layer`) as this frame's backdrop. A raw buffer copy, not
-    /// `draw_pixmap`/`fill_rect`: measured on real webOS hardware, routing a
-    /// full-frame composite through tiny-skia's general shader/blend pipeline
-    /// (same root cause as `dim`'s docs) cost ~330-350ms on its own — *more* than
-    /// the `render_home` call this cache exists to avoid, making the cache a net
-    /// loss until this changed. Both `Painter`s are always the same screen size
-    /// in practice (both sized from the same display mode), so a straight
-    /// `copy_from_slice` is always valid here.
-    pub fn blit_layer(&mut self, other: &Self) {
-        self.pixmap.data_mut().copy_from_slice(other.pixmap.data());
     }
 
     /// Composites `src` scaled to exactly fill `dst` — `image`-decoded cover art
@@ -513,22 +509,70 @@ pub fn premultiply_rgba(rgba: &mut [u8]) {
 
 // --------------------------------------------------------------------- text/font --
 
-/// Loads the system font at a size proportional to the display height (design
-/// reference: a 720px-tall reference screen — `size = design_size * height / 720`).
-pub fn load_font<'a>(
-    ttf: &'a sdl2::ttf::Sdl2TtfContext,
+/// The bundled Geist family (punktfunk's brand font, the same OTFs every other
+/// punktfunk client ships — copied verbatim from `pf-console-ui/assets/fonts/`;
+/// license in `assets/fonts/Geist-OFL.txt`). Embedded like the icon font, so
+/// nothing needs staging alongside the `.ipk`.
+static GEIST_REGULAR: &[u8] = include_bytes!("../assets/fonts/Geist-Regular.otf");
+static GEIST_MEDIUM: &[u8] = include_bytes!("../assets/fonts/Geist-Medium.otf");
+static GEIST_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/Geist-SemiBold.otf");
+
+/// Which Geist weight to load. (Geist-Bold.otf also sits in `assets/fonts/`,
+/// unembedded — add a variant if a Bold use appears; the logo lockup that
+/// briefly used it is real artwork now, not text.)
+#[derive(Clone, Copy)]
+pub enum FontWeight {
+    Regular,
+    Medium,
+    SemiBold,
+}
+
+/// Loads a bundled Geist weight at a size proportional to the display height
+/// (design reference: a 720px-tall reference screen —
+/// `size = design_size * height / 720`).
+pub fn load_font(
+    ttf: &sdl2::ttf::Sdl2TtfContext,
     height_px: u32,
     design_size: u16,
-) -> Result<Font<'a, 'static>> {
+    weight: FontWeight,
+) -> Result<Font<'_, 'static>> {
+    let bytes: &'static [u8] = match weight {
+        FontWeight::Regular => GEIST_REGULAR,
+        FontWeight::Medium => GEIST_MEDIUM,
+        FontWeight::SemiBold => GEIST_SEMIBOLD,
+    };
     let scaled = (u32::from(design_size) * height_px / 720).max(10) as u16;
-    ttf.load_font(SYSTEM_FONT_PATH, scaled)
-        .map_err(|e| anyhow::anyhow!("load_font {SYSTEM_FONT_PATH}: {e}"))
+    let rwops = sdl2::rwops::RWops::from_bytes(bytes).map_err(|e| anyhow::anyhow!("geist rwops: {e}"))?;
+    ttf.load_font_from_rwops(rwops, scaled)
+        .map_err(|e| anyhow::anyhow!("load_font (Geist): {e}"))
 }
 
 /// The bundled icon font's raw bytes (see the icons section above) — embedded into
 /// the binary at compile time, so there's no install-time asset to stage/ship
 /// alongside the `.ipk` and no runtime path to resolve.
 static ICON_FONT_BYTES: &[u8] = include_bytes!("../assets/icons/MaterialIcons-subset.ttf");
+
+/// The punktfunk logo lockup (mark + FUNK wordmark) — rasterized from the brand's
+/// actual vector artwork (`assets/logo/punktfunk-logo-dark.svg`, the dark/no-border
+/// variant) at the sidebar's exact display size, so it draws 1:1 with no scaling.
+/// See `assets/logo/NOTICE.md` for regeneration.
+static LOGO_PNG: &[u8] = include_bytes!("../assets/logo/logo-sidebar.png");
+
+/// Decodes the embedded logo once, lazily (premultiplied, ready to composite).
+/// `None` only if the embedded PNG were somehow invalid — the sidebar then just
+/// draws without a logo rather than failing.
+fn logo_pixmap() -> Option<&'static Pixmap> {
+    static LOGO: std::sync::OnceLock<Option<Pixmap>> = std::sync::OnceLock::new();
+    LOGO.get_or_init(|| {
+        let decoded = image::load_from_memory(LOGO_PNG).ok()?;
+        let rgba = decoded.to_rgba8();
+        let (w, h) = (rgba.width(), rgba.height());
+        let mut buf = rgba.into_raw();
+        premultiply_rgba(&mut buf);
+        Pixmap::from_vec(buf, IntSize::from_wh(w, h)?)
+    })
+    .as_ref()
+}
 
 /// Loads the bundled icon font at a fixed, generously large size — icon glyphs are
 /// always drawn through `draw_icon`, which composites (and, via `Painter`'s
@@ -803,14 +847,14 @@ fn draw_focus_ring(painter: &mut Painter, rect: Rect, radius: i32) {
 
 /// Draws a plain surface card for a text-entry field (PIN/IP digit boxes) — always
 /// visible, so every slot reads as "a box you can fill in", not just the current
-/// one — shadow and `SIDEBAR_BG` fill, zoom-inflated slightly when focused. Returns
+/// one — shadow and `SURFACE` fill, zoom-inflated slightly when focused. Returns
 /// the (possibly zoom-inflated) rect actually drawn, so callers can center content
 /// inside it. Selectable rows/buttons use [`draw_selectable`] instead, which only
 /// paints the box when focused.
 pub fn draw_card(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
     let r = inflate(rect, focused);
     draw_card_shadow(painter, r, CARD_RADIUS);
-    painter.fill_rounded_rect(r, CARD_RADIUS, SIDEBAR_BG);
+    painter.fill_rounded_rect(r, CARD_RADIUS, SURFACE);
     r
 }
 
@@ -821,7 +865,7 @@ fn draw_selectable(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
     let r = inflate(rect, focused);
     if focused {
         draw_card_shadow(painter, r, CARD_RADIUS);
-        painter.fill_rounded_rect(r, CARD_RADIUS, SIDEBAR_BG);
+        painter.fill_rounded_rect(r, CARD_RADIUS, SURFACE);
     }
     r
 }
@@ -829,12 +873,12 @@ fn draw_selectable(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
 /// A handful of muted hues for the poster-card placeholder tint (hash-selected per
 /// title, not arbitrary RGB) — kept dark enough that white text stays legible.
 const POSTER_TINTS: [Color; 6] = [
-    Color::RGB(0x5b, 0x3a, 0x8e), // violet
-    Color::RGB(0x1f, 0x6f, 0x8c), // teal
-    Color::RGB(0x8c, 0x3a, 0x4a), // maroon
-    Color::RGB(0x3a, 0x6f, 0x3a), // green
-    Color::RGB(0x8c, 0x6a, 0x1f), // amber-brown
-    Color::RGB(0x3a, 0x4a, 0x8c), // indigo
+    Color::RGB(0x4a, 0x3a, 0x7d), // violet
+    Color::RGB(0x35, 0x40, 0x6e), // indigo
+    Color::RGB(0x6b, 0x3a, 0x68), // plum
+    Color::RGB(0x57, 0x50, 0x93), // deep lavender
+    Color::RGB(0x3a, 0x4a, 0x8c), // slate blue
+    Color::RGB(0x7d, 0x4a, 0x5e), // mauve
 ];
 
 fn tint_for(title: &str) -> Color {
@@ -915,12 +959,161 @@ pub fn draw_poster_card(
     Ok(())
 }
 
+// ------------------------------------------------------------------ GPU tiles --
+// The compositor path (see `compositor.rs` + `App::prepare_tiles`): widgets are
+// rasterized by tiny-skia into standalone padded tiles ONCE (keeping the AA/soft
+// shadow look), then composed per frame by the GPU — position, scroll, the focus
+// pop's scale, and fades are all texture-copy parameters, not re-rasterization.
+
+/// Transparent padding around a card tile so its drop shadow (dx 3 / dy 5 /
+/// blur 14) fits inside the tile instead of clipping at its edge.
+pub const CARD_TILE_PAD: i32 = 20;
+
+/// One grid card pre-composited into its own padded transparent tile, drawn
+/// unfocused — the focused look is the GPU scaling this same tile up slightly
+/// plus the shared [`render_focus_ring_tile`] composited over it.
+pub fn render_card_tile(
+    text_cache: &mut TextCache,
+    font_title: &Font,
+    font_value: &Font,
+    card_w: u32,
+    card_h: u32,
+    title: &str,
+    art: Option<&Pixmap>,
+) -> Result<Painter> {
+    let pad = CARD_TILE_PAD;
+    let mut p = Painter::new(card_w + 2 * pad as u32, card_h + 2 * pad as u32);
+    draw_poster_card(
+        &mut p,
+        text_cache,
+        font_title,
+        font_value,
+        Rect::new(pad, pad, card_w, card_h),
+        title,
+        art,
+        false,
+    )?;
+    Ok(p)
+}
+
+/// Transparent padding around the focus-ring tile (the ring's outer glow pass
+/// sits 6px out + stroke width).
+pub const FOCUS_RING_PAD: i32 = 12;
+
+/// The focus-ring glow for a `(w, h)` card, in its own transparent tile — one
+/// shared tile serves every card (they're all the same size), scaled by the GPU
+/// together with the focused card and faded in via texture alpha.
+pub fn render_focus_ring_tile(w: u32, h: u32) -> Painter {
+    let pad = FOCUS_RING_PAD;
+    let mut p = Painter::new(w + 2 * pad as u32, h + 2 * pad as u32);
+    draw_focus_ring(&mut p, Rect::new(pad, pad, w, h), CARD_RADIUS);
+    p
+}
+
+/// Transparent padding around a focused sidebar-row tile: the row inflates ~2%
+/// (±7px) when focused and its shadow extends ~20px past that.
+pub const ROW_TILE_PAD: i32 = 28;
+
+/// Sidebar row `index`, focused, as its own padded transparent tile — composited
+/// by the GPU over the focus-free sidebar layer. Mirrors `draw_sidebar`'s row
+/// order (hosts, "+ Add host", bottom-pinned "Settings"); all three row kinds
+/// share one rect size, so the tile dimensions are constant.
+pub fn render_focused_row_tile(
+    text_cache: &mut TextCache,
+    font_label: &Font,
+    icon_font: &Font,
+    entries: &[HostEntry],
+    index: usize,
+) -> Result<Painter> {
+    let pad = ROW_TILE_PAD;
+    let base = sidebar_row_rect(0);
+    let rect = Rect::new(pad, pad, base.width(), base.height());
+    let mut p = Painter::new(base.width() + 2 * pad as u32, base.height() + 2 * pad as u32);
+    if let Some(entry) = entries.get(index) {
+        draw_host_row(
+            &mut p,
+            text_cache,
+            font_label,
+            icon_font,
+            rect,
+            entry.name(),
+            entry.is_paired(),
+            true,
+        )?;
+    } else if index == entries.len() {
+        draw_utility_row(&mut p, text_cache, font_label, icon_font, rect, "+ Add host", true)?;
+    } else {
+        draw_utility_row(&mut p, text_cache, font_label, icon_font, rect, "Settings", true)?;
+    }
+    Ok(p)
+}
+
+/// A single line of text as its own tight transparent tile.
+pub fn render_text_tile(
+    text_cache: &mut TextCache,
+    font: &Font,
+    text: &str,
+    color: Color,
+) -> Result<Painter> {
+    let (w, h) = font.size_of(text).unwrap_or((1, 1));
+    let mut p = Painter::new(w.max(1), h.max(1));
+    draw_text(&mut p, text_cache, font, text, 0, 0, color)?;
+    Ok(p)
+}
+
+/// A wrapped text block as its own transparent tile (`max_w` wide, as tall as
+/// its wrapped line count).
+pub fn render_wrapped_text_tile(
+    text_cache: &mut TextCache,
+    font: &Font,
+    text: &str,
+    max_w: u32,
+    color: Color,
+    line_gap: i32,
+) -> Result<Painter> {
+    let line_h = font.height() + line_gap;
+    let lines = wrap_text(font, text, max_w).len().max(1) as u32;
+    let mut p = Painter::new(max_w.max(1), lines * line_h.max(1) as u32);
+    draw_text_wrapped(&mut p, text_cache, font, text, 0, 0, max_w, color, line_gap)?;
+    Ok(p)
+}
+
+/// The in-stream stats overlay panel: a translucent brand-dark rounded card with
+/// one line of text per stat, sized to its content. Rebuilt at the overlay's
+/// ~2Hz refresh with a THROWAWAY `TextCache` — the numeric lines change every
+/// refresh, so a persistent cache would only accumulate dead entries for the
+/// whole stream's duration.
+pub fn render_stats_overlay_tile(font: &Font, lines: &[String]) -> Result<Painter> {
+    let pad = 18i32;
+    let line_h = font.height() + 6;
+    let text_w = lines
+        .iter()
+        .map(|l| font.size_of(l).map_or(0, |(w, _)| w))
+        .max()
+        .unwrap_or(0);
+    let w = text_w + 2 * pad as u32;
+    let h = (lines.len() as i32 * line_h + 2 * pad) as u32;
+    let mut p = Painter::new(w.max(1), h.max(1));
+    let mut tc = TextCache::new();
+    p.fill_rounded_rect(
+        Rect::new(0, 0, w, h),
+        14,
+        Color::RGBA(0x14, 0x10, 0x1f, 0xd2),
+    );
+    for (i, line) in lines.iter().enumerate() {
+        // First line (mode/codec header) pops; the measurements below are muted.
+        let color = if i == 0 { WHITE } else { MUTED };
+        draw_text(&mut p, &mut tc, font, line, pad, pad + i as i32 * line_h, color)?;
+    }
+    Ok(p)
+}
+
 // ---------------------------------------------------------------------- sidebar --
 
 // Sized for a 10-foot TV viewing distance, not a desktop/phone screen.
-pub const SIDEBAR_W: u32 = 400;
+pub const SIDEBAR_W: u32 = 460;
 pub const SIDEBAR_PAD: i32 = 24;
-pub const SIDEBAR_TOP_Y: i32 = 160;
+pub const SIDEBAR_TOP_Y: i32 = 216;
 pub const SIDEBAR_ROW_H: u32 = 76;
 pub const SIDEBAR_ROW_GAP: i32 = 10;
 
@@ -1011,14 +1204,28 @@ pub fn draw_sidebar(
     painter: &mut Painter,
     text_cache: &mut TextCache,
     font_label: &Font,
-    font_title: &Font,
+    font_value: &Font,
     icon_font: &Font,
     entries: &[HostEntry],
     focused_index: Option<usize>,
     screen_h: u32,
 ) -> Result<()> {
     painter.fill_rect(Rect::new(0, 0, SIDEBAR_W, screen_h), SIDEBAR_BG);
-    draw_text(painter, text_cache, font_title, "punktfunk", SIDEBAR_PAD, 56, WHITE)?;
+    // The real brand lockup (mark + FUNK wordmark), from the actual logo
+    // artwork — see `logo_pixmap`. Drawn 1:1, no scaling.
+    if let Some(logo) = logo_pixmap() {
+        painter.draw_pixmap(SIDEBAR_PAD, 32, logo);
+    }
+    // Small section label over the host list, clearly separated from the lockup.
+    draw_text(
+        painter,
+        text_cache,
+        font_value,
+        "Hosts",
+        SIDEBAR_PAD + 4,
+        SIDEBAR_TOP_Y - 40,
+        MUTED,
+    )?;
 
     let add_row = entries.len();
     let settings_row = entries.len() + 1;
@@ -1091,12 +1298,17 @@ fn draw_sidebar_row(
     );
     let color = if focused { WHITE } else { MUTED };
     draw_icon(painter, text_cache, icon_font, icon_rect, glyph, color)?;
+    // Ellipsized to the row's real text width (icon + paddings subtracted) — a
+    // long mDNS hostname used to run past the row/panel edge.
+    let text_x = icon_pad + icon_size as i32 + 16;
+    let max_w = drawn.width().saturating_sub(text_x as u32 + 20);
+    let label = ellipsize(font_label, label, max_w);
     draw_text(
         painter,
         text_cache,
         font_label,
-        label,
-        drawn.x() + icon_pad + icon_size as i32 + 16,
+        &label,
+        drawn.x() + text_x,
         drawn.y() + (drawn.height() as i32 - font_label.height()) / 2,
         color,
     )?;
@@ -1167,6 +1379,9 @@ pub fn grid_card_rect(index: usize, columns: usize, grid_x: i32, available_w: u3
     Rect::new(x, y, card_w, card_h)
 }
 
+/// `scroll` is the grid's current vertical scroll offset in px (see
+/// `App::grid_scroll`) — card rects live in unscrolled layout space, so the
+/// pointer's y is translated into that space before testing.
 pub fn hit_test_grid_card(
     mouse_x: i32,
     mouse_y: i32,
@@ -1174,20 +1389,29 @@ pub fn hit_test_grid_card(
     count: usize,
     grid_x: i32,
     available_w: u32,
+    scroll: i32,
 ) -> Option<usize> {
     if mouse_x < grid_x {
         return None;
     }
-    (0..count).find(|&i| grid_card_rect(i, columns, grid_x, available_w).contains_point((mouse_x, mouse_y)))
+    (0..count)
+        .find(|&i| grid_card_rect(i, columns, grid_x, available_w).contains_point((mouse_x, mouse_y + scroll)))
+}
+
+/// Headroom above/below the card rows inside the cached grid layer (see
+/// `App::grid_layer`), so row 0's shadow and the last row's shadow tail have
+/// somewhere to land instead of clipping at the layer edge.
+pub const GRID_LAYER_PAD: i32 = 24;
+
+/// Total pixel height of the cached grid layer for `count` cards: all rows plus
+/// the shadow headroom above and below.
+pub fn grid_layer_height(count: usize, columns: usize, available_w: u32) -> u32 {
+    let rows = count.div_ceil(columns.max(1));
+    let (_, card_h) = grid_card_size(available_w, columns);
+    (rows.max(1) as u32 * (card_h + GRID_GAP as u32)) + 2 * GRID_LAYER_PAD as u32
 }
 
 // ----------------------------------------------------------------------- modals --
-
-/// Dims the already-rendered frame beneath a modal (Settings/Pairing/Add host all
-/// render on top of the current Home frame, then this, then their own card).
-pub fn draw_modal_backdrop(painter: &mut Painter) {
-    painter.dim(MODAL_SCRIM.a);
-}
 
 /// A centered glass card of `(width_frac * screen_w, height)`.
 pub fn modal_card_rect(screen_w: u32, screen_h: u32, width_frac: f32, height: u32) -> Rect {
@@ -1267,7 +1491,8 @@ pub const ROW_FRAMERATE: usize = 1;
 pub const ROW_BITRATE: usize = 2;
 pub const ROW_HDR: usize = 3;
 pub const ROW_VIDEO_BACKEND: usize = 4;
-pub const SETTINGS_ROW_COUNT: usize = 5;
+pub const ROW_STATS_OVERLAY: usize = 5;
+pub const SETTINGS_ROW_COUNT: usize = 6;
 
 /// Cycles `current` to the next/previous value in a preset slice, wrapping.
 pub fn cycle<T: Copy + PartialEq>(options: &[T], current: T, forward: bool) -> T {
@@ -1342,6 +1567,16 @@ pub fn settings_rows(settings: &Settings) -> Vec<SettingsRow> {
                 VideoBackend::Starfish => "Starfish".into(),
             },
             kind: RowKind::Dropdown,
+            fraction: 0.0,
+        },
+        SettingsRow {
+            label: "Stats overlay".into(),
+            value: if settings.stats_overlay {
+                "On".into()
+            } else {
+                "Off".into()
+            },
+            kind: RowKind::Toggle,
             fraction: 0.0,
         },
     ]
@@ -1437,6 +1672,10 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
             let idx = dropdown_current_index(settings, ROW_VIDEO_BACKEND);
             let next = cycle_index(idx, 2, forward);
             apply_dropdown_choice(settings, ROW_VIDEO_BACKEND, next);
+            true
+        }
+        ROW_STATS_OVERLAY => {
+            settings.stats_overlay = !settings.stats_overlay;
             true
         }
         _ => false,
@@ -1741,7 +1980,7 @@ pub fn draw_dropdown_overlay(
 /// of this same triple (shadow, fill, stroke).
 fn draw_popup_panel(painter: &mut Painter, rect: Rect, border_color: Color) {
     draw_card_shadow(painter, rect, CARD_RADIUS);
-    painter.fill_rounded_rect(rect, CARD_RADIUS, Color::RGBA(0x10, 0x10, 0x10, 0xf0));
+    painter.fill_rounded_rect(rect, CARD_RADIUS, Color::RGBA(0x17, 0x11, 0x28, 0xf6));
     painter.stroke_rounded_rect(rect, CARD_RADIUS, border_color, 1.5);
 }
 

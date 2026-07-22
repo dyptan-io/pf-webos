@@ -60,9 +60,20 @@ pub fn load_known_hosts() -> Vec<KnownHost> {
         .unwrap_or_default()
 }
 
+/// Write-then-rename, never truncate-in-place: `std::fs::write` truncates first,
+/// so a kill/power-cut mid-write (this is a TV — losing power IS the off switch)
+/// leaves a half-file, and the loaders' `.ok().unwrap_or_default()` would then
+/// silently discard every paired host / all settings. A rename on the same
+/// filesystem is atomic; readers see the old file or the new one, never a torn one.
+fn write_atomic(path: std::path::PathBuf, contents: &str, what: &'static str) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents).with_context(|| format!("write {what} (tmp)"))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("rename {what} into place"))
+}
+
 pub fn save_known_hosts(hosts: &[KnownHost]) -> Result<()> {
     let json = serde_json::to_string_pretty(hosts).context("serialize known hosts")?;
-    std::fs::write(known_hosts_path(), json).context("write known-hosts.json")
+    write_atomic(known_hosts_path(), &json, "known-hosts.json")
 }
 
 /// Upserts by `(host, port)`, keeping the existing fingerprint if the new record
@@ -108,14 +119,14 @@ pub fn save_selected_host(host: &str, port: u16) -> Result<()> {
         port,
     })
     .context("serialize selected host")?;
-    std::fs::write(selected_host_path(), json).context("write selected-host.json")
+    write_atomic(selected_host_path(), &json, "selected-host.json")
 }
 
 /// Video decode backend selectable in Settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VideoBackend {
-    /// NDL DirectMedia v2 — stable baseline, no `pauseAtDecodeTime`.
+    /// NDL `DirectMedia` v2 — stable baseline, no `pauseAtDecodeTime`.
     #[default]
     Ndl,
     /// Starfish/SMP (`libplayerAPIs_C.so`) — `pauseAtDecodeTime` + smooth PTS pacing
@@ -148,6 +159,11 @@ pub struct Settings {
     /// Persisted across restarts; takes effect on the next stream.
     #[serde(default)]
     pub video_backend: VideoBackend,
+    /// Whether the in-stream stats overlay (resolution/codec, measured fps, drops,
+    /// decoder feed time) is drawn in the top-right corner during a stream. Off by
+    /// default; takes effect on the next stream.
+    #[serde(default)]
+    pub stats_overlay: bool,
 }
 
 impl Default for Settings {
@@ -163,6 +179,7 @@ impl Default for Settings {
             bitrate_kbps: 0,
             hdr_enabled: true,
             wol_auto_send: false,
+            stats_overlay: false,
             video_backend: VideoBackend::Ndl,
         }
     }
@@ -181,7 +198,7 @@ pub fn load_settings() -> Settings {
 
 pub fn save_settings(settings: &Settings) -> Result<()> {
     let json = serde_json::to_string_pretty(settings).context("serialize settings")?;
-    std::fs::write(settings_path(), json).context("write settings.json")
+    write_atomic(settings_path(), &json, "settings.json")
 }
 
 /// Test/dev override: a config file dropped alongside sideloading skips straight to
