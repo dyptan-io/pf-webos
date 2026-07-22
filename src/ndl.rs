@@ -1,18 +1,15 @@
-//! Safe wrapper over webOS's NDL `DirectMedia` v2 API (`NDL_Direct*`, webOS 5+) — the
-//! system's hardware video decode path for native apps. Reverse-engineered but
-//! well-established (the same API `mariotaku/moonlight-tv`/aurora-tv use); headers
-//! confirmed against `libNDL_directmedia.so.1` live on an LG CX (webOS 5.6): every
-//! symbol we call exists with a matching signature (checked via `nm -D`).
+//! Safe wrapper over webOS's NDL `DirectMedia` v2 API (`NDL_Direct*`, webOS 5+).
 //!
-//! We only use the VIDEO half. Audio is pre-decoded Opus→PCM in this client and goes
-//! straight to SDL2 (`audio.rs`), never through NDL — so the `audio` union in
-//! [`NdlDataInfo`] is always zeroed (`NDL_AUDIO_TYPE` tag 0 = none), which the
-//! reference implementation (ss4s's `ndl_player.c`) confirms NDL accepts as long as
-//! `video.type` is set.
+//! We only use the VIDEO half. Audio goes through SDL2 (`audio.rs`), never NDL —
+//! `NdlDataInfo.audio` is always zeroed (tag 0 = none), which NDL accepts as long as
+//! `video.type` is set (confirmed in ss4s's `ndl_player.c`).
 //!
-//! PTS is milliseconds since [`NdlVideo::load`] — not wall-clock, not the host's
-//! capture clock — matching the reference `GetPts()` (`ndl_player.c`): NDL only needs
-//! a monotonically increasing local clock for its own internal pacing.
+//! Deliberately never calls `NDL_DirectVideoSetArea`: ss4s's webOS 5 NDL module
+//! (`ndl_video.c`) doesn't either, letting NDL's own default punch-through mapping
+//! handle any decode resolution. Forcing an explicit rect sized from
+//! `SDL_GetCurrentDisplayMode` (which reports a fixed 1080p compositor resolution on
+//! this TV, not the physical panel size) made NDL scale every frame down into that
+//! rect above 1080p, causing resolution-triggered stutter independent of bitrate/fps.
 use std::ffi::{c_char, c_int, c_longlong, c_uint, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -112,15 +109,13 @@ extern "C" {
     fn NDL_DirectMediaLoad(data: *mut NdlDataInfo, cb: NdlMediaLoadCallback) -> c_int;
     fn NDL_DirectMediaUnload() -> c_int;
     fn NDL_DirectVideoPlay(buffer: *mut c_void, size: c_uint, pts: c_longlong) -> c_int;
-    fn NDL_DirectVideoSetArea(left: c_int, top: c_int, width: c_int, height: c_int) -> c_int;
     fn NDL_DirectVideoFlushRenderBuffer() -> c_int;
     fn NDL_DirectVideoSetHDRInfo(hdr_info: NdlHdrInfo) -> c_int;
 }
 
 /// Reads NDL's last error string (set on the most recent failing call).
 fn last_error() -> String {
-    // SAFETY: NDL_DirectMediaGetError returns a pointer to a static/internal buffer
-    // NDL owns; we only borrow it for the duration of the CStr read below.
+    // SAFETY: returns a pointer to NDL's internal buffer; only borrowed here.
     unsafe {
         let p = NDL_DirectMediaGetError();
         if p.is_null() {
@@ -133,16 +128,13 @@ fn last_error() -> String {
 
 static INIT_DONE: AtomicBool = AtomicBool::new(false);
 
-/// `NDL_DirectMediaInit` is process-global and idempotent-guarded on NDL's side, but we
-/// still only want to call it once. `app_id` matches `APPID` in the launched app's own
-/// environment (confirmed present — see `punktfunk_webos_client` memory notes).
+/// Calls `NDL_DirectMediaInit` once (process-global, idempotent-guarded).
 fn ensure_init(app_id: &str) -> Result<()> {
     if INIT_DONE.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
     let c_app_id = CString::new(app_id).unwrap_or_default();
-    // SAFETY: app_id points to a valid, live CString for the duration of this call;
-    // the callback is null (we don't need load-state notifications for phase 1).
+    // SAFETY: `c_app_id` is valid for the duration of this call.
     let ret = unsafe { NDL_DirectMediaInit(c_app_id.as_ptr(), None) };
     if ret != 0 {
         INIT_DONE.store(false, Ordering::SeqCst);
@@ -154,6 +146,10 @@ fn ensure_init(app_id: &str) -> Result<()> {
 /// One loaded NDL video decode session. Dropping it unloads (but does not call
 /// `NDL_DirectMediaQuit` — that's process-global; see [`quit`]).
 pub struct NdlVideo {
+    /// NDL's PTS is milliseconds since `NDL_DirectMediaLoad`, not wall-clock or the
+    /// host's capture clock (docs/NOTES.md) — NDL only needs a monotonically
+    /// increasing local clock for its own internal pacing, so `play` derives it from
+    /// this instead of the host-supplied timestamp.
     load_instant: Instant,
 }
 
@@ -171,10 +167,7 @@ impl NdlVideo {
             },
             audio: NdlAudioUnion { bytes: [0; 32] },
         };
-        // SAFETY: `info` is a valid, correctly-laid-out NDL_DIRECTMEDIA_DATA_INFO_T on
-        // the stack for the duration of this call; the load-complete callback is null
-        // (we don't block on it — NDL accepts NDL_DirectVideoPlay immediately after a
-        // successful Load call, per the reference ndl_player.c sequencing).
+        // SAFETY: `info` is valid for the duration of this call.
         let ret = unsafe { NDL_DirectMediaLoad(&mut info, None) };
         if ret != 0 {
             bail!("NDL_DirectMediaLoad failed: ret={ret} error={}", last_error());
@@ -184,47 +177,30 @@ impl NdlVideo {
         })
     }
 
-    /// Sets the punch-through video plane's rectangle in panel pixels. Call once after
-    /// `load` (and again on a display-mode/resize change) — the video plane is
-    /// composited by the display hardware independent of any SDL2 window.
-    pub fn set_area(&self, left: i32, top: i32, width: i32, height: i32) -> Result<()> {
-        // SAFETY: plain integer args, no aliasing concerns.
-        let ret = unsafe { NDL_DirectVideoSetArea(left, top, width, height) };
-        if ret != 0 {
-            bail!("NDL_DirectVideoSetArea failed: ret={ret} error={}", last_error());
-        }
-        Ok(())
-    }
-
-    /// Feeds one compressed access unit (Annex-B NAL units, as punktfunk's `Frame::data`
-    /// already is) to the hardware decoder. PTS is derived internally as milliseconds
-    /// since `load` — see module docs for why that (not the host's capture clock) is
-    /// what NDL wants.
+    /// Feed one access unit. The host's `pts_ns` is deliberately ignored — NDL wants
+    /// milliseconds since `load`, not wall-clock or the host's capture clock, so the
+    /// PTS is derived from `load_instant` instead (see the [`NdlVideo`] doc comment).
     pub fn play(&self, au: &[u8]) -> Result<()> {
         let pts_ms = self.load_instant.elapsed().as_millis() as c_longlong;
-        // SAFETY: NDL_DirectVideoPlay only reads `size` bytes from `buffer` for the
-        // duration of this call (it copies/consumes synchronously per the reference
-        // implementation's usage) and does not retain the pointer afterward.
-        let ret = unsafe { NDL_DirectVideoPlay(au.as_ptr() as *mut c_void, au.len() as c_uint, pts_ms) };
+        // SAFETY: NDL reads `size` bytes from `buffer` synchronously and does not
+        // retain the pointer.
+        let ret = unsafe {
+            NDL_DirectVideoPlay(au.as_ptr() as *mut c_void, au.len() as c_uint, pts_ms)
+        };
         if ret != 0 {
             bail!("NDL_DirectVideoPlay failed: ret={ret} error={}", last_error());
         }
         Ok(())
     }
 
-    /// Sets the static HDR mastering metadata (ST.2086 + MaxCLL/MaxFALL) NDL should
-    /// tag the punch-through plane with. `meta` is the host's per-session metadata
-    /// (`NativeClient::next_hdr_meta`), `color` its resolved CICP colour signalling
-    /// (`NativeClient::color`) — both already in the same SEI-standard units NDL's
-    /// fields expect (see the struct doc comment), so this is a direct field copy,
-    /// not a conversion.
+    /// Apply HDR mastering metadata. `meta` and `color` use the same SEI-standard
+    /// units NDL expects (G/B/R order per ST.2086), so no conversion is needed.
     pub fn set_hdr_info(
         &self,
         meta: &punktfunk_core::quic::HdrMeta,
         color: punktfunk_core::quic::ColorInfo,
     ) -> Result<()> {
-        // HdrMeta's own doc comment: "the ST.2086 RGB order is G, B, R" — already the
-        // order NDL's X0/Y0, X1/Y1, X2/Y2 fields expect (same SEI convention).
+        // G/B/R order (ST.2086 convention; same as `set_hdr_info` in starfish.rs).
         let [g, b, r] = meta.display_primaries;
         let info = NdlHdrInfo {
             display_primaries_x0: c_int::from(g[0]),
@@ -244,8 +220,7 @@ impl NdlVideo {
             matrix_coeffs: c_int::from(color.matrix),
             reserved: [0; 32],
         };
-        // SAFETY: `info` is passed by value (matches the C signature exactly), no
-        // pointers/aliasing involved.
+        // SAFETY: passed by value; no pointers or aliasing.
         let ret = unsafe { NDL_DirectVideoSetHDRInfo(info) };
         if ret != 0 {
             bail!("NDL_DirectVideoSetHDRInfo failed: ret={ret} error={}", last_error());
@@ -253,10 +228,10 @@ impl NdlVideo {
         Ok(())
     }
 
-    /// Drops any buffered-but-undisplayed frames — call after a seek/loss-recovery
-    /// keyframe request so stale frames don't head-of-line block the fresh one.
+    /// Flush buffered-but-undisplayed frames — call after a keyframe request so
+    /// stale frames don't head-of-line block the fresh one.
     pub fn flush(&self) -> Result<()> {
-        // SAFETY: no arguments, no aliasing concerns.
+        // SAFETY: no arguments.
         let ret = unsafe { NDL_DirectVideoFlushRenderBuffer() };
         if ret != 0 {
             bail!(
@@ -270,9 +245,7 @@ impl NdlVideo {
 
 impl Drop for NdlVideo {
     fn drop(&mut self) {
-        // SAFETY: no arguments; best-effort teardown, error ignored (matches
-        // DestroyPlayerContext in the reference implementation — Drop can't propagate
-        // a Result anyway).
+        // SAFETY: best-effort teardown; error ignored (Drop can't propagate a Result).
         let _ = unsafe { NDL_DirectMediaUnload() };
     }
 }

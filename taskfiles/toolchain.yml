@@ -156,6 +156,11 @@ tasks:
         # linker looks for, loaded via the $ORIGIN/../lib rpath build.rs sets.
         cp -L {{.SYSROOT}}/usr/lib/libSDL2-2.0.so.0 "$STAGE_DIR/lib/libSDL2-2.0.so.0"
         {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-strip "$STAGE_DIR/lib/libSDL2-2.0.so.0"
+        # libplayerAPIs_C.so: C wrapper for the C++ StarfishMediaAPIs class.
+        # build.rs compiles this from src/starfish_c_shim.cpp; it is not on the
+        # TV, so we bundle it here (same pattern as libSDL2-2.0.so.0 above).
+        cp target/{{.TARGET}}/release/libplayerAPIs_C.so "$STAGE_DIR/lib/libplayerAPIs_C.so"
+        {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-strip "$STAGE_DIR/lib/libplayerAPIs_C.so"
         cp packaging/appinfo.json packaging/icon.png packaging/icon_large.png packaging/splash.png "$STAGE_DIR/"
 
         # webOS/Homebrew Channel reads the *installed* app's own appinfo.json

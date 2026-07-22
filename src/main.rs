@@ -24,6 +24,8 @@ mod ndl;
 #[cfg(target_os = "linux")]
 mod session;
 #[cfg(target_os = "linux")]
+mod starfish;
+#[cfg(target_os = "linux")]
 mod store;
 #[cfg(target_os = "linux")]
 mod ui;
@@ -653,6 +655,7 @@ mod real {
                 Duration::from_secs(185),
                 display_mode.w,
                 display_mode.h,
+                settings.video_backend,
                 log,
             )
             .context("session connect")?;
