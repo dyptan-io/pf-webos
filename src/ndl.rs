@@ -195,13 +195,30 @@ impl NdlVideo {
 
     /// Apply HDR mastering metadata. `meta` and `color` use the same SEI-standard
     /// units NDL expects (G/B/R order per ST.2086), so no conversion is needed.
-    pub fn set_hdr_info(
+    /// Forwards the stream's colorimetry (and, for HDR, its mastering metadata)
+    /// to NDL. `meta: None` = an SDR stream: the mastering/light-level fields are
+    /// zeroed (the SEI "unknown" convention) and only the colour triplet
+    /// (transfer/primaries/matrix) is meaningful — without it, a bitstream with
+    /// missing/unspecified VUI colour info leaves the panel to guess colorimetry
+    /// from resolution, and a 4K SDR stream then decodes as BT.2020 instead of
+    /// the BT.709 punktfunk actually encodes (a visibly washed-out picture).
+    pub fn set_color_info(
         &self,
-        meta: &punktfunk_core::quic::HdrMeta,
+        meta: Option<&punktfunk_core::quic::HdrMeta>,
         color: punktfunk_core::quic::ColorInfo,
     ) -> Result<()> {
-        // G/B/R order (ST.2086 convention; same as `set_hdr_info` in starfish.rs).
-        let [g, b, r] = meta.display_primaries;
+        // G/B/R order (ST.2086 convention; same as starfish.rs).
+        let ([g, b, r], white, max_dml, min_dml, cll, fall) = match meta {
+            Some(m) => (
+                m.display_primaries,
+                m.white_point,
+                m.max_display_mastering_luminance,
+                m.min_display_mastering_luminance,
+                m.max_cll,
+                m.max_fall,
+            ),
+            None => ([[0; 2]; 3], [0; 2], 0, 0, 0, 0),
+        };
         let info = NdlHdrInfo {
             display_primaries_x0: c_int::from(g[0]),
             display_primaries_y0: c_int::from(g[1]),
@@ -209,12 +226,12 @@ impl NdlVideo {
             display_primaries_y1: c_int::from(b[1]),
             display_primaries_x2: c_int::from(r[0]),
             display_primaries_y2: c_int::from(r[1]),
-            white_point_x: c_int::from(meta.white_point[0]),
-            white_point_y: c_int::from(meta.white_point[1]),
-            max_display_mastering_luminance: meta.max_display_mastering_luminance as c_int,
-            min_display_mastering_luminance: meta.min_display_mastering_luminance as c_int,
-            max_content_light_level: c_int::from(meta.max_cll),
-            max_pic_average_light_level: c_int::from(meta.max_fall),
+            white_point_x: c_int::from(white[0]),
+            white_point_y: c_int::from(white[1]),
+            max_display_mastering_luminance: max_dml as c_int,
+            min_display_mastering_luminance: min_dml as c_int,
+            max_content_light_level: c_int::from(cll),
+            max_pic_average_light_level: c_int::from(fall),
             transfer_characteristics: c_int::from(color.transfer),
             color_primaries: c_int::from(color.primaries),
             matrix_coeffs: c_int::from(color.matrix),

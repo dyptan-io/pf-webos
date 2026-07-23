@@ -49,10 +49,10 @@ impl VideoPlayer {
         }
     }
 
-    fn set_hdr_info(&self, meta: &quic::HdrMeta, color: quic::ColorInfo) -> anyhow::Result<()> {
+    fn set_color_info(&self, meta: Option<&quic::HdrMeta>, color: quic::ColorInfo) -> anyhow::Result<()> {
         match self {
-            Self::Starfish(sf) => sf.set_hdr_info(meta, color),
-            Self::Ndl(ndl) => ndl.set_hdr_info(meta, color),
+            Self::Starfish(sf) => sf.set_color_info(meta, color),
+            Self::Ndl(ndl) => ndl.set_color_info(meta, color),
         }
     }
 
@@ -67,9 +67,35 @@ impl VideoPlayer {
 pub struct Connected {
     pub client: Arc<NativeClient>,
     pub stop: Arc<AtomicBool>,
+    /// Live pump counters for the stats overlay — see [`StreamStats`].
+    pub stats: Arc<StreamStats>,
     /// Kept alive so [`Connected::shutdown`] can join it and ensure `NativeClient::Drop`
     /// (which sends the QUIC close frame) runs to completion before process exit.
     video_thread: std::thread::JoinHandle<()>,
+}
+
+/// Live video-pump counters shared with the main thread for the in-stream stats
+/// overlay (`Settings::stats_overlay`): plain relaxed atomics, written per frame
+/// by [`video_pump`], read at the overlay's ~2Hz refresh. Dropped-frame counts
+/// come straight from `NativeClient::frames_dropped()` at read time instead.
+#[derive(Default)]
+pub struct StreamStats {
+    /// Total frames received from the host so far.
+    pub frames: std::sync::atomic::AtomicU64,
+    /// Whether the freeze-until-reanchor hold is currently active.
+    pub holding: AtomicBool,
+    /// The most recent decoder feed duration, in µs.
+    pub feed_us: std::sync::atomic::AtomicU32,
+}
+
+/// Short display name for a resolved wire codec id (the stats overlay's header).
+pub fn codec_name(codec: u8) -> &'static str {
+    match codec {
+        c if c == quic::CODEC_HEVC => "HEVC",
+        c if c == quic::CODEC_H264 => "H264",
+        c if c == quic::CODEC_AV1 => "AV1",
+        _ => "?",
+    }
 }
 
 impl Connected {
@@ -171,7 +197,11 @@ pub fn connect(
 
     let player = match video_backend {
         VideoBackend::Starfish => {
-            let sf = StarfishVideo::load(
+            // `StarfishVideo::load` documents failure (its wrapper `.so` absent /
+            // the service refusing the load) as "caller falls back to NDL" — honor
+            // that instead of propagating, which would take the whole app down on
+            // every launch until the user remembered to flip the setting back.
+            match StarfishVideo::load(
                 &app_id,
                 resolved_mode.width as i32,
                 resolved_mode.height as i32,
@@ -180,14 +210,32 @@ pub fn connect(
                 display_w,
                 display_h,
                 log,
-            )
-            .context("Starfish load")?;
-            writeln!(
-                log,
-                "Starfish loaded ({codec:?} {}x{}@{fps}fps, display {display_w}x{display_h})",
-                resolved_mode.width, resolved_mode.height,
-            )?;
-            VideoPlayer::Starfish(sf)
+            ) {
+                Ok(sf) => {
+                    writeln!(
+                        log,
+                        "Starfish loaded ({codec:?} {}x{}@{fps}fps, display {display_w}x{display_h})",
+                        resolved_mode.width, resolved_mode.height,
+                    )?;
+                    VideoPlayer::Starfish(sf)
+                }
+                Err(e) => {
+                    writeln!(log, "Starfish load failed ({e:#}) — falling back to NDL")?;
+                    let ndl = NdlVideo::load(
+                        &app_id,
+                        resolved_mode.width as i32,
+                        resolved_mode.height as i32,
+                        codec,
+                    )
+                    .context("NDL load (Starfish fallback)")?;
+                    writeln!(
+                        log,
+                        "NDL loaded ({codec:?} {}x{}@{fps}fps)",
+                        resolved_mode.width, resolved_mode.height,
+                    )?;
+                    VideoPlayer::Ndl(ndl)
+                }
+            }
         }
         VideoBackend::Ndl => {
             let ndl = NdlVideo::load(
@@ -206,23 +254,80 @@ pub fn connect(
         }
     };
 
+    // Forward the negotiated colorimetry to the decoder for BOTH HDR and SDR
+    // streams. The SDR case is not optional: punktfunk encodes BT.709, but with
+    // missing/"unspecified" VUI colour info in the bitstream this panel guesses
+    // colorimetry from resolution — a 4K SDR stream then decodes as BT.2020,
+    // which shows up as exactly the washed-out/desaturated picture reported
+    // on-device. `client.color` arrives out-of-band in `Welcome` for precisely
+    // this purpose; HDR streams additionally carry mastering metadata.
     let is_hdr = client.color.is_hdr();
-    if is_hdr {
-        if let Err(e) = player.set_hdr_info(&cx_display_hdr(), client.color) {
-            writeln!(log, "{} initial HDR metadata failed: {e:#}", player.backend_name())?;
-        }
+    let initial_meta = is_hdr.then(cx_display_hdr);
+    if let Err(e) = player.set_color_info(initial_meta.as_ref(), client.color) {
+        writeln!(log, "{} colour metadata failed: {e:#}", player.backend_name())?;
     }
+    writeln!(
+        log,
+        "colour metadata sent: hdr={is_hdr} transfer={} primaries={} matrix={} full_range={}",
+        client.color.transfer, client.color.primaries, client.color.matrix, client.color.full_range,
+    )?;
 
     let stop = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(StreamStats::default());
     let video_client = client.clone();
     let video_stop = stop.clone();
+    let video_stats = stats.clone();
     let mut video_log = log.try_clone().context("clone log")?;
     let video_thread = std::thread::Builder::new()
         .name("punktfunk-webos-video".into())
-        .spawn(move || video_pump(video_client, player, video_stop, is_hdr, &mut video_log))
+        .spawn(move || video_pump(video_client, player, video_stop, video_stats, is_hdr, &mut video_log))
         .context("spawn video thread")?;
 
-    Ok(Connected { client, stop, video_thread })
+    Ok(Connected { client, stop, stats, video_thread })
+}
+
+/// The no-PIN "request access" trust step: open a trust-on-first-use connection
+/// (`pin = None`) presenting our identity, which a host requiring pairing PARKS until
+/// its operator approves this device, then return the host's now-verified fingerprint
+/// to pin and tear the connection straight back down.
+///
+/// Uses [`NativeClient`] directly rather than [`connect`] above: no video backend
+/// (NDL/Starfish) is loaded and no pump thread is spawned, so the video plane is never
+/// touched — this only needs the handshake to reach `Welcome`, not a running stream. The
+/// negotiated `mode`/codec are irrelevant here (immediately dropped); a small 720p H.264
+/// request keeps the host from doing needless 4K/HEVC setup for a connection we close at
+/// once. Blocks up to `timeout` (the operator-approval window).
+pub fn request_access(
+    host: &str,
+    port: u16,
+    identity: (String, String),
+    timeout: Duration,
+) -> Result<[u8; 32]> {
+    let mode = Mode { width: 1280, height: 720, refresh_hz: 60 };
+    let client = NativeClient::connect(
+        host,
+        port,
+        mode,
+        CompositorPref::Auto,
+        punktfunk_core::config::GamepadPref::Auto,
+        1_000, // minimal bitrate — connection is closed as soon as trust is established
+        quic::VIDEO_CAP_CHACHA20,
+        2,
+        quic::CODEC_H264,
+        0,
+        None, // no HDR display metadata
+        None, // no launch
+        None, // pin = None → trust-on-first-use, host parks until operator approval
+        Some(identity),
+        timeout,
+    )
+    .context("request access connect")?;
+    let fingerprint = client.host_fingerprint;
+    // Deliberate teardown — the host should drop the parked/approved session now, not
+    // linger for a stream that isn't coming. (Runs on a background thread — see
+    // `App::try_request_access` — so no log handle here; the caller logs the outcome.)
+    client.disconnect_quit();
+    Ok(fingerprint)
 }
 
 /// Throttle for keyframe requests during hold or decode errors.
@@ -236,6 +341,7 @@ fn video_pump(
     client: Arc<NativeClient>,
     player: VideoPlayer,
     stop: Arc<AtomicBool>,
+    stats: Arc<StreamStats>,
     is_hdr: bool,
     log: &mut std::fs::File,
 ) {
@@ -267,6 +373,7 @@ fn video_pump(
         match client.next_frame(Duration::from_millis(500)) {
             Ok(frame) => {
                 frames_received += 1;
+                stats.frames.store(frames_received, Ordering::Relaxed);
                 if last_heartbeat.elapsed() >= Duration::from_secs(2) {
                     last_heartbeat = Instant::now();
                     let _ = writeln!(
@@ -284,6 +391,7 @@ fn video_pump(
                 }
                 if (gap || dropped) && !holding {
                     holding = true;
+                    stats.holding.store(true, Ordering::Relaxed);
                     hold_started = Some(Instant::now());
                     let _ = writeln!(
                         log,
@@ -319,10 +427,14 @@ fn video_pump(
                         );
                     }
                     holding = false;
+                    stats.holding.store(false, Ordering::Relaxed);
                     hold_started = None;
 
                     let pts_ns = frame.pts_ns;
                     let (play_result, feed_elapsed) = player.play(&frame.data, pts_ns);
+                    stats
+                        .feed_us
+                        .store(u32::try_from(feed_elapsed.as_micros()).unwrap_or(u32::MAX), Ordering::Relaxed);
 
                     if feed_elapsed >= FEED_BACKPRESSURE_WARN {
                         let _ = writeln!(
@@ -373,8 +485,8 @@ fn video_pump(
 
         if is_hdr {
             if let Ok(meta) = client.next_hdr_meta(Duration::ZERO) {
-                if let Err(e) = player.set_hdr_info(&meta, client.color) {
-                    let _ = writeln!(log, "{} set_hdr_info: {e:#}", player.backend_name());
+                if let Err(e) = player.set_color_info(Some(&meta), client.color) {
+                    let _ = writeln!(log, "{} set_color_info: {e:#}", player.backend_name());
                 }
             }
         }

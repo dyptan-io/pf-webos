@@ -167,6 +167,43 @@ narrowed per request, not removed outright.
 `-Z build-std` would close that gap but is a bigger toolchain change, worth it only if profiling
 still shows cost unexplained by the app's own draw calls.
 
+## UI rendering performance, round 3: cached-layer composition + grid scrolling (2026-07-22)
+
+Triggered by an on-device report that the menu UI was sluggish and the game grid couldn't scroll
+at all (rows past the second were laid out below the panel with no scroll state anywhere).
+
+**The question "is tiny-skia a dead end, should the backend be replaced?" was evaluated — answer:
+no.** The measured cost was never software rasterization per se; it was *re-pushing every card
+through tiny-skia's general pipeline on every dirty frame* (~28 pipeline blits/frame — at the
+measured per-call/area cost that alone reproduces the observed ~170-190ms Home frame). The
+alternatives all lose: SDL2-accelerated per-widget textures was the original backend (replaced for
+AA quality, and it had its own per-widget cost); real LVGL was already evaluated and rejected
+(see below); GLES2-direct is a rewrite of every drawing primitive for a 4-screen menu. Raw
+row-`memcpy` composition, in contrast, is measured fast on this SoC (`blit_layer`/`dim` history
+above).
+
+Architecture now (second iteration, same day — the first moved composition to raw CPU blits at
+~43ms/frame, then was superseded by moving composition to the GPU outright once animations were
+wanted): **hybrid rasterize-CPU / composite-GPU**. tiny-skia still rasterizes every widget (the
+AA/soft-shadow look is untouched), but into standalone cached *tiles* (`ui::render_card_tile`/
+`render_focused_row_tile`/`render_focus_ring_tile`/text tiles + the sidebar strip + the modal),
+each owning a GPU texture in `compositor.rs`. `App::prepare_tiles` re-rasterizes only stale tiles
+(art arrival = that one card); `App::draw_list` emits per-frame texture-copy commands the
+`opengles2` SDL renderer executes. Position, scroll, the focus pop's scale, and fades are dst-rect/
+alpha parameters — a pure animation/nav frame costs ~zero CPU, which is what makes the 60fps
+animations (eased scroll, card focus pop, modal fade/slide — `App::tick_animations`) viable on
+this SoC. Content frames measured on-device: ~38-41ms when a cover art arrives (rasterize + upload
+one tile), one-time ~460ms full-library tile build. Notes: tiles are premultiplied-alpha —
+`Compositor::upload` un-premultiplies on upload since SDL's `BlendMode::Blend` expects straight
+alpha; `SDL_RENDER_SCALE_QUALITY=1` (linear) is required or the pop shimmers; the sdl2 crate's
+`unsafe_textures` feature lets the texture cache live in a struct. The redraw-on-change loop
+gained one nuance: `tick_animations` keeps frames flowing while anything animates, and only
+`content_dirty` frames re-rasterize.
+
+If profiling is ever needed again: the render-cost log line in `run_ui_flow` ("render: Xms",
+currently a TEMP diagnostic, content frames only) is the ground truth on-device; re-add it rather
+than guessing.
+
 ## High-bitrate video decode choppiness (2026-07-21)
 
 Symptom: decode visibly lags the stream and framerate gets choppy above ~80 Mbps, unusable
@@ -325,9 +362,14 @@ host). The actual gap versus moonlight-tv's polish was rendering quality (no AA,
 "shadows"), not a missing widget/layout framework — `tiny-skia` closes that gap directly without
 either cost.
 
-Renders with LG's own on-device system font (`/usr/share/fonts/LG_Smart_UI-Regular.ttf`) —
-**assume it only reliably covers ASCII**: an earlier attempt at a "⚙ Settings" row using the
-U+2699 gear glyph rendered as a broken box. All 10 icons this UI uses (tv, lock, add, close,
+Text renders in punktfunk's brand font, **Geist** (2026-07-23; previously LG's on-device
+`LG_Smart_UI-Regular.ttf`) — the exact OTFs every other punktfunk client bundles, copied verbatim
+from `pf-console-ui/assets/fonts/` into `assets/fonts/` (OFL license alongside) and embedded via
+`include_bytes!` (`ui::load_font`, weights Regular/Medium/SemiBold/Bold). The sidebar header and
+the splash both come from the brand's ACTUAL logo artwork (`assets/logo/punktfunk-logo-dark.svg`,
+rasterized at display size — see `assets/logo/NOTICE.md`), not a hand-drawn approximation.
+**Assume text fonts only reliably cover Latin**: an earlier attempt at a "⚙ Settings" row using
+the U+2699 gear glyph in the LG font rendered as a broken box. All 10 icons this UI uses (tv, lock, add, close,
 settings, monitor, schedule, signal, sun, chevron-down) were originally vector-drawn path math for
 exactly this reason, then replaced (2026-07-12) with real glyphs from a bundled, subsetted copy of
 Google's Material Icons font (`assets/icons/MaterialIcons-subset.ttf`, Apache 2.0 — provenance,

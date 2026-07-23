@@ -1,7 +1,7 @@
 //! Starfish Media Player (SMP) backend — hardware video decode via webOS's own media
 //! pipeline (`StarfishMediaAPIs_C` / `libplayerAPIs_C.so`).
 //!
-//! Provides three capabilities NDL DirectMedia v2 lacks:
+//! Provides three capabilities NDL `DirectMedia` v2 lacks:
 //! - `pauseAtDecodeTime`: Starfish paces presentation to match PTS, giving a steady
 //!   decode grid when combined with frame-index PTS (see `session.rs`).
 //! - `maxFrameRate` hint: sizes the decode pipeline for the actual refresh rate.
@@ -96,7 +96,7 @@ impl StarfishFns {
     fn load_library() -> Result<Self> {
         let lib = unsafe {
             libc::dlopen(
-                b"libplayerAPIs_C.so\0".as_ptr() as *const c_char,
+                c"libplayerAPIs_C.so".as_ptr(),
                 libc::RTLD_LAZY | libc::RTLD_GLOBAL,
             )
         };
@@ -209,8 +209,7 @@ impl StarfishVideo {
             bail!("SDL_webOSCreateExportedWindow returned null");
         }
 
-        let window_id_cstr =
-            unsafe { CStr::from_ptr(raw_window_id) }.to_owned().into();
+        let window_id_cstr = unsafe { CStr::from_ptr(raw_window_id) }.to_owned();
         let window_id_str = unsafe { CStr::from_ptr(raw_window_id) }
             .to_str()
             .unwrap_or("");
@@ -261,7 +260,7 @@ impl StarfishVideo {
                         "audioOnly": false,
                         "maxWidth": width,
                         "maxHeight": height,
-                        "maxFrameRate": fps as f64
+                        "maxFrameRate": f64::from(fps)
                     },
                     "windowId": window_id_str
                 }
@@ -372,36 +371,50 @@ impl StarfishVideo {
     }
 
     /// Apply HDR10 mastering metadata (ss4s `smp_video.c::SetHDRInfo` JSON structure).
-    pub fn set_hdr_info(
+    /// Forwards the stream's colorimetry (and, for HDR, its mastering metadata)
+    /// to SMP. `meta: None` = an SDR stream: `hdrType` is "none" and only the
+    /// `vui` colour triplet is sent — see `ndl.rs::set_color_info` for why SDR
+    /// colorimetry must be forwarded at all (4K-decodes-as-BT.2020 washout).
+    pub fn set_color_info(
         &self,
-        meta: &punktfunk_core::quic::HdrMeta,
+        meta: Option<&punktfunk_core::quic::HdrMeta>,
         color: punktfunk_core::quic::ColorInfo,
     ) -> Result<()> {
-        // G/B/R order per ST.2086 convention (same as ndl.rs).
-        let [g, b, r] = meta.display_primaries;
-        let payload = serde_json::json!({
-            "hdrType": "HDR10",
-            "sei": {
-                "displayPrimariesX0": g[0],
-                "displayPrimariesY0": g[1],
-                "displayPrimariesX1": b[0],
-                "displayPrimariesY1": b[1],
-                "displayPrimariesX2": r[0],
-                "displayPrimariesY2": r[1],
-                "whitePointX": meta.white_point[0],
-                "whitePointY": meta.white_point[1],
-                "minDisplayMasteringLuminance": meta.min_display_mastering_luminance,
-                "maxDisplayMasteringLuminance": meta.max_display_mastering_luminance,
-                "maxContentLightLevel": meta.max_cll,
-                "maxPicAverageLightLevel": meta.max_fall
-            },
-            "vui": {
-                "transferCharacteristics": color.transfer,
-                "colorPrimaries": color.primaries,
-                "matrixCoeffs": color.matrix,
-                "videoFullRangeFlag": false
+        // The stream's own range flag, not a hardcoded value.
+        let vui = serde_json::json!({
+            "transferCharacteristics": color.transfer,
+            "colorPrimaries": color.primaries,
+            "matrixCoeffs": color.matrix,
+            "videoFullRangeFlag": color.full_range != 0
+        });
+        let payload = match meta {
+            Some(meta) => {
+                // G/B/R order per ST.2086 convention (same as ndl.rs).
+                let [g, b, r] = meta.display_primaries;
+                serde_json::json!({
+                    "hdrType": "HDR10",
+                    "sei": {
+                        "displayPrimariesX0": g[0],
+                        "displayPrimariesY0": g[1],
+                        "displayPrimariesX1": b[0],
+                        "displayPrimariesY1": b[1],
+                        "displayPrimariesX2": r[0],
+                        "displayPrimariesY2": r[1],
+                        "whitePointX": meta.white_point[0],
+                        "whitePointY": meta.white_point[1],
+                        "minDisplayMasteringLuminance": meta.min_display_mastering_luminance,
+                        "maxDisplayMasteringLuminance": meta.max_display_mastering_luminance,
+                        "maxContentLightLevel": meta.max_cll,
+                        "maxPicAverageLightLevel": meta.max_fall
+                    },
+                    "vui": vui
+                })
             }
-        })
+            None => serde_json::json!({
+                "hdrType": "none",
+                "vui": vui
+            }),
+        }
         .to_string();
 
         let payload_cstr = CString::new(payload)?;

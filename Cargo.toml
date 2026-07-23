@@ -74,10 +74,14 @@ mdns-sd = "0.20"
 # vars in .cargo/config.toml against the webOS sysroot (`task toolchain`) — no
 # bundled/static build.
 [target.'cfg(target_os = "linux")'.dependencies]
-# "ttf": SDL2_ttf + freetype are already on-device (confirmed on the CX), and we
-# render with LG's own system font (/usr/share/fonts/LG_Smart_UI-Regular.ttf) — see
-# ui.rs. No bundling needed, same build-time-link/runtime-resolve pattern as NDL.
-sdl2 = { version = "0.38", default-features = false, features = ["ttf"] }
+# "ttf": SDL2_ttf + freetype are already on-device (confirmed on the CX). Text
+# renders in punktfunk's brand font, Geist, embedded from assets/fonts/ (see
+# ui.rs::load_font) — the on-device LG system font is no longer used.
+# `unsafe_textures`: drops the `Texture<'r>` lifetime tie to its `TextureCreator`,
+# so the GPU compositor (see `compositor.rs`) can hold its texture cache in a
+# struct. Textures then don't auto-destroy on drop — ours live for the app's
+# lifetime, freed with the GL context at exit.
+sdl2 = { version = "0.38", default-features = false, features = ["ttf", "unsafe_textures"] }
 # Opus decode for the host's audio planes (audio.rs) — already a transitive dep via
 # punktfunk-core's `quic` feature (its C-ABI multistream path), but we call the crate
 # directly ourselves so it needs to be an explicit dependency too.
