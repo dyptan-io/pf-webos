@@ -282,21 +282,23 @@ this symptom.
   build (an earlier attempt's negative result was suspect due to a mismatched build) — same
   negative result confirmed. Not committed.
 
-**Fixed (2026-07-23), but NDL-only so far**: renicing the NDL/Starfish vendor `.so`'s internal
-decode-pipeline threads to -10 — **large, confirmed improvement on NDL**. These are
-`GStreamer`-element pad-task threads (`"<element>:<pad>"`, truncated to the kernel's 15-char
-`comm` limit) spawned *inside our own process* by the vendor library, invisible to
-punktfunk-core's hot-thread registry (that only covers threads this crate and punktfunk-core
-spawn themselves) and confirmed via live `/proc/<pid>/task` sampling to sit at default nice 0
-despite doing real decode work — a real contention cost on this SoC's **3 CPU cores**
-(`nproc`-confirmed on-device). `session.rs::spawn_vendor_decode_thread_renicer` matches by the
-`:src` pad-name suffix rather than the two exact names observed under NDL
-(`lxvideodec1:src`/`video-src:src`), on the theory that Starfish's own internal pipeline uses
-the same `GStreamer` pad-task convention with different element names — **not yet confirmed
-whether the broader match actually catches Starfish's threads; still choppy there as of this
-writing.** If Starfish remains unaffected after this generalization, the next step is live
-`/proc` sampling during an active Starfish session specifically, to find its actual thread names
-rather than assuming the `:src` suffix covers them.
+**Fixed (2026-07-23) for NDL — large, confirmed improvement. Starfish remains choppier despite an
+attempted generalization; parked, not pursued further for now.** Renicing the NDL/Starfish vendor
+`.so`'s internal decode-pipeline threads to -10 fixed NDL outright. These are `GStreamer`-element
+pad-task threads (`"<element>:<pad>"`, truncated to the kernel's 15-char `comm` limit) spawned
+*inside our own process* by the vendor library, invisible to punktfunk-core's hot-thread registry
+(that only covers threads this crate and punktfunk-core spawn themselves) and confirmed via live
+`/proc/<pid>/task` sampling to sit at default nice 0 despite doing real decode work — a real
+contention cost on this SoC's **3 CPU cores** (`nproc`-confirmed on-device).
+`session.rs::spawn_vendor_decode_thread_renicer` matches by the `:src` pad-name suffix rather than
+the two exact names observed under NDL (`lxvideodec1:src`/`video-src:src`), on the theory that
+Starfish's own internal pipeline uses the same `GStreamer` pad-task convention with different
+element names. **Retested after generalizing: no change for Starfish** — either its pipeline
+doesn't follow the `:src` naming convention, or thread priority isn't its bottleneck at all. Not
+investigated further this pass (would need live `/proc` sampling during an active Starfish
+session to find its actual thread names, or a different hypothesis entirely) — kept as a known,
+open gap rather than guessed at blindly. The suffix-based match and background-thread renicer
+are kept as shipped, confirmed-correct behavior for NDL regardless.
 
 **Still open**: a prior data point (2560x1440@120fps/150Mbps, NDL) showed the host's own frame
 *arrival* rate cycling ~76-120fps with zero client-side drops/gaps ever flagged — suggesting the
