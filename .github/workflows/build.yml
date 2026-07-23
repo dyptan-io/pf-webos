@@ -1,10 +1,5 @@
 name: Build
 
-# Every push to main/PR builds and uploads a dev .ipk as a build artifact. A
-# published GitHub Release additionally re-runs the same build against the
-# release tag (`task native:package` detects it via GITHUB_REF_TYPE/GITHUB_REF_NAME —
-# see taskfiles/toolchain.yml) and attaches the .ipk + Homebrew Channel manifest
-# to the release page instead of just uploading an artifact.
 on:
   push:
     branches: [main]
@@ -21,8 +16,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.sha }}
-          # Full history + tags: dev builds version themselves off the latest
-          # release tag (task native:package's LATEST_TAG, via `git describe`).
           fetch-depth: 0
 
       - name: Install Rust (stable, prebuilt) + cross target

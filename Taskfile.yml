@@ -23,6 +23,15 @@ vars:
   SYSROOT: '{{.NDK_DIR}}/arm-webos-linux-gnueabi/sysroot'
   TARGET: armv7-unknown-linux-gnueabi
   RUST_IMAGE: rust:bookworm
+  PKG_VERSION:
+    sh: |
+      if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+        echo "${GITHUB_REF_NAME#v}"
+      else
+        LATEST=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo 0.0.1)
+        SHA=$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
+        echo "${LATEST}+git.${SHA}"
+      fi
 
 tasks:
   build:
@@ -42,11 +51,6 @@ tasks:
     cmds:
       - task: toolchain:docker-run
         vars: {TARGET_TASK: native:package}
-
-  shell:
-    desc: Interactive shell in the Docker build container (debugging)
-    cmds:
-      - task: toolchain:docker-shell
 
   lint:
     desc: Cross-target `cargo clippy` (the lint set in Cargo.toml's `[lints.clippy]`), inside Docker
@@ -97,18 +101,29 @@ tasks:
     deps: [native:build, toolchain:ares-package]
     cmds:
       - task: toolchain:stage-and-package
+        vars:
+          PKG_VERSION: '{{.PKG_VERSION}}'
 
   deploy:
     desc: >-
-      Build, package, install on a real TV over SSH, and launch it — useful for
-      iterating/debugging on real hardware. Usage: task deploy TV_HOST=root@<tv-ip>
-      (or set TV_HOST in .env, see .env.example)
+      Build, package, install on a real TV over SSH, and launch it. Usage:
+      task deploy TV_HOST=root@<tv-ip> (or set TV_HOST in .env)
     deps: [package]
     requires:
       vars: [TV_HOST]
+    vars:
+      IPK: dist/io.dyptan.punktfunk.webos_{{.PKG_VERSION}}_arm.ipk
     cmds:
-      - task: toolchain:deploy
-        vars: {TV_HOST: '{{.TV_HOST}}'}
+      - test -f "{{.IPK}}" || exit 1
+      - scp "{{.IPK}}" {{.TV_HOST}}:/tmp/
+      - >-
+        ssh -tt {{.TV_HOST}}
+        "luna-send -i -n 1 -f luna://com.webos.appInstallService/dev/install
+        '{\"id\":\"io.dyptan.punktfunk.webos\",\"ipkUrl\":\"/tmp/$(basename {{.IPK}})\",\"subscribe\":true}'"
+      - sleep 3
+      - >-
+        ssh -tt {{.TV_HOST}}
+        "luna-send -n 1 -f luna://com.webos.applicationManager/launch '{\"id\":\"io.dyptan.punktfunk.webos\"}'"
 
   deploy:log:
     desc: >-
@@ -120,13 +135,8 @@ tasks:
       - ssh {{.TV_HOST}} "tail -f /tmp/punktfunk-webos.log"
 
   clean:
-    desc: Remove local build output (dist/) — keeps the toolchain/cargo caches
-    cmds:
-      - rm -rf dist
-
-  clean:all:
     desc: Remove everything — dist/, .toolchains/, target/, and the Docker volumes
     cmds:
-      - task: clean
+      - rm -rf dist
       - rm -rf .toolchains target
-      - task: toolchain:docker-volumes-rm
+      - docker volume rm -f pf-webos-toolchains pf-webos-target pf-webos-cargo pf-webos-apt-cache pf-webos-apt-lists pf-webos-tools

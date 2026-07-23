@@ -35,6 +35,8 @@ pub enum Tile {
     NoHost,
     /// The in-stream stats overlay panel (`ui::render_stats_overlay_tile`).
     StatsOverlay,
+    /// The in-stream disconnect-confirmation dialog (`ui::render_disconnect_dialog_tile`).
+    DisconnectDialog,
 }
 
 /// One step of a frame's composition, in paint order.
