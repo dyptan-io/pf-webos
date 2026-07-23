@@ -72,17 +72,6 @@ task deploy TV_HOST=root@<tv-ip>
 Only published [GitHub Releases](https://github.com/dyptan-io/pf-webos/releases) show up this way
 — dev/CI builds don't.
 
-## Known platform limitations
-
-Not fixable from application code — see `docs/NOTES.md` for the research trail:
-
-- **Frame rate paces the stream only; it can't change the TV panel's scan-out rate.** No webOS
-  system API exposes that to a native app.
-- **The Magic Remote's hardware Back button is intercepted by webOS's system launcher by
-  default** (a known upstream moonlight-tv issue too) — this client works around it (see
-  `docs/NOTES.md`), with the Red button kept as a fallback for firmware where the workaround isn't
-  honored.
-
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), matching upstream

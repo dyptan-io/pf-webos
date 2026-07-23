@@ -1,58 +1,35 @@
-# webOS-specific plumbing: cross-toolchain fetch, staging/packaging the .ipk, and
-# the Docker wrapper. Kept out of the root Taskfile.yml so that one stays short.
-# Vars are passed in explicitly from the root Taskfile's `includes:` block — Task
-# doesn't share `vars:` between a parent and an included Taskfile by default.
 version: '3'
 
 vars:
   SDL2_BACKPORT_RELEASE: release-2.30.12-webos.5
   SDL2_BACKPORT_VERSION: 2.30.12
   SDL2_BACKPORT_SONAME: libSDL2-2.0.so.0.3000.12
-  GIT_SHA:
-    sh: git rev-parse --short=8 HEAD 2>/dev/null || echo unknown
-  # Non-empty only on a tagged release build (GITHUB_REF_TYPE/GITHUB_REF_NAME are
-  # set by GitHub Actions on every job).
-  RELEASE_TAG:
-    sh: |
-      if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
-        echo "${GITHUB_REF_NAME#v}"
-      fi
-  # Most recent published release, for dev builds to version themselves off of
-  # (see stage-and-package below). Needs the repo's tags fetched — CI's checkout
-  # step uses fetch-depth: 0 for this.
-  LATEST_TAG:
-    sh: git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo 0.0.1
-  # Named volumes, never `/usr/local/cargo`/`/usr/local/rustup` themselves — a
-  # mount over either would blow away the base image's own Rust install.
   DOCKER_MOUNTS: >-
     -v {{.ROOT_DIR}}:/workspace
     -v pf-webos-toolchains:/workspace/.toolchains
     -v pf-webos-target:/workspace/target
-    -v pf-webos-cargo-registry:/usr/local/cargo/registry
-    -v pf-webos-cargo-git:/usr/local/cargo/git
+    -v pf-webos-cargo:/opt/pf-webos-cargo
     -v pf-webos-apt-cache:/var/cache/apt/archives
+    -v pf-webos-apt-lists:/var/lib/apt/lists
     -v pf-webos-tools:/opt/pf-webos-tools
     -w /workspace
-    -e PATH=/opt/pf-webos-tools/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    -e CARGO_HOME=/opt/pf-webos-cargo
+    -e PATH=/opt/pf-webos-tools/bin:/opt/pf-webos-cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 tasks:
   # ---------------------------------------------------------------- toolchain --
 
   ndk:
-    desc: Fetch the webosbrew/native-toolchain cross-compiler (idempotent)
+    desc: Fetch the webosbrew/native-toolchain cross-compiler
     status:
       - test -x {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-gcc
     cmds:
       - |
         set -eu
-        # Only a Linux aarch64 build exists (confirmed via the GitHub releases
-        # API back to 2023 — no linux-x86_64 ever shipped). This always runs
-        # inside the Docker container (forced to --platform linux/arm64) or on
-        # an aarch64 CI runner, so that's the only case handled.
         case "$(uname -s)-$(uname -m)" in
             Linux-aarch64|Linux-arm64) PLATFORM=linux-aarch64 ;;
             *)
-                echo "no webosbrew/native-toolchain release for $(uname -s)-$(uname -m) — this must run on Linux/aarch64 (inside the Docker container, or an aarch64 CI runner)" >&2
+                echo "no webosbrew/native-toolchain release for $(uname -s)-$(uname -m) — must run on Linux/aarch64" >&2
                 exit 1
                 ;;
         esac
@@ -61,33 +38,24 @@ tasks:
         mkdir -p "$(dirname {{.NDK_DIR}})"
         TMP="$(mktemp -d)"
         trap 'rm -rf "$TMP"' EXIT
-        echo "downloading $URL"
         curl -sL -o "$TMP/$ASSET" "$URL"
         tar xjf "$TMP/$ASSET" -C "$(dirname {{.NDK_DIR}})"
         sh {{.NDK_DIR}}/relocate-sdk.sh
-        # Baked-in default --sysroot is stale post-relocate (cc-shim.sh/
-        # cxx-shim.sh pass it explicitly) — this is just a link sanity check.
         echo 'int main(void) { return 0; }' | {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-gcc \
             --sysroot={{.SYSROOT}} -x c -o "$TMP/probe" -
-        echo "webOS NDK ready at {{.NDK_DIR}}"
 
   sdl2:
-    desc: Overlay webosbrew/SDL-webOS's webOS-patched SDL2 onto the NDK sysroot (idempotent)
+    desc: Overlay webosbrew/SDL-webOS onto the NDK sysroot
     deps: [ndk]
     status:
       - test "$(readlink {{.SYSROOT}}/usr/lib/libSDL2-2.0.so.0)" = "{{.SDL2_BACKPORT_SONAME}}"
     cmds:
       - |
         set -eu
-        # The NDK's own bundled SDL2 lacks webOS's Wayland shell-integration
-        # protocol, so its driver can't get a surface from the TV's compositor
-        # (confirmed live on an LG CX) — every other native webOS SDL2 app
-        # bundles this same fork for the same reason.
         TMP="$(mktemp -d)"
         trap 'rm -rf "$TMP"' EXIT
         ASSET="SDL2-{{.SDL2_BACKPORT_VERSION}}-webos.tar.gz"
         URL="https://github.com/webosbrew/SDL-webOS/releases/download/{{.SDL2_BACKPORT_RELEASE}}/${ASSET}"
-        echo "downloading $URL"
         curl -sL -o "$TMP/$ASSET" "$URL"
         mkdir -p "$TMP/extracted"
         tar xzf "$TMP/$ASSET" -C "$TMP/extracted"
@@ -97,10 +65,9 @@ tasks:
         ln -sf {{.SDL2_BACKPORT_SONAME}} {{.SYSROOT}}/usr/lib/libSDL2.so
         sed -i.bak "s/^Version:.*/Version: {{.SDL2_BACKPORT_VERSION}}/" {{.SYSROOT}}/usr/lib/pkgconfig/sdl2.pc
         rm -f {{.SYSROOT}}/usr/lib/pkgconfig/sdl2.pc.bak
-        echo "webOS SDL2 backport overlaid onto {{.SYSROOT}}"
 
   all:
-    desc: Fetch the full webOS cross-toolchain (NDK + SDL2 overlay) — idempotent
+    desc: Fetch the full webOS cross-toolchain
     deps: [ndk, sdl2]
 
   ares-package:
@@ -108,41 +75,14 @@ tasks:
     status:
       - command -v ares-package
     cmds:
-      # Needs a fairly recent stable Rust (its source uses let-chains).
       - cargo install --git https://github.com/webosbrew/ares-cli-rs ares-package
-
-  deploy:
-    internal: true
-    requires:
-      vars: [TV_HOST]
-    vars:
-      IPK_PATH:
-        sh: ls -t dist/*.ipk | head -1
-      IPK_NAME:
-        sh: basename {{.IPK_PATH}}
-    cmds:
-      - echo "installing {{.IPK_NAME}} on {{.TV_HOST}}"
-      - scp {{.IPK_PATH}} {{.TV_HOST}}:/tmp/
-      # -tt: luna-send needs a real PTY over non-interactive SSH or it silently
-      # swallows output (see docs/NOTES.md). install is async — `-n 1` only
-      # acks that it started, so launching too soon races it into "app is
-      # locked"; the sleep is the same margin the hand-verified recipe used.
-      - >-
-        ssh -tt {{.TV_HOST}}
-        "luna-send -i -n 1 -f luna://com.webos.appInstallService/dev/install
-        '{\"id\":\"io.dyptan.punktfunk.webos\",\"ipkUrl\":\"/tmp/{{.IPK_NAME}}\",\"subscribe\":true}'"
-      - sleep 3
-      - ssh {{.TV_HOST}} "rm -f /tmp/punktfunk-webos.log"
-      - >-
-        ssh -tt {{.TV_HOST}}
-        "luna-send -n 1 -f luna://com.webos.applicationManager/launch '{\"id\":\"io.dyptan.punktfunk.webos\"}'"
-      - 'echo "launched — tail the log with: task deploy:log TV_HOST={{.TV_HOST}}"'
 
   # ------------------------------------------------------------------ package --
 
   stage-and-package:
     internal: true
-    desc: Stage the stripped binary + bundled SDL2 + assets, then invoke ares-package
+    requires:
+      vars: [PKG_VERSION, TARGET, NDK_DIR, SYSROOT]
     cmds:
       - |
         set -eu
@@ -151,57 +91,30 @@ tasks:
         mkdir -p "$STAGE_DIR/bin" "$STAGE_DIR/lib"
         cp target/{{.TARGET}}/release/punktfunk-webos "$STAGE_DIR/bin/"
         {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-strip "$STAGE_DIR/bin/punktfunk-webos"
-        # On-device libSDL2 (2.0.10) is missing ABI symbols this binary needs —
-        # bundle the exact .so it linked against under the SONAME the dynamic
-        # linker looks for, loaded via the $ORIGIN/../lib rpath build.rs sets.
         cp -L {{.SYSROOT}}/usr/lib/libSDL2-2.0.so.0 "$STAGE_DIR/lib/libSDL2-2.0.so.0"
         {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-strip "$STAGE_DIR/lib/libSDL2-2.0.so.0"
-        # libplayerAPIs_C.so: C wrapper for the C++ StarfishMediaAPIs class.
-        # build.rs compiles this from src/starfish_c_shim.cpp; it is not on the
-        # TV, so we bundle it here (same pattern as libSDL2-2.0.so.0 above).
         cp target/{{.TARGET}}/release/libplayerAPIs_C.so "$STAGE_DIR/lib/libplayerAPIs_C.so"
         {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-strip "$STAGE_DIR/lib/libplayerAPIs_C.so"
         cp packaging/appinfo.json packaging/icon.png packaging/icon_large.png packaging/splash.png "$STAGE_DIR/"
 
-        # webOS/Homebrew Channel reads the *installed* app's own appinfo.json
-        # version (not just the manifest below) to decide if an update is
-        # available — so it must be patched to a real version before
-        # packaging, not left at the checked-in 0.0.1, or every install looks
-        # perpetually outdated. Release builds get the release tag; dev builds
-        # get the latest published release instead, with the HEAD commit's
-        # short sha (`{{.GIT_SHA}}`) appended to the *filename* for traceability
-        # (the version field itself must stay a plain x.x.x).
-        {{if .RELEASE_TAG}}
-        sed -i.bak 's/"version": "0.0.1"/"version": "{{.RELEASE_TAG}}"/' "$STAGE_DIR/appinfo.json"
-        {{else}}
-        sed -i.bak 's/"version": "0.0.1"/"version": "{{.LATEST_TAG}}"/' "$STAGE_DIR/appinfo.json"
-        {{end}}
+        PKG_VERSION="{{.PKG_VERSION}}"
+        APP_VERSION="${PKG_VERSION%%+git.*}"
+        case "$APP_VERSION" in
+          *+*|*[^0-9.]*) echo "error: APP_VERSION '${APP_VERSION}' is not x.x.x" >&2; exit 1 ;;
+        esac
+        sed -i.bak "s/\"version\": \"0.0.1\"/\"version\": \"${APP_VERSION}\"/" "$STAGE_DIR/appinfo.json"
         rm -f "$STAGE_DIR/appinfo.json.bak"
         mkdir -p dist
         ares-package "$STAGE_DIR" -o dist --force-arch arm
 
-        {{if .RELEASE_TAG}}
-        # Nothing to rename — ares-package already names the .ipk after the
-        # patched appinfo.json version above.
-        {{else}}
-        for f in dist/*_arm.ipk; do
-          [ -e "$f" ] || continue
-          case "$f" in *"+git.{{.GIT_SHA}}"*) continue ;; esac
-          mv "$f" "${f%_arm.ipk}+git.{{.GIT_SHA}}_arm.ipk"
-        done
-        {{end}}
-
-        {{if .RELEASE_TAG}}
-        # Homebrew Channel manifest (schema: webosbrew/docs/schemas/
-        # HomebrewPackageManifest.schema.json) — repo.json's manifestUrl
-        # resolves to this. Only generated on a tagged release build.
-        IPK_FILE="$(ls dist/*_{{.RELEASE_TAG}}_arm.ipk)"
-        IPK_SHA256="$(sha256sum "$IPK_FILE" | cut -d' ' -f1)"
-        REPO="${GITHUB_REPOSITORY:-dyptan-io/pf-webos}"
-        cat > dist/io.dyptan.punktfunk.webos.manifest.json <<EOF
+        if [ "$PKG_VERSION" = "$APP_VERSION" ]; then
+          IPK_FILE="dist/io.dyptan.punktfunk.webos_${PKG_VERSION}_arm.ipk"
+          IPK_SHA256="$(sha256sum "$IPK_FILE" | cut -d' ' -f1)"
+          REPO="${GITHUB_REPOSITORY:-dyptan-io/pf-webos}"
+          cat > dist/io.dyptan.punktfunk.webos.manifest.json <<EOF
         {
           "id": "io.dyptan.punktfunk.webos",
-          "version": "{{.RELEASE_TAG}}",
+          "version": "${APP_VERSION}",
           "type": "native",
           "title": "punktfunk",
           "appDescription": "punktfunk — low-latency desktop/game streaming client",
@@ -212,18 +125,12 @@ tasks:
           "ipkHash": { "sha256": "$IPK_SHA256" }
         }
         EOF
-        echo "manifest: dist/io.dyptan.punktfunk.webos.manifest.json"
-        {{end}}
-
-        echo "packaged:"
-        ls -lh dist/*.ipk
+        else
+          mv "dist/io.dyptan.punktfunk.webos_${APP_VERSION}_arm.ipk" \
+             "dist/io.dyptan.punktfunk.webos_${PKG_VERSION}_arm.ipk"
+        fi
 
   # ------------------------------------------------------------------- docker --
-  # Ephemeral `docker run --rm` against the stock `rust` image, re-invoking the
-  # root `native:*` tasks inside via a nested `task` install — no build logic
-  # duplicated between CI's native path and this one. Forced to
-  # --platform linux/arm64 regardless of host arch: the webOS NDK has no
-  # linux-x86_64 build, so an amd64 host runs it under QEMU instead of failing.
 
   docker-run:
     internal: true
@@ -239,12 +146,3 @@ tasks:
           task {{.TARGET_TASK}}
         '
 
-  docker-shell:
-    internal: true
-    cmds:
-      - "docker run --rm -it --platform linux/arm64 {{.DOCKER_MOUNTS}} {{.RUST_IMAGE}} bash"
-
-  docker-volumes-rm:
-    internal: true
-    cmds:
-      - docker volume rm -f pf-webos-toolchains pf-webos-target pf-webos-cargo-registry pf-webos-cargo-git pf-webos-apt-cache pf-webos-tools

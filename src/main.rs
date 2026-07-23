@@ -44,7 +44,6 @@ mod real {
     use anyhow::{Context, Result};
     use punktfunk_core::config::Mode;
     use sdl2::controller::GameController;
-    use sdl2::mouse::MouseButton;
 
     use crate::app::{App, Screen};
     use crate::compositor::{Compositor, DrawCmd, Tile};
@@ -136,16 +135,6 @@ mod real {
         }
     }
 
-    /// How long the keyboard/gamepad Back-equivalent must be held during a
-    /// stream before it disconnects and returns to the menu — long enough that a
-    /// normal game-input tap of the same physical button (many games use
-    /// B/Back-ish buttons) never triggers it.
-    const LONG_PRESS_BACK: Duration = Duration::from_millis(1500);
-    /// How long the Magic Remote's OK button (the pointer's left click) must be held
-    /// before it's promoted to a right click — long enough that a normal click never
-    /// trips it, short enough to feel deliberate rather than sluggish.
-    const LONG_PRESS_OK: Duration = Duration::from_millis(500);
-
     /// How long OK must be held on a sidebar host row before it opens
     /// `Screen::ForgetHost` instead of that row's normal short-press action
     /// (connect/pair) — see `run_ui_flow`'s `confirm_held_since`. Short enough
@@ -168,20 +157,6 @@ mod real {
         } else {
             *held = true;
             ev
-        }
-    }
-
-    /// Starts/clears the streaming loop's Back long-press timer (see
-    /// `LONG_PRESS_BACK`) — shared by the keyboard and controller arms, which
-    /// otherwise repeat this identically.
-    fn track_back_hold(is_back: bool, pressed: bool, held_since: &mut Option<Instant>) {
-        if !is_back {
-            return;
-        }
-        if pressed {
-            held_since.get_or_insert_with(Instant::now);
-        } else {
-            *held_since = None;
         }
     }
 
@@ -545,12 +520,8 @@ mod real {
     }
 
     fn run_inner(log: &mut std::fs::File) -> Result<()> {
-        // Without this, webOS's system launcher intercepts the Magic Remote's Back
-        // key before the app ever sees it (confirmed on-device — see
-        // docs/NOTES.md's "Tried and abandoned" note on this exact hint, previously
-        // removed after it appeared not to help; re-trying it here). Must be set
-        // before the window is created — `SDL_waylandwebos.c` only applies it at
-        // window-creation time (plus a runtime hint-watcher for later changes).
+        // Prevents webOS's system launcher from intercepting the Magic Remote's Back
+        // key. Must be set before window creation.
         sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
         // Linear texture filtering (SDL defaults to nearest) — the focus pop
         // scales card textures slightly, which shimmers without it.
@@ -729,9 +700,6 @@ mod real {
                 audio_player.spec()
             )?;
 
-            let mut back_held_since: Option<Instant> = None;
-            let mut ok_held_since: Option<Instant> = None;
-            let mut ok_promoted = false;
             let mut scroll_acc = mouse::ScrollAccumulator::default();
             // In-stream stats overlay (Settings toggle): refreshed at ~2Hz onto the
             // otherwise-transparent stream window. Drawing composites OVER the
@@ -743,6 +711,10 @@ mod real {
             let mut overlay_last: Option<Instant> = None;
             let mut overlay_prev_frames: u64 = 0;
             let mut overlay_prev_at = Instant::now();
+            // None = dialog not shown; Some(0) = shown, "Disconnect" focused;
+            // Some(1) = shown, "Cancel" focused (default on open — safer).
+            let mut disconnect_dialog: Option<usize> = None;
+            let mut dialog_dirty = false;
             let outcome = 'running: loop {
                 if QUIT_REQUESTED.load(Ordering::Relaxed) {
                     writeln!(log, "SIGTERM/SIGINT received — disconnecting before exit")?;
@@ -770,29 +742,73 @@ mod real {
                         Event::ControllerDeviceRemoved { .. } => {
                             controller = None;
                         }
-                        Event::KeyDown { keycode: Some(k), .. } => {
-                            let is_back = crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back);
-                            track_back_hold(is_back, true, &mut back_held_since);
-                            if let Some(ev) = keyboard::key_event(k, true) {
+                        // Dialog open: navigate it only, don't forward input to the
+                        // host. Non-repeat keys/fresh controller presses only, so the
+                        // held Back that opened it doesn't also dismiss it.
+                        _ if disconnect_dialog.is_some() => {
+                            let focus = disconnect_dialog.expect("guarded by is_some above");
+                            let nav = match &event {
+                                Event::KeyDown { keycode: Some(k), repeat: false, .. } => {
+                                    crate::ui::menu_event_for_key(*k)
+                                }
+                                Event::ControllerButtonDown { button, .. } => {
+                                    crate::ui::menu_event_for_button(*button)
+                                }
+                                _ => None,
+                            };
+                            match nav {
+                                Some(MenuEvent::Left) | Some(MenuEvent::Right) => {
+                                    disconnect_dialog = Some(1 - focus);
+                                    dialog_dirty = true;
+                                }
+                                Some(MenuEvent::Confirm) if focus == 0 => {
+                                    writeln!(log, "back — disconnecting to menu")?;
+                                    connected.client.disconnect_quit();
+                                    break 'running StreamOutcome::ReturnToMenu;
+                                }
+                                Some(MenuEvent::Confirm) | Some(MenuEvent::Back) => {
+                                    disconnect_dialog = None;
+                                    // Clear both double-buffer frames back to transparent
+                                    // (also wipes the stats overlay — force a redraw).
+                                    canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
+                                    canvas.clear();
+                                    canvas.present();
+                                    canvas.clear();
+                                    canvas.present();
+                                    overlay_last = None;
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Scancode keys are real game input (Backspace/Escape/etc.
+                        // included) — forward only, never open the dialog.
+                        Event::KeyDown { scancode: Some(sc), .. } => {
+                            if let Some(ev) = keyboard::key_event(sc, true) {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
                         }
-                        Event::KeyUp { keycode: Some(k), .. } => {
-                            let is_back = crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back);
-                            track_back_hold(is_back, false, &mut back_held_since);
-                            if let Some(ev) = keyboard::key_event(k, false) {
+                        // Magic Remote Back (0x200003): no scancode, never
+                        // forwarded to the host — open the disconnect dialog.
+                        Event::KeyDown { keycode: Some(k), scancode: None, repeat: false, .. }
+                            if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) =>
+                        {
+                            disconnect_dialog = Some(1);
+                            dialog_dirty = true;
+                        }
+                        Event::KeyUp { scancode: Some(sc), .. } => {
+                            if let Some(ev) = keyboard::key_event(sc, false) {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
                         }
                         Event::ControllerButtonDown { button, .. } => {
-                            let is_back = crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back);
-                            track_back_hold(is_back, true, &mut back_held_since);
+                            if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back) {
+                                disconnect_dialog = Some(1);
+                                dialog_dirty = true;
+                            }
                             let ev = gamepad::button_event(button, true, 0);
                             let _ = session::send_input(&connected.client, &ev);
                         }
                         Event::ControllerButtonUp { button, .. } => {
-                            let is_back = crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back);
-                            track_back_hold(is_back, false, &mut back_held_since);
                             let ev = gamepad::button_event(button, false, 0);
                             let _ = session::send_input(&connected.client, &ev);
                         }
@@ -809,25 +825,12 @@ mod real {
                             let _ = session::send_input(&connected.client, &ev);
                         }
                         Event::MouseButtonDown { mouse_btn, .. } => {
-                            if mouse_btn == MouseButton::Left {
-                                ok_held_since = Some(Instant::now());
-                                ok_promoted = false;
-                            }
                             if let Some(ev) = mouse::button_event(mouse_btn, true) {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
                         }
                         Event::MouseButtonUp { mouse_btn, .. } => {
-                            let released = if mouse_btn == MouseButton::Left && ok_promoted {
-                                MouseButton::Right
-                            } else {
-                                mouse_btn
-                            };
-                            if mouse_btn == MouseButton::Left {
-                                ok_held_since = None;
-                                ok_promoted = false;
-                            }
-                            if let Some(ev) = mouse::button_event(released, false) {
+                            if let Some(ev) = mouse::button_event(mouse_btn, false) {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
                         }
@@ -846,29 +849,42 @@ mod real {
                         _ => {}
                     }
                 }
-                if back_held_since.is_some_and(|t| t.elapsed() >= LONG_PRESS_BACK) {
-                    writeln!(log, "back — disconnecting to menu")?;
-                    // A deliberate user stop (not a network drop/backgrounding) — the
-                    // host tears the virtual display down immediately instead of
-                    // lingering for a reconnect that isn't coming (see the embedding
-                    // guide's teardown section). Every other exit path (host ended
-                    // the session, app quit) leaves this alone and just drops the
-                    // client, which closes with the "may reconnect" code instead.
-                    connected.client.disconnect_quit();
-                    break 'running StreamOutcome::ReturnToMenu;
-                }
-                if !ok_promoted && ok_held_since.is_some_and(|t| t.elapsed() >= LONG_PRESS_OK) {
-                    // Release left before pressing right so the host never sees both held.
-                    if let Some(ev) = mouse::button_event(MouseButton::Left, false) {
-                        let _ = session::send_input(&connected.client, &ev);
+                // Render the disconnect dialog when open. The card floats over
+                // the live video (transparent surroundings); tile re-rasterizes only
+                // on focus change, but scrim + card recomposite every tick (double
+                // buffered — a single present would leave the other buffer stale).
+                if let Some(focus) = disconnect_dialog {
+                    let full = sdl2::rect::Rect::new(0, 0, display_mode.w as u32, display_mode.h as u32);
+                    if dialog_dirty {
+                        dialog_dirty = false;
+                        let tile = crate::ui::render_disconnect_dialog_tile(
+                            full.width(),
+                            full.height(),
+                            &font_label,
+                            &icon_font,
+                            focus,
+                        )?;
+                        compositor.upload(&texture_creator, Tile::DisconnectDialog, &tile)?;
                     }
-                    if let Some(ev) = mouse::button_event(MouseButton::Right, true) {
-                        let _ = session::send_input(&connected.client, &ev);
-                    }
-                    ok_promoted = true;
+                    canvas.set_blend_mode(sdl2::render::BlendMode::None);
+                    canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
+                    canvas.clear();
+                    compositor.execute(
+                        &mut canvas,
+                        &[
+                            DrawCmd::Fill { rect: full, color: sdl2::pixels::Color::RGBA(0, 0, 0, crate::ui::MODAL_SCRIM.a) },
+                            DrawCmd::Tex { tile: Tile::DisconnectDialog, dst: full, alpha: 0xff },
+                        ],
+                    )?;
+                    canvas.present();
                 }
                 session::pump_audio_once(&connected.client, &mut audio_player, log);
-                if stats_enabled && overlay_last.is_none_or(|t| t.elapsed() >= Duration::from_millis(500)) {
+                // Skipped while the dialog is open — its own redraw above already
+                // owns the canvas this tick.
+                if stats_enabled
+                    && disconnect_dialog.is_none()
+                    && overlay_last.is_none_or(|t| t.elapsed() >= Duration::from_millis(500))
+                {
                     overlay_last = Some(Instant::now());
                     let frames = connected.stats.frames.load(Ordering::Relaxed);
                     let dt = overlay_prev_at.elapsed().as_secs_f32().max(0.001);

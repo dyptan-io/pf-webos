@@ -605,9 +605,9 @@ impl App {
     /// Applies a `Back` to whichever screen is current — the single shared
     /// definition of "what Back means here" for every caller that needs it
     /// pre-emptively rather than through the normal per-screen `MenuEvent`
-    /// dispatch: `main.rs`'s keyboard/gamepad Back shortcut on Home (straight
-    /// to Settings) and a modal's close (X) button click
-    /// (`handle_mouse_click`'s `hover_close` branch below).
+    /// dispatch: `main.rs`'s Back handling on Home (a no-op there, but routed
+    /// through here so the policy lives in one place) and a modal's close (X)
+    /// button click (`handle_mouse_click`'s `hover_close` branch below).
     pub fn back(&mut self, log: &mut std::fs::File) -> Option<ConnectTarget> {
         match self.screen {
             // Home has nothing to "back out" of (it's the root screen) — Back is a
@@ -1804,7 +1804,7 @@ impl App {
             Tile::NoHost => self.nohost_tile.as_ref(),
             // Stream-side only (uploaded directly by `run_inner`'s overlay
             // refresh) — never one of App's menu tiles.
-            Tile::StatsOverlay => None,
+            Tile::StatsOverlay | Tile::DisconnectDialog => None,
         }
     }
 

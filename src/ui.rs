@@ -1108,6 +1108,46 @@ pub fn render_stats_overlay_tile(font: &Font, lines: &[String]) -> Result<Painte
     Ok(p)
 }
 
+/// The in-stream disconnect-confirmation dialog: card, title, and confirm
+/// buttons, full-screen sized like `App`'s `Tile::Modal` so `main.rs` can
+/// place it at `(0, 0)`. No backdrop dim baked in — `main.rs` draws that as
+/// its own compositor `Fill`, same as `App::draw_list` scrims `Tile::Modal`.
+pub fn render_disconnect_dialog_tile(
+    screen_w: u32,
+    screen_h: u32,
+    font_label: &Font,
+    icon_font: &Font,
+    focused: usize,
+) -> Result<Painter> {
+    let mut p = Painter::new(screen_w, screen_h);
+    let mut tc = TextCache::new();
+    let card = modal_card_rect(screen_w, screen_h, 0.34, 200);
+    draw_modal_card(&mut p, card);
+    let title = "Stop streaming?";
+    let (title_w, _) = font_label.size_of(title).unwrap_or((0, 0));
+    let title_x = card.x() + (card.width() as i32 - title_w as i32) / 2;
+    draw_text(&mut p, &mut tc, font_label, title, title_x, card.y() + 36, WHITE)?;
+    let btn_rect = Rect::new(
+        card.x() + 32,
+        card.y() + 36 + font_label.height() + 28,
+        card.width().saturating_sub(64),
+        72,
+    );
+    draw_confirm_buttons(
+        &mut p,
+        &mut tc,
+        font_label,
+        icon_font,
+        btn_rect,
+        &[
+            ConfirmButton { icon: Some(ICON_CLOSE), label: "Disconnect", color: ERROR_RED },
+            ConfirmButton { icon: None, label: "Cancel", color: WHITE },
+        ],
+        focused,
+    )?;
+    Ok(p)
+}
+
 // ---------------------------------------------------------------------- sidebar --
 
 // Sized for a 10-foot TV viewing distance, not a desktop/phone screen.
