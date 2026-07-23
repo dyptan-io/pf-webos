@@ -337,6 +337,53 @@ const HOLD_GIVE_UP: Duration = Duration::from_secs(2);
 /// Feed calls slower than this suggest decoder backpressure rather than network loss.
 const FEED_BACKPRESSURE_WARN: Duration = Duration::from_millis(20);
 
+/// GStreamer-element-named threads the NDL/Starfish vendor `.so` spawns *inside our own
+/// process* for its internal decode pipeline — not part of punktfunk-core's hot-thread
+/// registry (that only covers threads this crate and punktfunk-core spawn themselves).
+/// Confirmed via live `/proc/<pid>/task` sampling during an active stream to be doing
+/// real CPU work while sitting at the default nice 0, unlike our own already-boosted
+/// video-pump/data-pump threads.
+const VENDOR_DECODE_THREAD_NAMES: [&str; 2] = ["lxvideodec1:src", "video-src:src"];
+
+/// Test: renice the vendor `.so`'s internal decode-pipeline threads to -10, same as our
+/// own hot threads. These spawn asynchronously sometime after the decoder loads (not
+/// synchronously within the load call), so this polls `/proc/self/task` for up to a few
+/// seconds rather than scanning once. See docs/NOTES.md's resolution-choppiness entry —
+/// checking whether thread contention on this `SoC`'s 3 cores is what caps smoothness
+/// above 1080p.
+fn renice_vendor_decode_threads(log: &mut std::fs::File) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut reniced = std::collections::HashSet::new();
+    while Instant::now() < deadline && reniced.len() < VENDOR_DECODE_THREAD_NAMES.len() {
+        if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+            for entry in entries.flatten() {
+                let Ok(tid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                    continue;
+                };
+                let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
+                    continue;
+                };
+                let comm = comm.trim();
+                if VENDOR_DECODE_THREAD_NAMES.contains(&comm) && reniced.insert(comm.to_string()) {
+                    // SAFETY: plain syscall — tid and priority value only, no pointers.
+                    if unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -10) } != 0 {
+                        let _ = writeln!(
+                            log,
+                            "setpriority(vendor thread {comm}, tid={tid}) failed: {}",
+                            std::io::Error::last_os_error()
+                        );
+                    } else {
+                        let _ = writeln!(log, "reniced vendor decode thread {comm} (tid={tid}) to -10");
+                    }
+                }
+            }
+        }
+        if reniced.len() < VENDOR_DECODE_THREAD_NAMES.len() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
 fn video_pump(
     client: Arc<NativeClient>,
     player: VideoPlayer,
@@ -356,6 +403,7 @@ fn video_pump(
             );
         }
     }
+    renice_vendor_decode_threads(log);
 
     let wants_decode_latency = client.wants_decode_latency();
     let mut last_dropped_seen = client.frames_dropped();
