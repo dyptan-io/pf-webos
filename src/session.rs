@@ -337,6 +337,77 @@ const HOLD_GIVE_UP: Duration = Duration::from_secs(2);
 /// Feed calls slower than this suggest decoder backpressure rather than network loss.
 const FEED_BACKPRESSURE_WARN: Duration = Duration::from_millis(20);
 
+/// Suffix identifying a `GStreamer` pad-task thread (`"<element-name>:<pad-name>"`,
+/// truncated to the kernel's 15-char `comm` limit) — both the NDL and Starfish vendor
+/// `.so`s build their internal decode pipeline out of `GStreamer` elements, each with its
+/// own pad-task thread spawned *inside our own process*. These are invisible to
+/// punktfunk-core's hot-thread registry (that only covers threads this crate and
+/// punktfunk-core spawn themselves) and sit at the default nice 0 despite doing real
+/// decode work — confirmed via live `/proc/<pid>/task` sampling during an active NDL
+/// stream (its `lxvideodec1:src`/`video-src:src` threads), a real contention cost
+/// against our own already-boosted video-pump/data-pump threads on this `SoC`'s 3 cores.
+/// Matched by suffix, not a fixed name list, so this also covers whichever
+/// differently-named elements the active backend's pipeline happens to use (e.g.
+/// Starfish's own, not just the ones observed under NDL).
+const VENDOR_DECODE_THREAD_SUFFIX: &str = ":src";
+/// How long a decode-thread scan may run with no new match before concluding the
+/// backend's pipeline has finished spawning threads (typically well under this in
+/// practice). Bounded separately by `VENDOR_DECODE_THREAD_SCAN_TIMEOUT` in case a
+/// backend never produces a matching thread at all.
+const VENDOR_DECODE_THREAD_QUIET_PERIOD: Duration = Duration::from_millis(500);
+const VENDOR_DECODE_THREAD_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Renices the active backend's vendor-spawned `GStreamer` pad-task threads to -10, same
+/// as this crate's own hot threads (see [`VENDOR_DECODE_THREAD_SUFFIX`]). Runs on its
+/// own thread — these threads spawn asynchronously sometime after the decoder loads,
+/// not synchronously within the load call, so this polls `/proc/self/task` rather than
+/// scanning once, and must not block `video_pump` from starting to feed frames while it
+/// does.
+fn spawn_vendor_decode_thread_renicer(mut log: std::fs::File) {
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        let mut last_found = start;
+        let mut reniced: std::collections::HashSet<i32> = std::collections::HashSet::new();
+        loop {
+            if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+                for entry in entries.flatten() {
+                    let Ok(tid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                        continue;
+                    };
+                    if reniced.contains(&tid) {
+                        continue;
+                    }
+                    let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
+                        continue;
+                    };
+                    let comm = comm.trim();
+                    if !comm.ends_with(VENDOR_DECODE_THREAD_SUFFIX) {
+                        continue;
+                    }
+                    reniced.insert(tid);
+                    last_found = Instant::now();
+                    // SAFETY: plain syscall — tid and priority value only, no pointers.
+                    if unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -10) } != 0 {
+                        let _ = writeln!(
+                            log,
+                            "setpriority(vendor thread {comm}, tid={tid}) failed: {}",
+                            std::io::Error::last_os_error()
+                        );
+                    } else {
+                        let _ = writeln!(log, "reniced vendor decode thread {comm} (tid={tid}) to -10");
+                    }
+                }
+            }
+            let now = Instant::now();
+            let quiet = !reniced.is_empty() && now.duration_since(last_found) >= VENDOR_DECODE_THREAD_QUIET_PERIOD;
+            if quiet || now.duration_since(start) >= VENDOR_DECODE_THREAD_SCAN_TIMEOUT {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+}
+
 fn video_pump(
     client: Arc<NativeClient>,
     player: VideoPlayer,
@@ -354,6 +425,12 @@ fn video_pump(
                 "setpriority(tid={tid}) failed (expected without CAP_SYS_NICE): {}",
                 std::io::Error::last_os_error()
             );
+        }
+    }
+    match log.try_clone() {
+        Ok(renicer_log) => spawn_vendor_decode_thread_renicer(renicer_log),
+        Err(e) => {
+            let _ = writeln!(log, "clone log for decode-thread renicer failed: {e:#}");
         }
     }
 

@@ -250,13 +250,60 @@ capability/version negotiation (every client and host must agree, so not a silen
 the key grows from 16 to 32 bytes. This is a `punktfunk-core`/`punktfunk-host` change — affects
 every client, not just this one.
 
-**Status (2026-07-21): the punktfunk maintainer has confirmed ChaCha20-Poly1305 is coming to
-the protocol.** Nothing to do in pf-webos yet — this client has no cipher-specific code of its
-own (it never touches `SessionCrypto`/`Aes128Gcm` directly; all of it is internal to
-`punktfunk-core`, invisible behind the `NativeClient` API this client consumes). Once
-punktfunk-core ships it and pf-webos bumps its pin, wire it in as the **sole** cipher — no
-client-side setting/toggle for encryption algorithm, same way codec/HDR/bitrate capability bits
-are just sent, not exposed as a user choice between wire-level options.
+**Status (2026-07-23): shipped and confirmed working.** `punktfunk-core` v0.17.2 negotiates
+ChaCha20-Poly1305 (`VIDEO_CAP_CHACHA20`, advertised unconditionally in `session.rs::connect` —
+no client-side setting/toggle, this is the one cipher this client speaks). Confirmed on-device:
+sustains meaningfully higher bitrate than AES-GCM did before it. The *grant* still isn't
+client-observable (`NativeClient` doesn't expose `Welcome::cipher`) — only the host's own log
+shows which cipher a given session actually resolved.
+
+## Resolution-dependent choppiness above 1080p (2026-07-22 – 2026-07-23)
+
+Symptom: both NDL and Starfish are butter-smooth at a *captured* (host-side) resolution of
+1080p, but choppy above it (1440p, 4K) — independent of bitrate or requested fps. aurora-tv is
+smooth above 1080p on the exact same TV/host, but over its GameStream-compatibility path, which
+is unencrypted and hits a different host code path — not a clean apples-to-apples reference for
+this symptom.
+
+**Tried, confirmed no measurable effect:**
+- **Starfish: reordering `SDL_webOSSetExportedWindow` to after `StarfishMediaAPIs_load()`**,
+  matching ss4s's `StarfishResourcePostLoad` timing — no change on its own, but kept: this is now
+  simply how `starfish.rs::load` binds the punch-through window (see the ordering there), not a
+  toggle.
+- **PTS smoothing/pacing** ported from aurora-tv's ss4s fork — anchor the host's PTS to a local
+  clock once, then either walk an idealized fixed-fps-interval grid, or just follow the host's
+  PTS deltas with a monotonic floor. The grid variant looked smoother on NDL but added real input
+  latency (holding frames back for a nominal cadence) and that improvement was never confirmed
+  reproducible; the non-grid variant removed the latency cost but fixed nothing. Neither helped
+  Starfish. Not committed — the actual reference `ss4s` (checked out locally) turns out not to
+  do any PTS smoothing at all (`SS4S_NDL_webOS5_GetPts` is plain wall-clock-since-load, same as
+  this client's own `ndl.rs`), so this was a custom design, not a direct port.
+- **Starfish `pauseAtDecodeTime: false`** — no change. Retested on a clean, correctly-isolated
+  build (an earlier attempt's negative result was suspect due to a mismatched build) — same
+  negative result confirmed. Not committed.
+
+**Fixed (2026-07-23) for NDL — large, confirmed improvement. Starfish remains choppier despite an
+attempted generalization; parked, not pursued further for now.** Renicing the NDL/Starfish vendor
+`.so`'s internal decode-pipeline threads to -10 fixed NDL outright. These are `GStreamer`-element
+pad-task threads (`"<element>:<pad>"`, truncated to the kernel's 15-char `comm` limit) spawned
+*inside our own process* by the vendor library, invisible to punktfunk-core's hot-thread registry
+(that only covers threads this crate and punktfunk-core spawn themselves) and confirmed via live
+`/proc/<pid>/task` sampling to sit at default nice 0 despite doing real decode work — a real
+contention cost on this SoC's **3 CPU cores** (`nproc`-confirmed on-device).
+`session.rs::spawn_vendor_decode_thread_renicer` matches by the `:src` pad-name suffix rather than
+the two exact names observed under NDL (`lxvideodec1:src`/`video-src:src`), on the theory that
+Starfish's own internal pipeline uses the same `GStreamer` pad-task convention with different
+element names. **Retested after generalizing: no change for Starfish** — either its pipeline
+doesn't follow the `:src` naming convention, or thread priority isn't its bottleneck at all. Not
+investigated further this pass (would need live `/proc` sampling during an active Starfish
+session to find its actual thread names, or a different hypothesis entirely) — kept as a known,
+open gap rather than guessed at blindly. The suffix-based match and background-thread renicer
+are kept as shipped, confirmed-correct behavior for NDL regardless.
+
+**Still open**: a prior data point (2560x1440@120fps/150Mbps, NDL) showed the host's own frame
+*arrival* rate cycling ~76-120fps with zero client-side drops/gaps ever flagged — suggesting the
+host itself wasn't always producing 120fps at that resolution, a separate, possibly-compounding
+host-side capture/encode throughput question, not yet re-examined after the thread-priority fix.
 
 ## Runtime/deploy gotchas (LG CX specifics)
 
