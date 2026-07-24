@@ -725,6 +725,12 @@ mod real {
             let mut disconnect_focus_dirty = false;
             let mut disconnect_focus_anim: Option<Instant> = None;
             let mut disconnect_tc = crate::ui::TextCache::new();
+            // Gamepad path to the disconnect dialog: hold the Xbox/PS "Guide"
+            // button for 3s (a plain Back/B press is real game input and must
+            // reach the host, never open the dialog). `Some(t)` = Guide pressed
+            // at `t` and still held; cleared on release or once it fires.
+            const GUIDE_HOLD: Duration = Duration::from_secs(2);
+            let mut guide_held_since: Option<Instant> = None;
             let outcome = 'running: loop {
                 if QUIT_REQUESTED.load(Ordering::Relaxed) {
                     writeln!(log, "SIGTERM/SIGINT received — disconnecting before exit")?;
@@ -814,16 +820,16 @@ mod real {
                             }
                         }
                         Event::ControllerButtonDown { button, .. } => {
-                            if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back) {
-                                disconnect_dialog = Some(1);
-                                disconnect_shell_dirty = true;
-                                disconnect_focus_dirty = true;
-                                disconnect_focus_anim = Some(Instant::now());
+                            if button == sdl2::controller::Button::Guide {
+                                guide_held_since = Some(Instant::now());
                             }
                             let ev = gamepad::button_event(button, true, 0);
                             let _ = session::send_input(&connected.client, &ev);
                         }
                         Event::ControllerButtonUp { button, .. } => {
+                            if button == sdl2::controller::Button::Guide {
+                                guide_held_since = None;
+                            }
                             let ev = gamepad::button_event(button, false, 0);
                             let _ = session::send_input(&connected.client, &ev);
                         }
@@ -862,6 +868,19 @@ mod real {
                             }
                         }
                         _ => {}
+                    }
+                }
+                // Guide held long enough (and the dialog isn't already up) —
+                // open it, then disarm so it fires once per hold.
+                if disconnect_dialog.is_none() {
+                    if let Some(since) = guide_held_since {
+                        if since.elapsed() >= GUIDE_HOLD {
+                            guide_held_since = None;
+                            disconnect_dialog = Some(1);
+                            disconnect_shell_dirty = true;
+                            disconnect_focus_dirty = true;
+                            disconnect_focus_anim = Some(Instant::now());
+                        }
                     }
                 }
                 // Render the disconnect dialog when open. The card floats over
