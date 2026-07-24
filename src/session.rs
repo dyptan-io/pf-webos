@@ -165,6 +165,7 @@ pub fn connect(
         quic::CODEC_HEVC | quic::CODEC_H264,
         0, // let the host choose
         display_hdr,
+        0, // client_caps: this client composites the host cursor into the video, not locally
         launch,
         pin,
         Some(identity),
@@ -316,6 +317,7 @@ pub fn request_access(
         quic::CODEC_H264,
         0,
         None, // no HDR display metadata
+        0,    // client_caps: no local cursor rendering
         None, // no launch
         None, // pin = None → trust-on-first-use, host parks until operator approval
         Some(identity),
