@@ -1383,12 +1383,20 @@ pub fn draw_sidebar(
     // alpha color here barely dims them, where a literally darker color reads
     // as dim against `SIDEBAR_BG` the same way `MUTED` text does everywhere
     // else in this UI.
-    let version = concat!("v", env!("CARGO_PKG_VERSION"));
+    // The packaged version (e.g. `0.0.1+git.abc12345`) is threaded in at compile
+    // time via `PKG_VERSION` by the Taskfile's build step; `Cargo.toml` stays a
+    // fixed `0.0.1` (see CLAUDE.md), so a bare native `cargo build` falls back to
+    // `CARGO_PKG_VERSION` rather than showing an empty marker.
+    const VERSION: &str = match option_env!("PKG_VERSION") {
+        Some(v) => v,
+        None => env!("CARGO_PKG_VERSION"),
+    };
+    let version = format!("v{VERSION}");
     draw_text(
         painter,
         text_cache,
         fonts.value,
-        version,
+        &version,
         settings_rect.x(),
         settings_rect.y() - 14 - 10 - fonts.value.height(),
         lerp_color(SIDEBAR_BG, MUTED, 0.35),
