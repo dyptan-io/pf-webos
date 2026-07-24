@@ -48,14 +48,21 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 # Pure Rust + libc (unix), portable — no FFmpeg/PipeWire/SDL3 baggage, unlike
 # pf-client-core's session::start() (see session.rs docs for why we don't use that).
-# Pinned to a tagged punktfunk release (not a branch tip) this client was
-# developed/tested against — bump deliberately, not automatically, since
-# punktfunk-core's wire/ABI surface can move. Currently v0.19.1 — bumped from
-# v0.17.2 to track the latest release; the ChaCha20-Poly1305 session cipher
-# (session.rs advertises `VIDEO_CAP_CHACHA20`) lifts the soft-AES decrypt ceiling
-# on this armv7 target. The C ABI in `abi.rs` stays irrelevant to us (we link the
-# Rust `client` API directly), so upstream's ABI_VERSION bumps don't reach us.
-punktfunk-core = { git = "https://git.unom.io/unom/punktfunk", tag = "v0.19.1", features = [
+# Local checkout of punktfunk-core, branch `webos-arm-aes` (based on v0.19.1). Its only
+# change is `crypto::register_aes128gcm_backend`, a generic extension point (no webOS/ARM
+# specifics in core) a binary can use to swap in its own AES-128-GCM; unregistered,
+# `SessionCrypto` keeps RustCrypto's `aes-gcm`. This client's `webos::aes` (src/webos/aes.rs)
+# registers a backend driven by the ARMv8 Crypto Extensions — the webOS SoCs are ARMv8-A on
+# a 32-bit userland, where RustCrypto's aarch64-gated hardware AES falls back to software.
+# With it, this client negotiates plain AES-128-GCM again (session.rs no longer advertises
+# `VIDEO_CAP_CHACHA20`), matching the host's default cipher at full speed.
+#
+# Path dep into `vendor/punktfunk`, a git submodule pinned to the v0.19.1 tag, with
+# `patches/0001-crypto-register-aes128gcm-backend.patch` applied on top (see
+# `task submodule:sync`) — not the git remote directly, since that patch isn't upstreamed
+# yet. Once it lands upstream, switch back to a normal pinned `git = ..., tag = "vX.Y.Z"`
+# dependency and drop the submodule/patch.
+punktfunk-core = { path = "vendor/punktfunk/crates/punktfunk-core", features = [
     "quic",
 ] }
 serde = { version = "1", features = ["derive"] }

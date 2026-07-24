@@ -85,6 +85,6 @@ cross-thread sync.
 **Toolchain fragility** (full detail in `docs/NOTES.md`): `armv7-unknown-linux-gnueabi` defaults to
 software-emulated floating point, not just a soft-float calling convention — `.cargo/config.toml`
 overrides this (`-C target-feature=+neon,+vfp3,-soft-float`), the single highest-impact perf fix found
-(~300ms → ~30ms per UI render). `src/glibc_compat_shim.c` + `build.rs` backfill `getauxval`/`gettid`/
+(~300ms → ~30ms per UI render). `src/webos/glibc_compat_shim.c` + `build.rs` backfill `getauxval`/`gettid`/
 `sendmmsg`, missing from webOS's ~2.12 glibc. SDL2 must be the `webosbrew/SDL-webOS` fork, not generic
 SDL2 or the on-device system copy (too old) — the `.ipk` bundles its own `libSDL2-2.0.so.0`.

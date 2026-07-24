@@ -18,7 +18,7 @@ fn main() {
     let obj = format!("{out_dir}/glibc_compat_shim.o");
     let status = std::process::Command::new(&cc)
         // -fPIC: the final binary links -pie (position-independent executable).
-        .args(["-fPIC", "-c", "src/glibc_compat_shim.c", "-o"])
+        .args(["-fPIC", "-c", "src/webos/glibc_compat_shim.c", "-o"])
         .arg(&obj)
         .status()
         .unwrap_or_else(|e| panic!("run {cc} to compile glibc_compat_shim.c: {e}"));
@@ -32,7 +32,27 @@ fn main() {
     // right after the crate's own objects instead — too early, so the linker treats
     // it as unneeded and drops it, and the real link still fails undefined.
     println!("cargo:rustc-link-arg={obj}");
-    println!("cargo:rerun-if-changed=src/glibc_compat_shim.c");
+    println!("cargo:rerun-if-changed=src/webos/glibc_compat_shim.c");
+
+    // ── aes_gcm_arm.c ────────────────────────────────────────────────────────
+    // Hardware AES-128-GCM (ARM Crypto Extensions) for webos/aes.rs — see its module docs.
+    let aes_obj = format!("{out_dir}/aes_gcm_arm.o");
+    let status = std::process::Command::new(&cc)
+        .args([
+            "-fPIC",
+            "-march=armv8-a+crypto",
+            "-mfpu=crypto-neon-fp-armv8",
+            "-O3",
+            "-c",
+            "src/webos/aes_gcm_arm.c",
+            "-o",
+        ])
+        .arg(&aes_obj)
+        .status()
+        .unwrap_or_else(|e| panic!("run {cc} to compile aes_gcm_arm.c: {e}"));
+    assert!(status.success(), "{cc} failed compiling aes_gcm_arm.c");
+    println!("cargo:rustc-link-arg={aes_obj}");
+    println!("cargo:rerun-if-changed=src/webos/aes_gcm_arm.c");
 
     // ── starfish_c_shim.cpp → libplayerAPIs_C.so ────────────────────────────
     // `libplayerAPIs.so` on the TV exposes a C++ ABI only; `starfish.rs` expects
@@ -47,7 +67,7 @@ fn main() {
          /arm-webos-linux-gnueabi/sysroot"
     );
     let include_dir = format!("{sysroot}/usr/include/starfish-media-pipeline");
-    let shim_src = format!("{manifest_dir}/src/starfish_c_shim.cpp");
+    let shim_src = format!("{manifest_dir}/src/webos/starfish_c_shim.cpp");
     let release_dir = std::path::PathBuf::from(&out_dir)
         .ancestors()
         .nth(3)
@@ -65,7 +85,7 @@ fn main() {
         .status()
         .unwrap_or_else(|e| panic!("run {cxx} to compile starfish_c_shim.cpp: {e}"));
     assert!(status.success(), "{cxx} failed compiling starfish_c_shim.cpp");
-    println!("cargo:rerun-if-changed=src/starfish_c_shim.cpp");
+    println!("cargo:rerun-if-changed=src/webos/starfish_c_shim.cpp");
 
     // The CX's on-device libSDL2 is 2.0.10 (confirmed live: missing SDL_Metal_DestroyView,
     // an ABI symbol our sdl2-sys build expects) — far older than the NDK sysroot's 2.24.1

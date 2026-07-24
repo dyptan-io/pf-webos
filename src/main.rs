@@ -32,6 +32,8 @@ mod store;
 #[cfg(target_os = "linux")]
 mod ui;
 #[cfg(target_os = "linux")]
+mod webos;
+#[cfg(target_os = "linux")]
 mod wol;
 
 #[cfg(target_os = "linux")]
@@ -96,6 +98,8 @@ mod real {
 
     pub fn run() -> Result<()> {
         install_signal_handlers();
+        // Must happen before the first SessionCrypto (session::connect).
+        crate::webos::aes::register()?;
         let log_path = log_path();
         // Truncate (not append) — this file previously grew unbounded across every
         // launch for the life of the install; each run's log now starts fresh, and

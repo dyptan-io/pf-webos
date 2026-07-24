@@ -38,26 +38,41 @@ vars:
       fi
 
 tasks:
+  submodule:sync:
+    desc: >-
+      Ensure vendor/punktfunk (the punktfunk-core submodule, see Cargo.toml) is checked
+      out and patched with patches/0001-crypto-register-aes128gcm-backend.patch.
+    cmds:
+      - git submodule update --init vendor/punktfunk
+      - git -C vendor/punktfunk apply {{.ROOT_DIR}}/patches/0001-crypto-register-aes128gcm-backend.patch
+    # Skip re-applying if the patch is already present (reversing it would succeed).
+    status:
+      - git -C vendor/punktfunk apply --check --reverse {{.ROOT_DIR}}/patches/0001-crypto-register-aes128gcm-backend.patch
+
   build:
     desc: Cross-compile the release binary, inside Docker — the local dev entry point
+    deps: [submodule:sync]
     cmds:
       - task: toolchain:docker-run
         vars: {TARGET_TASK: native:build}
 
   check:
     desc: Quick cross-target `cargo check`, inside Docker — the local dev entry point
+    deps: [submodule:sync]
     cmds:
       - task: toolchain:docker-run
         vars: {TARGET_TASK: native:check}
 
   package:
     desc: Build and package dist/*.ipk, inside Docker — this is the one you usually want
+    deps: [submodule:sync]
     cmds:
       - task: toolchain:docker-run
         vars: {TARGET_TASK: native:package}
 
   lint:
     desc: Cross-target `cargo clippy` (the lint set in Cargo.toml's `[lints.clippy]`), inside Docker
+    deps: [submodule:sync]
     cmds:
       - task: toolchain:docker-run
         vars: {TARGET_TASK: native:lint}
@@ -72,7 +87,7 @@ tasks:
       Cross-compile directly on the host, no Docker — only meaningful on a Linux
       aarch64 box with Rust already installed (used by CI; `build` is the local
       dev entry point).
-    deps: [toolchain:all]
+    deps: [toolchain:all, submodule:sync]
     env:
       # Modern CMake refuses vendored libopus's old cmake_minimum_required
       # (audiopus_sys, pulled in transitively by punktfunk-core's `quic` feature).
@@ -87,7 +102,7 @@ tasks:
 
   native:check:
     desc: Quick cross-target `cargo check`, no Docker (used by CI)
-    deps: [toolchain:all]
+    deps: [toolchain:all, submodule:sync]
     env:
       CMAKE_POLICY_VERSION_MINIMUM: '3.5'
     cmds:
@@ -96,7 +111,7 @@ tasks:
 
   native:lint:
     desc: Cross-target `cargo clippy`, no Docker (used by CI)
-    deps: [toolchain:all]
+    deps: [toolchain:all, submodule:sync]
     env:
       CMAKE_POLICY_VERSION_MINIMUM: '3.5'
     cmds:

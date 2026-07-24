@@ -147,10 +147,11 @@ pub fn connect(
     video_backend: VideoBackend,
     log: &mut std::fs::File,
 ) -> Result<Connected> {
-    // VIDEO_CAP_CHACHA20: unconditional — armv7 has no hardware AES, so ChaCha20 is
-    // faster. A ≥0.17.2 host picks it up; older hosts ignore the unknown bit.
-    let video_caps = quic::VIDEO_CAP_CHACHA20
-        | if hdr_enabled { quic::VIDEO_CAP_10BIT | quic::VIDEO_CAP_HDR } else { 0 };
+    // Negotiate plain AES-128-GCM (the host default): punktfunk-core's `webos-arm-aes`
+    // branch decrypts it with the ARMv8 Crypto Extensions on this 32-bit ARM target, so
+    // AES is now the fast path and we no longer advertise VIDEO_CAP_CHACHA20.
+    let video_caps =
+        if hdr_enabled { quic::VIDEO_CAP_10BIT | quic::VIDEO_CAP_HDR } else { 0 };
     let display_hdr = hdr_enabled.then(cx_display_hdr);
 
     let client = NativeClient::connect(
@@ -312,7 +313,7 @@ pub fn request_access(
         CompositorPref::Auto,
         punktfunk_core::config::GamepadPref::Auto,
         1_000, // minimal bitrate — connection is closed as soon as trust is established
-        quic::VIDEO_CAP_CHACHA20,
+        0,     // AES-128-GCM (host default; hardware-decrypted on this target)
         2,
         quic::CODEC_H264,
         0,

@@ -1,0 +1,220 @@
+diff --git a/crates/punktfunk-core/src/crypto.rs b/crates/punktfunk-core/src/crypto.rs
+index c0cb69c0..fd7432c8 100644
+--- a/crates/punktfunk-core/src/crypto.rs
++++ b/crates/punktfunk-core/src/crypto.rs
+@@ -30,11 +30,73 @@
+ 
+ use crate::config::Role;
+ use crate::error::{PunktfunkError, Result};
+-use aes_gcm::aead::{Aead, AeadInPlace, KeyInit, Payload};
+-use aes_gcm::{Aes128Gcm, Key, Nonce};
++use aes_gcm::aead::{AeadInPlace, KeyInit};
++use aes_gcm::{Key, Nonce};
+ use chacha20poly1305::ChaCha20Poly1305;
++use std::sync::OnceLock;
+ use zeroize::Zeroize;
+ 
++/// Extension point for a platform-specific AES-128-GCM implementation (e.g. hardware
++/// crypto extensions on a target where RustCrypto's own hardware backend doesn't apply).
++/// Call [`register_aes128gcm_backend`] once, before the first [`SessionCrypto`]; without a
++/// call, `SessionCrypto` uses RustCrypto's `aes-gcm`.
++pub trait Aes128GcmBackend: Send + Sync {
++    /// Same contract as `aead::AeadInPlace::encrypt_in_place_detached`.
++    fn seal_in_place(&self, nonce: &[u8; 12], aad: &[u8], buffer: &mut [u8]) -> Result<[u8; 16]>;
++
++    /// Same contract as `aead::AeadInPlace::decrypt_in_place_detached`: on a tag mismatch,
++    /// `buffer` is left unchanged and `Err` is returned.
++    fn open_in_place(&self, nonce: &[u8; 12], aad: &[u8], buffer: &mut [u8], tag: &[u8; 16]) -> Result<()>;
++}
++
++/// Constructor for an [`Aes128GcmBackend`], given the 16-byte session key.
++pub type Aes128GcmCtor = fn(&[u8; 16]) -> Box<dyn Aes128GcmBackend>;
++
++static AES128GCM_BACKEND: OnceLock<Aes128GcmCtor> = OnceLock::new();
++
++/// Register the AES-128-GCM backend every [`SessionCrypto`] constructed afterwards will use.
++/// Must be called before the first `SessionCrypto` with an `Aes128Gcm` key; `Err` if a
++/// backend is already set (by an earlier call, or by the RustCrypto default having already
++/// been lazily installed on a prior `SessionCrypto::new`).
++pub fn register_aes128gcm_backend(ctor: Aes128GcmCtor) -> Result<()> {
++    AES128GCM_BACKEND.set(ctor).map_err(|_| {
++        PunktfunkError::InvalidArg("AES-128-GCM backend already registered or already in use")
++    })
++}
++
++/// Wraps RustCrypto's `aes-gcm`, used whenever [`register_aes128gcm_backend`] is never called.
++struct RustCryptoAes128Gcm(aes_gcm::Aes128Gcm);
++
++impl Aes128GcmBackend for RustCryptoAes128Gcm {
++    fn seal_in_place(&self, nonce: &[u8; 12], aad: &[u8], buffer: &mut [u8]) -> Result<[u8; 16]> {
++        let tag = self
++            .0
++            .encrypt_in_place_detached(Nonce::from_slice(nonce), aad, buffer)
++            .map_err(|_| PunktfunkError::Crypto)?;
++        let mut out = [0u8; TAG_LEN];
++        out.copy_from_slice(&tag);
++        Ok(out)
++    }
++
++    fn open_in_place(
++        &self,
++        nonce: &[u8; 12],
++        aad: &[u8],
++        buffer: &mut [u8],
++        tag: &[u8; 16],
++    ) -> Result<()> {
++        self.0
++            .decrypt_in_place_detached(Nonce::from_slice(nonce), aad, buffer, aes_gcm::Tag::from_slice(tag))
++            .map_err(|_| PunktfunkError::Crypto)
++    }
++}
++
++fn default_aes128gcm_ctor(key: &[u8; 16]) -> Box<dyn Aes128GcmBackend> {
++    Box::new(RustCryptoAes128Gcm(aes_gcm::Aes128Gcm::new(
++        Key::<aes_gcm::Aes128Gcm>::from_slice(key),
++    )))
++}
++
+ /// 16-byte AEAD authentication tag appended by either session cipher.
+ pub const TAG_LEN: usize = 16;
+ 
+@@ -94,15 +156,10 @@ impl Zeroize for SessionKey {
+     }
+ }
+ 
+-/// The two negotiated AEADs behind one seal/open surface. Both are the same RustCrypto
+-/// `aead 0.5` generation (identical trait shapes, nonce/tag types), so each call below is a
+-/// two-arm match right next to the cipher work itself.
+-// AES's precomputed round keys (~0.7 KB) dwarf ChaCha's 32-byte state, but there is exactly
+-// one long-lived `SessionCrypto` per session — boxing the variant would trade that one-off
+-// slack for a pointer chase on every per-datagram seal/open.
+-#[allow(clippy::large_enum_variant)]
++/// The two negotiated AEADs behind one seal/open surface. AES-128-GCM is boxed (see
++/// [`Aes128GcmBackend`]) so a backend can be injected at runtime; ChaCha's cost is unaffected.
+ enum Cipher {
+-    Aes128Gcm(Aes128Gcm),
++    Aes128Gcm(Box<dyn Aes128GcmBackend>),
+     ChaCha20Poly1305(ChaCha20Poly1305),
+ }
+ 
+@@ -118,7 +175,8 @@ impl SessionCrypto {
+     pub fn new(key: &SessionKey, salt: [u8; 4], role: Role) -> Self {
+         let cipher = match key {
+             SessionKey::Aes128Gcm(k) => {
+-                Cipher::Aes128Gcm(Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(k)))
++                let ctor = *AES128GCM_BACKEND.get_or_init(|| default_aes128gcm_ctor);
++                Cipher::Aes128Gcm(ctor(k))
+             }
+             SessionKey::ChaCha20Poly1305(k) => Cipher::ChaCha20Poly1305(ChaCha20Poly1305::new(
+                 Key::<ChaCha20Poly1305>::from_slice(k),
+@@ -133,19 +191,12 @@ impl SessionCrypto {
+     }
+ 
+     /// Seal `plaintext` for sequence `seq`, returning `ciphertext || tag`. `seq` is
+-    /// authenticated as associated data.
++    /// authenticated as associated data. Built atop [`seal_in_place`](Self::seal_in_place).
+     pub fn seal(&self, seq: u64, plaintext: &[u8]) -> Result<Vec<u8>> {
+-        let nonce = nonce(self.send_salt, seq);
+-        let aad = seq.to_be_bytes();
+-        let payload = Payload {
+-            msg: plaintext,
+-            aad: &aad,
+-        };
+-        match &self.cipher {
+-            Cipher::Aes128Gcm(c) => c.encrypt(Nonce::from_slice(&nonce), payload),
+-            Cipher::ChaCha20Poly1305(c) => c.encrypt(Nonce::from_slice(&nonce), payload),
+-        }
+-        .map_err(|_| PunktfunkError::Crypto)
++        let mut buf = plaintext.to_vec();
++        buf.resize(plaintext.len() + TAG_LEN, 0);
++        self.seal_in_place(seq, &mut buf)?;
++        Ok(buf)
+     }
+ 
+     /// Seal in place, no per-packet allocation: `buf` is laid out as `[plaintext .. ][TAG_LEN]` (the
+@@ -158,32 +209,33 @@ impl SessionCrypto {
+         let split = buf.len() - TAG_LEN;
+         let (plaintext, tag_slot) = buf.split_at_mut(split);
+         let aad = seq.to_be_bytes();
+-        let tag = match &self.cipher {
+-            Cipher::Aes128Gcm(c) => {
+-                c.encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, plaintext)
+-            }
++        let tag: [u8; TAG_LEN] = match &self.cipher {
++            Cipher::Aes128Gcm(c) => c.seal_in_place(&nonce, &aad, plaintext)?,
+             Cipher::ChaCha20Poly1305(c) => {
+-                c.encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, plaintext)
++                let tag = c
++                    .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, plaintext)
++                    .map_err(|_| PunktfunkError::Crypto)?;
++                let mut out = [0u8; TAG_LEN];
++                out.copy_from_slice(&tag);
++                out
+             }
+-        }
+-        .map_err(|_| PunktfunkError::Crypto)?;
++        };
+         tag_slot.copy_from_slice(&tag);
+         Ok(())
+     }
+ 
+-    /// Open `ciphertext || tag` for sequence `seq` (also bound as associated data).
++    /// Open `ciphertext || tag` for sequence `seq` (also bound as associated data). Built atop
++    /// [`open_in_place`](Self::open_in_place); a too-short `ciphertext` is `Crypto`, matching
++    /// the pre-0.19.2 behavior (`open_in_place` itself uses `BadPacket`, a newer, more precise
++    /// error for the same case).
+     pub fn open(&self, seq: u64, ciphertext: &[u8]) -> Result<Vec<u8>> {
+-        let nonce = nonce(self.recv_salt, seq);
+-        let aad = seq.to_be_bytes();
+-        let payload = Payload {
+-            msg: ciphertext,
+-            aad: &aad,
+-        };
+-        match &self.cipher {
+-            Cipher::Aes128Gcm(c) => c.decrypt(Nonce::from_slice(&nonce), payload),
+-            Cipher::ChaCha20Poly1305(c) => c.decrypt(Nonce::from_slice(&nonce), payload),
++        if ciphertext.len() < TAG_LEN {
++            return Err(PunktfunkError::Crypto);
+         }
+-        .map_err(|_| PunktfunkError::Crypto)
++        let mut buf = ciphertext.to_vec();
++        let n = self.open_in_place(seq, &mut buf)?;
++        buf.truncate(n);
++        Ok(buf)
+     }
+ 
+     /// Open in place, no per-packet allocation: `buf` holds `[ciphertext .. ][tag]` on entry and
+@@ -202,20 +254,20 @@ impl SessionCrypto {
+         let (ciphertext, tag) = buf.split_at_mut(split);
+         let aad = seq.to_be_bytes();
+         match &self.cipher {
+-            Cipher::Aes128Gcm(c) => c.decrypt_in_place_detached(
+-                Nonce::from_slice(&nonce),
+-                &aad,
+-                ciphertext,
+-                aes_gcm::Tag::from_slice(tag),
+-            ),
+-            Cipher::ChaCha20Poly1305(c) => c.decrypt_in_place_detached(
+-                Nonce::from_slice(&nonce),
+-                &aad,
+-                ciphertext,
+-                chacha20poly1305::Tag::from_slice(tag),
+-            ),
++            Cipher::Aes128Gcm(c) => {
++                let tag_arr: [u8; TAG_LEN] = tag.try_into().expect("tag slice is TAG_LEN bytes");
++                c.open_in_place(&nonce, &aad, ciphertext, &tag_arr)?;
++            }
++            Cipher::ChaCha20Poly1305(c) => {
++                c.decrypt_in_place_detached(
++                    Nonce::from_slice(&nonce),
++                    &aad,
++                    ciphertext,
++                    chacha20poly1305::Tag::from_slice(tag),
++                )
++                .map_err(|_| PunktfunkError::Crypto)?;
++            }
+         }
+-        .map_err(|_| PunktfunkError::Crypto)?;
+         Ok(split)
+     }
+ }

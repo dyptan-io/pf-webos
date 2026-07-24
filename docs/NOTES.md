@@ -103,7 +103,7 @@ state-machine loops with no natural seam, for a line-count threshold alone.
   std's, so this fix is the one that mattered.
 - **getauxval/gettid/sendmmsg shims required**: webOS's shipped glibc is ~2.12, predating
   `getauxval()` (2.16+), `gettid()` (2.30+), and `sendmmsg()` (2.14+) — all linked unconditionally
-  by Rust std / punktfunk-core's UDP batching. Fixed via `src/glibc_compat_shim.c` (raw
+  by Rust std / punktfunk-core's UDP batching. Fixed via `src/webos/glibc_compat_shim.c` (raw
   `syscall(2)` for the latter two, `/proc/self/auxv` parsing for the first) + `build.rs`, linked
   as a bare object via `cargo:rustc-link-arg` — **must land AFTER libstd in the link line**:
   `cargo:rustc-link-lib=static=...` places it too early and a single-pass linker drops it as
@@ -230,32 +230,22 @@ Two real, fixed contributors:
 
 Confirmed on-device: 100 Mbps went from choppy/unusable to usable and mostly stable.
 
-**Known remaining gap, not yet fixed — the likely dominant remaining cost**: punktfunk's
-*native* protocol (what this client speaks) negotiates AES-128-GCM on every video datagram
-(`punktfunk-host/src/native.rs`), decrypted client-side per packet. The CX's SoC is
-Cortex-A9/ARMv7-A — the ARM Crypto Extensions (dedicated AES instructions) only exist on
-ARMv8+, so this runs as constant-time software AES-GCM on a single core, an O(bytes) cost that
-scales with bitrate. aurora-tv's GameStream-compatibility path is explicitly plaintext
-(`punktfunk-host/src/gamestream/video.rs`: "AES-GCM video encryption is negotiated off for
-now") — zero decrypt cost, part of why it sustains 150+ Mbps.
-
-The fix is **not** disabling encryption: swap to **ChaCha20-Poly1305** (RFC 8439, same
-security tier as AES-GCM, a standard TLS 1.3 AEAD). Its core is 32-bit add/rotate/xor — no
-S-box lookups, no GHASH carry-less multiply — so it stays fast in pure software on a CPU with
-no crypto instructions at all (why Google/BoringSSL default to it on ARM devices without an
-AES-NI equivalent). `punktfunk-core/src/crypto.rs` already builds on RustCrypto's `aead` traits
-around `Aes128Gcm`; `chacha20poly1305` is the same crate family with the same trait shape, so
-the in-crate change is close to a type swap. The real work is the wire-visible part: needs a
-capability/version negotiation (every client and host must agree, so not a silent swap), and
-the key grows from 16 to 32 bytes. This is a `punktfunk-core`/`punktfunk-host` change — affects
-every client, not just this one.
-
-**Status (2026-07-23): shipped and confirmed working.** `punktfunk-core` v0.17.2 negotiates
-ChaCha20-Poly1305 (`VIDEO_CAP_CHACHA20`, advertised unconditionally in `session.rs::connect` —
-no client-side setting/toggle, this is the one cipher this client speaks). Confirmed on-device:
-sustains meaningfully higher bitrate than AES-GCM did before it. The *grant* still isn't
-client-observable (`NativeClient` doesn't expose `Welcome::cipher`) — only the host's own log
-shows which cipher a given session actually resolved.
+**Cipher decrypt cost (2026-07-21 – 2026-07-24), resolved.** punktfunk's native protocol
+negotiates AES-128-GCM on every video datagram, decrypted client-side per packet. The real
+device (confirmed via on-device `/proc/cpuinfo`) is **4× Cortex-A55, ARMv8.2-A**, running a
+32-bit (AArch32, `armv7-unknown-linux-gnueabi`) userland — a correction of an earlier, wrong
+"Cortex-A9/ARMv7-A" assumption in this doc, made before the real device's `/proc/cpuinfo` was
+checked. RustCrypto's `aes`/`ghash` crates (`punktfunk-core`'s AES-128-GCM) gate their hardware
+backend to `target_arch = "aarch64"` only, so on this 32-bit target they ran as software AES-GCM
+regardless of the CPU's actual crypto support — an O(bytes) cost scaling with bitrate. An
+interim fix shipped ChaCha20-Poly1305 (faster in portable software, no hardware dependency) but
+that's since been superseded: `punktfunk-core` v0.19.1+ (branch `webos-arm-aes`) exposes a
+generic `crypto::register_aes128gcm_backend` extension point (see its module docs), and this
+client's `src/webos/aes.rs` registers a backend driven by the ARMv8 Crypto Extensions
+(`src/webos/aes_gcm_arm.c`, `<arm_neon.h>` intrinsics — PMULL/AES aren't in stable Rust's stdarch
+for 32-bit ARM). `session.rs` negotiates plain AES-128-GCM again (no longer advertises
+`VIDEO_CAP_CHACHA20`). On-device A/B: ~12% less total CPU than the ChaCha20 fallback; confirmed
+via disassembly of the deployed binary (`aese.8`/`aesmc.8`/`vmull.p64` present).
 
 ## Resolution-dependent choppiness above 1080p (2026-07-22 – 2026-07-23)
 
@@ -289,7 +279,8 @@ pad-task threads (`"<element>:<pad>"`, truncated to the kernel's 15-char `comm` 
 *inside our own process* by the vendor library, invisible to punktfunk-core's hot-thread registry
 (that only covers threads this crate and punktfunk-core spawn themselves) and confirmed via live
 `/proc/<pid>/task` sampling to sit at default nice 0 despite doing real decode work — a real
-contention cost on this SoC's **3 CPU cores** (`nproc`-confirmed on-device).
+contention cost on this SoC's **4 Cortex-A55 (ARMv8.2-A) cores** (`/proc/cpuinfo`-confirmed
+on-device; an earlier `nproc`-based "3 cores" figure here was wrong).
 `session.rs::spawn_vendor_decode_thread_renicer` matches by the `:src` pad-name suffix rather than
 the two exact names observed under NDL (`lxvideodec1:src`/`video-src:src`), on the theory that
 Starfish's own internal pipeline uses the same `GStreamer` pad-task convention with different
