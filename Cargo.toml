@@ -50,14 +50,12 @@ tracing-subscriber = "0.3"
 # pf-client-core's session::start() (see session.rs docs for why we don't use that).
 # Pinned to a tagged punktfunk release (not a branch tip) this client was
 # developed/tested against — bump deliberately, not automatically, since
-# punktfunk-core's wire/ABI surface can move. Currently v0.17.2 — bumped from
-# v0.16.0 for the ChaCha20-Poly1305 session cipher (session.rs advertises
-# `VIDEO_CAP_CHACHA20`; lifts the soft-AES decrypt ceiling on this armv7 target).
-# WIRE_VERSION 2 (verified unchanged across v0.16.0..v0.17.2 — the cipher rides a
-# new Welcome tail field, fail-closed, no protocol migration), and the C ABI in
-# `abi.rs` stays irrelevant to us (we link the Rust `client` API directly;
-# `NativeClient::connect`'s signature is unchanged across the bump).
-punktfunk-core = { git = "https://git.unom.io/unom/punktfunk", tag = "v0.17.2", features = [
+# punktfunk-core's wire/ABI surface can move. Currently v0.19.1 — bumped from
+# v0.17.2 to track the latest release; the ChaCha20-Poly1305 session cipher
+# (session.rs advertises `VIDEO_CAP_CHACHA20`) lifts the soft-AES decrypt ceiling
+# on this armv7 target. The C ABI in `abi.rs` stays irrelevant to us (we link the
+# Rust `client` API directly), so upstream's ABI_VERSION bumps don't reach us.
+punktfunk-core = { git = "https://git.unom.io/unom/punktfunk", tag = "v0.19.1", features = [
     "quic",
 ] }
 serde = { version = "1", features = ["derive"] }
