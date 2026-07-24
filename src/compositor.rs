@@ -131,6 +131,23 @@ impl Compositor {
         Ok(())
     }
 
+    /// Drops `tile`'s GPU texture, if it has one.
+    ///
+    /// Needed because card tiles are now windowed: a texture for a card scrolled far out
+    /// of view is pure retained memory, and with `unsafe_textures` a `Texture` is not
+    /// freed by dropping the map entry alone — the SDL object must be destroyed. Safe to
+    /// call for a tile that was never uploaded.
+    pub fn drop_tile(&mut self, tile: Tile) {
+        if let Some(tex) = self.textures.remove(&tile) {
+            // SAFETY: `unsafe_textures` detaches a `Texture` from its `TextureCreator`'s
+            // lifetime, making destruction the owner's responsibility. This texture came
+            // from `self`'s own creator, is removed from the map above so nothing can
+            // reach it again, and every draw goes through `execute`, which only ever
+            // borrows from that same map.
+            unsafe { tex.destroy() };
+        }
+    }
+
     /// Executes one frame's draw list. The caller has already cleared the canvas
     /// to the background color.
     pub fn execute(&mut self, canvas: &mut Canvas<Window>, cmds: &[DrawCmd]) -> Result<()> {

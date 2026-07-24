@@ -164,6 +164,16 @@ pub struct Settings {
     /// default; takes effect on the next stream.
     #[serde(default)]
     pub stats_overlay: bool,
+    /// Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to
+    /// what it can actually capture, and the *resolved* count drives the decoder and
+    /// playback layout — `audio.rs` has always handled up to 8; only the request was
+    /// pinned at stereo. `#[serde(default …)]` so an existing settings.json loads as 2.
+    #[serde(default = "default_audio_channels")]
+    pub audio_channels: u8,
+}
+
+fn default_audio_channels() -> u8 {
+    2
 }
 
 impl Default for Settings {
@@ -181,6 +191,7 @@ impl Default for Settings {
             wol_auto_send: false,
             stats_overlay: false,
             video_backend: VideoBackend::Ndl,
+            audio_channels: default_audio_channels(),
         }
     }
 }
@@ -242,6 +253,18 @@ impl SettingsWriter {
         *lock.lock().expect("settings-writer mutex poisoned") = Some(settings);
         cvar.notify_one();
     }
+}
+
+/// Test/dev override for NDL's undocumented frame-drop threshold: a single integer in
+/// `$HOME/ndl-drop-threshold.conf`, absent by default.
+///
+/// Exists because the value's units aren't documented anywhere (the SDK header declares
+/// `NDL_DirectVideoSetFrameDropThreshold` and stops), so it has to be swept against real
+/// playback — and a full rebuild/redeploy per candidate value makes that impractical.
+/// Same reasoning, and the same mechanism, as `dev_override_connect` below.
+pub fn dev_override_ndl_drop_threshold() -> Option<i32> {
+    let path = Path::new(&app_dir()).join("ndl-drop-threshold.conf");
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// Test/dev override: a config file dropped alongside sideloading skips straight to

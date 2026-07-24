@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use punktfunk_core::client::NativeClient;
+use punktfunk_core::client::{NativeClient, ProbeOutcome};
 use punktfunk_core::config::{CompositorPref, Mode};
 use punktfunk_core::input::InputEvent;
 use punktfunk_core::packet::{FLAG_SOF, USER_FLAG_RECOVERY_ANCHOR};
@@ -56,6 +56,33 @@ impl VideoPlayer {
         }
     }
 
+    /// Whether the active backend is decoding audio itself (NDL only — the Starfish
+    /// payload sets `needAudio: false`, so that path always uses the software decoder).
+    fn audio_offloaded(&self) -> bool {
+        match self {
+            Self::Ndl(ndl) => ndl.audio_offloaded(),
+            Self::Starfish(_) => false,
+        }
+    }
+
+    /// Hands one raw Opus packet to the backend. Only called when `audio_offloaded`.
+    fn play_audio(&self, packet: &[u8]) -> anyhow::Result<()> {
+        match self {
+            Self::Ndl(ndl) => ndl.play_audio(packet),
+            Self::Starfish(_) => Ok(()),
+        }
+    }
+
+    /// NDL's undecoded/unpresented backlog, when the active backend can report it.
+    /// Starfish exposes no equivalent through the wrapper, so it reports `None` — the
+    /// overlay and the log then simply omit the figure rather than showing a fake zero.
+    fn render_buffer_length(&self) -> Option<i32> {
+        match self {
+            Self::Ndl(ndl) => ndl.render_buffer_length(),
+            Self::Starfish(_) => None,
+        }
+    }
+
     fn backend_name(&self) -> &'static str {
         match self {
             Self::Starfish(_) => "Starfish/SMP",
@@ -72,6 +99,9 @@ pub struct Connected {
     /// Kept alive so [`Connected::shutdown`] can join it and ensure `NativeClient::Drop`
     /// (which sends the QUIC close frame) runs to completion before process exit.
     video_thread: std::thread::JoinHandle<()>,
+    /// Set when NDL accepted the Opus config and is decoding audio itself, so the caller
+    /// must NOT also open an SDL2 audio device — see `ndl_audio_config`.
+    pub audio_offloaded: bool,
 }
 
 /// Live video-pump counters shared with the main thread for the in-stream stats
@@ -86,6 +116,9 @@ pub struct StreamStats {
     pub holding: AtomicBool,
     /// The most recent decoder feed duration, in µs.
     pub feed_us: std::sync::atomic::AtomicU32,
+    /// NDL's render-buffer backlog at the last heartbeat, or `-1` when the active
+    /// backend can't report one (see `VideoPlayer::render_buffer_length`).
+    pub render_backlog: std::sync::atomic::AtomicI32,
 }
 
 /// Short display name for a resolved wire codec id (the stats overlay's header).
@@ -108,6 +141,25 @@ impl Connected {
         let _ = self.video_thread.join();
         drop(self.client);
     }
+}
+
+/// Whether to ask NDL to decode the audio stream, given the host-resolved channel count.
+///
+/// **Stereo only, by construction.** `NDL_DIRECTMEDIA_AUDIO_OPUS_INFO_T` carries a channel
+/// count and a sample rate and nothing else — it has no multistream mapping field, so it
+/// cannot describe the 5.1/7.1 layouts `punktfunk_core::audio::layout_for` negotiates
+/// (those are Opus multistream, with a per-layout stream/coupled/mapping triple). Handing
+/// NDL a `channels: 6` it would decode as plain 6-channel Opus would produce noise, not
+/// surround, so anything above stereo stays on the software decoder.
+///
+/// Whether the *device* implements the Opus path at all is a separate question, answered
+/// by probe rather than assumption — see `NdlVideo::load`.
+fn ndl_audio_config(resolved_channels: u8) -> Option<crate::ndl::NdlAudioConfig> {
+    (resolved_channels == 2).then_some(crate::ndl::NdlAudioConfig {
+        channels: 2,
+        // punktfunk's audio plane is fixed at 48 kHz (see `audio.rs`'s SAMPLE_RATE).
+        sample_rate: 48_000.0,
+    })
 }
 
 /// Default HDR10 mastering metadata for the LG CX OLED panel.
@@ -138,6 +190,7 @@ pub fn connect(
     mode: Mode,
     bitrate_kbps: u32,
     hdr_enabled: bool,
+    audio_channels: u8,
     identity: (String, String),
     pin: Option<[u8; 32]>,
     launch: Option<String>,
@@ -161,7 +214,10 @@ pub fn connect(
         punktfunk_core::config::GamepadPref::Auto,
         bitrate_kbps,
         video_caps,
-        2, // stereo
+        // Requested only — the host clamps to what it can capture, and
+        // `AudioPlayer::new` is built from the RESOLVED `client.audio_channels`,
+        // never from this.
+        audio_channels,
         quic::CODEC_HEVC | quic::CODEC_H264,
         0, // let the host choose
         display_hdr,
@@ -227,6 +283,7 @@ pub fn connect(
                         resolved_mode.width as i32,
                         resolved_mode.height as i32,
                         codec,
+                        ndl_audio_config(client.audio_channels),
                     )
                     .context("NDL load (Starfish fallback)")?;
                     writeln!(
@@ -244,6 +301,7 @@ pub fn connect(
                 resolved_mode.width as i32,
                 resolved_mode.height as i32,
                 codec,
+                ndl_audio_config(client.audio_channels),
             )
             .context("NDL load")?;
             writeln!(
@@ -254,6 +312,19 @@ pub fn connect(
             VideoPlayer::Ndl(ndl)
         }
     };
+
+    // An on-device sweep value for NDL's undocumented frame-drop threshold, if one has
+    // been dropped in (see `store::dev_override_ndl_drop_threshold`). Never set by
+    // default — the units aren't documented and a guessed pacing change to this decoder
+    // is exactly what `docs/NOTES.md` warns against shipping unverified.
+    if matches!(video_backend, VideoBackend::Ndl) {
+        if let Some(threshold) = crate::store::dev_override_ndl_drop_threshold() {
+            match crate::ndl::NdlVideo::set_frame_drop_threshold(threshold) {
+                Ok(()) => writeln!(log, "NDL frame-drop threshold override: {threshold}")?,
+                Err(e) => writeln!(log, "NDL frame-drop threshold override failed: {e:#}")?,
+            }
+        }
+    }
 
     // Forward the negotiated colorimetry to the decoder for BOTH HDR and SDR
     // streams. The SDR case is not optional: punktfunk encodes BT.709, but with
@@ -273,6 +344,18 @@ pub fn connect(
         client.color.transfer, client.color.primaries, client.color.matrix, client.color.full_range,
     )?;
 
+    let audio_offloaded = player.audio_offloaded();
+    writeln!(
+        log,
+        "audio path: {} (host resolved {} channel(s))",
+        if audio_offloaded {
+            "NDL hardware Opus decode"
+        } else {
+            "software Opus decode -> SDL2"
+        },
+        client.audio_channels,
+    )?;
+
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(StreamStats::default());
     let video_client = client.clone();
@@ -281,10 +364,20 @@ pub fn connect(
     let mut video_log = log.try_clone().context("clone log")?;
     let video_thread = std::thread::Builder::new()
         .name("punktfunk-webos-video".into())
-        .spawn(move || video_pump(video_client, player, video_stop, video_stats, is_hdr, &mut video_log))
+        .spawn(move || {
+            video_pump(
+                video_client,
+                player,
+                video_stop,
+                video_stats,
+                is_hdr,
+                audio_offloaded,
+                &mut video_log,
+            )
+        })
         .context("spawn video thread")?;
 
-    Ok(Connected { client, stop, stats, video_thread })
+    Ok(Connected { client, stop, stats, video_thread, audio_offloaded })
 }
 
 /// The no-PIN "request access" trust step: open a trust-on-first-use connection
@@ -330,6 +423,214 @@ pub fn request_access(
     // `App::try_request_access` — so no log handle here; the caller logs the outcome.)
     client.disconnect_quit();
     Ok(fingerprint)
+}
+
+/// What the host is asked to burst during a speed test, and for how long.
+///
+/// Deliberately **not** the other clients' 3 Gbps / 5 s, and not the 1 Gbps this first
+/// shipped with either. Measured on a real CX over Wi-Fi against a 0.19.2 host: a 1 Gbps
+/// request was honoured exactly (375 MB pushed in 3 s) while the TV received 87 MB —
+/// **~80 % loss** — and in half the attempts the host's end-of-burst `ProbeResult`, which
+/// travels over the QUIC control stream *through that same saturated path*, never arrived
+/// at all. Overshooting capacity is how a probe finds a ceiling, but overshooting it
+/// fourfold mostly measures the access point's drop policy and costs the measurement its
+/// own result message.
+///
+/// The target is chosen against what the answer can actually be *used* for: the bitrate
+/// slider caps at `ui::BITRATE_MAX_KBPS` (200 Mbps) and the recommendation is 70 % of
+/// measured, so anything above ~285 Mbps already produces an identical clamped
+/// recommendation. 320 Mbps stays above that — it can still detect any ceiling that
+/// would change the advice — while keeping the overshoot bounded. Measured on a G5
+/// (2026-07-24, warm data plane, sweep 260/280/320/400): delivered goodput is a flat
+/// ~245 Mbps at every offered rate — the TV's own Wi-Fi radio (USB 2.0-attached) is the
+/// ceiling, independently confirmed with a raw UDP flood — so a 400 Mbps burst just
+/// raises the shed overshoot (51 % packet loss vs 38 % at 320) and with it the odds the
+/// end-of-burst report is starved out, for zero extra information.
+const PROBE_TARGET_KBPS: u32 = 320_000;
+/// A pinned (non-zero) session rate for the probe connect — see the call site: its only
+/// job is to keep `bitrate_kbps == 0` from arming core's own capacity probe against the
+/// single shared `ProbeState`. Nothing decodes here, so the value itself is immaterial.
+const PROBE_SESSION_BITRATE_KBPS: u32 = 20_000;
+/// Below this many delivered bytes, a missing host report is a failure rather than
+/// something to salvage — 1 MB over a 3 s burst is ~2.7 Mbps, far under anything worth
+/// recommending a bitrate from.
+const SALVAGE_MIN_BYTES: u64 = 1024 * 1024;
+const PROBE_DURATION_MS: u32 = 3_000;
+/// How long to wait for the data plane to prove itself live (first completed video frame)
+/// before bursting. Observed on the G5 over Wi-Fi (2026-07-24): a NEW host→client UDP flow
+/// is sometimes black-holed (AP/driver flow setup — even the session's own 20 Mbps video
+/// is held, while QUIC control chats at ~1 ms RTT), then dumped all at once. Measured
+/// holes ranged ~10-29 s, longer after longer idle. A burst fired into that window
+/// measures the black hole, not the link. Waiting for the first delivered frame starts
+/// every measurement on a proven-live plane; if nothing arrives within the cap, proceed
+/// anyway — the burst then behaves exactly as before.
+const PROBE_WARMUP_CAP: Duration = Duration::from_secs(35);
+/// How long to keep polling for the host's end-of-burst report after the burst should
+/// have finished before giving up. Generous: the report shares a link the burst has just
+/// been hammering, so its first delivery attempt can well be lost and need a retransmit.
+const PROBE_REPORT_GRACE: Duration = Duration::from_secs(12);
+
+/// A finished speed test, and whether the host confirmed the figures.
+pub struct SpeedProbeResult {
+    pub outcome: ProbeOutcome,
+    /// `true` when the host's end-of-burst report arrived. `false` means it never did and
+    /// the throughput was derived from what this client actually received over the burst
+    /// window it asked for — a real measurement, but with no host-side cross-check, so no
+    /// loss figure and a conservative reading if the burst was cut short.
+    pub confirmed: bool,
+}
+
+/// Runs one network speed test against `host` and returns the host's final measurement.
+///
+/// Like [`request_access`], this uses [`NativeClient`] directly rather than [`connect`]:
+/// no video backend is loaded and no pump thread is spawned, so the punch-through plane
+/// is never touched — the host builds a virtual output, but nothing is decoded or
+/// presented. Blocks; run it on a worker thread.
+///
+/// **`video_caps` must advertise `VIDEO_CAP_CHACHA20` exactly as a real session does.**
+/// `punktfunk-core` counts the delivered bytes this measurement is derived from *after*
+/// AEAD decrypt, so a probe that negotiated AES-GCM would measure a ceiling this armv7
+/// CPU can't reach with the cipher an actual stream uses — reporting a number no session
+/// could ever deliver. See `docs/NOTES.md` on why `ChaCha20` exists on this client at all.
+///
+/// `progress` is called with each partial poll so the UI can show the figure climbing.
+pub fn run_speed_probe(
+    host: &str,
+    port: u16,
+    identity: (String, String),
+    pin: Option<[u8; 32]>,
+    timeout: Duration,
+    log: &mut std::fs::File,
+    mut progress: impl FnMut(ProbeOutcome),
+) -> Result<SpeedProbeResult> {
+    let mode = Mode { width: 1280, height: 720, refresh_hz: 60 };
+    let client = NativeClient::connect(
+        host,
+        port,
+        mode,
+        CompositorPref::Auto,
+        punktfunk_core::config::GamepadPref::Auto,
+        // NOT 0. `bitrate_kbps == 0` is what arms punktfunk-core's OWN startup
+        // link-capacity probe (`client/pump/data.rs`: 2 Gbps for 800ms, ~2s after
+        // connect) — and core has exactly one `ProbeState` slot with no correlation id,
+        // which our `request_probe` below would be sharing with it. Core defers its
+        // probe while ours is active, but the reverse race (its probe landing just as
+        // ours finishes and resetting the state we're about to read) is real. Pinning a
+        // rate disarms core's probe entirely; the value is irrelevant since nothing is
+        // decoded here.
+        PROBE_SESSION_BITRATE_KBPS,
+        quic::VIDEO_CAP_CHACHA20,
+        2, // stereo baseline
+        quic::CODEC_HEVC | quic::CODEC_H264,
+        0,    // no preferred codec
+        None, // no HDR display metadata: nothing presents
+        0,    // client_caps: nothing renders a cursor
+        None, // no launch
+        pin,
+        Some(identity),
+        timeout,
+    )
+    .context("speed test connect")?;
+
+    // The negotiated session, logged before the burst: if a measurement comes back
+    // empty, this line is what says whether the connection itself was sane.
+    writeln!(
+        log,
+        "speed test connected: codec={} audio_ch={} resolved_bitrate_kbps={} caps=0x{:02x}",
+        client.codec,
+        client.audio_channels,
+        client.resolved_bitrate_kbps,
+        quic::VIDEO_CAP_CHACHA20,
+    )?;
+
+    // Don't burst into a dead plane — see PROBE_WARMUP_CAP. `next_frame` drains the session's
+    // decode-less video into the void; the first completed frame is the "plane is live" edge.
+    let warmup = Instant::now();
+    let mut warmed = false;
+    while warmup.elapsed() < PROBE_WARMUP_CAP {
+        if client.next_frame(Duration::from_millis(250)).is_ok() {
+            warmed = true;
+            break;
+        }
+    }
+    writeln!(
+        log,
+        "speed test: data plane {} after {} ms",
+        if warmed { "live" } else { "still silent (proceeding anyway)" },
+        warmup.elapsed().as_millis(),
+    )?;
+
+    client
+        .request_probe(PROBE_TARGET_KBPS, PROBE_DURATION_MS)
+        .context("request_probe")?;
+    // Flip the UI from "Connecting…" to "Measuring…" the moment the burst is requested —
+    // with the warmup above, the first 250 ms poll is no longer the earliest signal.
+    progress(client.probe_result());
+
+    let deadline = Instant::now() + Duration::from_millis(u64::from(PROBE_DURATION_MS)) + PROBE_REPORT_GRACE;
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let outcome = client.probe_result();
+        if outcome.done {
+            // Let the last in-flight UDP shards land before tearing the connection
+            // down, so the delivered-bytes figure isn't cut short by our own exit.
+            std::thread::sleep(Duration::from_millis(400));
+            let final_outcome = client.probe_result();
+            // Both sides of the measurement, separately. This is the line that tells a
+            // host-side problem from a client-side one: `host_bytes == 0` means the host
+            // never put filler on the wire (it ignored or couldn't serve the request),
+            // whereas `host_bytes > 0` with `recv_bytes == 0` means it sent and we
+            // received nothing usable — a network path or a decrypt mismatch, since
+            // punktfunk-core counts bytes only AFTER a successful AEAD open.
+            writeln!(
+                log,
+                "speed test result: recv_bytes={} recv_packets={} host_bytes={} host_packets={} \
+                 elapsed_ms={} throughput_kbps={} loss_pct={:.2} host_drop_pct={:.2} \
+                 wire_packets_sent={} send_dropped={}",
+                final_outcome.recv_bytes,
+                final_outcome.recv_packets,
+                final_outcome.host_bytes,
+                final_outcome.host_packets,
+                final_outcome.elapsed_ms,
+                final_outcome.throughput_kbps,
+                final_outcome.loss_pct,
+                final_outcome.host_drop_pct,
+                final_outcome.wire_packets_sent,
+                final_outcome.send_dropped,
+            )?;
+            client.disconnect_quit();
+            return Ok(SpeedProbeResult { outcome: final_outcome, confirmed: true });
+        }
+        progress(outcome);
+        if Instant::now() > deadline {
+            // The report never came — but `recv_bytes` is live during the burst (core
+            // computes it as `rx_now - base`), so if a real amount of filler arrived the
+            // measurement is not lost: divide it by the burst window we asked for. The
+            // host honours that duration exactly when it does report (confirmed
+            // on-device: a 3,000 ms request came back as `elapsed_ms=3000`), so this is
+            // the same denominator, just not host-attested. Only the loss figure is
+            // genuinely unavailable, since that needs the host's sent-packet count.
+            let mut salvaged = client.probe_result();
+            client.disconnect_quit();
+            if salvaged.recv_bytes >= SALVAGE_MIN_BYTES {
+                salvaged.elapsed_ms = PROBE_DURATION_MS;
+                salvaged.throughput_kbps =
+                    (salvaged.recv_bytes.saturating_mul(8) / u64::from(PROBE_DURATION_MS)) as u32;
+                writeln!(
+                    log,
+                    "speed test: no host report; salvaged from {} received bytes over the {} ms \
+                     burst window -> {} kbps (unconfirmed)",
+                    salvaged.recv_bytes, PROBE_DURATION_MS, salvaged.throughput_kbps,
+                )?;
+                return Ok(SpeedProbeResult { outcome: salvaged, confirmed: false });
+            }
+            anyhow::bail!(
+                "the host never sent its result, and almost nothing arrived. The test burst can \
+                 saturate the link the result has to come back over — try again, or move the TV \
+                 closer to the access point."
+            );
+        }
+    }
 }
 
 /// Throttle for keyframe requests during hold or decode errors.
@@ -410,12 +711,14 @@ fn spawn_vendor_decode_thread_renicer(mut log: std::fs::File) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn video_pump(
     client: Arc<NativeClient>,
     player: VideoPlayer,
     stop: Arc<AtomicBool>,
     stats: Arc<StreamStats>,
     is_hdr: bool,
+    audio_offloaded: bool,
     log: &mut std::fs::File,
 ) {
     client.register_hot_thread();
@@ -455,10 +758,18 @@ fn video_pump(
                 stats.frames.store(frames_received, Ordering::Relaxed);
                 if last_heartbeat.elapsed() >= Duration::from_secs(2) {
                     last_heartbeat = Instant::now();
+                    let backlog = player.render_buffer_length();
+                    stats
+                        .render_backlog
+                        .store(backlog.unwrap_or(-1), Ordering::Relaxed);
+                    // `backlog` separates "the decoder is behind" from "frames are
+                    // arriving late" — indistinguishable before this, since play()
+                    // decodes and presents in one opaque call.
                     let _ = writeln!(
                         log,
-                        "video: {frames_received} frames, holding={holding}, dropped={}",
-                        client.frames_dropped()
+                        "video: {frames_received} frames, holding={holding}, dropped={}, backlog={}",
+                        client.frames_dropped(),
+                        backlog.map_or_else(|| "n/a".to_string(), |b| b.to_string()),
                     );
                 }
 
@@ -562,12 +873,30 @@ fn video_pump(
             }
         }
 
+        if audio_offloaded {
+            pump_ndl_audio(&client, &player, log);
+        }
+
         if is_hdr {
             if let Ok(meta) = client.next_hdr_meta(Duration::ZERO) {
                 if let Err(e) = player.set_color_info(Some(&meta), client.color) {
                     let _ = writeln!(log, "{} set_color_info: {e:#}", player.backend_name());
                 }
             }
+        }
+    }
+}
+
+/// Drains raw Opus packets straight into NDL, for the offloaded path.
+///
+/// Unlike the software path this does NOT have to run on the main thread — the
+/// main-thread constraint is `sdl2::audio::AudioQueue` being `!Send`, and there is no
+/// `AudioQueue` here. It runs on the video pump thread, which also means audio keeps
+/// flowing across a main-loop stall rather than hitching with it.
+fn pump_ndl_audio(client: &NativeClient, player: &VideoPlayer, log: &mut std::fs::File) {
+    while let Ok(packet) = client.next_audio(Duration::ZERO) {
+        if let Err(e) = player.play_audio(&packet.data) {
+            let _ = writeln!(log, "NDL audio error (seq {}): {e:#}", packet.seq);
         }
     }
 }
@@ -579,21 +908,40 @@ pub fn pump_audio_once(
     audio: &mut crate::audio::AudioPlayer,
     log: &mut std::fs::File,
 ) {
+    use crate::audio::AudioEvent;
     // Logged roughly once/sec (200 packets @ 5ms/frame).
     static PACKET_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     while let Ok(packet) = client.next_audio(Duration::ZERO) {
-        match audio.play(&packet.data) {
-            Ok((peak, resnapped)) => {
-                if resnapped {
-                    let _ = writeln!(
-                        log,
-                        "audio resnapped (queue was >{}ms behind)",
-                        crate::audio::MAX_QUEUED_LAG_MS
-                    );
-                }
-                let n = PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n % 200 == 0 {
-                    let _ = writeln!(log, "audio peak: {peak:.4}");
+        match audio.play(packet.seq, &packet.data) {
+            Ok((peak, event)) => {
+                match event {
+                    // The two queue-too-full cases and the starved case are each audible
+                    // and have different causes, so they are never collapsed into one
+                    // message: `Underrun` means this thread was too slow, `Dropped`/
+                    // `Resnapped` mean audio arrived faster than realtime.
+                    AudioEvent::Underrun => {
+                        let _ = writeln!(log, "audio underrun (device queue ran dry before this packet)");
+                    }
+                    AudioEvent::Resnapped => {
+                        let _ = writeln!(
+                            log,
+                            "audio resnapped (queue was >{}ms behind)",
+                            crate::audio::MAX_QUEUED_LAG_MS
+                        );
+                    }
+                    AudioEvent::Dropped => {
+                        let _ = writeln!(
+                            log,
+                            "audio packet dropped (queue >{}ms, draining)",
+                            crate::audio::SOFT_QUEUED_LAG_MS
+                        );
+                    }
+                    AudioEvent::Queued => {
+                        let n = PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if n % 200 == 0 {
+                            let _ = writeln!(log, "audio peak: {peak:.4}");
+                        }
+                    }
                 }
             }
             Err(e) => {

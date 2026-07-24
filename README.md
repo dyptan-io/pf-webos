@@ -13,9 +13,16 @@ git dependency — see `Cargo.toml`).
 
 ## Features
 
-- LAN discovery (mDNS) or add a host manually by IP; PIN pairing with persisted trust.
-- Configurable resolution (1080p/1440p/4K), frame rate, bitrate, and HDR.
-- Browses the host's game library (with cover art) and launches straight into a title.
+- LAN discovery (mDNS) or add a host manually by IP; PIN pairing with persisted trust, and a
+  live reachability dot on every host so an offline machine is visible before you try it.
+- Per-host actions behind a ⋯ button on each host row: connect, pair, **network speed test**
+  (measures over the real data plane and applies a recommended bitrate in one press), wake,
+  edit address, forget.
+- Configurable resolution (1080p/1440p/4K), frame rate, bitrate, HDR, and audio channels
+  (stereo / 5.1 / 7.1).
+- Browses the host's game library (with cover art, alphabetically sorted) and launches
+  straight into a title.
+- About & licenses screen with the build version and full third-party notices.
 - Hardware H.264/H.265 decode via webOS's NDL DirectMedia API; audio via SDL2/PulseAudio.
 - Magic Remote friendly: d-pad navigation, pointer hover/click, number-pad PIN/IP entry, and the
   Red button as a Back/disconnect substitute (see `docs/NOTES.md` for why).

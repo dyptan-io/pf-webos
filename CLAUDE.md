@@ -27,6 +27,7 @@ that. CI skips Docker and calls the `native:*` tasks directly (its runner is alr
 | `task package` | Build + package `dist/*.ipk` — the one you usually want |
 | `task build` / `task check` | Faster inner loop: just compile, or just `cargo check` |
 | `task lint` / `task fmt` | `cargo clippy` (Docker) / `cargo fmt` (native) |
+| `task notices` | Regenerate `THIRD-PARTY-NOTICES.txt` (embedded in the About screen) |
 | `task deploy TV_HOST=root@<tv-ip>` | Build, package, install, and launch on a real TV over SSH |
 | `task deploy:log TV_HOST=root@<tv-ip>` | Tail the app's log (`/tmp/punktfunk-webos.log`) on the TV |
 | `task shell` | Interactive shell in the Docker build container (debugging) |
@@ -62,9 +63,17 @@ SDL2/PulseAudio; NDL's own audio path is unused. This matters for loss recovery:
 **Two runtime phases in `main.rs`, looped**: a pre-stream UI flow (`run_ui_flow`) and a streaming
 event loop (in `run_inner`), alternating on `StreamOutcome::ReturnToMenu` vs. `Quit`.
 
-- **Pre-stream UI** (`app.rs` + `ui.rs`): `app.rs` owns the screen state machine (`Screen::Home` —
-  sidebar of known hosts + game grid — with `Pairing`/`Settings`/`AddHost`/`Wake`/`ForgetHost` as
-  modals over it); `ui.rs` owns drawing primitives and key-to-`MenuEvent` mapping; `store.rs` owns
+- **Pre-stream UI** (`app/` + `ui/`): `app/` owns the screen state machine (`Screen::Home` —
+  sidebar of known hosts + game grid — with `Pairing`/`Settings`/`AddHost`/`EditHost`/`Wake`/
+  `HostMenu`/`ForgetHost`/`About` as modals over it — `HostMenu` opens from the ⋯ button on each
+  sidebar host row), one module per screen (`app/mod.rs` keeps
+  the `App` struct, the shared drains, and the tile orchestration; its fields are `pub(crate)` so
+  the screen modules can reach them). `ui/` owns drawing primitives and key-to-`MenuEvent`
+  mapping, split along the same seams (`painter`/`text`/`rows`/`sidebar`/`grid`/`listmodal`/…) and
+  glob-re-exported from `ui/mod.rs`, so everything is still reached as `crate::ui::X`.
+  **Adding a screen**: if it's a list of actions, build it on `ui::ListModal` (see
+  `app/hostmenu.rs` — rows + a Confirm arm, and the shell/focus-tile/animation machinery is
+  shared); the `Screen` enum's eight dispatch sites are the only other edits. `store.rs` owns
   persistence (identity/hosts/settings JSON); `discovery.rs` owns mDNS LAN discovery. Rendering goes
   through `ui::Painter` (`tiny_skia`-backed software framebuffer — no Skia/Vulkan/LVGL on webOS):
   `App::render` draws each screen into one `Painter` per dirty tick, `main.rs` uploads it to one
