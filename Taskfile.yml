@@ -77,6 +77,10 @@ tasks:
       # Modern CMake refuses vendored libopus's old cmake_minimum_required
       # (audiopus_sys, pulled in transitively by punktfunk-core's `quic` feature).
       CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+      # Thread the packaged version into the binary so the UI's build marker matches
+      # the .ipk (Cargo.toml stays a fixed 0.0.1; recomputed inside Docker from the
+      # mounted repo's git, so both `build` and CI's `native:build` pick it up).
+      PKG_VERSION: '{{.PKG_VERSION}}'
     cmds:
       - rustup target add {{.TARGET}}
       - cargo build --release --target {{.TARGET}}
