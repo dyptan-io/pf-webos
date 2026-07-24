@@ -29,14 +29,33 @@ pub enum Tile {
     Ring,
     /// The active modal, full-screen with transparent surroundings.
     Modal,
+    /// Whichever modal's single focused, zoom-animated widget is currently
+    /// cached — a settings/Wake row, a pairing PIN digit or button, or a
+    /// Forget-host confirm button (see `app::ModalFocusKey`). Composited over
+    /// `Modal`'s shell (which draws every widget unfocused) so moving focus,
+    /// or zooming it in, recomposites this instead of re-rasterizing the
+    /// whole modal. Only one modal is ever open at a time, so one tile
+    /// suffices for all of them.
+    ModalFocusElement,
+    /// An open dropdown's focused option, as its own small tile — composited
+    /// over `Modal`'s shell (which draws the dropdown's option list
+    /// unfocused) so moving the dropdown's own focus recomposites this
+    /// instead of re-rasterizing the whole modal.
+    DropdownFocusOption,
     /// The Home status line block (bottom of the grid panel).
     Status,
     /// The "No host selected" hint line.
     NoHost,
     /// The in-stream stats overlay panel (`ui::render_stats_overlay_tile`).
     StatsOverlay,
-    /// The in-stream disconnect-confirmation dialog (`ui::render_disconnect_dialog_tile`).
+    /// The in-stream disconnect-confirmation dialog's shell — card, title,
+    /// both buttons unfocused (`ui::render_disconnect_dialog_shell`).
     DisconnectDialog,
+    /// The disconnect dialog's focused button, as its own small zoom-animated
+    /// tile (`ui::render_confirm_button_tile`) — composited over
+    /// `DisconnectDialog`'s shell, same shell/focus-tile split as every
+    /// pre-stream modal.
+    DisconnectFocusButton,
 }
 
 /// One step of a frame's composition, in paint order.

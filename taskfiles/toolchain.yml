@@ -1,5 +1,8 @@
 version: '3'
 
+# Match the root Taskfile: suppress go-task's per-command echo.
+silent: true
+
 vars:
   SDL2_BACKPORT_RELEASE: release-2.30.12-webos.5
   SDL2_BACKPORT_VERSION: 2.30.12
@@ -138,11 +141,13 @@ tasks:
       vars: [TARGET_TASK]
     cmds:
       - >-
-        docker run --rm --platform linux/arm64 {{.DOCKER_MOUNTS}} {{.RUST_IMAGE}}
+        docker run --rm --platform linux/arm64 -e DEBIAN_FRONTEND=noninteractive {{.DOCKER_MOUNTS}} {{.RUST_IMAGE}}
         sh -c '
           apt-get update -qq &&
-          apt-get install -y -qq --no-install-recommends cmake curl ca-certificates git pkg-config build-essential xz-utils > /dev/null &&
-          curl -sL https://taskfile.dev/install.sh | sh -s -- -d -b /opt/pf-webos-tools/bin > /dev/null &&
+          apt-get install -y -qq --no-install-recommends apt-utils cmake curl ca-certificates git pkg-config build-essential xz-utils > /dev/null &&
+          if ! command -v task > /dev/null 2>&1; then
+            curl -sL https://taskfile.dev/install.sh | sh -s -- -d -b /opt/pf-webos-tools/bin > /dev/null;
+          fi &&
           task {{.TARGET_TASK}}
         '
 

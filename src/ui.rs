@@ -19,6 +19,7 @@
 //! icons are glyphs from a small bundled, subsetted icon font (see the icons
 //! section below and `assets/icons/NOTICE.md`).
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use sdl2::pixels::Color;
@@ -30,6 +31,43 @@ use tiny_skia::{
 
 use crate::discovery::DiscoveredHost;
 use crate::store::{KnownHost, Settings, VideoBackend};
+
+// -------------------------------------------------------------------- animation --
+// Shared by every GPU-scale zoom-pop in the app — the grid's card focus-pop
+// (`app.rs`), every pre-stream modal's focused-widget tile, and the in-stream
+// disconnect dialog's (`main.rs`) — so there's exactly one implementation of
+// "ease a clock, then scale a rect around its center" instead of one per caller.
+
+/// How long a focus-pop (zoom-in) animation runs — the grid's card, every
+/// pre-stream modal's focused widget, and the disconnect dialog's button.
+pub const FOCUS_POP: Duration = Duration::from_millis(140);
+
+/// Cubic ease-out for the animation fractions below.
+fn ease(f: f32) -> f32 {
+    1.0 - (1.0 - f).powi(3)
+}
+
+/// Eased 0..=1 progress of an animation started at `t`; 1.0 when done/absent.
+pub fn anim_frac(anim: Option<Instant>, dur: Duration) -> f32 {
+    match anim {
+        Some(t) => ease((t.elapsed().as_secs_f32() / dur.as_secs_f32()).min(1.0)),
+        None => 1.0,
+    }
+}
+
+/// Scales `base` by `1.0 + growth * frac` around its own center — the GPU
+/// zoom-in technique behind every focus-pop in the app. The source tile is
+/// rasterized once, at its literal size; only this destination rect changes
+/// per frame, so the zoom costs nothing beyond a GPU texture copy at a
+/// different size.
+pub fn zoom_rect(base: Rect, frac: f32, growth: f32) -> Rect {
+    let scale = 1.0 + growth * frac;
+    let cx = base.x() as f32 + base.width() as f32 / 2.0;
+    let cy = base.y() as f32 + base.height() as f32 / 2.0;
+    let tw = base.width() as f32 * scale;
+    let th = base.height() as f32 * scale;
+    Rect::new((cx - tw / 2.0) as i32, (cy - th / 2.0) as i32, tw as u32, th as u32)
+}
 
 // ---------------------------------------------------------------------- palette --
 // The punktfunk brand palette, sampled from `packaging/icon_large.png` (the
@@ -527,6 +565,17 @@ pub enum FontWeight {
     SemiBold,
 }
 
+/// The app's four UI fonts, bundled so the many functions needing several of
+/// them take one `&Fonts` instead of threading each separately. Borrow-only —
+/// the fonts are owned in `main.rs`'s `run_inner` for the whole menu/stream
+/// cycle (see `load_font`), so this never needs storing anywhere.
+pub struct Fonts<'a, 'ttf> {
+    pub label: &'a Font<'ttf, 'static>,
+    pub value: &'a Font<'ttf, 'static>,
+    pub title: &'a Font<'ttf, 'static>,
+    pub icon: &'a Font<'ttf, 'static>,
+}
+
 /// Loads a bundled Geist weight at a size proportional to the display height
 /// (design reference: a 720px-tall reference screen —
 /// `size = design_size * height / 720`).
@@ -768,6 +817,17 @@ pub fn draw_text_wrapped(
     Ok(cursor_y)
 }
 
+/// The pure geometry `draw_modal_header` and `modal_header_end_y` share:
+/// `(text_x, subtitle_y, max_w)` — the one place it's computed, so the two
+/// can never drift apart.
+fn modal_header_geometry(title_font: &Font, card: Rect) -> (i32, i32, u32) {
+    let text_x = card.x() + 32;
+    let title_y = card.y() + 28;
+    let subtitle_y = title_y + title_font.height() + 18;
+    let max_w = card.width().saturating_sub(64);
+    (text_x, subtitle_y, max_w)
+}
+
 /// The title + wrapped subtitle every Pairing/Add-host/Wake/Forget-host modal draws
 /// before its own content, on top of `draw_modal_card`'s chrome — pulled out once these
 /// four had each grown (then separately re-fixed) the same bug: a subtitle positioned a
@@ -787,12 +847,19 @@ pub fn draw_modal_header(
     subtitle: &str,
     subtitle_color: Color,
 ) -> Result<i32> {
-    let text_x = card.x() + 32;
-    let title_y = card.y() + 28;
-    draw_text(painter, text_cache, title_font, title, text_x, title_y, title_color)?;
-    let subtitle_y = title_y + title_font.height() + 18;
-    let max_w = card.width().saturating_sub(64);
+    let (text_x, subtitle_y, max_w) = modal_header_geometry(title_font, card);
+    draw_text(painter, text_cache, title_font, title, text_x, card.y() + 28, title_color)?;
     draw_text_wrapped(painter, text_cache, subtitle_font, subtitle, text_x, subtitle_y, max_w, subtitle_color, 6)
+}
+
+/// The same `y` [`draw_modal_header`] would return, computed without drawing —
+/// for positioning content below it (e.g. Pairing's PIN row) from `app.rs`'s
+/// `prepare_tiles`/`draw_list`, which need that position but must not
+/// re-render the header just to get it.
+pub fn modal_header_end_y(title_font: &Font, subtitle_font: &Font, card: Rect, subtitle: &str) -> i32 {
+    let (_, subtitle_y, max_w) = modal_header_geometry(title_font, card);
+    let lines = wrap_text(subtitle_font, subtitle, max_w).len() as i32;
+    subtitle_y + lines * (subtitle_font.height() + 6)
 }
 
 // -------------------------------------------------------------------- focus/cards --
@@ -860,7 +927,8 @@ pub fn draw_card(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
 
 /// Same card as [`draw_card`], but only painted when focused — an unfocused
 /// row/button has no background at all. Used by every selectable row/button
-/// (sidebar, settings, Wake, confirm).
+/// (sidebar, Wake, confirm) except settings rows, which use
+/// [`draw_selectable_fixed`] instead (see its docs).
 fn draw_selectable(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
     let r = inflate(rect, focused);
     if focused {
@@ -868,6 +936,19 @@ fn draw_selectable(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
         painter.fill_rounded_rect(r, CARD_RADIUS, SURFACE);
     }
     r
+}
+
+/// Same as [`draw_selectable`] but never inflates: settings rows are
+/// rasterized once at their literal size, and `app.rs`'s `draw_list` animates
+/// the zoom-in itself by GPU-scaling the whole focused-row tile around its
+/// center (same technique as the grid's card focus-pop) — a CPU-baked inflate
+/// here would fight that, since the rasterized content would then need
+/// re-rendering every animation frame instead of just repositioning.
+fn draw_selectable_fixed(painter: &mut Painter, rect: Rect, focused: bool) {
+    if focused {
+        draw_card_shadow(painter, rect, CARD_RADIUS);
+        painter.fill_rounded_rect(rect, CARD_RADIUS, SURFACE);
+    }
 }
 
 /// A handful of muted hues for the poster-card placeholder tint (hash-selected per
@@ -894,12 +975,10 @@ fn tint_for(title: &str) -> Color {
 /// initial letter (no real art fetched yet, or the host has none for this title).
 /// Either way a bottom title strip overlays the art/tint, matching the reference's
 /// always-present (ellipsized) title label.
-#[allow(clippy::too_many_arguments)]
 pub fn draw_poster_card(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    font_title: &Font,
-    font_value: &Font,
+    fonts: &Fonts,
     rect: Rect,
     title: &str,
     art: Option<&Pixmap>,
@@ -908,7 +987,7 @@ pub fn draw_poster_card(
     let r = inflate(rect, focused);
     draw_card_shadow(painter, r, CARD_RADIUS);
 
-    let strip_h = (font_value.height() + 16).min(r.height() as i32 / 3);
+    let strip_h = (fonts.value.height() + 16).min(r.height() as i32 / 3);
     match art {
         Some(pixmap) => {
             painter.draw_pixmap_scaled(r, pixmap);
@@ -921,12 +1000,12 @@ pub fn draw_poster_card(
                 .unwrap_or('?')
                 .to_uppercase()
                 .to_string();
-            let (iw, ih) = font_title.size_of(&initial).unwrap_or((0, 0));
+            let (iw, ih) = fonts.title.size_of(&initial).unwrap_or((0, 0));
             let art_h = r.height() as i32 - strip_h;
             draw_text(
                 painter,
                 text_cache,
-                font_title,
+                fonts.title,
                 &initial,
                 r.x() + (r.width() as i32 - iw as i32) / 2,
                 r.y() + (art_h - ih as i32) / 2,
@@ -942,14 +1021,14 @@ pub fn draw_poster_card(
         strip_h.max(0) as u32,
     );
     painter.fill_rect(strip, Color::RGBA(0x00, 0x00, 0x00, 0x70));
-    let label = ellipsize(font_value, title, strip.width().saturating_sub(16));
+    let label = ellipsize(fonts.value, title, strip.width().saturating_sub(16));
     draw_text(
         painter,
         text_cache,
-        font_value,
+        fonts.value,
         &label,
         strip.x() + 8,
-        strip.y() + (strip.height() as i32 - font_value.height()) / 2,
+        strip.y() + (strip.height() as i32 - fonts.value.height()) / 2,
         WHITE,
     )?;
 
@@ -974,8 +1053,7 @@ pub const CARD_TILE_PAD: i32 = 20;
 /// plus the shared [`render_focus_ring_tile`] composited over it.
 pub fn render_card_tile(
     text_cache: &mut TextCache,
-    font_title: &Font,
-    font_value: &Font,
+    fonts: &Fonts,
     card_w: u32,
     card_h: u32,
     title: &str,
@@ -986,8 +1064,7 @@ pub fn render_card_tile(
     draw_poster_card(
         &mut p,
         text_cache,
-        font_title,
-        font_value,
+        fonts,
         Rect::new(pad, pad, card_w, card_h),
         title,
         art,
@@ -1010,8 +1087,12 @@ pub fn render_focus_ring_tile(w: u32, h: u32) -> Painter {
     p
 }
 
-/// Transparent padding around a focused sidebar-row tile: the row inflates ~2%
-/// (±7px) when focused and its shadow extends ~20px past that.
+/// Transparent padding around a focused-row tile, generous enough for a
+/// row's shadow bleed (~20px) plus, for rows that still bake their own ~2%
+/// inflate (sidebar rows — see [`draw_selectable`]), that growth too.
+/// Settings rows animate their zoom via GPU scale instead (see
+/// [`draw_selectable_fixed`]) and so don't need the second allowance, but
+/// share this same constant for simplicity.
 pub const ROW_TILE_PAD: i32 = 28;
 
 /// Sidebar row `index`, focused, as its own padded transparent tile — composited
@@ -1020,8 +1101,7 @@ pub const ROW_TILE_PAD: i32 = 28;
 /// share one rect size, so the tile dimensions are constant.
 pub fn render_focused_row_tile(
     text_cache: &mut TextCache,
-    font_label: &Font,
-    icon_font: &Font,
+    fonts: &Fonts,
     entries: &[HostEntry],
     index: usize,
 ) -> Result<Painter> {
@@ -1033,17 +1113,16 @@ pub fn render_focused_row_tile(
         draw_host_row(
             &mut p,
             text_cache,
-            font_label,
-            icon_font,
+            fonts,
             rect,
             entry.name(),
             entry.is_paired(),
             true,
         )?;
     } else if index == entries.len() {
-        draw_utility_row(&mut p, text_cache, font_label, icon_font, rect, "+ Add host", true)?;
+        draw_utility_row(&mut p, text_cache, fonts, rect, "+ Add host", true)?;
     } else {
-        draw_utility_row(&mut p, text_cache, font_label, icon_font, rect, "Settings", true)?;
+        draw_utility_row(&mut p, text_cache, fonts, rect, "Settings", true)?;
     }
     Ok(p)
 }
@@ -1078,20 +1157,27 @@ pub fn render_wrapped_text_tile(
     Ok(p)
 }
 
+/// A worst-case stat line (max resolution + longest codec/HDR tag), measured to
+/// fix the overlay's width — see `render_stats_overlay_tile`.
+const STATS_OVERLAY_REF_LINE: &str = "3840x2160@120 HEVC HDR";
+
 /// The in-stream stats overlay panel: a translucent brand-dark rounded card with
-/// one line of text per stat, sized to its content. Rebuilt at the overlay's
-/// ~2Hz refresh with a THROWAWAY `TextCache` — the numeric lines change every
-/// refresh, so a persistent cache would only accumulate dead entries for the
-/// whole stream's duration.
+/// one line of text per stat. Rebuilt at the overlay's ~2Hz refresh with a
+/// THROWAWAY `TextCache` — the numeric lines change every refresh, so a
+/// persistent cache would only accumulate dead entries for the whole stream's
+/// duration.
+///
+/// Width is FIXED — measured from `STATS_OVERLAY_REF_LINE` plus a safety margin,
+/// not from the live content — so the right-anchored panel keeps a constant left
+/// edge instead of jittering horizontally as the numbers change digit count.
+/// Lines are ellipsized to the inner width as a further safety, so an unexpectedly
+/// long line can never overflow the card.
 pub fn render_stats_overlay_tile(font: &Font, lines: &[String]) -> Result<Painter> {
     let pad = 18i32;
+    let safety = 16u32; // extra slack past the reference width, so nothing touches the edge
     let line_h = font.height() + 6;
-    let text_w = lines
-        .iter()
-        .map(|l| font.size_of(l).map_or(0, |(w, _)| w))
-        .max()
-        .unwrap_or(0);
-    let w = text_w + 2 * pad as u32;
+    let inner_w = font.size_of(STATS_OVERLAY_REF_LINE).map_or(0, |(w, _)| w) + safety;
+    let w = inner_w + 2 * pad as u32;
     let h = (lines.len() as i32 * line_h + 2 * pad) as u32;
     let mut p = Painter::new(w.max(1), h.max(1));
     let mut tc = TextCache::new();
@@ -1103,48 +1189,55 @@ pub fn render_stats_overlay_tile(font: &Font, lines: &[String]) -> Result<Painte
     for (i, line) in lines.iter().enumerate() {
         // First line (mode/codec header) pops; the measurements below are muted.
         let color = if i == 0 { WHITE } else { MUTED };
-        draw_text(&mut p, &mut tc, font, line, pad, pad + i as i32 * line_h, color)?;
+        let clipped = ellipsize(font, line, inner_w);
+        draw_text(&mut p, &mut tc, font, &clipped, pad, pad + i as i32 * line_h, color)?;
     }
     Ok(p)
 }
 
-/// The in-stream disconnect-confirmation dialog: card, title, and confirm
-/// buttons, full-screen sized like `App`'s `Tile::Modal` so `main.rs` can
-/// place it at `(0, 0)`. No backdrop dim baked in — `main.rs` draws that as
-/// its own compositor `Fill`, same as `App::draw_list` scrims `Tile::Modal`.
-pub fn render_disconnect_dialog_tile(
-    screen_w: u32,
-    screen_h: u32,
-    font_label: &Font,
-    icon_font: &Font,
-    focused: usize,
-) -> Result<Painter> {
-    let mut p = Painter::new(screen_w, screen_h);
-    let mut tc = TextCache::new();
+/// The Disconnect/Cancel button pair — shared by the shell and the
+/// focused-button tile (`render_confirm_button_tile`), so their
+/// `ConfirmButton` data can't drift apart.
+pub fn disconnect_dialog_buttons() -> [ConfirmButton<'static>; 2] {
+    [
+        ConfirmButton { icon: Some(ICON_CLOSE), label: "Disconnect", color: ERROR_RED },
+        ConfirmButton { icon: None, label: "Cancel", color: WHITE },
+    ]
+}
+
+/// The disconnect dialog's card rect and its button row's rect — the one
+/// place this layout lives, shared by `render_disconnect_dialog_shell` and
+/// `main.rs` (which needs the button rect, without drawing, to position the
+/// focused-button tile).
+pub fn disconnect_dialog_layout(screen_w: u32, screen_h: u32, font_label: &Font) -> (Rect, Rect) {
     let card = modal_card_rect(screen_w, screen_h, 0.34, 200);
-    draw_modal_card(&mut p, card);
-    let title = "Stop streaming?";
-    let (title_w, _) = font_label.size_of(title).unwrap_or((0, 0));
-    let title_x = card.x() + (card.width() as i32 - title_w as i32) / 2;
-    draw_text(&mut p, &mut tc, font_label, title, title_x, card.y() + 36, WHITE)?;
-    let btn_rect = Rect::new(
+    let content = Rect::new(
         card.x() + 32,
         card.y() + 36 + font_label.height() + 28,
         card.width().saturating_sub(64),
         72,
     );
-    draw_confirm_buttons(
-        &mut p,
-        &mut tc,
-        font_label,
-        icon_font,
-        btn_rect,
-        &[
-            ConfirmButton { icon: Some(ICON_CLOSE), label: "Disconnect", color: ERROR_RED },
-            ConfirmButton { icon: None, label: "Cancel", color: WHITE },
-        ],
-        focused,
-    )?;
+    (card, content)
+}
+
+/// The in-stream disconnect-confirmation dialog's shell: card, title, and
+/// both confirm buttons unfocused — full-screen sized like `App`'s
+/// `Tile::Modal` so `main.rs` can place it at `(0, 0)`. No backdrop dim baked
+/// in — `main.rs` draws that as its own compositor `Fill`, same as
+/// `App::draw_list` scrims `Tile::Modal`. The actually focused button
+/// composites on top as its own small, zoom-animated tile (see
+/// `render_confirm_button_tile`) — same shell/focus-tile split as every other
+/// modal in the app.
+pub fn render_disconnect_dialog_shell(screen_w: u32, screen_h: u32, fonts: &Fonts) -> Result<Painter> {
+    let mut p = Painter::new(screen_w, screen_h);
+    let mut tc = TextCache::new();
+    let (card, content) = disconnect_dialog_layout(screen_w, screen_h, fonts.label);
+    draw_modal_card(&mut p, card);
+    let title = "Stop streaming?";
+    let (title_w, _) = fonts.label.size_of(title).unwrap_or((0, 0));
+    let title_x = card.x() + (card.width() as i32 - title_w as i32) / 2;
+    draw_text(&mut p, &mut tc, fonts.label, title, title_x, card.y() + 36, WHITE)?;
+    draw_confirm_buttons(&mut p, &mut tc, fonts, content, &disconnect_dialog_buttons(), usize::MAX)?;
     Ok(p)
 }
 
@@ -1239,33 +1332,25 @@ impl HostEntry {
 /// put regardless of how many hosts are known, instead of drifting down the
 /// screen as the list grows. `focused_index` is `Some` only when the sidebar
 /// itself has focus (see `app.rs`'s `HomeFocus`).
-#[allow(clippy::too_many_arguments)]
 pub fn draw_sidebar(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    font_label: &Font,
-    font_value: &Font,
-    icon_font: &Font,
+    fonts: &Fonts,
     entries: &[HostEntry],
     focused_index: Option<usize>,
     screen_h: u32,
 ) -> Result<()> {
     painter.fill_rect(Rect::new(0, 0, SIDEBAR_W, screen_h), SIDEBAR_BG);
     // The real brand lockup (mark + FUNK wordmark), from the actual logo
-    // artwork — see `logo_pixmap`. Drawn 1:1, no scaling.
+    // artwork — see `logo_pixmap`. The bundled asset is exported at exactly
+    // its on-screen display size (rendered fresh from
+    // `punktfunk-logo-dark.svg` at that size, not a scaled copy of a smaller
+    // export — see its NOTICE.md), so this draws it 1:1, no runtime scaling
+    // in either direction. Centered horizontally.
     if let Some(logo) = logo_pixmap() {
-        painter.draw_pixmap(SIDEBAR_PAD, 32, logo);
+        let logo_x = (SIDEBAR_W as i32 - logo.width() as i32) / 2;
+        painter.draw_pixmap(logo_x, 32, logo);
     }
-    // Small section label over the host list, clearly separated from the lockup.
-    draw_text(
-        painter,
-        text_cache,
-        font_value,
-        "Hosts",
-        SIDEBAR_PAD + 4,
-        SIDEBAR_TOP_Y - 40,
-        MUTED,
-    )?;
 
     let add_row = entries.len();
     let settings_row = entries.len() + 1;
@@ -1273,8 +1358,7 @@ pub fn draw_sidebar(
         draw_host_row(
             painter,
             text_cache,
-            font_label,
-            icon_font,
+            fonts,
             sidebar_row_rect(i),
             entry.name(),
             entry.is_paired(),
@@ -1284,14 +1368,31 @@ pub fn draw_sidebar(
     draw_utility_row(
         painter,
         text_cache,
-        font_label,
-        icon_font,
+        fonts,
         sidebar_row_rect(add_row),
         "+ Add host",
         focused_index == Some(add_row),
     )?;
 
     let settings_rect = settings_row_rect(screen_h);
+    // Small, dim, left-aligned — a quiet build marker, not something anyone
+    // needs to read at a glance, so it sits clear of the divider (a fixed gap
+    // above it) instead of its own row. Blended toward the panel background
+    // rather than given a low alpha: `draw_text`'s glyphs are cached as
+    // already-rendered pixmaps (see `TextCache`), composited opaquely — an
+    // alpha color here barely dims them, where a literally darker color reads
+    // as dim against `SIDEBAR_BG` the same way `MUTED` text does everywhere
+    // else in this UI.
+    let version = concat!("v", env!("CARGO_PKG_VERSION"));
+    draw_text(
+        painter,
+        text_cache,
+        fonts.value,
+        version,
+        settings_rect.x(),
+        settings_rect.y() - 14 - 10 - fonts.value.height(),
+        lerp_color(SIDEBAR_BG, MUTED, 0.35),
+    )?;
     painter.fill_rect(
         Rect::new(settings_rect.x(), settings_rect.y() - 14, settings_rect.width(), 1),
         Color::RGBA(0xff, 0xff, 0xff, 0x1a),
@@ -1299,8 +1400,7 @@ pub fn draw_sidebar(
     draw_utility_row(
         painter,
         text_cache,
-        font_label,
-        icon_font,
+        fonts,
         settings_rect,
         "Settings",
         focused_index == Some(settings_row),
@@ -1316,12 +1416,10 @@ pub fn draw_sidebar(
 /// background at all. Host rows and utility rows used to each carry their own
 /// near-identical copy of this (differing only by accident of drift, in icon
 /// size/padding, not by design).
-#[allow(clippy::too_many_arguments)]
 fn draw_sidebar_row(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    font_label: &Font,
-    icon_font: &Font,
+    fonts: &Fonts,
     rect: Rect,
     glyph: &str,
     label: &str,
@@ -1337,44 +1435,41 @@ fn draw_sidebar_row(
         icon_size,
     );
     let color = if focused { WHITE } else { MUTED };
-    draw_icon(painter, text_cache, icon_font, icon_rect, glyph, color)?;
+    draw_icon(painter, text_cache, fonts.icon, icon_rect, glyph, color)?;
     // Ellipsized to the row's real text width (icon + paddings subtracted) — a
     // long mDNS hostname used to run past the row/panel edge.
     let text_x = icon_pad + icon_size as i32 + 16;
     let max_w = drawn.width().saturating_sub(text_x as u32 + 20);
-    let label = ellipsize(font_label, label, max_w);
+    let label = ellipsize(fonts.label, label, max_w);
     draw_text(
         painter,
         text_cache,
-        font_label,
+        fonts.label,
         &label,
         drawn.x() + text_x,
-        drawn.y() + (drawn.height() as i32 - font_label.height()) / 2,
+        drawn.y() + (drawn.height() as i32 - fonts.label.height()) / 2,
         color,
     )?;
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn draw_host_row(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    font_label: &Font,
-    icon_font: &Font,
+    fonts: &Fonts,
     rect: Rect,
     name: &str,
     paired: bool,
     focused: bool,
 ) -> Result<()> {
     let glyph = if paired { ICON_TV } else { ICON_LOCK };
-    draw_sidebar_row(painter, text_cache, font_label, icon_font, rect, glyph, name, focused)
+    draw_sidebar_row(painter, text_cache, fonts, rect, glyph, name, focused)
 }
 
 fn draw_utility_row(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    font_label: &Font,
-    icon_font: &Font,
+    fonts: &Fonts,
     rect: Rect,
     label: &str,
     focused: bool,
@@ -1385,7 +1480,7 @@ fn draw_utility_row(
         ICON_SETTINGS
     };
     let label = label.trim_start_matches('+').trim();
-    draw_sidebar_row(painter, text_cache, font_label, icon_font, rect, glyph, label, focused)
+    draw_sidebar_row(painter, text_cache, fonts, rect, glyph, label, focused)
 }
 
 // ------------------------------------------------------------------------ grid --
@@ -1479,9 +1574,69 @@ pub fn modal_close_rect(card_rect: Rect) -> Rect {
     )
 }
 
+// ----------------------------------------------------------------------- pairing --
+
+/// PIN digit box size/gap — shared by `pairing_digit_rect` and the digit
+/// tiles so they can never disagree.
+pub const PAIRING_DIGIT_W: u32 = 64;
+pub const PAIRING_DIGIT_H: u32 = 80;
+const PAIRING_DIGIT_GAP: i32 = 14;
+
+/// PIN digit `index`'s rect within `card`, given the row's top `y` (from
+/// `modal_header_end_y` plus a fixed gap) — the one place this layout formula
+/// lives, shared by `render_pairing` and `app.rs`'s `draw_list`.
+pub fn pairing_digit_rect(card: Rect, digit_y: i32, index: usize) -> Rect {
+    let total_w = 4 * PAIRING_DIGIT_W as i32 + 3 * PAIRING_DIGIT_GAP;
+    let start_x = card.x() + (card.width() as i32 - total_w) / 2;
+    Rect::new(
+        start_x + index as i32 * (PAIRING_DIGIT_W as i32 + PAIRING_DIGIT_GAP),
+        digit_y,
+        PAIRING_DIGIT_W,
+        PAIRING_DIGIT_H,
+    )
+}
+
+pub const PAIRING_REQUEST_LABEL: &str = "Request access";
+
+/// A focused card tile with centered text — a padded transparent tile holding
+/// one `draw_card(.., false)` box (no CPU inflate; the zoom is a GPU animation
+/// in `app.rs`'s `draw_list`) with `text` centered in it. Backs both pairing
+/// focus tiles below.
+fn render_card_text_tile(text_cache: &mut TextCache, font: &Font, text: &str, w: u32, h: u32) -> Result<Painter> {
+    let pad = ROW_TILE_PAD;
+    let mut p = Painter::new(w + 2 * pad as u32, h + 2 * pad as u32);
+    let drawn = draw_card(&mut p, Rect::new(pad, pad, w, h), false);
+    let tw = font.size_of(text).map_or(0, |(w, _)| w);
+    draw_text(
+        &mut p,
+        text_cache,
+        font,
+        text,
+        drawn.x() + (drawn.width() as i32 - tw as i32) / 2,
+        drawn.y() + (drawn.height() as i32 - font.height()) / 2,
+        WHITE,
+    )?;
+    Ok(p)
+}
+
+/// One PIN digit, focused, as its own zoom-animated tile — composited by the
+/// GPU over the shell's unfocused digit boxes, same pattern as
+/// `render_focus_row_tile`.
+pub fn render_pairing_digit_tile(text_cache: &mut TextCache, font_title: &Font, digit: u8) -> Result<Painter> {
+    render_card_text_tile(text_cache, font_title, &digit.to_string(), PAIRING_DIGIT_W, PAIRING_DIGIT_H)
+}
+
+/// The "Request access" button, focused, as its own zoom-animated tile —
+/// mirrors [`render_pairing_digit_tile`].
+pub fn render_pairing_button_tile(text_cache: &mut TextCache, font_label: &Font, w: u32, h: u32) -> Result<Painter> {
+    render_card_text_tile(text_cache, font_label, PAIRING_REQUEST_LABEL, w, h)
+}
+
 // ------------------------------------------------------------------- settings --
 
-/// How a settings row behaves when focused/confirmed.
+/// How a focus row's right-hand control behaves — shared by the settings
+/// modal's row list and the Wake modal's two rows (`draw_focus_rows`'s single
+/// implementation, see its docs).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
     Dropdown,
@@ -1489,7 +1644,11 @@ pub enum RowKind {
     Toggle,
 }
 
-pub struct SettingsRow {
+/// One focusable icon + label (+ dropdown pill / slider / switch) row, drawn
+/// by `draw_focus_rows`/`draw_focus_row` — shared by the settings modal's row
+/// list (`settings_rows`) and the Wake modal's toggle row (`wake_rows`).
+pub struct FocusRow {
+    pub icon: &'static str,
     pub label: String,
     pub value: String,
     pub kind: RowKind,
@@ -1508,9 +1667,9 @@ pub const RESOLUTIONS: [(u32, u32, &str); 3] = [
 /// Framerate presets — sent to the host as the exact wire refresh rate.
 pub const REFRESH_RATES: [u32; 3] = [30, 60, 120];
 
-/// Bitrate slider range/step, in kbps — the user's explicit ask ("10-150 Mbps max").
+/// Bitrate slider range/step, in kbps — the user's explicit ask ("10-200 Mbps max").
 pub const BITRATE_MIN_KBPS: u32 = 10_000;
-pub const BITRATE_MAX_KBPS: u32 = 150_000;
+pub const BITRATE_MAX_KBPS: u32 = 200_000;
 pub const BITRATE_STEP_KBPS: u32 = 5_000;
 /// Sentinel one notch below `BITRATE_MIN_KBPS` on the slider: `punktfunk_core::client::NativeClient`
 /// arms its own client-side AIMD bitrate controller (`punktfunk_core::abr`) precisely when it's
@@ -1519,10 +1678,10 @@ pub const BITRATE_STEP_KBPS: u32 = 5_000;
 /// or climbing every ~750ms. A fixed Mbps number, however carefully picked, never adapts to a link
 /// that degrades mid-session — this does.
 pub const BITRATE_AUTOMATIC: u32 = 0;
-/// Above this, aurora-tv's own moonlight-tv wiki notes stability drops off on
-/// typical Wi-Fi — shown as an amber caution, matching the reference's settings
-/// pane (not a hard cap, the slider still allows up to `BITRATE_MAX_KBPS`).
-pub const BITRATE_WARN_KBPS: u32 = 65_000;
+/// Above this, stability drops off on typical Wi-Fi — shown as an amber
+/// caution, matching the reference's settings pane (not a hard cap, the
+/// slider still allows up to `BITRATE_MAX_KBPS`).
+pub const BITRATE_WARN_KBPS: u32 = 150_000;
 
 /// Settings-modal row indices — shared by `settings_rows`, `adjust_setting`, and
 /// `app.rs`'s event handling so the mapping only lives in one place.
@@ -1561,26 +1720,29 @@ fn resolution_label(width: u32, height: u32) -> String {
         .map_or_else(|| format!("{width}x{height}"), |(_, _, s)| s.to_string())
 }
 
-pub fn settings_rows(settings: &Settings) -> Vec<SettingsRow> {
+pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
     let bitrate_frac = if settings.bitrate_kbps == BITRATE_AUTOMATIC {
         0.0
     } else {
         (settings.bitrate_kbps.saturating_sub(BITRATE_MIN_KBPS)) as f32 / (BITRATE_MAX_KBPS - BITRATE_MIN_KBPS) as f32
     };
     vec![
-        SettingsRow {
+        FocusRow {
+            icon: ICON_MONITOR,
             label: "Resolution".into(),
             value: resolution_label(settings.width, settings.height),
             kind: RowKind::Dropdown,
             fraction: 0.0,
         },
-        SettingsRow {
+        FocusRow {
+            icon: ICON_SCHEDULE,
             label: "Frame rate".into(),
             value: format!("{} Hz", settings.refresh_hz),
             kind: RowKind::Dropdown,
             fraction: 0.0,
         },
-        SettingsRow {
+        FocusRow {
+            icon: ICON_SIGNAL,
             label: "Bitrate".into(),
             value: if settings.bitrate_kbps == BITRATE_AUTOMATIC {
                 "Automatic".into()
@@ -1590,7 +1752,8 @@ pub fn settings_rows(settings: &Settings) -> Vec<SettingsRow> {
             kind: RowKind::Slider,
             fraction: bitrate_frac,
         },
-        SettingsRow {
+        FocusRow {
+            icon: ICON_SUN,
             label: "HDR".into(),
             value: if settings.hdr_enabled {
                 "On".into()
@@ -1600,7 +1763,8 @@ pub fn settings_rows(settings: &Settings) -> Vec<SettingsRow> {
             kind: RowKind::Toggle,
             fraction: 0.0,
         },
-        SettingsRow {
+        FocusRow {
+            icon: ICON_TV,
             label: "Video backend".into(),
             value: match settings.video_backend {
                 VideoBackend::Ndl => "NDL".into(),
@@ -1609,7 +1773,8 @@ pub fn settings_rows(settings: &Settings) -> Vec<SettingsRow> {
             kind: RowKind::Dropdown,
             fraction: 0.0,
         },
-        SettingsRow {
+        FocusRow {
+            icon: ICON_SUN,
             label: "Stats overlay".into(),
             value: if settings.stats_overlay {
                 "On".into()
@@ -1620,6 +1785,23 @@ pub fn settings_rows(settings: &Settings) -> Vec<SettingsRow> {
             fraction: 0.0,
         },
     ]
+}
+
+/// The Wake modal's one row — the "Always send automatically" toggle (see
+/// `app::WakeState`) — as a single-element `FocusRow` list, so it draws and
+/// zoom-animates through the exact same `draw_focus_rows`/
+/// `render_focus_row_tile` machinery as the settings modal. The actual
+/// "Wake"/"Cancel" actions are a `draw_confirm_buttons` row below this one
+/// (see `app.rs`'s `render_wake`), not rows here — mirroring the
+/// Forget-host confirmation's shell/buttons split.
+pub fn wake_rows(auto_send: bool) -> Vec<FocusRow> {
+    vec![FocusRow {
+        icon: ICON_SETTINGS,
+        label: "Always send automatically".into(),
+        value: if auto_send { "On".into() } else { "Off".into() },
+        kind: RowKind::Toggle,
+        fraction: 0.0,
+    }]
 }
 
 /// The option labels for a dropdown row (Resolution/Frame rate only).
@@ -1726,159 +1908,166 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
 // control right), consistent with the sidebar/grid's card+focus-ring language
 // rather than the bare flat rows the upstream reference uses.
 pub const SETTINGS_ROW_H: u32 = 92;
-pub const SETTINGS_ROW_GAP: i32 = 18;
+pub const SETTINGS_ROW_GAP: i32 = 8;
 const SETTINGS_ICON_SIZE: u32 = 30;
 
-/// Draws the settings modal's row list inside `content_rect` (the modal card's
-/// interior, below its title/divider) — icon + label on the left, a dropdown
-/// pill / slider / modern switch on the right. Only the focused row gets a
-/// background card (see [`draw_selectable`]), zoomed in slightly, with brighter
-/// icon/label/value color; an unfocused row is bare.
-#[allow(clippy::too_many_arguments)]
-pub fn draw_settings_rows(
+/// Row `index`'s rect within a modal's `content_rect` (the modal card's
+/// interior, below its title/divider) — the one place this stacked-row layout
+/// formula lives, shared by `draw_focus_rows` and `app.rs`'s `draw_list`
+/// (which needs it to position the composited focused-row tile), for both the
+/// settings modal's row list and the Wake modal's two rows.
+pub fn focus_row_rect(content_rect: Rect, index: usize) -> Rect {
+    let y = content_rect.y() + index as i32 * (SETTINGS_ROW_H as i32 + SETTINGS_ROW_GAP);
+    Rect::new(content_rect.x(), y, content_rect.width(), SETTINGS_ROW_H)
+}
+
+/// Fixed reserved width for a slider row's value label (e.g. "150 Mbps",
+/// "Automatic") — the track's position is anchored to this fixed slot rather
+/// than to the label's actual (variable) text width, so the track never
+/// shifts or appears to resize as the label's digit count changes.
+const SLIDER_VALUE_SLOT_W: i32 = 150;
+
+/// Draws a modal's focus-row list inside `content_rect` — icon + label on the
+/// left, a dropdown pill / slider / modern switch on the right — shared by the
+/// settings modal (`settings_rows`) and the Wake modal (`wake_rows`). Only the
+/// focused row gets a background card (see [`draw_selectable`]); an unfocused
+/// row is bare. Every row here renders at its normal, un-zoomed size — the
+/// focused row's zoom-in is a GPU animation applied on top (`app.rs`'s
+/// `draw_list`), not baked into this rasterized layer.
+pub fn draw_focus_rows(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    font_label: &Font,
-    font_value: &Font,
-    icon_font: &Font,
-    rows: &[SettingsRow],
+    fonts: &Fonts,
+    rows: &[FocusRow],
     focused_index: usize,
+    open_dropdown_row: Option<usize>,
     content_rect: Rect,
 ) -> Result<()> {
     for (i, row) in rows.iter().enumerate() {
-        let y = content_rect.y() + i as i32 * (SETTINGS_ROW_H as i32 + SETTINGS_ROW_GAP);
-        let focused = i == focused_index;
-        let row_rect = Rect::new(content_rect.x(), y, content_rect.width(), SETTINGS_ROW_H);
-        let drawn = draw_selectable(painter, row_rect, focused);
-
-        let icon_pad = 24;
-        let icon_rect = Rect::new(
-            drawn.x() + icon_pad,
-            drawn.y() + (drawn.height() as i32 - SETTINGS_ICON_SIZE as i32) / 2,
-            SETTINGS_ICON_SIZE,
-            SETTINGS_ICON_SIZE,
-        );
-        let icon_color = if focused { WHITE } else { MUTED };
-        let glyph = match row.kind {
-            RowKind::Dropdown if i == ROW_RESOLUTION => ICON_MONITOR,
-            RowKind::Dropdown if i == ROW_VIDEO_BACKEND => ICON_TV,
-            RowKind::Dropdown => ICON_SCHEDULE,
-            RowKind::Slider => ICON_SIGNAL,
-            RowKind::Toggle => ICON_SUN,
-        };
-        draw_icon(painter, text_cache, icon_font, icon_rect, glyph, icon_color)?;
-        let label_x = icon_rect.x() + SETTINGS_ICON_SIZE as i32 + 20;
-        draw_text(
+        let row_rect = focus_row_rect(content_rect, i);
+        let switch_frac = if row.value == "On" { 1.0 } else { 0.0 };
+        draw_focus_row(
             painter,
             text_cache,
-            font_label,
-            &row.label,
-            label_x,
-            drawn.y() + (drawn.height() as i32 - font_label.height()) / 2,
-            if focused { WHITE } else { MUTED },
+            fonts,
+            row,
+            i == focused_index,
+            open_dropdown_row == Some(i),
+            switch_frac,
+            row_rect,
         )?;
-
-        let control_pad = 28;
-        match row.kind {
-            RowKind::Dropdown => {
-                let pill_w = 220u32.min(drawn.width() / 2);
-                let pill = Rect::new(
-                    drawn.x() + drawn.width() as i32 - control_pad - pill_w as i32,
-                    drawn.y() + (drawn.height() as i32 - 52) / 2,
-                    pill_w,
-                    52,
-                );
-                draw_dropdown_pill(painter, text_cache, font_value, icon_font, pill, &row.value, focused)?;
-            }
-            RowKind::Slider => {
-                let value_w = font_value.size_of(&row.value).map_or(0, |(w, _)| w);
-                let track_w = 220u32.min(drawn.width() / 3);
-                let value_x = drawn.x() + drawn.width() as i32 - control_pad - value_w as i32;
-                draw_text(
-                    painter,
-                    text_cache,
-                    font_value,
-                    &row.value,
-                    value_x,
-                    drawn.y() + (drawn.height() as i32 - font_value.height()) / 2,
-                    if focused { WHITE } else { MUTED },
-                )?;
-                let track = Rect::new(
-                    value_x - 24 - track_w as i32,
-                    drawn.y() + (drawn.height() as i32 - 10) / 2,
-                    track_w,
-                    10,
-                );
-                draw_slider_with_thumb(painter, track, row.fraction, focused);
-            }
-            RowKind::Toggle => {
-                let switch = Rect::new(
-                    drawn.x() + drawn.width() as i32 - control_pad - 64,
-                    drawn.y() + (drawn.height() as i32 - 34) / 2,
-                    64,
-                    34,
-                );
-                draw_switch(painter, switch, row.value == "On");
-            }
-        }
     }
     Ok(())
 }
 
-/// The Wake modal's two rows — "Send Wake-on-LAN now" and the "Always send
-/// automatically" toggle (see `app::WakeState`) — drawn with the same icon +
-/// label + control row language as `draw_settings_rows`, but as a fixed pair
-/// rather than a data-driven list, since these rows live outside the Settings
-/// screen. `content` is the first row's rect; the second is stacked directly
-/// below it using `SETTINGS_ROW_GAP`, same as `draw_settings_rows`.
+/// A modal's focused row, as its own padded transparent tile — composited by
+/// the GPU over its shell (which draws every row unfocused via
+/// `draw_focus_rows`, see its docs). Mirrors `render_focused_row_tile`'s
+/// sidebar equivalent: moving row focus recomposites this small tile instead of
+/// re-rasterizing the whole modal. `switch_frac` (see `draw_switch`) lets the
+/// caller animate a `Toggle` row's knob slide independently of everything else
+/// on the row.
+pub fn render_focus_row_tile(
+    text_cache: &mut TextCache,
+    fonts: &Fonts,
+    rows: &[FocusRow],
+    content_width: u32,
+    index: usize,
+    dropdown_open: bool,
+    switch_frac: f32,
+) -> Result<Painter> {
+    let pad = ROW_TILE_PAD;
+    let rect = Rect::new(pad, pad, content_width, SETTINGS_ROW_H);
+    let mut p = Painter::new(content_width + 2 * pad as u32, SETTINGS_ROW_H + 2 * pad as u32);
+    if let Some(row) = rows.get(index) {
+        draw_focus_row(&mut p, text_cache, fonts, row, true, dropdown_open, switch_frac, rect)?;
+    }
+    Ok(p)
+}
+
+/// Draws one focus row (icon + label + dropdown pill / slider / modern switch
+/// / nothing, per `RowKind`) into `row_rect`, focused or not — shared by
+/// `draw_focus_rows` (the static, always-unfocused shell) and
+/// `render_focus_row_tile` (the single focused row, recomposited on its own
+/// when focus moves or its `Toggle` control animates). `row_rect` is always
+/// drawn at its literal, un-zoomed size (see [`draw_selectable`]'s docs on why
+/// the zoom lives elsewhere). `dropdown_open` is independent of `focused`: a
+/// `Dropdown` row's pill only gets its bright outline while *its own* dropdown
+/// is actually expanded, not merely while the row has keyboard focus.
 #[allow(clippy::too_many_arguments)]
-pub fn draw_wake_rows(
+fn draw_focus_row(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    font_label: &Font,
-    icon_font: &Font,
-    content: Rect,
-    send_label: &str,
-    focused_index: usize,
-    auto_send: bool,
+    fonts: &Fonts,
+    row: &FocusRow,
+    focused: bool,
+    dropdown_open: bool,
+    switch_frac: f32,
+    row_rect: Rect,
 ) -> Result<()> {
+    draw_selectable_fixed(painter, row_rect, focused);
+
     let icon_pad = 24;
+    let icon_rect = Rect::new(
+        row_rect.x() + icon_pad,
+        row_rect.y() + (row_rect.height() as i32 - SETTINGS_ICON_SIZE as i32) / 2,
+        SETTINGS_ICON_SIZE,
+        SETTINGS_ICON_SIZE,
+    );
+    let icon_color = if focused { WHITE } else { MUTED };
+    draw_icon(painter, text_cache, fonts.icon, icon_rect, row.icon, icon_color)?;
+    let label_x = icon_rect.x() + SETTINGS_ICON_SIZE as i32 + 20;
+    draw_text(
+        painter,
+        text_cache,
+        fonts.label,
+        &row.label,
+        label_x,
+        row_rect.y() + (row_rect.height() as i32 - fonts.label.height()) / 2,
+        if focused { WHITE } else { MUTED },
+    )?;
+
     let control_pad = 28;
-    for (i, label) in [send_label, "Always send automatically"].into_iter().enumerate() {
-        let row_rect = Rect::new(
-            content.x(),
-            content.y() + i as i32 * (SETTINGS_ROW_H as i32 + SETTINGS_ROW_GAP),
-            content.width(),
-            SETTINGS_ROW_H,
-        );
-        let focused = i == focused_index;
-        let drawn = draw_selectable(painter, row_rect, focused);
-        let color = if focused { WHITE } else { MUTED };
-        let icon_rect = Rect::new(
-            drawn.x() + icon_pad,
-            drawn.y() + (drawn.height() as i32 - SETTINGS_ICON_SIZE as i32) / 2,
-            SETTINGS_ICON_SIZE,
-            SETTINGS_ICON_SIZE,
-        );
-        draw_icon(painter, text_cache, icon_font, icon_rect, ICON_POWER, color)?;
-        draw_text(
-            painter,
-            text_cache,
-            font_label,
-            label,
-            icon_rect.x() + SETTINGS_ICON_SIZE as i32 + 20,
-            drawn.y() + (drawn.height() as i32 - font_label.height()) / 2,
-            color,
-        )?;
-        // Only the second row ("Always send automatically") has a control.
-        if i == 1 {
+    match row.kind {
+        RowKind::Dropdown => {
+            let pill_w = 264u32.min(row_rect.width() / 2);
+            let pill = Rect::new(
+                row_rect.x() + row_rect.width() as i32 - control_pad - pill_w as i32,
+                row_rect.y() + (row_rect.height() as i32 - 52) / 2,
+                pill_w,
+                52,
+            );
+            draw_dropdown_pill(painter, text_cache, fonts, pill, &row.value, dropdown_open)?;
+        }
+        RowKind::Slider => {
+            let value_w = fonts.value.size_of(&row.value).map_or(0, |(w, _)| w);
+            let slot_right = row_rect.x() + row_rect.width() as i32 - control_pad;
+            draw_text(
+                painter,
+                text_cache,
+                fonts.value,
+                &row.value,
+                slot_right - value_w as i32,
+                row_rect.y() + (row_rect.height() as i32 - fonts.value.height()) / 2,
+                if focused { WHITE } else { MUTED },
+            )?;
+            let track_w = 220u32.min(row_rect.width() / 3);
+            let track = Rect::new(
+                slot_right - SLIDER_VALUE_SLOT_W - track_w as i32,
+                row_rect.y() + (row_rect.height() as i32 - 10) / 2,
+                track_w,
+                10,
+            );
+            draw_slider_with_thumb(painter, track, row.fraction, focused);
+        }
+        RowKind::Toggle => {
             let switch = Rect::new(
-                drawn.x() + drawn.width() as i32 - control_pad - 64,
-                drawn.y() + (drawn.height() as i32 - 34) / 2,
+                row_rect.x() + row_rect.width() as i32 - control_pad - 64,
+                row_rect.y() + (row_rect.height() as i32 - 34) / 2,
                 64,
                 34,
             );
-            draw_switch(painter, switch, auto_send);
+            draw_switch(painter, switch, switch_frac);
         }
     }
     Ok(())
@@ -1886,25 +2075,22 @@ pub fn draw_wake_rows(
 
 /// A rounded pill button showing the current dropdown value + a small chevron
 /// (`ICON_CHEVRON_DOWN`, replacing a hand-drawn triangle — see the icons section).
+/// `open` gets the bright outline only while this pill's own dropdown overlay
+/// is actually expanded — not while the row merely has keyboard focus.
 pub fn draw_dropdown_pill(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    font: &Font,
-    icon_font: &Font,
+    fonts: &Fonts,
     rect: Rect,
     label: &str,
-    focused: bool,
+    open: bool,
 ) -> Result<()> {
     let radius = rect.height() as i32 / 2;
     painter.fill_rounded_rect(rect, radius, Color::RGBA(0xff, 0xff, 0xff, 0x12));
     painter.stroke_rounded_rect(
         rect,
         radius,
-        if focused {
-            ACCENT_BRIGHT
-        } else {
-            Color::RGBA(0xff, 0xff, 0xff, 0x30)
-        },
+        if open { ACCENT_BRIGHT } else { Color::RGBA(0xff, 0xff, 0xff, 0x30) },
         1.5,
     );
     let chevron_size = 20u32;
@@ -1915,16 +2101,16 @@ pub fn draw_dropdown_pill(
         chevron_size,
         chevron_size,
     );
-    draw_icon(painter, text_cache, icon_font, chevron_rect, ICON_CHEVRON_DOWN, WHITE)?;
-    let text_w = font.size_of(label).map_or(0, |(w, _)| w);
+    draw_icon(painter, text_cache, fonts.icon, chevron_rect, ICON_CHEVRON_DOWN, WHITE)?;
+    let text_w = fonts.value.size_of(label).map_or(0, |(w, _)| w);
     let text_x = rect.x() + ((rect.width() as i32 - chevron_size as i32 - chevron_pad) - text_w as i32) / 2;
     draw_text(
         painter,
         text_cache,
-        font,
+        fonts.value,
         label,
         text_x.max(rect.x()),
-        rect.y() + (rect.height() as i32 - font.height()) / 2,
+        rect.y() + (rect.height() as i32 - fonts.value.height()) / 2,
         WHITE,
     )?;
     Ok(())
@@ -1947,30 +2133,36 @@ pub fn draw_slider_with_thumb(painter: &mut Painter, rect: Rect, fraction: f32, 
     painter.fill_circle(cx, cy, thumb_r, if focused { WHITE } else { MUTED });
 }
 
+/// Linear interpolation between two colors (including alpha), `frac` clamped
+/// to `0.0..=1.0` — used to cross-fade the switch track color as it slides.
+fn lerp_color(from: Color, to: Color, frac: f32) -> Color {
+    let f = frac.clamp(0.0, 1.0);
+    let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * f) as u8;
+    Color::RGBA(lerp(from.r, to.r), lerp(from.g, to.g), lerp(from.b, to.b), lerp(from.a, to.a))
+}
+
+const SWITCH_OFF_TRACK: Color = Color::RGBA(0xff, 0xff, 0xff, 0x22);
+
 /// A modern sliding pill switch (iOS/Android-style) — accent-filled track with
 /// the knob at the right when on, muted track with the knob at the left when
-/// off.
-pub fn draw_switch(painter: &mut Painter, rect: Rect, on: bool) {
+/// off. `frac` (0.0 = off, 1.0 = on) lerps the knob position and track color
+/// between those two states, so a toggle flip can animate as a slide instead
+/// of an instant snap — pass a static `0.0`/`1.0` for an unanimated switch.
+pub fn draw_switch(painter: &mut Painter, rect: Rect, frac: f32) {
+    let frac = frac.clamp(0.0, 1.0);
     let radius = rect.height() as i32 / 2;
-    painter.fill_rounded_rect(
-        rect,
-        radius,
-        if on {
-            ACCENT
-        } else {
-            Color::RGBA(0xff, 0xff, 0xff, 0x22)
-        },
-    );
+    painter.fill_rounded_rect(rect, radius, lerp_color(SWITCH_OFF_TRACK, ACCENT, frac));
     let knob_r = radius as f32 - 4.0;
     let cy = rect.y() as f32 + rect.height() as f32 / 2.0;
-    let cx = if on {
-        rect.x() as f32 + rect.width() as f32 - radius as f32
-    } else {
-        rect.x() as f32 + radius as f32
-    };
+    let left = rect.x() as f32 + radius as f32;
+    let right = rect.x() as f32 + rect.width() as f32 - radius as f32;
+    let cx = left + (right - left) * frac;
     painter.fill_circle(cx + 1.0, cy + 2.0, knob_r, Color::RGBA(0x00, 0x00, 0x00, 0x40));
     painter.fill_circle(cx, cy, knob_r, WHITE);
 }
+
+/// Row height of one dropdown option — also `render_dropdown_option_tile`'s tile size.
+pub const DROPDOWN_OPTION_H: u32 = 56;
 
 /// Renders a dropdown's options as an overlay list anchored just below the row that
 /// opened it, inside the settings modal card. One shadow/background for the whole
@@ -1986,31 +2178,65 @@ pub fn draw_dropdown_overlay(
     focused_index: usize,
     rect: Rect,
 ) -> Result<()> {
-    let row_h = 56u32;
-    let bg_rect = Rect::new(rect.x(), rect.y(), rect.width(), options.len() as u32 * row_h);
+    let bg_rect = Rect::new(rect.x(), rect.y(), rect.width(), options.len() as u32 * DROPDOWN_OPTION_H);
     draw_popup_panel(painter, bg_rect, Color::RGBA(0xff, 0xff, 0xff, 0x20));
     for (i, opt) in options.iter().enumerate() {
-        let row_rect = Rect::new(rect.x(), rect.y() + i as i32 * row_h as i32, rect.width(), row_h);
-        let focused = i == focused_index;
-        if focused {
-            let highlight = Rect::new(
-                row_rect.x() + 6,
-                row_rect.y() + 4,
-                row_rect.width().saturating_sub(12),
-                row_rect.height().saturating_sub(8),
-            );
-            painter.fill_rounded_rect(highlight, 8, Color::RGBA(ACCENT.r, ACCENT.g, ACCENT.b, 0x50));
-        }
-        draw_text(
-            painter,
-            text_cache,
-            font_value,
-            opt,
-            row_rect.x() + 20,
-            row_rect.y() + (row_rect.height() as i32 - font_value.height()) / 2,
-            if focused { WHITE } else { MUTED },
-        )?;
+        let row_rect = dropdown_option_rect(rect, i);
+        draw_dropdown_option(painter, text_cache, font_value, opt, i == focused_index, row_rect)?;
     }
+    Ok(())
+}
+
+/// Option `index`'s rect within a dropdown overlay anchored at `rect` — the one
+/// place this layout formula lives, shared by `draw_dropdown_overlay` and
+/// `app.rs`'s `draw_list` (which needs it to position the composited
+/// focused-option tile).
+pub fn dropdown_option_rect(rect: Rect, index: usize) -> Rect {
+    Rect::new(rect.x(), rect.y() + index as i32 * DROPDOWN_OPTION_H as i32, rect.width(), DROPDOWN_OPTION_H)
+}
+
+/// One dropdown option, focused, as its own tile (no padding needed — unlike
+/// the settings-row focus tile, this highlight has no shadow/zoom overflowing
+/// its row rect) — composited by the GPU over the overlay's unfocused option
+/// list. Moving the dropdown's own focus recomposites just this small tile
+/// instead of re-rasterizing the whole modal.
+pub fn render_dropdown_option_tile(text_cache: &mut TextCache, font_value: &Font, option: &str, width: u32) -> Result<Painter> {
+    let mut p = Painter::new(width, DROPDOWN_OPTION_H);
+    let rect = Rect::new(0, 0, width, DROPDOWN_OPTION_H);
+    draw_dropdown_option(&mut p, text_cache, font_value, option, true, rect)?;
+    Ok(p)
+}
+
+/// Draws one dropdown option (highlight when focused + its label) into
+/// `row_rect` — shared by `draw_dropdown_overlay` (the static, always-unfocused
+/// list) and `render_dropdown_option_tile` (the single focused option,
+/// recomposited on its own when the dropdown's focus moves).
+fn draw_dropdown_option(
+    painter: &mut Painter,
+    text_cache: &mut TextCache,
+    font_value: &Font,
+    option: &str,
+    focused: bool,
+    row_rect: Rect,
+) -> Result<()> {
+    if focused {
+        let highlight = Rect::new(
+            row_rect.x() + 6,
+            row_rect.y() + 4,
+            row_rect.width().saturating_sub(12),
+            row_rect.height().saturating_sub(8),
+        );
+        painter.fill_rounded_rect(highlight, 8, Color::RGBA(ACCENT.r, ACCENT.g, ACCENT.b, 0x50));
+    }
+    draw_text(
+        painter,
+        text_cache,
+        font_value,
+        option,
+        row_rect.x() + 20,
+        row_rect.y() + (row_rect.height() as i32 - font_value.height()) / 2,
+        if focused { WHITE } else { MUTED },
+    )?;
     Ok(())
 }
 
@@ -2034,60 +2260,96 @@ pub struct ConfirmButton<'a> {
     pub color: Color,
 }
 
+/// Button `index`'s rect within a [`draw_confirm_buttons`] row anchored at
+/// `content` — the one place this side-by-side layout formula lives, shared
+/// by `draw_confirm_buttons` and `app.rs`'s `draw_list` (which needs it to
+/// position the composited focused-button tile).
+pub fn confirm_button_rect(content: Rect, index: usize) -> Rect {
+    let gap = 20i32;
+    let btn_w = content.width().saturating_sub(gap as u32) / 2;
+    Rect::new(content.x() + index as i32 * (btn_w as i32 + gap), content.y(), btn_w, content.height())
+}
+
 /// A row of side-by-side buttons for a Yes/No-style confirmation (currently
 /// just the "Forget this host?" dialog's Forget/Cancel pair, but not written
 /// specifically for that) — an optional leading icon and a label colored by
-/// that button's own identity when focused, or [`MUTED`] otherwise. The focused
-/// button (only) gets a background card, zoomed in slightly (see
-/// [`draw_selectable`]). `focused_index` picks which of `buttons` has focus.
+/// that button's own identity when focused, or [`MUTED`] otherwise.
+/// `focused_index` picks which of `buttons` has focus; every button renders
+/// at its normal, un-zoomed size (see [`draw_selectable_fixed`]'s docs on why
+/// the zoom lives elsewhere, in `app.rs`'s `draw_list`).
 pub fn draw_confirm_buttons(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    font_label: &Font,
-    icon_font: &Font,
+    fonts: &Fonts,
     content: Rect,
     buttons: &[ConfirmButton; 2],
     focused_index: usize,
 ) -> Result<()> {
-    let gap = 20i32;
-    let btn_w = content.width().saturating_sub(gap as u32) / 2;
     for (i, button) in buttons.iter().enumerate() {
-        let rect = Rect::new(
-            content.x() + i as i32 * (btn_w as i32 + gap),
-            content.y(),
-            btn_w,
-            content.height(),
-        );
-        let focused = i == focused_index;
-        let drawn = draw_selectable(painter, rect, focused);
-        let color = if focused { button.color } else { MUTED };
-
-        let label_w = font_label.size_of(button.label).map_or(0, |(w, _)| w);
-        let text_x = match button.icon {
-            Some(icon) => {
-                let icon_size = 26u32;
-                let icon_rect = Rect::new(
-                    drawn.x() + 20,
-                    drawn.y() + (drawn.height() as i32 - icon_size as i32) / 2,
-                    icon_size,
-                    icon_size,
-                );
-                draw_icon(painter, text_cache, icon_font, icon_rect, icon, color)?;
-                icon_rect.x() + icon_size as i32 + 12
-            }
-            // No icon: center the label instead of left-aligning it after one.
-            None => drawn.x() + (drawn.width() as i32 - label_w as i32) / 2,
-        };
-        draw_text(
-            painter,
-            text_cache,
-            font_label,
-            button.label,
-            text_x,
-            drawn.y() + (drawn.height() as i32 - font_label.height()) / 2,
-            color,
-        )?;
+        let rect = confirm_button_rect(content, i);
+        draw_confirm_button(painter, text_cache, fonts, button, i == focused_index, rect)?;
     }
+    Ok(())
+}
+
+/// One focused confirm button, as its own padded transparent tile —
+/// composited by the GPU over the shell (which draws every button unfocused
+/// via `draw_confirm_buttons`, see its docs). Mirrors `render_focus_row_tile`'s
+/// settings-row equivalent.
+pub fn render_confirm_button_tile(
+    text_cache: &mut TextCache,
+    fonts: &Fonts,
+    button: &ConfirmButton<'_>,
+    w: u32,
+    h: u32,
+) -> Result<Painter> {
+    let pad = ROW_TILE_PAD;
+    let rect = Rect::new(pad, pad, w, h);
+    let mut p = Painter::new(w + 2 * pad as u32, h + 2 * pad as u32);
+    draw_confirm_button(&mut p, text_cache, fonts, button, true, rect)?;
+    Ok(p)
+}
+
+/// Draws one confirm button into `rect`, focused or not — shared by
+/// `draw_confirm_buttons` (the static, always-unfocused shell) and
+/// `render_confirm_button_tile` (the single focused button, recomposited on
+/// its own when focus moves).
+fn draw_confirm_button(
+    painter: &mut Painter,
+    text_cache: &mut TextCache,
+    fonts: &Fonts,
+    button: &ConfirmButton<'_>,
+    focused: bool,
+    rect: Rect,
+) -> Result<()> {
+    draw_selectable_fixed(painter, rect, focused);
+    let color = if focused { button.color } else { MUTED };
+
+    let label_w = fonts.label.size_of(button.label).map_or(0, |(w, _)| w);
+    let text_x = match button.icon {
+        Some(icon) => {
+            let icon_size = 26u32;
+            let icon_rect = Rect::new(
+                rect.x() + 20,
+                rect.y() + (rect.height() as i32 - icon_size as i32) / 2,
+                icon_size,
+                icon_size,
+            );
+            draw_icon(painter, text_cache, fonts.icon, icon_rect, icon, color)?;
+            icon_rect.x() + icon_size as i32 + 12
+        }
+        // No icon: center the label instead of left-aligning it after one.
+        None => rect.x() + (rect.width() as i32 - label_w as i32) / 2,
+    };
+    draw_text(
+        painter,
+        text_cache,
+        fonts.label,
+        button.label,
+        text_x,
+        rect.y() + (rect.height() as i32 - fonts.label.height()) / 2,
+        color,
+    )?;
     Ok(())
 }
 

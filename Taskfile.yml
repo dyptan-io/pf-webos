@@ -5,6 +5,10 @@
 # this file stays short.
 version: '3'
 
+# Suppress go-task's echo of each command before it runs — keeps task output
+# to just the command's own output (less noise, fewer tokens when read back).
+silent: true
+
 # TV_HOST (used by deploy/deploy:log below) can live in a local, gitignored .env
 # instead of being typed on every invocation — see .env.example.
 dotenv: ['.env']

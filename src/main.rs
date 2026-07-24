@@ -183,10 +183,7 @@ mod real {
         controller: &mut Option<GameController>,
         identity: &(String, String),
         display_mode: sdl2::video::DisplayMode,
-        font_label: &sdl2::ttf::Font,
-        font_value: &sdl2::ttf::Font,
-        font_title: &sdl2::ttf::Font,
-        icon_font: &sdl2::ttf::Font,
+        fonts: &crate::ui::Fonts,
         initial_status: Option<String>,
         log: &mut std::fs::File,
     ) -> Result<Option<ConnectOutcome>> {
@@ -262,7 +259,13 @@ mod real {
                 // if the motion actually changed the focused/hovered element,
                 // not on every no-op tick.
                 if let Event::MouseMotion { x, y, .. } = event {
-                    dirty |= app.handle_mouse_motion(x, y, display_mode.w as u32, display_mode.h as u32);
+                    dirty |= app.handle_mouse_motion(
+                        x,
+                        y,
+                        display_mode.w as u32,
+                        display_mode.h as u32,
+                        fonts,
+                    );
                     continue;
                 }
                 // The Magic Remote's scroll wheel — scrolls the game grid on Home
@@ -305,7 +308,7 @@ mod real {
                             continue;
                         }
                         if let Some(target) =
-                            app.handle_mouse_click(x, y, display_mode.w as u32, display_mode.h as u32, log)
+                            app.handle_mouse_click(x, y, display_mode.w as u32, display_mode.h as u32, fonts, log)
                         {
                             break 'ui target;
                         }
@@ -320,7 +323,7 @@ mod real {
                         let held = confirm_held_since.take().is_some();
                         if held && !confirm_long_fired {
                             if let Some(target) =
-                                app.handle_mouse_click(x, y, display_mode.w as u32, display_mode.h as u32, log)
+                                app.handle_mouse_click(x, y, display_mode.w as u32, display_mode.h as u32, fonts, log)
                             {
                                 break 'ui target;
                             }
@@ -490,10 +493,7 @@ mod real {
             dirty = false;
             let updated = app.prepare_tiles(
                 &mut text_cache,
-                font_label,
-                font_value,
-                font_title,
-                icon_font,
+                fonts,
                 display_mode.w as u32,
                 display_mode.h as u32,
                 content_dirty,
@@ -503,7 +503,7 @@ mod real {
                     compositor.upload(texture_creator, tile, pm)?;
                 }
             }
-            let cmds = app.draw_list(display_mode.w as u32, display_mode.h as u32);
+            let cmds = app.draw_list(display_mode.w as u32, display_mode.h as u32, fonts);
             canvas.set_blend_mode(sdl2::render::BlendMode::None);
             canvas.set_draw_color(crate::ui::BG);
             canvas.clear();
@@ -571,6 +571,12 @@ mod real {
         let font_value = crate::ui::load_font(&ttf, display_mode.h as u32, 20, crate::ui::FontWeight::Regular)?;
         let font_title = crate::ui::load_font(&ttf, display_mode.h as u32, 40, crate::ui::FontWeight::SemiBold)?;
         let icon_font = crate::ui::load_icon_font(&ttf)?;
+        let fonts = crate::ui::Fonts {
+            label: &font_label,
+            value: &font_value,
+            title: &font_title,
+            icon: &icon_font,
+        };
 
         // Owned here, at the top of the menu/stream cycle, rather than re-declared in
         // each: `ControllerDeviceAdded` only fires once per physical (re)connection, so
@@ -593,10 +599,7 @@ mod real {
                 &mut controller,
                 &identity,
                 display_mode,
-                &font_label,
-                &font_value,
-                &font_title,
-                &icon_font,
+                &fonts,
                 menu_status.take(),
                 log,
             )?
@@ -714,7 +717,14 @@ mod real {
             // None = dialog not shown; Some(0) = shown, "Disconnect" focused;
             // Some(1) = shown, "Cancel" focused (default on open — safer).
             let mut disconnect_dialog: Option<usize> = None;
-            let mut dialog_dirty = false;
+            // The shell (card/title/both buttons unfocused) only needs
+            // re-rendering when the dialog opens; the focused button is its
+            // own small tile (same shell/focus-tile split as every pre-stream
+            // modal) so toggling focus never re-rasterizes the shell.
+            let mut disconnect_shell_dirty = false;
+            let mut disconnect_focus_dirty = false;
+            let mut disconnect_focus_anim: Option<Instant> = None;
+            let mut disconnect_tc = crate::ui::TextCache::new();
             let outcome = 'running: loop {
                 if QUIT_REQUESTED.load(Ordering::Relaxed) {
                     writeln!(log, "SIGTERM/SIGINT received — disconnecting before exit")?;
@@ -759,7 +769,8 @@ mod real {
                             match nav {
                                 Some(MenuEvent::Left) | Some(MenuEvent::Right) => {
                                     disconnect_dialog = Some(1 - focus);
-                                    dialog_dirty = true;
+                                    disconnect_focus_dirty = true;
+                                    disconnect_focus_anim = Some(Instant::now());
                                 }
                                 Some(MenuEvent::Confirm) if focus == 0 => {
                                     writeln!(log, "back — disconnecting to menu")?;
@@ -793,7 +804,9 @@ mod real {
                             if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) =>
                         {
                             disconnect_dialog = Some(1);
-                            dialog_dirty = true;
+                            disconnect_shell_dirty = true;
+                            disconnect_focus_dirty = true;
+                            disconnect_focus_anim = Some(Instant::now());
                         }
                         Event::KeyUp { scancode: Some(sc), .. } => {
                             if let Some(ev) = keyboard::key_event(sc, false) {
@@ -803,7 +816,9 @@ mod real {
                         Event::ControllerButtonDown { button, .. } => {
                             if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back) {
                                 disconnect_dialog = Some(1);
-                                dialog_dirty = true;
+                                disconnect_shell_dirty = true;
+                                disconnect_focus_dirty = true;
+                                disconnect_focus_anim = Some(Instant::now());
                             }
                             let ev = gamepad::button_event(button, true, 0);
                             let _ = session::send_input(&connected.client, &ev);
@@ -850,22 +865,45 @@ mod real {
                     }
                 }
                 // Render the disconnect dialog when open. The card floats over
-                // the live video (transparent surroundings); tile re-rasterizes only
-                // on focus change, but scrim + card recomposite every tick (double
-                // buffered — a single present would leave the other buffer stale).
+                // the live video (transparent surroundings); the shell
+                // re-rasterizes only when the dialog opens, the focused
+                // button only on focus change — but scrim + tiles recomposite
+                // every tick (double buffered — a single present would leave
+                // the other buffer stale), so the zoom-pop plays smoothly.
                 if let Some(focus) = disconnect_dialog {
                     let full = sdl2::rect::Rect::new(0, 0, display_mode.w as u32, display_mode.h as u32);
-                    if dialog_dirty {
-                        dialog_dirty = false;
-                        let tile = crate::ui::render_disconnect_dialog_tile(
-                            full.width(),
-                            full.height(),
-                            &font_label,
-                            &icon_font,
-                            focus,
-                        )?;
-                        compositor.upload(&texture_creator, Tile::DisconnectDialog, &tile)?;
+                    if disconnect_shell_dirty {
+                        disconnect_shell_dirty = false;
+                        let shell = crate::ui::render_disconnect_dialog_shell(full.width(), full.height(), &fonts)?;
+                        compositor.upload(&texture_creator, Tile::DisconnectDialog, &shell)?;
                     }
+                    let (_, content) = crate::ui::disconnect_dialog_layout(full.width(), full.height(), fonts.label);
+                    let btn_rect = crate::ui::confirm_button_rect(content, focus);
+                    if disconnect_focus_dirty {
+                        disconnect_focus_dirty = false;
+                        let buttons = crate::ui::disconnect_dialog_buttons();
+                        let tile = crate::ui::render_confirm_button_tile(
+                            &mut disconnect_tc,
+                            &fonts,
+                            &buttons[focus],
+                            btn_rect.width(),
+                            btn_rect.height(),
+                        )?;
+                        compositor.upload(&texture_creator, Tile::DisconnectFocusButton, &tile)?;
+                    }
+                    // The zoom-in: same GPU-scale-around-center technique as
+                    // every other modal's focused widget (see `app.rs`'s
+                    // `draw_list`) — `Tile::DisconnectFocusButton` is
+                    // rasterized once, at its literal size, never re-rendered
+                    // for this.
+                    let pad = crate::ui::ROW_TILE_PAD;
+                    let base = sdl2::rect::Rect::new(
+                        btn_rect.x() - pad,
+                        btn_rect.y() - pad,
+                        btn_rect.width() + 2 * pad as u32,
+                        btn_rect.height() + 2 * pad as u32,
+                    );
+                    let f = crate::ui::anim_frac(disconnect_focus_anim, crate::ui::FOCUS_POP);
                     canvas.set_blend_mode(sdl2::render::BlendMode::None);
                     canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
                     canvas.clear();
@@ -874,6 +912,11 @@ mod real {
                         &[
                             DrawCmd::Fill { rect: full, color: sdl2::pixels::Color::RGBA(0, 0, 0, crate::ui::MODAL_SCRIM.a) },
                             DrawCmd::Tex { tile: Tile::DisconnectDialog, dst: full, alpha: 0xff },
+                            DrawCmd::Tex {
+                                tile: Tile::DisconnectFocusButton,
+                                dst: crate::ui::zoom_rect(base, f, 0.02),
+                                alpha: 0xff,
+                            },
                         ],
                     )?;
                     canvas.present();
@@ -915,7 +958,7 @@ mod real {
                             connected.client.resolved_bitrate_kbps / 1000,
                         ),
                     ];
-                    match crate::ui::render_stats_overlay_tile(&font_value, &lines) {
+                    match crate::ui::render_stats_overlay_tile(fonts.value, &lines) {
                         Ok(tile) => {
                             let (tw, th) = (tile.width(), tile.height());
                             compositor.upload(&texture_creator, Tile::StatsOverlay, &tile)?;
