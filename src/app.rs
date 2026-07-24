@@ -41,10 +41,29 @@ pub enum PairingFocus {
     RequestAccess,
 }
 
-/// How long the grid focus pop (card scaling in) runs.
-const FOCUS_POP: Duration = Duration::from_millis(140);
+/// How much the grid's focused card (and its ring) grows during
+/// `ui::FOCUS_POP` — see `ui::zoom_rect`.
+const CARD_GROWTH: f32 = 0.028;
 /// How long a modal's fade/slide-in runs.
 const MODAL_FADE: Duration = Duration::from_millis(170);
+
+/// The pairing modal's subtitle — pulled out to a constant since both
+/// `render_pairing` (drawing it) and `Self::pairing_pin_row_y` (measuring its
+/// wrapped height, without drawing, to position the PIN row) need the exact
+/// same string.
+const PAIRING_SUBTITLE: &str = "Enter the host's PIN, or request access and approve on the host.";
+
+/// Shared card width for the four simple confirmation-style modals (Pairing,
+/// `AddHost`, Wake, `ForgetHost`) — they used to each pick their own width
+/// too (0.34-0.46 of screen width), which read as an inconsistent set of
+/// window sizes popping up over Home. Height is deliberately *not* shared:
+/// each of the four fits its own card to its own content (see
+/// `pairing_card_rect`'s docs) rather than guessing one height that has to
+/// fit all four (a fixed guess is exactly what clipped Wake's buttons once
+/// its content changed). Settings is not one of these four at all: its row
+/// list is real, variable content that needs the room, not a single
+/// confirmation.
+const SIMPLE_MODAL_WIDTH_FRAC: f32 = 0.40;
 
 /// How often the magic packet is re-sent while a wake is in flight — see
 /// `App::tick_wake`.
@@ -73,8 +92,9 @@ pub struct WakeState {
     /// without sending — so declining the prompt looks exactly like it did before this
     /// flow existed.
     reason: String,
-    /// Row focus on the modal: `0` = "Send Wake-on-LAN now", `1` = the "Always send
-    /// automatically" toggle.
+    /// Focus on the modal: `0` = the "Always send automatically" toggle row,
+    /// `1` = the "Wake" button, `2` = the "Cancel" button (see `render_wake`'s
+    /// shell/buttons split, mirroring `Screen::ForgetHost`'s).
     focused: usize,
     /// Whether a packet has gone out for the current wait window.
     sent: bool,
@@ -132,6 +152,56 @@ pub struct DropdownState {
     pub focused: usize,
 }
 
+/// What each modal's shell (every widget drawn unfocused, see `modal_tile`'s
+/// docs) actually depends on — a value change invalidates it, but a pure
+/// focus move must not, or the shell re-rasterizes (screen-sized) on every
+/// single d-pad press regardless of the zoom-pop this whole mechanism exists
+/// to make cheap. One enum since only one modal is ever open at a time.
+/// Deliberately excludes whichever field only the *focused* widget's own
+/// `ModalFocusKey` tracks (e.g. Settings excludes `settings_focused` itself,
+/// the dropdown's focused option, Pairing excludes `pin_digit_index`) — moving
+/// focus there is `modal_focus_tile`'s job, not this one's.
+#[derive(PartialEq)]
+enum ModalShellKey {
+    Settings(Settings, Option<usize>, bool),
+    Wake {
+        name: String,
+        mac_empty: bool,
+        sent: bool,
+        auto_send: bool,
+        hover_close: bool,
+    },
+    Pairing {
+        digits: [u8; 4],
+        status: Option<String>,
+        busy: bool,
+        hover_close: bool,
+    },
+    ForgetHost {
+        name: Option<String>,
+        hover_close: bool,
+    },
+}
+
+/// Identifies whichever single widget `App::modal_focus_tile` currently holds
+/// — every modal screen (Settings/Wake/Pairing/ForgetHost) has exactly one
+/// focused, zoom-animated widget at a time, and only one modal is ever open at
+/// once, so one key type + one tile slot covers all of them instead of a
+/// separate copy of this machinery per modal. Each variant carries whatever
+/// that modal's focused widget's content actually depends on, so a value
+/// change on it (not just a focus move) invalidates the tile too — e.g.
+/// `SettingsRow` carries the whole `Settings` snapshot so dragging the
+/// bitrate slider updates live (see the settings-focus-tile bug this fixed).
+#[derive(PartialEq)]
+enum ModalFocusKey {
+    SettingsRow(usize, Settings),
+    WakeToggle(bool),
+    WakeButton(usize),
+    PairingDigit(usize, u8),
+    PairingButton,
+    ForgetButton(usize),
+}
+
 pub struct App {
     pub screen: Screen,
     pub known_hosts: Vec<KnownHost>,
@@ -164,6 +234,9 @@ pub struct App {
     /// since that's cleared as soon as a result arrives, before `main.rs` can act.
     launch_ready: Option<ConnectTarget>,
     pub settings: Settings,
+    /// Persists `settings` off the UI thread — see its docs on why a blocking
+    /// `store::save_settings` on every adjustment read as input lag.
+    settings_writer: store::SettingsWriter,
     pub settings_focused: usize,
     pub dropdown: Option<DropdownState>,
     /// The sidebar row `Screen::ForgetHost` is confirming forgetting — set
@@ -214,8 +287,25 @@ pub struct App {
     /// The focused sidebar row's tile, keyed by row index.
     focused_row_tile: Option<(usize, Painter)>,
     /// The active modal rasterized full-screen (transparent surroundings);
-    /// rebuilt on content changes, composited with fade/slide by the GPU.
+    /// rebuilt on content changes, composited with fade/slide by the GPU. This
+    /// is always the *shell* — every selectable widget drawn unfocused — with
+    /// the actually focused one composited on top from `modal_focus_tile`
+    /// instead of baked in here (see `ModalFocusKey`'s docs).
     modal_tile: Option<Painter>,
+    /// What `modal_tile` was last rasterized from — a value change invalidates
+    /// it, but moving focus alone must not (that's `modal_focus_tile`'s job).
+    /// `None` while `Screen::Home`/`Screen::AddHost` (no `ModalShellKey`
+    /// variant; `AddHost` just redraws on any `content_dirty` tick instead —
+    /// its typed-digit display has no separate focus tile to protect).
+    modal_shell_key: Option<ModalShellKey>,
+    /// The single focused, zoom-animated widget of whichever modal is open —
+    /// see `ModalFocusKey`'s docs on why one tile/key suffices for all of them.
+    modal_focus_tile: Option<(ModalFocusKey, Painter)>,
+    /// The open dropdown's focused option, as its own small tile — keyed by
+    /// (dropdown row, focused option index). Composited over `modal_tile`'s
+    /// shell (which draws the overlay's option list unfocused); moving the
+    /// dropdown's own focus rebuilds only this.
+    dropdown_focus_tile: Option<((usize, usize), Painter)>,
     /// Home's status line block, keyed by its text.
     status_tile: Option<(String, Painter)>,
     /// The static "No host selected" hint line.
@@ -226,10 +316,21 @@ pub struct App {
     pub grid_scroll: i32,
     grid_scroll_target: i32,
     /// When the current grid-focus pop started (card scales in over
-    /// `FOCUS_POP` — set on every d-pad focus move).
+    /// `ui::FOCUS_POP` — set on every d-pad focus move).
     focus_anim: Option<Instant>,
     /// When the open modal's fade/slide-in started (`MODAL_FADE`).
     modal_anim: Option<Instant>,
+    /// When the open modal's focused widget last moved (zooms it in over
+    /// `ui::FOCUS_POP`, same GPU-scale technique as `focus_anim` — see
+    /// `draw_list`'s `Tile::ModalFocusElement` handling). Shared by every
+    /// modal (Settings row, Wake row, Pairing digit/button, `ForgetHost`
+    /// button) since only one is ever open, and focused, at a time.
+    modal_focus_anim: Option<Instant>,
+    /// In-flight `Toggle` row flip: `(when it started, the value it flipped
+    /// from)` — lets `modal_focus_tile`'s render slide the switch knob from
+    /// its old state to its new one over `ui::FOCUS_POP` instead of snapping.
+    /// Shared by Settings' HDR/Stats-overlay toggles and Wake's auto-send one.
+    switch_anim: Option<(Instant, bool)>,
     /// Last screen `prepare_tiles` saw — a change triggers the modal-open
     /// animation and a modal re-rasterize without every transition site
     /// needing to remember to.
@@ -292,6 +393,7 @@ impl App {
             pending_launch: None,
             launch_ready: None,
             settings: store::load_settings(),
+            settings_writer: store::SettingsWriter::spawn(),
             settings_focused: 0,
             dropdown: None,
             host_menu_index: None,
@@ -314,12 +416,17 @@ impl App {
             ring_tile: None,
             focused_row_tile: None,
             modal_tile: None,
+            modal_shell_key: None,
+            modal_focus_tile: None,
+            dropdown_focus_tile: None,
             status_tile: None,
             nohost_tile: None,
             grid_scroll: 0,
             grid_scroll_target: 0,
             focus_anim: None,
             modal_anim: None,
+            modal_focus_anim: None,
+            switch_anim: None,
             last_screen: Screen::Home,
             pairing_rx: None,
         };
@@ -496,7 +603,10 @@ impl App {
     /// the host, or just backs out for Cancel); Back is the same as Cancel.
     pub fn handle_forget_host_event(&mut self, ev: MenuEvent) {
         match ev {
-            MenuEvent::Left | MenuEvent::Right => self.host_menu_focused = 1 - self.host_menu_focused,
+            MenuEvent::Left | MenuEvent::Right => {
+                self.host_menu_focused = 1 - self.host_menu_focused;
+                self.modal_focus_anim = Some(Instant::now());
+            }
             MenuEvent::Confirm => {
                 if self.host_menu_focused == 0 {
                     if let Some(idx) = self.host_menu_index {
@@ -715,7 +825,7 @@ impl App {
             animating = true;
         }
         if let Some(t) = self.focus_anim {
-            if t.elapsed() >= FOCUS_POP {
+            if t.elapsed() >= ui::FOCUS_POP {
                 self.focus_anim = None;
             }
             animating = true;
@@ -723,6 +833,18 @@ impl App {
         if let Some(t) = self.modal_anim {
             if t.elapsed() >= MODAL_FADE {
                 self.modal_anim = None;
+            }
+            animating = true;
+        }
+        if let Some(t) = self.modal_focus_anim {
+            if t.elapsed() >= ui::FOCUS_POP {
+                self.modal_focus_anim = None;
+            }
+            animating = true;
+        }
+        if let Some((t, _)) = self.switch_anim {
+            if t.elapsed() >= ui::FOCUS_POP {
+                self.switch_anim = None;
             }
             animating = true;
         }
@@ -871,7 +993,11 @@ impl App {
             name,
             mac,
             reason,
-            focused: if auto { 1 } else { 0 },
+            // Lands on the "Wake" button by default — the likely reason the
+            // user is here (`tick_wake`'s silent-escalation path below moves
+            // focus to the toggle instead, since that's what needs revisiting
+            // there).
+            focused: 1,
             sent: false,
             since: None,
             last_attempt: None,
@@ -957,7 +1083,7 @@ impl App {
 
         if wake.silent && wake.since.is_some_and(|t| now.duration_since(t) >= WAKE_ESCALATE_AFTER) {
             wake.silent = false;
-            wake.focused = 1; // land on the toggle — the likely reason the user is here
+            wake.focused = 0; // land on the toggle — it's what this silent escalation is about
             self.screen = Screen::Wake;
             changed = true;
         }
@@ -986,30 +1112,52 @@ impl App {
         crate::library::load_games_async(host.to_string(), port, mgmt_port, identity.clone(), fingerprint)
     }
 
-    /// Handles one menu event on the Wake modal: Up/Down move focus between the two
-    /// rows, Confirm sends (row 0) or flips the auto-send toggle (row 1), Left/Right
-    /// also flip the toggle when it's focused (matching the Settings modal's toggle
-    /// idiom), Back dismisses back to the plain error text `WakeState::reason` carries.
+    /// Handles one menu event on the Wake modal — the auto-send toggle row
+    /// (focus `0`) above a Forget-host-style "Wake"/"Cancel" button pair
+    /// (focus `1`/`2`, see `render_wake`). Up/Down move between the toggle
+    /// and the button row (always re-entering on "Wake"); Left/Right flip the
+    /// toggle when it's focused, or switch between the two buttons otherwise;
+    /// Confirm flips the toggle, sends, or cancels depending on which is
+    /// focused. Back always dismisses back to the plain error text
+    /// `WakeState::reason` carries, same as Cancel.
     pub fn handle_wake_event(&mut self, ev: MenuEvent, log: &mut std::fs::File) {
         let Some(wake) = self.wake.as_mut() else { return };
         // No MAC on record for this host yet — there's nothing to send or automate
-        // (see `render_wake`, which hides those rows in this case too), so every
-        // event but Back (handled below, same as always) is a no-op.
+        // (see `render_wake`, which hides the toggle/buttons in this case too), so
+        // every event but Back (handled below, same as always) is a no-op.
         if wake.mac.is_empty() && ev != MenuEvent::Back {
             return;
         }
+        if ev == MenuEvent::Back {
+            self.home_status = self.wake.take().map(|w| w.reason);
+            self.screen = Screen::Home;
+            return;
+        }
         match ev {
-            MenuEvent::Up | MenuEvent::Down => wake.focused = 1 - wake.focused,
-            MenuEvent::Confirm | MenuEvent::Left | MenuEvent::Right if wake.focused == 1 => {
-                self.settings.wol_auto_send = !self.settings.wol_auto_send;
-                let _ = store::save_settings(&self.settings);
+            MenuEvent::Up | MenuEvent::Down => {
+                wake.focused = if wake.focused == 0 { 1 } else { 0 };
+                self.modal_focus_anim = Some(Instant::now());
             }
-            MenuEvent::Confirm => Self::send_wake(wake, log),
-            MenuEvent::Back => {
+            // On the toggle row, Left/Right/Confirm all flip it (matching the
+            // Settings modal's toggle idiom); on a button, Left/Right instead
+            // switch which one has focus and Confirm activates it.
+            MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm if wake.focused == 0 => {
+                let from = self.settings.wol_auto_send;
+                self.settings.wol_auto_send = !from;
+                self.settings_writer.save(self.settings);
+                self.switch_anim = Some((Instant::now(), from));
+            }
+            MenuEvent::Left | MenuEvent::Right => {
+                wake.focused = if wake.focused == 1 { 2 } else { 1 };
+                self.modal_focus_anim = Some(Instant::now());
+            }
+            MenuEvent::Confirm if wake.focused == 1 => Self::send_wake(wake, log),
+            MenuEvent::Confirm => {
+                // focused == 2 ("Cancel") — same as Back.
                 self.home_status = self.wake.take().map(|w| w.reason);
                 self.screen = Screen::Home;
             }
-            MenuEvent::Left | MenuEvent::Right | MenuEvent::Secondary => {}
+            MenuEvent::Back | MenuEvent::Secondary => {}
         }
     }
 
@@ -1143,6 +1291,7 @@ impl App {
                     PairingFocus::Pin => PairingFocus::RequestAccess,
                     PairingFocus::RequestAccess => PairingFocus::Pin,
                 };
+                self.modal_focus_anim = Some(Instant::now());
                 return;
             }
             _ => {}
@@ -1162,6 +1311,7 @@ impl App {
                 MenuEvent::Left => {
                     if self.pin_digit_index > 0 {
                         self.pin_digit_index -= 1;
+                        self.modal_focus_anim = Some(Instant::now());
                     }
                 }
                 MenuEvent::Right => {
@@ -1170,13 +1320,17 @@ impl App {
                     } else {
                         self.pairing_focus = PairingFocus::RequestAccess;
                     }
+                    self.modal_focus_anim = Some(Instant::now());
                 }
                 MenuEvent::Confirm => self.try_pair(log),
                 MenuEvent::Back | MenuEvent::Secondary => {} // handled above
             },
             // Left tabs back onto the PIN row; Confirm sends the access request.
             PairingFocus::RequestAccess => match ev {
-                MenuEvent::Left => self.pairing_focus = PairingFocus::Pin,
+                MenuEvent::Left => {
+                    self.pairing_focus = PairingFocus::Pin;
+                    self.modal_focus_anim = Some(Instant::now());
+                }
                 MenuEvent::Confirm => self.try_request_access(log),
                 // Up/Down/Right are no-ops here; Back/Secondary were handled above.
                 MenuEvent::Up | MenuEvent::Down | MenuEvent::Right | MenuEvent::Back | MenuEvent::Secondary => {}
@@ -1329,8 +1483,10 @@ impl App {
                 MenuEvent::Down => dd.focused = (dd.focused + 1) % len,
                 MenuEvent::Confirm => {
                     let choice = dd.focused;
+                    // Not persisted here — `MenuEvent::Back` below (leaving the
+                    // whole Settings screen) saves once for every change made
+                    // during this visit, not per-row.
                     ui::apply_dropdown_choice(&mut self.settings, row, choice);
-                    let _ = store::save_settings(&self.settings);
                     self.dropdown = None;
                 }
                 MenuEvent::Back => self.dropdown = None,
@@ -1346,20 +1502,14 @@ impl App {
                 } else {
                     self.settings_focused - 1
                 };
+                self.modal_focus_anim = Some(Instant::now());
             }
             MenuEvent::Down => {
                 self.settings_focused = (self.settings_focused + 1) % total;
+                self.modal_focus_anim = Some(Instant::now());
             }
-            MenuEvent::Left => {
-                if ui::adjust_setting(&mut self.settings, self.settings_focused, false) {
-                    let _ = store::save_settings(&self.settings);
-                }
-            }
-            MenuEvent::Right => {
-                if ui::adjust_setting(&mut self.settings, self.settings_focused, true) {
-                    let _ = store::save_settings(&self.settings);
-                }
-            }
+            MenuEvent::Left => self.apply_setting_adjust(self.settings_focused, false),
+            MenuEvent::Right => self.apply_setting_adjust(self.settings_focused, true),
             MenuEvent::Confirm => match self.settings_focused {
                 ui::ROW_RESOLUTION | ui::ROW_FRAMERATE | ui::ROW_VIDEO_BACKEND => {
                     let focused = ui::dropdown_current_index(&self.settings, self.settings_focused);
@@ -1368,14 +1518,39 @@ impl App {
                         focused,
                     });
                 }
-                row => {
-                    if ui::adjust_setting(&mut self.settings, row, true) {
-                        let _ = store::save_settings(&self.settings);
-                    }
-                }
+                row => self.apply_setting_adjust(row, true),
             },
-            MenuEvent::Back => self.screen = Screen::Home,
+            // Leaving Settings (Back key or the modal's close-X, both funnel
+            // through `App::back`) — save once for whatever changed during
+            // this visit instead of once per row/keystroke. `settings_writer`
+            // still queues the write on a background thread either way (see
+            // its docs), but there's no reason to touch disk at all more than
+            // once per Settings visit.
+            MenuEvent::Back => {
+                self.settings_writer.save(self.settings);
+                self.screen = Screen::Home;
+            }
             MenuEvent::Secondary => {}
+        }
+    }
+
+    /// Adjusts settings row `row` in memory (see `ui::adjust_setting`) — the
+    /// one place `Left`/`Right`/`Confirm` all funnel through. Not persisted
+    /// here; `handle_settings_event`'s `Back` arm saves once when the whole
+    /// Settings screen closes. For a `Toggle` row this also starts
+    /// `switch_anim`, capturing the value it's about to flip *from* so the
+    /// switch's render can slide the knob from there instead of snapping to
+    /// the new state.
+    fn apply_setting_adjust(&mut self, row: usize, forward: bool) {
+        let toggled_from = match row {
+            ui::ROW_HDR => Some(self.settings.hdr_enabled),
+            ui::ROW_STATS_OVERLAY => Some(self.settings.stats_overlay),
+            _ => None,
+        };
+        if ui::adjust_setting(&mut self.settings, row, forward) {
+            if let Some(from) = toggled_from {
+                self.switch_anim = Some((Instant::now(), from));
+            }
         }
     }
 
@@ -1431,11 +1606,36 @@ impl App {
 
     // ---------------------------------------------------------------- mouse --
 
+    /// Shared width, per-modal height: the four simple modals all size to
+    /// `SIMPLE_MODAL_WIDTH_FRAC` but fit their own content (a shared *height*
+    /// once clipped Wake's buttons — see the constant's docs). `content_height`
+    /// receives a zero-y/height probe card at the final width and returns the
+    /// card's total height.
+    fn simple_modal_card(screen_w: u32, screen_h: u32, content_height: impl FnOnce(Rect) -> u32) -> Rect {
+        let w = (screen_w as f32 * SIMPLE_MODAL_WIDTH_FRAC).round() as u32;
+        let height = content_height(Rect::new(0, 0, w, 0));
+        ui::modal_card_rect(screen_w, screen_h, SIMPLE_MODAL_WIDTH_FRAC, height)
+    }
+
     /// The pairing modal's card rect — shared by `render_pairing` and mouse
-    /// hit-testing. Sized generously for `ui::draw_modal_header`'s layout (see its
-    /// docs) plus the PIN boxes and an up-to-two-line pairing-failure status below.
-    fn pairing_card_rect(screen_w: u32, screen_h: u32) -> Rect {
-        ui::modal_card_rect(screen_w, screen_h, 0.36, 480)
+    /// hit-testing. Fits the header, PIN boxes, an up-to-two-line pairing
+    /// failure status, and the button.
+    fn pairing_card_rect(screen_w: u32, screen_h: u32, font_label: &sdl2::ttf::Font) -> Rect {
+        Self::simple_modal_card(screen_w, screen_h, |probe| {
+            let digit_bottom = Self::pairing_pin_row_y(probe, font_label) + ui::PAIRING_DIGIT_H as i32;
+            let status_room = 24 + 2 * (font_label.height() + 6); // up-to-two-line status
+            (digit_bottom + status_room + 52 + 26) as u32
+        })
+    }
+
+    /// The PIN row's top `y` — computed without drawing (see
+    /// `ui::modal_header_end_y`'s docs) so `prepare_tiles`/`draw_list` can
+    /// position the focused-digit tile without re-rendering the header.
+    /// `font_label` twice, not `font_title`: `render_pairing`'s header uses
+    /// `font_label` for both the title and subtitle (`font_title` is reserved
+    /// for the PIN digits themselves, at a deliberately large display style).
+    fn pairing_pin_row_y(card: Rect, font_label: &sdl2::ttf::Font) -> i32 {
+        ui::modal_header_end_y(font_label, font_label, card, PAIRING_SUBTITLE) + 38
     }
 
     /// The "Request access" button's rect — anchored to the card bottom (not to the
@@ -1449,23 +1649,35 @@ impl App {
     }
 
     /// The add-host modal's card rect — shared by `render_add_host` and mouse
-    /// hit-testing.
-    fn add_host_card_rect(screen_w: u32, screen_h: u32) -> Rect {
-        ui::modal_card_rect(screen_w, screen_h, 0.46, 260)
+    /// hit-testing. Height fits its (fully static) content.
+    fn add_host_card_rect(screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Rect {
+        Self::simple_modal_card(screen_w, screen_h, |probe| {
+            let header_end = ui::modal_header_end_y(fonts.label, fonts.value, probe, "Enter the host's IP address.");
+            (header_end + 20 + 80 + 32) as u32 // field + bottom margin
+        })
     }
 
-    /// The wake modal's card rect — shared by `render_wake` and mouse hit-testing.
-    /// Sized generously for `ui::draw_modal_header`'s layout (its title uses the
-    /// large `font_title`) plus the two action rows below.
-    fn wake_card_rect(screen_w: u32, screen_h: u32) -> Rect {
-        ui::modal_card_rect(screen_w, screen_h, 0.42, 520)
+    /// The wake modal's card rect — shared by `render_wake` and mouse
+    /// hit-testing. Height fits `wake`'s status (one or two lines) plus the
+    /// toggle/buttons, which are absent entirely with no MAC on record.
+    fn wake_card_rect(screen_w: u32, screen_h: u32, wake: &WakeState, fonts: &ui::Fonts) -> Rect {
+        Self::simple_modal_card(screen_w, screen_h, |probe| {
+            let header_end = ui::modal_header_end_y(fonts.title, fonts.label, probe, &Self::wake_status_text(wake));
+            if wake.mac.is_empty() {
+                (header_end + 32) as u32
+            } else {
+                (header_end + 28 + ui::SETTINGS_ROW_H as i32 + 18 + 72 + 32) as u32
+            }
+        })
     }
 
     /// The "Forget this host?" confirmation's card rect — shared by
-    /// `render_forget_host` and mouse hit-testing. Sized generously for
-    /// `ui::draw_modal_header`'s layout plus an up-to-two-line host-name subtitle.
-    fn forget_host_card_rect(screen_w: u32, screen_h: u32) -> Rect {
-        ui::modal_card_rect(screen_w, screen_h, 0.34, 340)
+    /// `render_forget_host` and mouse hit-testing. Height fits `name`'s subtitle.
+    fn forget_host_card_rect(screen_w: u32, screen_h: u32, name: &str, fonts: &ui::Fonts) -> Rect {
+        Self::simple_modal_card(screen_w, screen_h, |probe| {
+            let header_end = ui::modal_header_end_y(fonts.label, fonts.value, probe, &Self::forget_host_subtitle(name));
+            (header_end + 32 + 72 + 32) as u32
+        })
     }
 
     /// The settings modal's card/content rects — shared by `render` and mouse
@@ -1496,7 +1708,14 @@ impl App {
     /// the pointer drifting across the screen. Only keyboard/remote navigation or a
     /// click (`handle_mouse_click` below) moves it now. Hover still drives the
     /// close (X) button's highlight, a conventional affordance this excludes.
-    pub fn handle_mouse_motion(&mut self, x: i32, y: i32, screen_w: u32, screen_h: u32) -> bool {
+    pub fn handle_mouse_motion(
+        &mut self,
+        x: i32,
+        y: i32,
+        screen_w: u32,
+        screen_h: u32,
+        fonts: &ui::Fonts,
+    ) -> bool {
         match self.screen {
             Screen::Home => {
                 // Home has no close button, but `hover_close` is only ever set by
@@ -1517,16 +1736,25 @@ impl App {
             }
             // Pairing/AddHost/Wake/ForgetHost are plain single-card modals with
             // nothing but the close button to hover-test (unlike Settings
-            // above, which also tracks per-row hover) — same one-liner for
-            // all four, just a different card rect.
-            Screen::Pairing | Screen::AddHost | Screen::Wake | Screen::ForgetHost => {
-                let card = match self.screen {
-                    Screen::Pairing => Self::pairing_card_rect(screen_w, screen_h),
-                    Screen::AddHost => Self::add_host_card_rect(screen_w, screen_h),
-                    Screen::Wake => Self::wake_card_rect(screen_w, screen_h),
-                    Screen::ForgetHost => Self::forget_host_card_rect(screen_w, screen_h),
-                    Screen::Home | Screen::Settings => unreachable!(),
-                };
+            // above, which also tracks per-row hover) — same shape for all
+            // four, just each its own card rect (see their docs on why that's
+            // no longer a single shared size).
+            Screen::Pairing => {
+                let card = Self::pairing_card_rect(screen_w, screen_h, fonts.label);
+                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
+            }
+            Screen::AddHost => {
+                let card = Self::add_host_card_rect(screen_w, screen_h, fonts);
+                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
+            }
+            Screen::Wake => {
+                let Some(wake) = &self.wake else { return false };
+                let card = Self::wake_card_rect(screen_w, screen_h, wake, fonts);
+                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
+            }
+            Screen::ForgetHost => {
+                let name = self.host_menu_index.and_then(|i| self.entries.get(i)).map(HostEntry::name).unwrap_or_default();
+                let card = Self::forget_host_card_rect(screen_w, screen_h, name, fonts);
                 self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
             }
         }
@@ -1549,12 +1777,13 @@ impl App {
         y: i32,
         screen_w: u32,
         screen_h: u32,
+        fonts: &ui::Fonts,
         log: &mut std::fs::File,
     ) -> Option<ConnectTarget> {
         // Re-sync the close-button hover to the click's own position first — a
         // MouseButtonDown can carry a slightly different (x, y) than the last
         // MouseMotion (the physical button press can jostle the remote a little).
-        self.handle_mouse_motion(x, y, screen_w, screen_h);
+        self.handle_mouse_motion(x, y, screen_w, screen_h, fonts);
         if self.hover_close {
             // Same "what Back means here" as everywhere else — see `back`'s docs.
             return self.back(log);
@@ -1603,7 +1832,7 @@ impl App {
             Screen::Pairing => {
                 // The Magic Remote pointer is the most reliable input on this TV, so the
                 // "Request access" button is clickable directly: focus it and confirm.
-                let card = Self::pairing_card_rect(screen_w, screen_h);
+                let card = Self::pairing_card_rect(screen_w, screen_h, fonts.label);
                 if Self::pairing_request_button_rect(card).contains_point((x, y)) {
                     self.pairing_focus = PairingFocus::RequestAccess;
                     self.handle_pairing_event(MenuEvent::Confirm, log);
@@ -1635,16 +1864,17 @@ impl App {
         }
     }
 
-    /// Cubic ease-out for the animation fractions below.
-    fn ease(f: f32) -> f32 {
-        1.0 - (1.0 - f).powi(3)
-    }
-
-    /// Eased 0..=1 progress of an animation started at `t`; 1.0 when done/absent.
-    fn anim_frac(anim: Option<Instant>, dur: Duration) -> f32 {
-        match anim {
-            Some(t) => Self::ease((t.elapsed().as_secs_f32() / dur.as_secs_f32()).min(1.0)),
-            None => 1.0,
+    /// The current position (0.0..=1.0, see `ui::draw_switch`) of a `Toggle`
+    /// row's switch given its settled state `target_on` — mid-slide while
+    /// `switch_anim` is in flight *for that same transition*, otherwise
+    /// settled at the endpoint.
+    fn toggle_frac(&self, target_on: bool) -> f32 {
+        match self.switch_anim {
+            Some((t, from_on)) if from_on != target_on => {
+                let f = ui::anim_frac(Some(t), ui::FOCUS_POP);
+                if target_on { f } else { 1.0 - f }
+            }
+            _ => f32::from(target_on),
         }
     }
 
@@ -1654,14 +1884,10 @@ impl App {
     /// tick" flag — it forces the open modal's tile to re-rasterize, since modal
     /// content has no finer dirty tracking of its own. Pure animation frames pass
     /// `false` and rasterize nothing at all.
-    #[allow(clippy::too_many_arguments)]
     pub fn prepare_tiles(
         &mut self,
         text_cache: &mut crate::ui::TextCache,
-        font_label: &sdl2::ttf::Font,
-        font_value: &sdl2::ttf::Font,
-        font_title: &sdl2::ttf::Font,
-        icon_font: &sdl2::ttf::Font,
+        fonts: &ui::Fonts,
         screen_w: u32,
         screen_h: u32,
         content_dirty: bool,
@@ -1690,9 +1916,7 @@ impl App {
             ui::draw_sidebar(
                 &mut layer,
                 text_cache,
-                font_label,
-                font_value,
-                icon_font,
+                fonts,
                 &self.entries,
                 None,
                 screen_h,
@@ -1705,7 +1929,7 @@ impl App {
         if let HomeFocus::Sidebar(i) = self.home_focus {
             let stale = !matches!(&self.focused_row_tile, Some((idx, _)) if *idx == i);
             if stale {
-                let tile = ui::render_focused_row_tile(text_cache, font_label, icon_font, &self.entries, i)?;
+                let tile = ui::render_focused_row_tile(text_cache, fonts, &self.entries, i)?;
                 self.focused_row_tile = Some((i, tile));
                 updated.push(Tile::FocusRow);
             }
@@ -1728,7 +1952,7 @@ impl App {
                 if self.card_tiles[idx].is_none() {
                     let tile = {
                         let (title, art) = self.grid_card_content(idx);
-                        ui::render_card_tile(text_cache, font_title, font_value, card_w, card_h, title, art)?
+                        ui::render_card_tile(text_cache, fonts, card_w, card_h, title, art)?
                     };
                     self.card_tiles[idx] = Some(tile);
                     updated.push(Tile::Card(idx));
@@ -1744,7 +1968,7 @@ impl App {
                     let stale = !matches!(&self.status_tile, Some((t, _)) if t == s);
                     if stale {
                         let max_w = available_w.saturating_sub(2 * ui::GRID_PAD as u32);
-                        let tile = ui::render_wrapped_text_tile(text_cache, font_label, s, max_w, ui::MUTED, 6)?;
+                        let tile = ui::render_wrapped_text_tile(text_cache, fonts.label, s, max_w, ui::MUTED, 6)?;
                         self.status_tile = Some((s.clone(), tile));
                         updated.push(Tile::Status);
                     }
@@ -1754,7 +1978,7 @@ impl App {
         } else if self.nohost_tile.is_none() {
             self.nohost_tile = Some(ui::render_text_tile(
                 text_cache,
-                font_label,
+                fonts.label,
                 "No host selected — pick one from the list, or add one.",
                 ui::MUTED,
             )?);
@@ -1762,7 +1986,43 @@ impl App {
         }
 
         let modal_open = !matches!(self.screen, Screen::Home);
-        if modal_open && (screen_changed || content_dirty || self.modal_tile.is_none()) {
+        // Every modal's shell only reacts to *content* changes — not to
+        // `content_dirty`, which is also `true` on plain focus movement (see
+        // `ModalShellKey`'s docs). `AddHost` has no `ModalShellKey` variant
+        // (no split focus tile to protect) and just redraws on any
+        // `content_dirty` tick, same as every modal did before this split.
+        let modal_shell_key = match self.screen {
+            Screen::Settings => Some(ModalShellKey::Settings(
+                self.settings,
+                self.dropdown.as_ref().map(|dd| dd.row),
+                self.hover_close,
+            )),
+            Screen::Wake => self.wake.as_ref().map(|w| ModalShellKey::Wake {
+                name: w.name.clone(),
+                mac_empty: w.mac.is_empty(),
+                sent: w.sent,
+                auto_send: self.settings.wol_auto_send,
+                hover_close: self.hover_close,
+            }),
+            Screen::Pairing => Some(ModalShellKey::Pairing {
+                digits: self.pin_digits,
+                status: self.pairing_status.clone(),
+                busy: self.pairing_busy,
+                hover_close: self.hover_close,
+            }),
+            Screen::ForgetHost => Some(ModalShellKey::ForgetHost {
+                name: self.host_menu_index.and_then(|i| self.entries.get(i)).map(|e| e.name().to_string()),
+                hover_close: self.hover_close,
+            }),
+            Screen::Home | Screen::AddHost => None,
+        };
+        let modal_stale = if modal_shell_key.is_some() {
+            self.modal_tile.is_none() || self.modal_shell_key != modal_shell_key
+        } else {
+            content_dirty || self.modal_tile.is_none()
+        };
+        self.modal_shell_key = modal_shell_key;
+        if modal_open && (screen_changed || modal_stale) {
             let mut p = match self.modal_tile.take() {
                 Some(p) => p,
                 None => Painter::new(screen_w, screen_h),
@@ -1771,23 +2031,140 @@ impl App {
             match self.screen {
                 Screen::Home => unreachable!("modal_open checked above"),
                 Screen::Pairing => {
-                    self.render_pairing(&mut p, text_cache, font_label, font_title, icon_font, screen_w, screen_h)?;
+                    self.render_pairing(&mut p, text_cache, fonts, screen_w, screen_h)?;
                 }
                 Screen::Settings => {
-                    self.render_settings(&mut p, text_cache, font_label, font_value, icon_font, screen_w, screen_h)?;
+                    self.render_settings(&mut p, text_cache, fonts, screen_w, screen_h)?;
                 }
-                Screen::AddHost => self.render_add_host(
-                    &mut p, text_cache, font_label, font_value, font_title, icon_font, screen_w, screen_h,
-                )?,
+                Screen::AddHost => self.render_add_host(&mut p, text_cache, fonts, screen_w, screen_h)?,
                 Screen::Wake => {
-                    self.render_wake(&mut p, text_cache, font_label, font_title, icon_font, screen_w, screen_h)?;
+                    self.render_wake(&mut p, text_cache, fonts, screen_w, screen_h)?;
                 }
                 Screen::ForgetHost => {
-                    self.render_forget_host(&mut p, text_cache, font_label, font_value, icon_font, screen_w, screen_h)?;
+                    self.render_forget_host(&mut p, text_cache, fonts, screen_w, screen_h)?;
                 }
             }
             self.modal_tile = Some(p);
             updated.push(Tile::Modal);
+        }
+        // Whichever modal is open has at most one focused, zoom-animated widget
+        // (`ModalFocusKey`'s docs) — `None` for screens with no such widget
+        // (Home, AddHost) or when Wake has nothing to focus (no MAC on record,
+        // see `handle_wake_event`'s matching guard).
+        let focus_key = match self.screen {
+            Screen::Settings => Some(ModalFocusKey::SettingsRow(self.settings_focused, self.settings)),
+            Screen::Wake => self.wake.as_ref().filter(|w| !w.mac.is_empty()).map(|w| {
+                if w.focused == 0 {
+                    ModalFocusKey::WakeToggle(self.settings.wol_auto_send)
+                } else {
+                    ModalFocusKey::WakeButton(w.focused)
+                }
+            }),
+            Screen::Pairing => Some(match self.pairing_focus {
+                PairingFocus::Pin => {
+                    ModalFocusKey::PairingDigit(self.pin_digit_index, self.pin_digits[self.pin_digit_index])
+                }
+                PairingFocus::RequestAccess => ModalFocusKey::PairingButton,
+            }),
+            Screen::ForgetHost => Some(ModalFocusKey::ForgetButton(self.host_menu_focused)),
+            Screen::Home | Screen::AddHost => None,
+        };
+        if let Some(key) = focus_key {
+            // Also stale on every tick of an in-flight `switch_anim`: the knob's
+            // position depends on elapsed time, not on `key`, which doesn't
+            // change mid-flip.
+            let stale = self.switch_anim.is_some() || !matches!(&self.modal_focus_tile, Some((k, _)) if *k == key);
+            if stale {
+                let tile = match self.screen {
+                    Screen::Settings => {
+                        let (_, content) = Self::settings_layout(screen_w, screen_h);
+                        let rows = ui::settings_rows(&self.settings);
+                        let dropdown_open = self.dropdown.as_ref().is_some_and(|dd| dd.row == self.settings_focused);
+                        let target_on = rows.get(self.settings_focused).is_some_and(|r| r.value == "On");
+                        ui::render_focus_row_tile(
+                            text_cache,
+                            fonts,
+                            &rows,
+                            content.width(),
+                            self.settings_focused,
+                            dropdown_open,
+                            self.toggle_frac(target_on),
+                        )?
+                    }
+                    Screen::Wake => {
+                        let wake = self.wake.as_ref().expect("focus_key only Some for a Wake with a focusable widget");
+                        let card = Self::wake_card_rect(screen_w, screen_h, wake, fonts);
+                        if wake.focused == 0 {
+                            let rows = ui::wake_rows(self.settings.wol_auto_send);
+                            let content_w = Self::wake_toggle_rect(card, wake, fonts).width();
+                            ui::render_focus_row_tile(
+                                text_cache,
+                                fonts,
+                                &rows,
+                                content_w,
+                                0,
+                                false,
+                                self.toggle_frac(self.settings.wol_auto_send),
+                            )?
+                        } else {
+                            let toggle = Self::wake_toggle_rect(card, wake, fonts);
+                            let rect = ui::confirm_button_rect(Self::wake_buttons_rect(toggle), wake.focused - 1);
+                            let buttons = Self::wake_buttons();
+                            ui::render_confirm_button_tile(
+                                text_cache,
+                                fonts,
+                                &buttons[wake.focused - 1],
+                                rect.width(),
+                                rect.height(),
+                            )?
+                        }
+                    }
+                    Screen::Pairing => match self.pairing_focus {
+                        PairingFocus::Pin => {
+                            ui::render_pairing_digit_tile(text_cache, fonts.title, self.pin_digits[self.pin_digit_index])?
+                        }
+                        PairingFocus::RequestAccess => {
+                            let card = Self::pairing_card_rect(screen_w, screen_h, fonts.label);
+                            let btn = Self::pairing_request_button_rect(card);
+                            ui::render_pairing_button_tile(text_cache, fonts.label, btn.width(), btn.height())?
+                        }
+                    },
+                    Screen::ForgetHost => {
+                        let name = self.host_menu_index.and_then(|i| self.entries.get(i)).map(HostEntry::name).unwrap_or_default();
+                        let card = Self::forget_host_card_rect(screen_w, screen_h, name, fonts);
+                        let content = Self::forget_host_content_rect(card, name, fonts);
+                        let rect = ui::confirm_button_rect(content, self.host_menu_focused);
+                        let buttons = Self::forget_buttons();
+                        ui::render_confirm_button_tile(
+                            text_cache,
+                            fonts,
+                            &buttons[self.host_menu_focused],
+                            rect.width(),
+                            rect.height(),
+                        )?
+                    }
+                    Screen::Home | Screen::AddHost => unreachable!("focus_key checked above"),
+                };
+                self.modal_focus_tile = Some((key, tile));
+                updated.push(Tile::ModalFocusElement);
+            }
+        } else {
+            self.modal_focus_tile = None;
+        }
+
+        if let Some(dd) = &self.dropdown {
+            let key = (dd.row, dd.focused);
+            let stale = !matches!(&self.dropdown_focus_tile, Some((k, _)) if *k == key);
+            if stale {
+                let (_, content) = Self::settings_layout(screen_w, screen_h);
+                let options = ui::dropdown_options(dd.row);
+                let option = options.get(dd.focused).map_or("", String::as_str);
+                let tile = ui::render_dropdown_option_tile(text_cache, fonts.value, option, content.width())?;
+                self.dropdown_focus_tile = Some((key, tile));
+                updated.push(Tile::DropdownFocusOption);
+            }
+        } else {
+            self.dropdown_focus_tile = None;
         }
         Ok(updated)
     }
@@ -1800,18 +2177,27 @@ impl App {
             Tile::Card(i) => self.card_tiles.get(i).and_then(|t| t.as_ref()),
             Tile::Ring => self.ring_tile.as_ref(),
             Tile::Modal => self.modal_tile.as_ref(),
+            Tile::ModalFocusElement => self.modal_focus_tile.as_ref().map(|(_, p)| p),
+            Tile::DropdownFocusOption => self.dropdown_focus_tile.as_ref().map(|(_, p)| p),
             Tile::Status => self.status_tile.as_ref().map(|(_, p)| p),
             Tile::NoHost => self.nohost_tile.as_ref(),
             // Stream-side only (uploaded directly by `run_inner`'s overlay
             // refresh) — never one of App's menu tiles.
-            Tile::StatsOverlay | Tile::DisconnectDialog => None,
+            Tile::StatsOverlay | Tile::DisconnectDialog | Tile::DisconnectFocusButton => None,
         }
     }
 
     /// Builds this frame's draw list (paint order) from the current state and
-    /// animation clocks — pure bookkeeping, no rasterization. The GPU executes it
-    /// (`Compositor::execute`).
-    pub fn draw_list(&self, screen_w: u32, screen_h: u32) -> Vec<DrawCmd> {
+    /// animation clocks — pure bookkeeping, no rasterization (the font
+    /// params are only for pure geometry — `ui::modal_header_end_y` and
+    /// friends — needed to position a modal's focused-widget tile without
+    /// re-rendering its header). The GPU executes it (`Compositor::execute`).
+    pub fn draw_list(
+        &self,
+        screen_w: u32,
+        screen_h: u32,
+        fonts: &ui::Fonts,
+    ) -> Vec<DrawCmd> {
         let mut cmds = Vec::new();
         let grid_x = ui::SIDEBAR_W as i32;
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
@@ -1857,25 +2243,22 @@ impl App {
                 // The focus pop: the GPU scales the (unfocused) card tile up
                 // around its center as the pop progresses, with the shared ring
                 // tile fading in over it at the same scale.
-                let f = Self::anim_frac(self.focus_anim, FOCUS_POP);
-                let scale = 1.0 + 0.028 * f;
+                let f = ui::anim_frac(self.focus_anim, ui::FOCUS_POP);
                 let r = ui::grid_card_rect(idx, columns, grid_x, available_w);
                 let y = r.y() - self.grid_scroll;
-                let cx = r.x() as f32 + r.width() as f32 / 2.0;
-                let cy = y as f32 + r.height() as f32 / 2.0;
-                let tw = (r.width() + 2 * pad as u32) as f32 * scale;
-                let th = (r.height() + 2 * pad as u32) as f32 * scale;
+                let card_base =
+                    Rect::new(r.x() - pad, y - pad, r.width() + 2 * pad as u32, r.height() + 2 * pad as u32);
                 cmds.push(DrawCmd::Tex {
                     tile: Tile::Card(idx),
-                    dst: Rect::new((cx - tw / 2.0) as i32, (cy - th / 2.0) as i32, tw as u32, th as u32),
+                    dst: ui::zoom_rect(card_base, f, CARD_GROWTH),
                     alpha: 0xff,
                 });
                 let rp = ui::FOCUS_RING_PAD;
-                let rw = (r.width() + 2 * rp as u32) as f32 * scale;
-                let rh = (r.height() + 2 * rp as u32) as f32 * scale;
+                let ring_base =
+                    Rect::new(r.x() - rp, y - rp, r.width() + 2 * rp as u32, r.height() + 2 * rp as u32);
                 cmds.push(DrawCmd::Tex {
                     tile: Tile::Ring,
-                    dst: Rect::new((cx - rw / 2.0) as i32, (cy - rh / 2.0) as i32, rw as u32, rh as u32),
+                    dst: ui::zoom_rect(ring_base, f, CARD_GROWTH),
                     alpha: (255.0 * f) as u8,
                 });
             }
@@ -1908,7 +2291,7 @@ impl App {
         if !matches!(self.screen, Screen::Home) {
             // Modal open: the scrim fades in and the modal slides up its last
             // ~26px while fading — both pure GPU parameters.
-            let m = Self::anim_frac(self.modal_anim, MODAL_FADE);
+            let m = ui::anim_frac(self.modal_anim, MODAL_FADE);
             cmds.push(DrawCmd::Fill {
                 rect: Rect::new(0, 0, screen_w, screen_h),
                 color: sdl2::pixels::Color::RGBA(0, 0, 0, (f32::from(ui::MODAL_SCRIM.a) * m) as u8),
@@ -1919,6 +2302,77 @@ impl App {
                 dst: Rect::new(0, dy, screen_w, screen_h),
                 alpha: (255.0 * m) as u8,
             });
+            // Whichever modal is open, its one focused widget — a settings/Wake
+            // row, a pairing digit/button, or a Forget-host button (see
+            // `ModalFocusKey`'s docs) — composites on top of the shell (which
+            // draws every widget unfocused) at its actual on-screen position,
+            // so moving focus needs no modal re-rasterize at all. Same
+            // fade/slide as the shell so it stays glued to it during the
+            // modal-open animation.
+            let focus_rect = match self.screen {
+                Screen::Settings => {
+                    let (_, content) = Self::settings_layout(screen_w, screen_h);
+                    Some(ui::focus_row_rect(content, self.settings_focused))
+                }
+                Screen::Wake => self.wake.as_ref().filter(|w| !w.mac.is_empty()).map(|w| {
+                    let card = Self::wake_card_rect(screen_w, screen_h, w, fonts);
+                    let toggle = Self::wake_toggle_rect(card, w, fonts);
+                    if w.focused == 0 {
+                        ui::focus_row_rect(toggle, 0)
+                    } else {
+                        ui::confirm_button_rect(Self::wake_buttons_rect(toggle), w.focused - 1)
+                    }
+                }),
+                Screen::Pairing => {
+                    let card = Self::pairing_card_rect(screen_w, screen_h, fonts.label);
+                    Some(match self.pairing_focus {
+                        PairingFocus::Pin => {
+                            let digit_y = Self::pairing_pin_row_y(card, fonts.label);
+                            ui::pairing_digit_rect(card, digit_y, self.pin_digit_index)
+                        }
+                        PairingFocus::RequestAccess => Self::pairing_request_button_rect(card),
+                    })
+                }
+                Screen::ForgetHost => {
+                    let name = self.host_menu_index.and_then(|i| self.entries.get(i)).map(HostEntry::name).unwrap_or_default();
+                    let card = Self::forget_host_card_rect(screen_w, screen_h, name, fonts);
+                    let content = Self::forget_host_content_rect(card, name, fonts);
+                    Some(ui::confirm_button_rect(content, self.host_menu_focused))
+                }
+                Screen::Home | Screen::AddHost => None,
+            };
+            if let Some(rect) = focus_rect {
+                let pad = ui::ROW_TILE_PAD;
+                let base =
+                    Rect::new(rect.x() - pad, rect.y() - pad + dy, rect.width() + 2 * pad as u32, rect.height() + 2 * pad as u32);
+                // The zoom-in: same GPU-scale-around-center technique as the
+                // grid's card focus pop (see above) — `modal_focus_tile` is
+                // rasterized once at its literal size, never re-rendered for
+                // this (except while `switch_anim` animates its content, see
+                // `prepare_tiles`).
+                let f = ui::anim_frac(self.modal_focus_anim, ui::FOCUS_POP);
+                cmds.push(DrawCmd::Tex {
+                    tile: Tile::ModalFocusElement,
+                    dst: ui::zoom_rect(base, f, 0.02),
+                    alpha: (255.0 * m) as u8,
+                });
+            }
+            // The open dropdown's focused option — same idea, composited on
+            // top of the shell's unfocused option list at its actual
+            // position, so navigating dropdown options needs no modal
+            // re-rasterize either.
+            if matches!(self.screen, Screen::Settings) {
+                if let Some(dd) = &self.dropdown {
+                    let (_, content) = Self::settings_layout(screen_w, screen_h);
+                    let overlay_rect = Self::dropdown_overlay_rect(content, dd.row);
+                    let option_rect = ui::dropdown_option_rect(overlay_rect, dd.focused);
+                    cmds.push(DrawCmd::Tex {
+                        tile: Tile::DropdownFocusOption,
+                        dst: Rect::new(option_rect.x(), option_rect.y() + dy, option_rect.width(), option_rect.height()),
+                        alpha: (255.0 * m) as u8,
+                    });
+                }
+            }
         }
         cmds
     }
@@ -1947,59 +2401,49 @@ impl App {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_pairing(
         &self,
         painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
-        font_label: &sdl2::ttf::Font,
-        font_title: &sdl2::ttf::Font,
-        icon_font: &sdl2::ttf::Font,
+        fonts: &ui::Fonts,
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
-        let card = Self::pairing_card_rect(screen_w, screen_h);
-        self.draw_modal_shell(painter, text_cache, icon_font, card)?;
+        let card = Self::pairing_card_rect(screen_w, screen_h, fonts.label);
+        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
 
         // Title in `font_label`, matching the other modals — `font_title` is used
         // below for the PIN digits themselves, at a deliberately large display style.
         let after_subtitle_y = ui::draw_modal_header(
             painter,
             text_cache,
-            font_label,
-            font_label,
+            fonts.label,
+            fonts.label,
             card,
             "Pair with host",
             ui::WHITE,
-            "Enter the host's PIN, or request access and approve on the host.",
+            PAIRING_SUBTITLE,
             ui::MUTED,
         )?;
 
         // A clear, generous gap below the subtitle — the PIN entry is this
         // screen's whole point, and it read as cramped sitting right under
         // the subtitle text.
-        let digit_h = 80u32;
         let digit_y = after_subtitle_y + 38;
-        let digit_w = 64i32;
-        let digit_gap = 14i32;
-        let total_w = 4 * digit_w + 3 * digit_gap;
-        let start_x = card.x() + (card.width() as i32 - total_w) / 2;
+        // Shell draws every digit/button unfocused; the focused one is a
+        // separate `Tile::ModalFocusElement` (see `prepare_tiles`).
         for (i, digit) in self.pin_digits.iter().enumerate() {
-            let x = start_x + i as i32 * (digit_w + digit_gap);
-            let rect = Rect::new(x, digit_y, digit_w as u32, digit_h);
-            // Only highlight a digit while the PIN row actually has focus — when focus is
-            // on the Request-access button, no digit should read as selected.
-            let focused = i == self.pin_digit_index && self.pairing_focus == PairingFocus::Pin;
-            let drawn = ui::draw_card(painter, rect, focused);
+            let rect = ui::pairing_digit_rect(card, digit_y, i);
+            let drawn = ui::draw_card(painter, rect, false);
             let text = digit.to_string();
-            let tw = font_title.size_of(&text).map_or(0, |(w, _)| w);
+            let tw = fonts.title.size_of(&text).map_or(0, |(w, _)| w);
             ui::draw_text(
                 painter,
                 text_cache,
-                font_title,
+                fonts.title,
                 &text,
                 drawn.x() + (drawn.width() as i32 - tw as i32) / 2,
-                drawn.y() + (drawn.height() as i32 - font_title.height()) / 2,
+                drawn.y() + (drawn.height() as i32 - fonts.title.height()) / 2,
                 ui::WHITE,
             )?;
         }
@@ -2011,10 +2455,10 @@ impl App {
             ui::draw_text_wrapped(
                 painter,
                 text_cache,
-                font_label,
+                fonts.label,
                 status,
                 card.x() + 32,
-                digit_y + digit_h as i32 + 24,
+                digit_y + ui::PAIRING_DIGIT_H as i32 + 24,
                 card.width().saturating_sub(64),
                 color,
                 6,
@@ -2023,39 +2467,34 @@ impl App {
 
         // The no-PIN "Request access" button, anchored to the card bottom.
         let btn = Self::pairing_request_button_rect(card);
-        let btn_focused = self.pairing_focus == PairingFocus::RequestAccess;
-        let drawn = ui::draw_card(painter, btn, btn_focused);
-        let label = "Request access";
-        let lw = font_label.size_of(label).map_or(0, |(w, _)| w);
+        let drawn = ui::draw_card(painter, btn, false);
+        let lw = fonts.label.size_of(ui::PAIRING_REQUEST_LABEL).map_or(0, |(w, _)| w);
         ui::draw_text(
             painter,
             text_cache,
-            font_label,
-            label,
+            fonts.label,
+            ui::PAIRING_REQUEST_LABEL,
             drawn.x() + (drawn.width() as i32 - lw as i32) / 2,
-            drawn.y() + (drawn.height() as i32 - font_label.height()) / 2,
-            if btn_focused { ui::WHITE } else { ui::MUTED },
+            drawn.y() + (drawn.height() as i32 - fonts.label.height()) / 2,
+            ui::MUTED,
         )?;
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_settings(
         &self,
         painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
-        font_label: &sdl2::ttf::Font,
-        font_value: &sdl2::ttf::Font,
-        icon_font: &sdl2::ttf::Font,
+        fonts: &ui::Fonts,
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
         let (card, content) = Self::settings_layout(screen_w, screen_h);
-        self.draw_modal_shell(painter, text_cache, icon_font, card)?;
+        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
         ui::draw_text(
             painter,
             text_cache,
-            font_label,
+            fonts.label,
             "Settings",
             card.x() + 40,
             card.y() + 36,
@@ -2067,14 +2506,17 @@ impl App {
         );
 
         let rows = ui::settings_rows(&self.settings);
-        ui::draw_settings_rows(
+        // `usize::MAX` = no row focused: this shell draws every row unfocused,
+        // the focused one is a separate `Tile::ModalFocusElement` (see
+        // `prepare_tiles`), so moving focus never re-rasterizes the modal.
+        let open_dropdown_row = self.dropdown.as_ref().map(|dd| dd.row);
+        ui::draw_focus_rows(
             painter,
             text_cache,
-            font_label,
-            font_value,
-            icon_font,
+            fonts,
             &rows,
-            self.settings_focused,
+            usize::MAX,
+            open_dropdown_row,
             content,
         )?;
 
@@ -2082,8 +2524,8 @@ impl App {
             ui::draw_text(
                 painter,
                 text_cache,
-                font_value,
-                "Higher bitrate may be unstable on Wi-Fi — try Ethernet if streaming drops.",
+                fonts.value,
+                "May be unstable on Wi-Fi — try Ethernet if streaming drops.",
                 content.x(),
                 content.y() + content.height() as i32 + 16,
                 ui::WARNING,
@@ -2092,33 +2534,39 @@ impl App {
 
         if let Some(dd) = &self.dropdown {
             let options = ui::dropdown_options(dd.row);
-            let overlay_y = content.y() + (dd.row as i32 + 1) * (ui::SETTINGS_ROW_H as i32 + ui::SETTINGS_ROW_GAP);
-            let overlay_rect = Rect::new(content.x(), overlay_y, content.width(), 0);
-            ui::draw_dropdown_overlay(painter, text_cache, font_value, &options, dd.focused, overlay_rect)?;
+            let overlay_rect = Self::dropdown_overlay_rect(content, dd.row);
+            // `usize::MAX` = no option focused; the focused one is a separate
+            // `Tile::DropdownFocusOption` (see `prepare_tiles`).
+            ui::draw_dropdown_overlay(painter, text_cache, fonts.value, &options, usize::MAX, overlay_rect)?;
         }
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Where a dropdown opened from settings row `row` anchors its option
+    /// overlay — one row below it. Shared by `render_settings` and `draw_list`,
+    /// which both need it (as a whole, or per-option via
+    /// `ui::dropdown_option_rect`).
+    fn dropdown_overlay_rect(content: Rect, row: usize) -> Rect {
+        let y = ui::focus_row_rect(content, row + 1).y();
+        Rect::new(content.x(), y, content.width(), 0)
+    }
+
     fn render_add_host(
         &self,
         painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
-        font_label: &sdl2::ttf::Font,
-        font_value: &sdl2::ttf::Font,
-        font_title: &sdl2::ttf::Font,
-        icon_font: &sdl2::ttf::Font,
+        fonts: &ui::Fonts,
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
-        let card = Self::add_host_card_rect(screen_w, screen_h);
-        self.draw_modal_shell(painter, text_cache, icon_font, card)?;
+        let card = Self::add_host_card_rect(screen_w, screen_h, fonts);
+        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
 
         let after_subtitle_y = ui::draw_modal_header(
             painter,
             text_cache,
-            font_label,
-            font_value,
+            fonts.label,
+            fonts.value,
             card,
             "Add host",
             ui::WHITE,
@@ -2135,14 +2583,14 @@ impl App {
         let drawn = ui::draw_card(painter, field, true);
         let text_x = drawn.x() + 24;
         let typed = self.add_host.display_text();
-        let text_w = font_title.size_of(&typed).map_or(0, |(w, _)| w);
+        let text_w = fonts.title.size_of(&typed).map_or(0, |(w, _)| w);
         ui::draw_text(
             painter,
             text_cache,
-            font_title,
+            fonts.title,
             &typed,
             text_x,
-            drawn.y() + (drawn.height() as i32 - font_title.height()) / 2,
+            drawn.y() + (drawn.height() as i32 - fonts.title.height()) / 2,
             ui::WHITE,
         )?;
         // A blinkless text-cursor bar right after what's typed so far — there's
@@ -2158,22 +2606,65 @@ impl App {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_wake(
         &self,
         painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
-        font_label: &sdl2::ttf::Font,
-        font_title: &sdl2::ttf::Font,
-        icon_font: &sdl2::ttf::Font,
+        fonts: &ui::Fonts,
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
         let Some(wake) = &self.wake else { return Ok(()) };
-        let card = Self::wake_card_rect(screen_w, screen_h);
-        self.draw_modal_shell(painter, text_cache, icon_font, card)?;
+        let card = Self::wake_card_rect(screen_w, screen_h, wake, fonts);
+        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
 
-        let status = if wake.mac.is_empty() {
+        let status = Self::wake_status_text(wake);
+        ui::draw_modal_header(
+            painter, text_cache, fonts.title, fonts.label, card, "Host unreachable", ui::WHITE, &status, ui::MUTED,
+        )?;
+
+        // No MAC on record — nothing to send or automate, so there's nothing
+        // else to draw (see `handle_wake_event`'s matching guard); the status
+        // text above already explains why, and `App::drain_discovery` still
+        // reconnects automatically the moment this host reappears on mDNS.
+        if !wake.mac.is_empty() {
+            let toggle = Self::wake_toggle_rect(card, wake, fonts);
+            let rows = ui::wake_rows(self.settings.wol_auto_send);
+            // `usize::MAX` = nothing focused; the focused row/button is a
+            // separate `Tile::ModalFocusElement` (see `prepare_tiles`).
+            ui::draw_focus_rows(painter, text_cache, fonts, &rows, usize::MAX, None, toggle)?;
+
+            let buttons = Self::wake_buttons_rect(toggle);
+            ui::draw_confirm_buttons(painter, text_cache, fonts, buttons, &Self::wake_buttons(), usize::MAX)?;
+        }
+        Ok(())
+    }
+
+    /// The Wake/Cancel button pair — shared by `render_wake`'s shell and the
+    /// focused-button tile (`prepare_tiles`), so their `ConfirmButton` data
+    /// can't drift apart. Mirrors `forget_buttons`.
+    fn wake_buttons() -> [ui::ConfirmButton<'static>; 2] {
+        [
+            ui::ConfirmButton {
+                icon: Some(ui::ICON_POWER),
+                label: "Wake",
+                color: ui::ACCENT_BRIGHT,
+            },
+            ui::ConfirmButton {
+                icon: None,
+                label: "Cancel",
+                color: ui::WHITE,
+            },
+        ]
+    }
+
+    /// The Wake modal's status line — depends on the host's name and whether
+    /// a wake was just sent, so unlike Pairing's fixed subtitle this isn't a
+    /// constant, but it's still reconstructible from `wake` alone. Shared by
+    /// `render_wake` (drawing it) and `wake_toggle_rect` (measuring it,
+    /// without drawing, to position the toggle row).
+    fn wake_status_text(wake: &WakeState) -> String {
+        if wake.mac.is_empty() {
             format!(
                 "Couldn't reach {} — it may be powered off, asleep, or off the network. No \
                  Wake-on-LAN address is on record for it yet, so it can't be woken from here; it'll \
@@ -2187,45 +2678,29 @@ impl App {
             )
         } else {
             format!("Couldn't reach {} — it may be powered off or asleep.", wake.name)
-        };
-        let after_status_y = ui::draw_modal_header(
-            painter, text_cache, font_title, font_label, card, "Host unreachable", ui::WHITE, &status, ui::MUTED,
-        )?;
-
-        // No MAC on record — nothing to send or automate, so there's no row to draw
-        // (see `handle_wake_event`'s matching guard); the status text above already
-        // explains why, and `App::drain_discovery` still reconnects automatically the
-        // moment this host reappears on mDNS.
-        if !wake.mac.is_empty() {
-            let content = Rect::new(
-                card.x() + 32,
-                after_status_y + 28,
-                card.width().saturating_sub(64),
-                ui::SETTINGS_ROW_H,
-            );
-            let send_label = if wake.sent { "Send again" } else { "Send Wake-on-LAN now" };
-            ui::draw_wake_rows(
-                painter,
-                text_cache,
-                font_label,
-                icon_font,
-                content,
-                send_label,
-                wake.focused,
-                self.settings.wol_auto_send,
-            )?;
         }
-        Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// The Wake modal's toggle row rect — depends on the status text's
+    /// wrapped height, computed via `ui::modal_header_end_y` without drawing
+    /// so `prepare_tiles`/`draw_list` can position the focused-row tile
+    /// without re-rendering the header.
+    fn wake_toggle_rect(card: Rect, wake: &WakeState, fonts: &ui::Fonts) -> Rect {
+        let after_status_y = ui::modal_header_end_y(fonts.title, fonts.label, card, &Self::wake_status_text(wake));
+        Rect::new(card.x() + 32, after_status_y + 28, card.width().saturating_sub(64), ui::SETTINGS_ROW_H)
+    }
+
+    /// The Wake/Cancel button row's rect, stacked below the toggle row —
+    /// mirrors `forget_host_content_rect`'s button-row sizing.
+    fn wake_buttons_rect(toggle: Rect) -> Rect {
+        Rect::new(toggle.x(), toggle.y() + toggle.height() as i32 + 18, toggle.width(), 72)
+    }
+
     fn render_forget_host(
         &self,
         painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
-        font_label: &sdl2::ttf::Font,
-        font_value: &sdl2::ttf::Font,
-        icon_font: &sdl2::ttf::Font,
+        fonts: &ui::Fonts,
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
@@ -2236,42 +2711,56 @@ impl App {
         else {
             return Ok(());
         };
-        let card = Self::forget_host_card_rect(screen_w, screen_h);
-        self.draw_modal_shell(painter, text_cache, icon_font, card)?;
+        let card = Self::forget_host_card_rect(screen_w, screen_h, name, fonts);
+        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
 
-        let after_subtitle_y = ui::draw_modal_header(
+        ui::draw_modal_header(
             painter,
             text_cache,
-            font_label,
-            font_value,
+            fonts.label,
+            fonts.value,
             card,
             "Forget this host?",
             ui::WHITE,
-            &format!("\"{name}\" will be removed from your host list."),
+            &Self::forget_host_subtitle(name),
             ui::MUTED,
         )?;
 
-        let content = Rect::new(card.x() + 32, after_subtitle_y + 32, card.width().saturating_sub(64), 72);
-        ui::draw_confirm_buttons(
-            painter,
-            text_cache,
-            font_label,
-            icon_font,
-            content,
-            &[
-                ui::ConfirmButton {
-                    icon: Some(ui::ICON_DELETE),
-                    label: "Forget",
-                    color: ui::ERROR_RED,
-                },
-                ui::ConfirmButton {
-                    icon: None,
-                    label: "Cancel",
-                    color: ui::WHITE,
-                },
-            ],
-            self.host_menu_focused,
-        )?;
+        let content = Self::forget_host_content_rect(card, name, fonts);
+        // `usize::MAX` = no button focused; the focused one is a separate
+        // `Tile::ModalFocusElement` (see `prepare_tiles`).
+        ui::draw_confirm_buttons(painter, text_cache, fonts, content, &Self::forget_buttons(), usize::MAX)?;
         Ok(())
+    }
+
+    /// The Forget/Cancel button pair — shared by `render_forget_host`'s shell
+    /// and the focused-button tile (`prepare_tiles`), so their `ConfirmButton`
+    /// data can't drift apart.
+    fn forget_buttons() -> [ui::ConfirmButton<'static>; 2] {
+        [
+            ui::ConfirmButton {
+                icon: Some(ui::ICON_DELETE),
+                label: "Forget",
+                color: ui::ERROR_RED,
+            },
+            ui::ConfirmButton {
+                icon: None,
+                label: "Cancel",
+                color: ui::WHITE,
+            },
+        ]
+    }
+
+    fn forget_host_subtitle(name: &str) -> String {
+        format!("\"{name}\" will be removed from your host list.")
+    }
+
+    /// The Forget/Cancel button row's rect — depends on the host-name
+    /// subtitle's wrapped height, computed via `ui::modal_header_end_y`
+    /// without drawing so `prepare_tiles`/`draw_list` can position the
+    /// focused-button tile without re-rendering the header.
+    fn forget_host_content_rect(card: Rect, name: &str, fonts: &ui::Fonts) -> Rect {
+        let after_subtitle_y = ui::modal_header_end_y(fonts.label, fonts.value, card, &Self::forget_host_subtitle(name));
+        Rect::new(card.x() + 32, after_subtitle_y + 32, card.width().saturating_sub(64), 72)
     }
 }

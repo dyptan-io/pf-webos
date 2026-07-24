@@ -135,7 +135,7 @@ pub enum VideoBackend {
 }
 
 /// Stream settings: resolution/framerate/bitrate/HDR/video-backend.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub width: u32,
     pub height: u32,
@@ -199,6 +199,49 @@ pub fn load_settings() -> Settings {
 pub fn save_settings(settings: &Settings) -> Result<()> {
     let json = serde_json::to_string_pretty(settings).context("serialize settings")?;
     write_atomic(settings_path(), &json, "settings.json")
+}
+
+/// Persists `Settings` on a dedicated background thread instead of the caller's —
+/// `save_settings`'s write-then-rename blocks on real disk I/O (measured ~100-200ms
+/// on-device), which is fine for the occasional save but was stalling the UI thread
+/// on every single settings-row adjustment (bitrate slider steps, a toggle flip),
+/// reading as input lag on the very controls someone expects to feel instant.
+///
+/// A single long-lived writer thread, not one spawn per save: rapid adjustments
+/// (holding the bitrate slider) replace the pending value rather than queuing every
+/// intermediate one, so a burst of changes costs one disk write of the final state,
+/// not N — and, since one thread ever calls `save_settings`, writes can't complete
+/// out of order the way N independently-spawned threads racing the filesystem could.
+pub struct SettingsWriter {
+    pending: std::sync::Arc<(std::sync::Mutex<Option<Settings>>, std::sync::Condvar)>,
+}
+
+impl SettingsWriter {
+    pub fn spawn() -> Self {
+        let state = std::sync::Arc::new((std::sync::Mutex::new(None::<Settings>), std::sync::Condvar::new()));
+        let worker_state = state.clone();
+        std::thread::spawn(move || {
+            let (lock, cvar) = &*worker_state;
+            loop {
+                let mut guard = lock.lock().expect("settings-writer mutex poisoned");
+                while guard.is_none() {
+                    guard = cvar.wait(guard).expect("settings-writer mutex poisoned");
+                }
+                let settings = guard.take().expect("just checked Some");
+                drop(guard);
+                let _ = save_settings(&settings);
+            }
+        });
+        Self { pending: state }
+    }
+
+    /// Queues `settings` to be written, replacing any not-yet-written value already
+    /// queued. Returns immediately — never touches disk on the calling thread.
+    pub fn save(&self, settings: Settings) {
+        let (lock, cvar) = &*self.pending;
+        *lock.lock().expect("settings-writer mutex poisoned") = Some(settings);
+        cvar.notify_one();
+    }
 }
 
 /// Test/dev override: a config file dropped alongside sideloading skips straight to
