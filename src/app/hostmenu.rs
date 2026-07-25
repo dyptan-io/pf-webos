@@ -1,0 +1,186 @@
+//! The per-host actions menu — the extension point for anything that acts on one host.
+//!
+//! Split out of the former single-file `app.rs`; see `super`'s module docs.
+//!
+//! Adding an action here is deliberately two edits and nothing else: a row in
+//! [`App::host_menu_actions`] and an arm in [`App::confirm_host_menu_row`]. Everything
+//! else — card geometry, the unfocused shell, the focused-row tile, the focus pop — is
+//! `ui::ListModal`'s, shared with any future list screen.
+use super::*;
+use sdl2::rect::Rect;
+use std::time::Instant;
+
+use crate::ui::{self, FocusRow, HostEntry, MenuEvent, Painter};
+
+/// One actionable entry in the host menu. Kept as an explicit enum rather than a bare
+/// row index so the conditional rows (Wake only with a MAC on record, Edit/Forget only
+/// for a saved host) can't silently shift what a given index means.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostAction {
+    Connect,
+    Pair,
+    SpeedTest,
+    Wake,
+    Edit,
+    Forget,
+}
+
+impl App {
+    /// Enters `Screen::HostMenu` for the sidebar row at `idx` — from that row's ⋯
+    /// button, by pointer or by focusing it with Right (see `HomeFocus::SidebarMenu`).
+    pub(crate) fn open_host_menu(&mut self, idx: usize) {
+        self.host_menu_index = Some(idx);
+        self.menu_focused = 0;
+        self.screen = Screen::HostMenu;
+    }
+
+    /// The menu's rows, paired with what each one does. Conditional on the host's
+    /// state: a discovered-but-never-saved host has nothing to edit or forget, and a
+    /// host whose Wake-on-LAN MAC has never been seen advertised can't be woken.
+    pub(crate) fn host_menu_actions(&self) -> Vec<(HostAction, FocusRow)> {
+        let Some(entry) = self.host_menu_index.and_then(|i| self.entries.get(i)) else {
+            return Vec::new();
+        };
+        let saved = matches!(entry, HostEntry::Known(_));
+        let mut rows = vec![
+            (
+                HostAction::Connect,
+                if entry.is_paired() {
+                    FocusRow::action(ui::ICON_TV, "Connect")
+                } else {
+                    // The hint goes in the value column like every other Action row's,
+                    // rather than being parenthesised into the label.
+                    FocusRow::action_with_value(ui::ICON_TV, "Connect", "pairs first")
+                },
+            ),
+            (HostAction::Pair, FocusRow::action(ui::ICON_LOCK, "Pair with PIN…")),
+            (
+                HostAction::SpeedTest,
+                FocusRow::action(ui::ICON_SIGNAL, "Test network speed…"),
+            ),
+        ];
+        if !entry.mac().is_empty() {
+            rows.push((HostAction::Wake, FocusRow::action(ui::ICON_POWER, "Wake host")));
+        }
+        if saved {
+            rows.push((HostAction::Edit, FocusRow::action(ui::ICON_EDIT, "Edit address…")));
+            rows.push((
+                HostAction::Forget,
+                FocusRow::action(ui::ICON_DELETE, "Forget host").danger(),
+            ));
+        }
+        rows
+    }
+
+    pub(crate) fn host_menu_rows(&self) -> Vec<FocusRow> {
+        self.host_menu_actions().into_iter().map(|(_, r)| r).collect()
+    }
+
+    /// The host's name — the menu's title.
+    pub(crate) fn host_menu_title(&self) -> String {
+        self.host_menu_index
+            .and_then(|i| self.entries.get(i))
+            .map_or_else(String::new, |e| e.name().to_string())
+    }
+
+    /// `address:port`, plus the pairing state — the menu's subtitle.
+    pub(crate) fn host_menu_subtitle(&self) -> String {
+        self.host_menu_index
+            .and_then(|i| self.entries.get(i))
+            .map_or_else(String::new, |e| {
+                format!(
+                    "{}:{} · {}",
+                    e.host(),
+                    e.port(),
+                    if e.is_paired() { "paired" } else { "not paired" }
+                )
+            })
+    }
+
+    pub(crate) fn host_menu_card_rect(
+        screen_w: u32,
+        screen_h: u32,
+        fonts: &ui::Fonts,
+        subtitle: &str,
+        rows: usize,
+    ) -> Rect {
+        ui::list_modal_card_rect(screen_w, screen_h, fonts, subtitle, rows)
+    }
+
+    /// Handles one menu event on the host actions menu. Returns a `ConnectTarget`
+    /// only if the chosen action starts a stream directly (it never does today —
+    /// Connect goes through the same reachability pre-flight as the grid).
+    pub(crate) fn handle_host_menu_event(&mut self, ev: MenuEvent) {
+        let len = self.host_menu_actions().len();
+        if ui::list_nav(&mut self.menu_focused, len, ev) {
+            self.modal_focus_anim = Some(Instant::now());
+            return;
+        }
+        match ev {
+            MenuEvent::Confirm => self.confirm_host_menu_row(),
+            MenuEvent::Back => {
+                self.host_menu_index = None;
+                self.screen = Screen::Home;
+            }
+            MenuEvent::Up | MenuEvent::Down | MenuEvent::Left | MenuEvent::Right | MenuEvent::Secondary => {}
+        }
+    }
+
+    /// Runs the focused row's action. Every arm either leaves for another screen or
+    /// closes the menu — nothing stays here having "done something" invisibly.
+    pub(crate) fn confirm_host_menu_row(&mut self) {
+        let actions = self.host_menu_actions();
+        let Some((action, _)) = actions.get(self.menu_focused) else {
+            return;
+        };
+        let Some(idx) = self.host_menu_index else { return };
+        match action {
+            HostAction::Connect => {
+                self.host_menu_index = None;
+                self.screen = Screen::Home;
+                self.confirm_sidebar_host(idx);
+            }
+            // Straight to the PIN ceremony, even for an already-paired host: re-pairing
+            // is the documented recovery when a host's certificate has changed.
+            HostAction::Pair => {
+                self.host_menu_index = None;
+                self.open_pairing(idx);
+            }
+            HostAction::SpeedTest => self.open_speed_test(idx),
+            HostAction::Wake => {
+                let Some(entry) = self.entries.get(idx) else { return };
+                let (host, port) = (entry.host().to_string(), entry.port());
+                let mac = entry.mac().to_vec();
+                let name = entry.name().to_string();
+                self.host_menu_index = None;
+                self.screen = Screen::Home;
+                self.start_wake(host, port, mac, format!("Waking {name}…"));
+            }
+            HostAction::Edit => self.open_edit_host(idx),
+            HostAction::Forget => self.open_forget_host(idx),
+        }
+    }
+
+    pub(crate) fn render_host_menu(
+        &self,
+        painter: &mut Painter,
+        text_cache: &mut crate::ui::TextCache,
+        fonts: &ui::Fonts,
+        screen_w: u32,
+        screen_h: u32,
+    ) -> Result<()> {
+        let rows = self.host_menu_rows();
+        let subtitle = self.host_menu_subtitle();
+        let card = Self::host_menu_card_rect(screen_w, screen_h, fonts, &subtitle, rows.len());
+        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
+        ui::render_list_modal(
+            painter,
+            text_cache,
+            fonts,
+            card,
+            &self.host_menu_title(),
+            &subtitle,
+            &rows,
+        )
+    }
+}

@@ -46,6 +46,15 @@ pub enum Tile {
     Status,
     /// The "No host selected" hint line.
     NoHost,
+    /// The Settings modal's scroll indicator (`ui::render_list_scrollbar_tile`).
+    SettingsScrollbar,
+    /// Every Settings row, unfocused, at its *unscrolled* position — full row-list
+    /// height, not just the visible window. Scrolling crops/repositions this via
+    /// `DrawCmd::TexCropped` (a GPU op), so it only needs rebuilding when a value or
+    /// the open dropdown changes, never when the list merely scrolls.
+    SettingsRows,
+    /// The loading spinner shown over the grid while it fills in (`ui::render_spinner_tile`).
+    Spinner,
     /// The in-stream stats overlay panel (`ui::render_stats_overlay_tile`).
     StatsOverlay,
     /// The in-stream disconnect-confirmation dialog's shell — card, title,
@@ -63,6 +72,15 @@ pub enum DrawCmd {
     /// Copy `tile`'s texture to `dst` (scaled by the GPU if sizes differ),
     /// modulated by `alpha`.
     Tex { tile: Tile, dst: Rect, alpha: u8 },
+    /// Same as `Tex`, but samples only `src` (in the tile's own pixel space) —
+    /// how the Settings row list scrolls: cropping/repositioning a fixed texture
+    /// is a GPU op, so scrolling never needs the tile re-rasterized.
+    TexCropped {
+        tile: Tile,
+        src: Rect,
+        dst: Rect,
+        alpha: u8,
+    },
     /// A blended solid fill — the modal scrim.
     Fill { rect: Rect, color: sdl2::pixels::Color },
 }
@@ -131,6 +149,23 @@ impl Compositor {
         Ok(())
     }
 
+    /// Drops `tile`'s GPU texture, if it has one.
+    ///
+    /// Needed because card tiles are now windowed: a texture for a card scrolled far out
+    /// of view is pure retained memory, and with `unsafe_textures` a `Texture` is not
+    /// freed by dropping the map entry alone — the SDL object must be destroyed. Safe to
+    /// call for a tile that was never uploaded.
+    pub fn drop_tile(&mut self, tile: Tile) {
+        if let Some(tex) = self.textures.remove(&tile) {
+            // SAFETY: `unsafe_textures` detaches a `Texture` from its `TextureCreator`'s
+            // lifetime, making destruction the owner's responsibility. This texture came
+            // from `self`'s own creator, is removed from the map above so nothing can
+            // reach it again, and every draw goes through `execute`, which only ever
+            // borrows from that same map.
+            unsafe { tex.destroy() };
+        }
+    }
+
     /// Executes one frame's draw list. The caller has already cleared the canvas
     /// to the background color.
     pub fn execute(&mut self, canvas: &mut Canvas<Window>, cmds: &[DrawCmd]) -> Result<()> {
@@ -145,10 +180,21 @@ impl Compositor {
                         .copy(tex, None, Some(*dst))
                         .map_err(|e| anyhow::anyhow!("copy {tile:?}: {e}"))?;
                 }
+                DrawCmd::TexCropped { tile, src, dst, alpha } => {
+                    let Some(tex) = self.textures.get_mut(tile) else {
+                        continue; // not uploaded yet — skip
+                    };
+                    tex.set_alpha_mod(*alpha);
+                    canvas
+                        .copy(tex, Some(*src), Some(*dst))
+                        .map_err(|e| anyhow::anyhow!("copy cropped {tile:?}: {e}"))?;
+                }
                 DrawCmd::Fill { rect, color } => {
                     canvas.set_blend_mode(BlendMode::Blend);
                     canvas.set_draw_color(*color);
-                    canvas.fill_rect(Some(*rect)).map_err(|e| anyhow::anyhow!("fill: {e}"))?;
+                    canvas
+                        .fill_rect(Some(*rect))
+                        .map_err(|e| anyhow::anyhow!("fill: {e}"))?;
                 }
             }
         }

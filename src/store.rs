@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-fn app_dir() -> PathBuf {
+pub(crate) fn app_dir() -> PathBuf {
     std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from)
 }
 
@@ -134,6 +134,25 @@ pub enum VideoBackend {
     Starfish,
 }
 
+/// Codec preference selectable in Settings — a *preference*, not a demand. The host
+/// resolves the session codec from the client's advertised set via its own precedence
+/// ladder (HEVC > AV1 > H.264), honouring the preference only when its encoder can
+/// actually produce it — so "H264" on a host that can't encode H.264 still gets HEVC
+/// rather than no session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodecPref {
+    /// No preference — the host's precedence ladder decides (HEVC in practice).
+    #[default]
+    Auto,
+    H264,
+    Hevc,
+    /// AV1 — only decodable through the Starfish backend (the platform decoder
+    /// advertises `video/x-av1`; NDL's impl does not — see docs/NOTES.md), so this
+    /// choice is only offered/advertised when `video_backend` is `Starfish`.
+    Av1,
+}
+
 /// Stream settings: resolution/framerate/bitrate/HDR/video-backend.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
@@ -159,11 +178,26 @@ pub struct Settings {
     /// Persisted across restarts; takes effect on the next stream.
     #[serde(default)]
     pub video_backend: VideoBackend,
+    /// Preferred session codec — see [`CodecPref`]. `Av1` is additionally gated on the
+    /// Starfish backend and the platform decoder actually declaring AV1
+    /// (`device::supports_av1`), both in the picker and again at connect time.
+    #[serde(default)]
+    pub codec: CodecPref,
     /// Whether the in-stream stats overlay (resolution/codec, measured fps, drops,
     /// decoder feed time) is drawn in the top-right corner during a stream. Off by
     /// default; takes effect on the next stream.
     #[serde(default)]
     pub stats_overlay: bool,
+    /// Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to
+    /// what it can actually capture, and the *resolved* count drives the decoder and
+    /// playback layout — `audio.rs` has always handled up to 8; only the request was
+    /// pinned at stereo. `#[serde(default …)]` so an existing settings.json loads as 2.
+    #[serde(default = "default_audio_channels")]
+    pub audio_channels: u8,
+}
+
+fn default_audio_channels() -> u8 {
+    2
 }
 
 impl Default for Settings {
@@ -181,6 +215,8 @@ impl Default for Settings {
             wol_auto_send: false,
             stats_overlay: false,
             video_backend: VideoBackend::Ndl,
+            codec: CodecPref::Auto,
+            audio_channels: default_audio_channels(),
         }
     }
 }
@@ -244,10 +280,63 @@ impl SettingsWriter {
     }
 }
 
+/// Test/dev override for NDL's undocumented frame-drop threshold: a single integer in
+/// `$HOME/ndl-drop-threshold.conf`, absent by default.
+///
+/// Exists because the value's units aren't documented anywhere (the SDK header declares
+/// `NDL_DirectVideoSetFrameDropThreshold` and stops), so it has to be swept against real
+/// playback — and a full rebuild/redeploy per candidate value makes that impractical.
+/// Same reasoning, and the same mechanism, as `dev_override_connect` below.
+pub fn dev_override_ndl_drop_threshold() -> Option<i32> {
+    let path = Path::new(&app_dir()).join("ndl-drop-threshold.conf");
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Opt **in** to handing NDL the Opus audio stream: `$HOME/ndl-audio-offload.conf`
+/// containing `1`/`on`/`true`. Absent (the default) keeps NDL video-only and decodes
+/// audio in-process.
+///
+/// **Off by default because on the one device it has been tested against it stops video
+/// dead.** On an LG G5 (webOS 10.3) an audio-enabled `NDL_DirectMediaLoad` succeeds, then
+/// every `NDL_DirectVideoPlay` keeps succeeding while the panel holds the first frame
+/// forever — see `docs/NOTES.md`. That is strictly worse than the failure this feature's
+/// own docs anticipated (silent audio): it takes the video plane with it, and it cannot be
+/// detected the way the rest of this crate detects capabilities, because *the load
+/// returns success*. Probe-by-attempt has nothing to catch.
+///
+/// The code stays, behind this file, because the offload is a real CPU saving on a 2-core
+/// TV and may well work on other models — but a feature that has never been confirmed
+/// working anywhere, and is confirmed to break the current target, cannot be the default.
+/// Promote it to a real setting once some model is verified end-to-end.
+pub fn dev_override_enable_ndl_audio_offload() -> bool {
+    let path = Path::new(&app_dir()).join("ndl-audio-offload.conf");
+    std::fs::read_to_string(path).is_ok_and(|s| matches!(s.trim(), "1" | "on" | "true"))
+}
+
+/// Opt **in** to offering AV1 at all: `$HOME/av1.conf` containing `1`/`on`/`true`.
+///
+/// **Off by default because AV1 has never produced a picture on the hardware this client
+/// has been tested against.** The G5's platform decoder advertises `video/x-av1`
+/// (`device::supports_av1`), and its host happily encodes AV1 — but through Starfish the
+/// load either times out or completes and then shows a black screen with frames flowing,
+/// and twice the process died outright; NDL cannot decode AV1 at all, and accepts the
+/// stream silently if handed one. A codec that fails in three different ways is not a
+/// menu option someone should be able to pick by accident, however good the bitrate
+/// argument for it is.
+///
+/// The negotiation path stays wired (`CodecPref::Av1`, the `CODEC_AV1` advertisement,
+/// the Starfish gating) so this is one file away from being testable on a device that
+/// might do better. Promote it to a real setting when some TV plays an AV1 stream.
+pub fn dev_override_enable_av1() -> bool {
+    let path = Path::new(&app_dir()).join("av1.conf");
+    std::fs::read_to_string(path).is_ok_and(|s| matches!(s.trim(), "1" | "on" | "true"))
+}
+
 /// Test/dev override: a config file dropped alongside sideloading skips straight to
-/// a connect target — see `punktfunk-webos-client` memory notes for why this exists
-/// (no documented way to pass CLI args through a normal SAM launch). Still supported
-/// for quick bring-up testing; the UI flow below is the normal path.
+/// a connect target — predates the finding (see `docs/NOTES.md`) that SAM launch
+/// `params` reach a native app as `argv[1]` JSON on initial launch, which
+/// `logger.rs` uses instead for telemetry. Still supported for quick bring-up
+/// testing; the UI flow below is the normal path.
 pub fn dev_override_connect() -> Option<(String, u16)> {
     let path = Path::new(&app_dir()).join("connect.conf");
     let content = std::fs::read_to_string(path).ok()?;

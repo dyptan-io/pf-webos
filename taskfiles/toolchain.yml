@@ -141,10 +141,11 @@ tasks:
       vars: [TARGET_TASK]
     cmds:
       - >-
-        docker run --rm --platform linux/arm64 -e DEBIAN_FRONTEND=noninteractive {{.DOCKER_MOUNTS}} {{.RUST_IMAGE}}
+        docker run --rm --platform linux/arm64 -e DEBIAN_FRONTEND=noninteractive
+        {{.DOCKER_MOUNTS}} {{.RUST_IMAGE}}
         sh -c '
           apt-get update -qq &&
-          apt-get install -y -qq --no-install-recommends apt-utils cmake curl ca-certificates git pkg-config build-essential xz-utils > /dev/null &&
+          apt-get install -y -qq --no-install-recommends apt-utils cmake curl ca-certificates git pkg-config build-essential xz-utils python3 > /dev/null &&
           if ! command -v task > /dev/null 2>&1; then
             curl -sL https://taskfile.dev/install.sh | sh -s -- -d -b /opt/pf-webos-tools/bin > /dev/null;
           fi &&
