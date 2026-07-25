@@ -261,6 +261,20 @@ impl NdlVideo {
             // Fall through to a video-only load rather than failing the session: audio
             // offload is an optimisation, and losing the stream over it would be a poor
             // trade.
+            //
+            // Unload first. A failed `NDL_DirectMediaLoad` is NOT documented to leave
+            // nothing behind, and underneath it the platform acquires the decoder
+            // through decproxy by resource permissions (docs/NOTES.md) — so a load that
+            // got far enough to take those resources and then failed would make the
+            // retry below fail too, turning "this TV doesn't do Opus offload" into "this
+            // TV can't stream at all". Return ignored: there may be nothing to unload,
+            // and an error here says nothing about whether the retry will work.
+            tracing::warn!(
+                "NDL audio-enabled load failed (ret={ret} error={}) — retrying video-only",
+                last_error()
+            );
+            // SAFETY: no arguments; unloads at most the load attempted just above.
+            let _ = unsafe { NDL_DirectMediaUnload() };
         }
         let mut info = NdlDataInfo {
             video,
