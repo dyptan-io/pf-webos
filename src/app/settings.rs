@@ -179,6 +179,8 @@ impl App {
 
         // The row list itself is drawn separately — see `Tile::SettingsRows` — so
         // scrolling never re-rasterizes this shell; only a value/dropdown change does.
+        // The open dropdown's panel is drawn separately too — see `Tile::DropdownOverlay`
+        // — so it composites *after* `Tile::SettingsRows` instead of being covered by it.
 
         if self.settings.bitrate_kbps > ui::BITRATE_WARN_KBPS {
             ui::draw_text(
@@ -190,17 +192,6 @@ impl App {
                 content.y() + content.height() as i32 + 16,
                 ui::WARNING,
             )?;
-        }
-
-        if let Some(dd) = &self.dropdown {
-            let options = ui::dropdown_options(&self.settings, dd.row);
-            // Scroll is always frozen while a dropdown is open (`handle_settings_event`
-            // routes Up/Down to the dropdown itself, not `settings_scroll`), so this
-            // stays correct for the dropdown's whole lifetime.
-            let overlay_rect = Self::dropdown_overlay_rect(content, dd.row - self.clamped_settings_scroll(screen_h));
-            // `usize::MAX` = no option focused; the focused one is a separate
-            // `Tile::DropdownFocusOption` (see `prepare_tiles`).
-            ui::draw_dropdown_overlay(painter, text_cache, fonts.value, &options, usize::MAX, overlay_rect)?;
         }
         Ok(())
     }

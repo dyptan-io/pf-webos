@@ -440,9 +440,13 @@ pub struct App {
     /// The single focused, zoom-animated widget of whichever modal is open —
     /// see `ModalFocusKey`'s docs on why one tile/key suffices for all of them.
     pub(crate) modal_focus_tile: Option<(ModalFocusKey, Painter)>,
+    /// The open dropdown's panel + unfocused option list, keyed by its row (the
+    /// options list depends only on which row opened it). Composited *after*
+    /// `settings_rows_tile` — see `Tile::DropdownOverlay`'s docs.
+    pub(crate) dropdown_overlay_tile: Option<(usize, Painter)>,
     /// The open dropdown's focused option, as its own small tile — keyed by
-    /// (dropdown row, focused option index). Composited over `modal_tile`'s
-    /// shell (which draws the overlay's option list unfocused); moving the
+    /// (dropdown row, focused option index). Composited over `dropdown_overlay_tile`
+    /// (which draws the overlay's option list unfocused); moving the
     /// dropdown's own focus rebuilds only this.
     pub(crate) dropdown_focus_tile: Option<((usize, usize), Painter)>,
     /// The Settings scrollbar, keyed by `(total rows, visible rows, scroll)` — rebuilt
@@ -585,6 +589,7 @@ impl App {
             modal_tile: None,
             modal_shell_key: None,
             modal_focus_tile: None,
+            dropdown_overlay_tile: None,
             dropdown_focus_tile: None,
             settings_scrollbar_tile: None,
             settings_rows_tile: None,
@@ -1544,17 +1549,29 @@ impl App {
         }
 
         if let Some(dd) = &self.dropdown {
+            let (_, content) = Self::settings_layout(screen_w, screen_h);
+            let options = ui::dropdown_options(&self.settings, dd.row);
+
+            let overlay_stale = !matches!(&self.dropdown_overlay_tile, Some((k, _)) if *k == dd.row);
+            if overlay_stale {
+                let overlay_h = options.len() as u32 * ui::DROPDOWN_OPTION_H;
+                let mut p = Painter::new(content.width(), overlay_h.max(1));
+                let rect = Rect::new(0, 0, content.width(), overlay_h);
+                ui::draw_dropdown_overlay(&mut p, text_cache, fonts.value, &options, usize::MAX, rect)?;
+                self.dropdown_overlay_tile = Some((dd.row, p));
+                updated.push(Tile::DropdownOverlay);
+            }
+
             let key = (dd.row, dd.focused);
             let stale = !matches!(&self.dropdown_focus_tile, Some((k, _)) if *k == key);
             if stale {
-                let (_, content) = Self::settings_layout(screen_w, screen_h);
-                let options = ui::dropdown_options(&self.settings, dd.row);
                 let option = options.get(dd.focused).map_or("", String::as_str);
                 let tile = ui::render_dropdown_option_tile(text_cache, fonts.value, option, content.width())?;
                 self.dropdown_focus_tile = Some((key, tile));
                 updated.push(Tile::DropdownFocusOption);
             }
         } else {
+            self.dropdown_overlay_tile = None;
             self.dropdown_focus_tile = None;
         }
 
@@ -1598,6 +1615,7 @@ impl App {
             Tile::Ring => self.ring_tile.as_ref(),
             Tile::Modal => self.modal_tile.as_ref(),
             Tile::ModalFocusElement => self.modal_focus_tile.as_ref().map(|(_, p)| p),
+            Tile::DropdownOverlay => self.dropdown_overlay_tile.as_ref().map(|(_, p)| p),
             Tile::DropdownFocusOption => self.dropdown_focus_tile.as_ref().map(|(_, p)| p),
             Tile::SettingsScrollbar => self.settings_scrollbar_tile.as_ref().map(|(_, p)| p),
             Tile::SettingsRows => self.settings_rows_tile.as_ref().map(|(_, p)| p),
@@ -1774,6 +1792,25 @@ impl App {
                     dst: Rect::new(content.x(), content.y() + dy, content.width(), content.height()),
                     alpha: (255.0 * m) as u8,
                 });
+            }
+            // The open dropdown's panel + unfocused option list — its own tile so it
+            // composites *after* `Tile::SettingsRows` (which would otherwise redraw the
+            // rows the overlay extends over, on top of it).
+            if let Some(((_, content), scroll)) = settings_geom {
+                if let Some(dd) = &self.dropdown {
+                    let overlay_rect = Self::dropdown_overlay_rect(content, dd.row - scroll);
+                    let options_len = ui::dropdown_options(&self.settings, dd.row).len();
+                    cmds.push(DrawCmd::Tex {
+                        tile: Tile::DropdownOverlay,
+                        dst: Rect::new(
+                            overlay_rect.x(),
+                            overlay_rect.y() + dy,
+                            overlay_rect.width(),
+                            options_len as u32 * ui::DROPDOWN_OPTION_H,
+                        ),
+                        alpha: (255.0 * m) as u8,
+                    });
+                }
             }
             // Whichever modal is open, its one focused widget — a settings/Wake
             // row, a pairing digit/button, or a Forget-host button (see

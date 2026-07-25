@@ -201,15 +201,10 @@ impl App {
         match entry {
             HostEntry::Known(h) if h.fingerprint.is_some() => {
                 let (host, port, mgmt_port) = (h.host, h.port, h.mgmt_port);
-                // Re-confirming the already-active host must not refetch — `select_host`
-                // unconditionally clears art/games and re-hits the library API, blinking
-                // every card back to a placeholder for nothing. Just jump focus into the
-                // grid instead. Assumes `mgmt_port`/cert can't change without `(host, port)`.
-                if self.selected_host.as_ref() == Some(&(host.clone(), port)) {
-                    self.home_focus = HomeFocus::Grid(0);
-                } else {
-                    self.select_host(host, port, mgmt_port);
-                }
+                // Re-confirming the already-active host refreshes its library too — a
+                // user clicking it is asking to see the current game list, e.g. after
+                // installing something new on the host.
+                self.select_host(host, port, mgmt_port);
             }
             _ => self.open_pairing(idx),
         }

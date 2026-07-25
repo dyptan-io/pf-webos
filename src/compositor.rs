@@ -37,8 +37,13 @@ pub enum Tile {
     /// whole modal. Only one modal is ever open at a time, so one tile
     /// suffices for all of them.
     ModalFocusElement,
+    /// An open dropdown's panel + unfocused option list, positioned over the
+    /// row that opened it. Its own tile — rather than being baked into
+    /// `Modal`'s shell — so it composites *after* `SettingsRows`, which would
+    /// otherwise redraw the rows the panel overlaps on top of it.
+    DropdownOverlay,
     /// An open dropdown's focused option, as its own small tile — composited
-    /// over `Modal`'s shell (which draws the dropdown's option list
+    /// over `DropdownOverlay` (which draws the dropdown's option list
     /// unfocused) so moving the dropdown's own focus recomposites this
     /// instead of re-rasterizing the whole modal.
     DropdownFocusOption,
