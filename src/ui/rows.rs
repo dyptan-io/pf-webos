@@ -512,29 +512,45 @@ pub fn draw_confirm_button(
     draw_selectable_fixed(painter, rect, focused);
     let color = if focused { button.color } else { MUTED };
 
-    let label_w = fonts.label.size_of(button.label).map_or(0, |(w, _)| w);
-    let text_x = match button.icon {
-        Some(icon) => {
-            let icon_size = 26u32;
-            let icon_rect = Rect::new(
-                rect.x() + 20,
-                rect.y() + (rect.height() as i32 - icon_size as i32) / 2,
-                icon_size,
-                icon_size,
-            );
-            draw_icon(painter, text_cache, fonts.icon, icon_rect, icon, color)?;
-            icon_rect.x() + icon_size as i32 + 12
-        }
-        // No icon: center the label instead of left-aligning it after one.
-        None => rect.x() + (rect.width() as i32 - label_w as i32) / 2,
+    // Every inset here is derived from the label font's own line height, which
+    // `load_font` already scales by the panel's height — the button's width scales with
+    // the screen too, so a hardcoded icon inset does not stay in proportion to either.
+    // It used to be a fixed `20 + 26 + 12`, which left "Stop streaming" more label than
+    // button below 4K (~117px of room for ~154px of text at 720p) and ran it past the
+    // right edge, because nothing clamped the label either.
+    let line_h = fonts.label.height().max(1);
+    let icon_size = (line_h * 2 / 3).max(1) as u32;
+    let icon_gap = (line_h / 3).max(1);
+    let side_pad = (line_h / 2).max(1);
+
+    // Icon and label are centred as one group, the same way a label without an icon
+    // was already centred on its own — and the label is ellipsized to whatever the icon
+    // leaves, so no label can overflow the button regardless of resolution.
+    let leading = match button.icon {
+        Some(_) => icon_size + icon_gap as u32,
+        None => 0,
     };
+    let budget = rect.width().saturating_sub(2 * side_pad as u32).saturating_sub(leading);
+    let label = ellipsize(fonts.label, button.label, budget);
+    let label_w = fonts.label.size_of(&label).map_or(0, |(w, _)| w);
+    let start_x = rect.x() + (rect.width() as i32 - (leading + label_w) as i32) / 2;
+
+    if let Some(icon) = button.icon {
+        let icon_rect = Rect::new(
+            start_x,
+            rect.y() + (rect.height() as i32 - icon_size as i32) / 2,
+            icon_size,
+            icon_size,
+        );
+        draw_icon(painter, text_cache, fonts.icon, icon_rect, icon, color)?;
+    }
     draw_text(
         painter,
         text_cache,
         fonts.label,
-        button.label,
-        text_x,
-        rect.y() + (rect.height() as i32 - fonts.label.height()) / 2,
+        &label,
+        start_x + leading as i32,
+        rect.y() + (rect.height() as i32 - line_h) / 2,
         color,
     )?;
     Ok(())
