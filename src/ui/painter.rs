@@ -205,14 +205,13 @@ impl Painter {
             .draw_pixmap(x, y, src.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
     }
 
-    /// Composites `src` scaled to exactly fill `dst` — `image`-decoded cover art
-    /// (see `art.rs`) is already downscaled close to display size, so this is just
-    /// a small final-fit correction, not doing the heavy lifting of the downscale.
-    /// `FilterQuality::Nearest`, not `Bilinear`: tiny-skia's bilinear `Pattern`
-    /// pushes extra interpolation stages into its raster pipeline whenever the
-    /// transform scales (see `Pattern::push_stages`), which measured as a real
-    /// (if modest) per-call cost on real webOS hardware — see docs/NOTES.md's "UI
-    /// performance, round 2" entry.
+    /// Composites `src` scaled to exactly fill `dst` — the one caller is game-art
+    /// rendering (`ui::draw_poster_card`), and only at tile-build time (see
+    /// `App::prepare_tiles`), not per frame: the result is cached into the card's tile
+    /// and only re-scaled when the art or card size actually changes. `Bilinear`
+    /// (rather than `Nearest`) is worth its modest per-call cost here since it's paid
+    /// once per card build, not every frame — plain `Nearest` scaling left visible
+    /// jaggies on art whose source resolution didn't cleanly divide into the card size.
     pub fn draw_pixmap_scaled(&mut self, dst: Rect, src: &Pixmap) {
         let (dw, dh) = (dst.width() as f32, dst.height() as f32);
         let (sw, sh) = (src.width() as f32, src.height() as f32);
@@ -221,7 +220,7 @@ impl Painter {
         }
         let transform = Transform::from_scale(dw / sw, dh / sh).post_translate(dst.x() as f32, dst.y() as f32);
         let paint = PixmapPaint {
-            quality: FilterQuality::Nearest,
+            quality: FilterQuality::Bilinear,
             ..PixmapPaint::default()
         };
         self.pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
