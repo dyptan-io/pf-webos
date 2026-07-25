@@ -46,6 +46,7 @@ anyhow = "1"
 # for this whole client until this was added.
 tracing = "0.1"
 tracing-subscriber = "0.3"
+tracing-appender = "0.2"
 # Pure Rust + libc (unix), portable — no FFmpeg/PipeWire/SDL3 baggage, unlike
 # pf-client-core's session::start() (see session.rs docs for why we don't use that).
 # Pinned to a tagged punktfunk release (not a branch tip) this client was

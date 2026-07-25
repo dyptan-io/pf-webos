@@ -2,8 +2,6 @@
 //! (`_punktfunk._udp` advert, same TXT keys) but as our own direct `mdns-sd`
 //! dependency rather than depending on `pf-client-core` itself (see `session.rs`
 //! docs for why: its Cargo.toml would drag in FFmpeg/PipeWire for our target too).
-use std::io::Write as _;
-
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 
 #[derive(Clone, Debug)]
@@ -31,17 +29,16 @@ pub struct DiscoveredHost {
 /// returned `ServiceDaemon` handle is `Clone` and lets a caller call `shutdown()`
 /// explicitly once discovery is no longer needed (see `App`'s `Drop` impl) — that
 /// unblocks the thread's `receiver.recv()` promptly instead of waiting on a lucky
-/// future resolution event. `log` is a second handle onto the app's own log file
-/// (see `main.rs::log_path`) — every failure/event point here is logged, since this
-/// previously failed completely silently: a `ServiceDaemon::new()`/`browse()` error,
-/// or every non-`ServiceResolved` event, was just dropped with no trace, making "no
-/// hosts showed up" undiagnosable from the log alone (was it a permissions/socket
-/// failure, wrong interface, or genuinely nothing advertising?).
-pub fn browse(mut log: std::fs::File) -> Option<(std::sync::mpsc::Receiver<DiscoveredHost>, ServiceDaemon)> {
+/// future resolution event. Every failure/event point here is logged via `tracing`,
+/// since this previously failed completely silently: a `ServiceDaemon::new()`/
+/// `browse()` error, or every non-`ServiceResolved` event, was just dropped with no
+/// trace, making "no hosts showed up" undiagnosable from the log alone (was it a
+/// permissions/socket failure, wrong interface, or genuinely nothing advertising?).
+pub fn browse() -> Option<(std::sync::mpsc::Receiver<DiscoveredHost>, ServiceDaemon)> {
     let (tx, rx) = std::sync::mpsc::channel();
     let daemon = ServiceDaemon::new()
         .inspect_err(|e| {
-            let _ = writeln!(log, "mdns: ServiceDaemon::new failed: {e}");
+            tracing::error!("mdns: ServiceDaemon::new failed: {e}");
         })
         .ok()?;
     let daemon_handle = daemon.clone();
@@ -51,16 +48,16 @@ pub fn browse(mut log: std::fs::File) -> Option<(std::sync::mpsc::Receiver<Disco
             let receiver = match daemon.browse("_punktfunk._udp.local.") {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = writeln!(log, "mdns: browse(_punktfunk._udp.local.) failed: {e}");
+                    tracing::error!("mdns: browse(_punktfunk._udp.local.) failed: {e}");
                     return;
                 }
             };
-            let _ = writeln!(log, "mdns: browsing _punktfunk._udp.local.");
+            tracing::debug!("mdns: browsing _punktfunk._udp.local.");
             while let Ok(event) = receiver.recv() {
                 let info = match event {
                     ServiceEvent::ServiceResolved(info) => info,
                     other => {
-                        let _ = writeln!(log, "mdns: {other:?}");
+                        tracing::debug!("mdns: {other:?}");
                         continue;
                     }
                 };
@@ -72,11 +69,7 @@ pub fn browse(mut log: std::fs::File) -> Option<(std::sync::mpsc::Receiver<Disco
                     .next()
                     .map(std::string::ToString::to_string)
                 else {
-                    let _ = writeln!(
-                        log,
-                        "mdns: resolved {} with no IPv4 address, skipping",
-                        info.get_fullname()
-                    );
+                    tracing::warn!("mdns: resolved {} with no IPv4 address, skipping", info.get_fullname());
                     continue;
                 };
                 let props = info.get_properties();
@@ -93,12 +86,12 @@ pub fn browse(mut log: std::fs::File) -> Option<(std::sync::mpsc::Receiver<Disco
                         .filter(|s| !s.is_empty())
                         .collect(),
                 };
-                let _ = writeln!(log, "mdns: resolved {} at {}:{}", host.name, host.addr, host.port);
+                tracing::info!("mdns: resolved {} at {}:{}", host.name, host.addr, host.port);
                 if tx.send(host).is_err() {
                     break; // receiver gone — stop browsing
                 }
             }
-            let _ = writeln!(log, "mdns: receiver loop ended, shutting down");
+            tracing::debug!("mdns: receiver loop ended, shutting down");
             let _ = daemon.shutdown();
         })
         .expect("spawn mdns thread");

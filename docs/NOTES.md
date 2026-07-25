@@ -127,16 +127,20 @@ a host-side capture/encode throughput question, not this client. See
 
 ## Runtime/deploy gotchas (LG CX)
 
-- Apps install to `/media/developer/apps/usr/palm/applications/<appid>/`; jail root
-  `/var/palm/jail/<appid>/`. **`/tmp` is shared between jail and host** — a log written to `/tmp/` is
-  readable from the plain host SSH shell (`/tmp/punktfunk-webos.log`).
+- Apps install to `/media/developer/apps/usr/palm/applications/<appid>/`, which is also `$HOME` —
+  the app's own writable directory (`store::app_dir`), where the versioned log file
+  (`punktfunk-webos-<version>.log`) and `connect.conf` live.
 - `luna-send` **needs `ssh -tt`** (a real PTY) or its output is silently swallowed even on success.
 - **Black screen despite correct decode**: launch through the real app lifecycle
   (`luna-send .../launch`, jailed uid under SAM), never a raw SSH exec — NDL's punch-through plane
   only composites for the real SAM-managed foreground app. (Install/launch luna-send invocations are
   in `Taskfile.yml`'s `deploy` task.)
-- No documented way to pass CLI args through a SAM launch — worked around with a `$HOME/connect.conf`
-  dev-override file read on startup if present.
+- No env vars through a SAM launch, but `params` given to `applicationManager/launch` DOES reach a
+  native app — SAM JSON-encodes it as `argv[1]` on initial launch (confirmed against the webOS OSE
+  native-app docs, contradicting an earlier assumption here). `src/logger.rs` reads a `telemetry`/
+  `telemetry_level` key from it this way (see `task deploy TELEMETRY=...`); the older
+  `$HOME/connect.conf` dev-override file predates this finding and could likely become a launch
+  param too, but hasn't been converted.
 - SDL2/Wayland may report `refresh_rate=0` in some launch contexts; clamp to a real default.
 
 ## Confirmed platform limitations (don't try to "fix" these again)

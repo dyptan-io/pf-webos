@@ -41,25 +41,15 @@ struct SdlRect {
 #[link(name = "SDL2")]
 extern "C" {
     fn SDL_webOSCreateExportedWindow(hint: c_int) -> *const c_char;
-    fn SDL_webOSSetExportedWindow(
-        window_id: *const c_char,
-        src: *const SdlRect,
-        dst: *const SdlRect,
-    ) -> c_int;
+    fn SDL_webOSSetExportedWindow(window_id: *const c_char, src: *const SdlRect, dst: *const SdlRect) -> c_int;
     fn SDL_webOSDestroyExportedWindow(window_id: *const c_char);
 }
 
 // StarfishMediaAPIs_C function types — mirrored from StarfishMediaAPIs_C.h, resolved via dlsym.
 
 type FnCreate = unsafe extern "C" fn(*const c_char) -> *mut c_void;
-type FnLoad = unsafe extern "C" fn(
-    *mut c_void,
-    *const c_char,
-    Option<LoadCb>,
-    *mut c_void,
-) -> bool;
-type FnFeed =
-    unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_char, usize) -> bool;
+type FnLoad = unsafe extern "C" fn(*mut c_void, *const c_char, Option<LoadCb>, *mut c_void) -> bool;
+type FnFeed = unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_char, usize) -> bool;
 type FnPlay = unsafe extern "C" fn(*mut c_void) -> bool;
 type FnPushEos = unsafe extern "C" fn(*mut c_void) -> bool;
 type FnUnload = unsafe extern "C" fn(*mut c_void) -> bool;
@@ -94,12 +84,7 @@ struct StarfishFns {
 
 impl StarfishFns {
     fn load_library() -> Result<Self> {
-        let lib = unsafe {
-            libc::dlopen(
-                c"libplayerAPIs_C.so".as_ptr(),
-                libc::RTLD_LAZY | libc::RTLD_GLOBAL,
-            )
-        };
+        let lib = unsafe { libc::dlopen(c"libplayerAPIs_C.so".as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL) };
         if lib.is_null() {
             bail!("dlopen(libplayerAPIs_C.so) failed — Starfish/SMP not available");
         }
@@ -108,10 +93,7 @@ impl StarfishFns {
             ($sym:literal, $ty:ty) => {
                 match unsafe { sym::<$ty>(lib, concat!($sym, "\0").as_bytes()) } {
                     Some(f) => f,
-                    None => bail!(concat!(
-                        "StarfishMediaAPIs_C.so missing symbol: ",
-                        $sym
-                    )),
+                    None => bail!(concat!("StarfishMediaAPIs_C.so missing symbol: ", $sym)),
                 }
             };
         }
@@ -146,12 +128,7 @@ unsafe impl Sync for LoadState {}
 
 /// `StarfishMediaAPIs_load` callback. On LOADCOMPLETED, calls `play` (required by
 /// the SMP API) and signals the spin-wait in [`StarfishVideo::load`].
-unsafe extern "C" fn on_load_event(
-    event_type: c_int,
-    _num_value: i64,
-    _str_value: *const c_char,
-    data: *mut c_void,
-) {
+unsafe extern "C" fn on_load_event(event_type: c_int, _num_value: i64, _str_value: *const c_char, data: *mut c_void) {
     if data.is_null() {
         return;
     }
@@ -190,10 +167,7 @@ impl StarfishVideo {
         codec: NdlCodec,
         display_w: i32,
         display_h: i32,
-        log: &mut std::fs::File,
     ) -> Result<Self> {
-        use std::io::Write as _;
-
         let fns = StarfishFns::load_library()?;
 
         let api = unsafe { (fns.create)(std::ptr::null()) };
@@ -210,9 +184,7 @@ impl StarfishVideo {
         }
 
         let window_id_cstr = unsafe { CStr::from_ptr(raw_window_id) }.to_owned();
-        let window_id_str = unsafe { CStr::from_ptr(raw_window_id) }
-            .to_str()
-            .unwrap_or("");
+        let window_id_str = unsafe { CStr::from_ptr(raw_window_id) }.to_str().unwrap_or("");
 
         let codec_str = match codec {
             NdlCodec::H264 => "H264",
@@ -268,11 +240,7 @@ impl StarfishVideo {
         })
         .to_string();
 
-        writeln!(
-            log,
-            "Starfish load payload: {}",
-            &payload[..payload.len().min(512)]
-        )?;
+        tracing::debug!("Starfish load payload: {}", &payload[..payload.len().min(512)]);
 
         let payload_cstr = CString::new(payload)?;
 
@@ -285,8 +253,7 @@ impl StarfishVideo {
 
         // SAFETY: `payload_cstr` and `state_ptr` outlive this call; `state_ptr`
         // remains valid for the session (owned by `load_state` in `Self`).
-        let load_ok =
-            unsafe { (fns.load)(api, payload_cstr.as_ptr(), Some(on_load_event), state_ptr) };
+        let load_ok = unsafe { (fns.load)(api, payload_cstr.as_ptr(), Some(on_load_event), state_ptr) };
         if !load_ok {
             unsafe {
                 (fns.destroy)(api);
@@ -311,8 +278,18 @@ impl StarfishVideo {
         // Bind source (stream rect) and destination (full display) punch-through area
         // only after load completes — matches ss4s's `StarfishResourcePostLoad` timing,
         // rather than binding it before the pipeline exists.
-        let src = SdlRect { x: 0, y: 0, w: width, h: height };
-        let dst = SdlRect { x: 0, y: 0, w: display_w, h: display_h };
+        let src = SdlRect {
+            x: 0,
+            y: 0,
+            w: width,
+            h: height,
+        };
+        let dst = SdlRect {
+            x: 0,
+            y: 0,
+            w: display_w,
+            h: display_h,
+        };
         unsafe { SDL_webOSSetExportedWindow(raw_window_id, &src, &dst) };
 
         Ok(Self {
@@ -344,10 +321,7 @@ impl StarfishVideo {
             )
         };
 
-        let result_str = std::str::from_utf8(&result)
-            .unwrap_or("")
-            .trim_end_matches('\0')
-            .trim();
+        let result_str = std::str::from_utf8(&result).unwrap_or("").trim_end_matches('\0').trim();
         // Feed's result is JSON, e.g. `{"returnValue":"Ok"}` — not a bare string.
         let return_value = serde_json::from_str::<serde_json::Value>(result_str)
             .ok()

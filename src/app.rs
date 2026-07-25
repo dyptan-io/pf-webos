@@ -3,15 +3,14 @@
 //! centered modals on top of it — modeled on moonlight-tv's actual layout (see
 //! `ui.rs`'s module docs). `ui.rs` owns drawing/input-mapping primitives,
 //! `store.rs` owns persistence, `discovery.rs` owns mDNS.
-use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use sdl2::rect::Rect;
 use tiny_skia::Pixmap;
 
-use crate::library::GameEntry;
 use crate::compositor::{DrawCmd, Tile};
+use crate::library::GameEntry;
 use crate::store::{self, KnownHost, Settings};
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};
 
@@ -366,14 +365,10 @@ impl Drop for App {
 }
 
 impl App {
-    pub fn new(identity: (String, String), log: &mut std::fs::File) -> Self {
+    pub fn new(identity: (String, String)) -> Self {
         let known_hosts = store::load_known_hosts();
         let entries = known_hosts.iter().cloned().map(HostEntry::Known).collect();
-        // A second handle onto the same log file (both just append — see
-        // `main.rs::log_path`) for the mdns background thread to log through, since
-        // it can't share this `&mut File` across threads.
-        let discovery_log = log.try_clone().expect("clone log file handle for mdns thread");
-        let (discovered, discovery_daemon) = match crate::discovery::browse(discovery_log) {
+        let (discovered, discovery_daemon) = match crate::discovery::browse() {
             Some((rx, daemon)) => (rx, Some(daemon)),
             None => (std::sync::mpsc::channel().1, None),
         };
@@ -439,7 +434,7 @@ impl App {
                 .find(|h| h.host == host && h.port == port && h.fingerprint.is_some())
             {
                 let (host, port, mgmt_port) = (h.host.clone(), h.port, h.mgmt_port);
-                app.select_host(host, port, mgmt_port, log);
+                app.select_host(host, port, mgmt_port);
             }
         }
         app
@@ -452,7 +447,7 @@ impl App {
     /// waking host reappears on mDNS and reconnects. Returns whether the sidebar
     /// actually changed — `main.rs`'s render loop uses this to skip a redraw when a
     /// discovery tick found nothing new (see its dirty-flag docs).
-    pub fn drain_discovery(&mut self, log: &mut std::fs::File) -> bool {
+    pub fn drain_discovery(&mut self) -> bool {
         let mut changed = false;
         let mut mac_learned = false;
         let mut woke = None;
@@ -496,7 +491,7 @@ impl App {
             let _ = store::save_known_hosts(&self.known_hosts);
         }
         if let Some((host, port, mgmt_port)) = woke {
-            self.wake_succeeded(host, port, mgmt_port, "mDNS", log);
+            self.wake_succeeded(host, port, mgmt_port, "mDNS");
             changed = true;
         }
         if changed {
@@ -508,11 +503,11 @@ impl App {
     /// Ends an in-flight wake because the host is actually back — whether that was
     /// noticed passively (`drain_discovery` seeing a fresh mDNS resolve) or actively
     /// (`tick_wake`'s reachability probe succeeding). `source` is just for the log line.
-    fn wake_succeeded(&mut self, host: String, port: u16, mgmt_port: Option<u16>, source: &str, log: &mut std::fs::File) {
-        let _ = writeln!(log, "wake succeeded: {host}:{port} back ({source})");
+    fn wake_succeeded(&mut self, host: String, port: u16, mgmt_port: Option<u16>, source: &str) {
+        tracing::info!("wake succeeded: {host}:{port} back ({source})");
         self.wake = None;
         self.screen = Screen::Home;
-        self.select_host(host, port, mgmt_port, log);
+        self.select_host(host, port, mgmt_port);
     }
 
     /// Drains any cover art that's finished decoding since the last tick — called
@@ -626,13 +621,7 @@ impl App {
 
     /// Handles one menu event on the Home screen (sidebar + grid). Returns a
     /// `ConnectTarget` when a grid card is confirmed.
-    pub fn handle_home_event(
-        &mut self,
-        ev: MenuEvent,
-        screen_w: u32,
-        screen_h: u32,
-        log: &mut std::fs::File,
-    ) -> Option<ConnectTarget> {
+    pub fn handle_home_event(&mut self, ev: MenuEvent, screen_w: u32, screen_h: u32) -> Option<ConnectTarget> {
         let sidebar_len = self.sidebar_len();
         let grid_len = self.grid_len();
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
@@ -685,7 +674,7 @@ impl App {
             },
             MenuEvent::Confirm => match self.home_focus {
                 HomeFocus::Sidebar(i) if i < self.entries.len() => {
-                    self.confirm_sidebar_host(i, log);
+                    self.confirm_sidebar_host(i);
                 }
                 HomeFocus::Sidebar(i) if i == self.entries.len() => {
                     self.add_host = AddHostState::default();
@@ -696,7 +685,7 @@ impl App {
                     self.dropdown = None;
                     self.settings_focused = 0;
                 }
-                HomeFocus::Grid(i) => self.confirm_grid_card(i, log),
+                HomeFocus::Grid(i) => self.confirm_grid_card(i),
             },
             // Forgets the focused host (removes its persisted entry/fingerprint —
             // it'll reappear as "not paired" if still discoverable on the LAN).
@@ -718,7 +707,7 @@ impl App {
     /// dispatch: `main.rs`'s Back handling on Home (a no-op there, but routed
     /// through here so the policy lives in one place) and a modal's close (X)
     /// button click (`handle_mouse_click`'s `hover_close` branch below).
-    pub fn back(&mut self, log: &mut std::fs::File) -> Option<ConnectTarget> {
+    pub fn back(&mut self) -> Option<ConnectTarget> {
         match self.screen {
             // Home has nothing to "back out" of (it's the root screen) — Back is a
             // no-op. (It used to be a shortcut straight to Settings, but that made
@@ -726,7 +715,7 @@ impl App {
             // Settings popped right back up.)
             Screen::Home => None,
             Screen::Pairing => {
-                self.handle_pairing_event(MenuEvent::Back, log);
+                self.handle_pairing_event(MenuEvent::Back);
                 None
             }
             Screen::Settings => {
@@ -738,7 +727,7 @@ impl App {
                 None
             }
             Screen::Wake => {
-                self.handle_wake_event(MenuEvent::Back, log);
+                self.handle_wake_event(MenuEvent::Back);
                 None
             }
             Screen::ForgetHost => {
@@ -752,9 +741,7 @@ impl App {
     /// everything already fits on screen.
     fn max_grid_scroll(&self, columns: usize, available_w: u32, screen_h: u32) -> i32 {
         let viewport_h = screen_h as i32 - ui::GRID_PAD - ui::GRID_TOP_Y;
-        (ui::grid_layer_height(self.grid_len(), columns, available_w) as i32
-            - 2 * ui::GRID_LAYER_PAD
-            - viewport_h)
+        (ui::grid_layer_height(self.grid_len(), columns, available_w) as i32 - 2 * ui::GRID_LAYER_PAD - viewport_h)
             .max(0)
     }
 
@@ -851,12 +838,12 @@ impl App {
         animating
     }
 
-    fn confirm_sidebar_host(&mut self, idx: usize, log: &mut std::fs::File) {
+    fn confirm_sidebar_host(&mut self, idx: usize) {
         let entry = self.entries[idx].clone();
         match entry {
             HostEntry::Known(h) if h.fingerprint.is_some() => {
                 let (host, port, mgmt_port) = (h.host, h.port, h.mgmt_port);
-                self.select_host(host, port, mgmt_port, log);
+                self.select_host(host, port, mgmt_port);
             }
             _ => {
                 self.pairing_entry = idx;
@@ -879,7 +866,7 @@ impl App {
     /// time out. `App::new` calls this synchronously-in-spirit-only at startup
     /// too (restoring the last-selected host), so that froze every launch just
     /// the same.
-    fn select_host(&mut self, host: String, port: u16, mgmt_port: Option<u16>, log: &mut std::fs::File) {
+    fn select_host(&mut self, host: String, port: u16, mgmt_port: Option<u16>) {
         let _ = store::save_selected_host(&host, port);
         self.selected_host = Some((host.clone(), port));
         self.home_status = Some("Loading library…".into());
@@ -899,7 +886,7 @@ impl App {
             .find(|h| h.host == host && h.port == port)
             .and_then(|h| h.fingerprint);
         let mgmt_port = mgmt_port.unwrap_or(crate::library::DEFAULT_MGMT_PORT);
-        let _ = writeln!(log, "library: fetching from {host}:{mgmt_port}…");
+        tracing::debug!("library: fetching from {host}:{mgmt_port}…");
         self.games_rx = Some(crate::library::load_games_async(
             host,
             port,
@@ -914,7 +901,7 @@ impl App {
     /// Switching hosts again before a fetch finishes discards its result safely:
     /// `select_host` already replaced `games_rx` with a fresh channel by the time
     /// this could run, so there's nothing here to receive from for the stale one.
-    pub fn drain_games(&mut self, log: &mut std::fs::File) -> bool {
+    pub fn drain_games(&mut self) -> bool {
         let Some(rx) = &self.games_rx else { return false };
         let Ok(loaded) = rx.try_recv() else { return false };
         self.games_rx = None;
@@ -926,7 +913,7 @@ impl App {
         } = loaded;
         match result {
             Ok(games) => {
-                let _ = writeln!(log, "library: {} games from {host}:{mgmt_port}", games.len());
+                tracing::info!("library: {} games from {host}:{mgmt_port}", games.len());
                 let identity = (self.identity.0.clone(), self.identity.1.clone());
                 let fingerprint = self
                     .known_hosts
@@ -944,8 +931,8 @@ impl App {
                 self.home_status = None;
             }
             Err(e) => {
-                let _ = writeln!(log, "library fetch failed ({host}:{mgmt_port}): {e}");
-                self.handle_library_error(host, port, e, log);
+                tracing::warn!("library fetch failed ({host}:{mgmt_port}): {e}");
+                self.handle_library_error(host, port, e);
             }
         }
         self.grid_dirty = true;
@@ -957,7 +944,7 @@ impl App {
     /// (even with no MAC on record — `start_wake`/`render_wake` just hide the send
     /// controls then); `NotPaired`/`PinMismatch`/`Http` mean the host answered, so
     /// Wake-on-LAN wouldn't help — those stay a plain status line.
-    fn handle_library_error(&mut self, host: String, port: u16, e: crate::library::LibraryError, log: &mut std::fs::File) {
+    fn handle_library_error(&mut self, host: String, port: u16, e: crate::library::LibraryError) {
         let reason = format!("{e} (Desktop is still available.)");
         if matches!(e, crate::library::LibraryError::Unreachable(_)) {
             let mac = self
@@ -966,7 +953,7 @@ impl App {
                 .find(|h| h.host == host && h.port == port)
                 .map(|h| h.mac.clone())
                 .unwrap_or_default();
-            self.start_wake(host, port, mac, reason, log);
+            self.start_wake(host, port, mac, reason);
         } else {
             self.home_status = Some(reason);
         }
@@ -978,7 +965,7 @@ impl App {
     /// silently — the prompt only appears if the host still hasn't come back a minute
     /// later (`tick_wake`), which is also the one place that setting can be turned back
     /// off (no separate settings row for it — see `Settings::wol_auto_send`).
-    fn start_wake(&mut self, host: String, port: u16, mac: Vec<String>, reason: String, log: &mut std::fs::File) {
+    fn start_wake(&mut self, host: String, port: u16, mac: Vec<String>, reason: String) {
         let name = self
             .known_hosts
             .iter()
@@ -1008,7 +995,7 @@ impl App {
             probe_rx: None,
         };
         if auto {
-            Self::send_wake(&mut wake, log);
+            Self::send_wake(&mut wake);
         } else {
             self.screen = Screen::Wake;
         }
@@ -1018,12 +1005,12 @@ impl App {
     /// Fires (or re-fires) the magic packet for an in-flight wake, bumping its resend
     /// timer — shared by the modal's explicit "Send" action and `tick_wake`'s periodic
     /// resend.
-    fn send_wake(wake: &mut WakeState, log: &mut std::fs::File) {
+    fn send_wake(wake: &mut WakeState) {
         // Only claim "sent" if a magic packet actually went out — `wake_and_log`
         // returns false on an unparseable MAC / no usable interface, and showing
         // "Sent a wake signal… waiting" for a packet that never left would leave
         // the user waiting on nothing.
-        let sent = crate::wol::wake_and_log(&wake.mac, wake.host.parse().ok(), &wake.name, log);
+        let sent = crate::wol::wake_and_log(&wake.mac, wake.host.parse().ok(), &wake.name);
         let now = Instant::now();
         if sent {
             wake.sent = true;
@@ -1044,7 +1031,7 @@ impl App {
     /// check can also end a wake independently, whichever notices first. Called every UI
     /// tick; returns whether anything visibly changed (same contract as
     /// `drain_discovery`/`drain_art`).
-    pub fn tick_wake(&mut self, log: &mut std::fs::File) -> bool {
+    pub fn tick_wake(&mut self) -> bool {
         let Some(wake) = &mut self.wake else { return false };
         let now = Instant::now();
         let mut changed = false;
@@ -1060,7 +1047,7 @@ impl App {
                         .iter()
                         .find(|h| h.host == host && h.port == port)
                         .and_then(|h| h.mgmt_port);
-                    self.wake_succeeded(host, port, mgmt_port, "reachability probe", log);
+                    self.wake_succeeded(host, port, mgmt_port, "reachability probe");
                     return true;
                 }
                 wake.last_probe = Some(now);
@@ -1074,9 +1061,12 @@ impl App {
         // send is either `start_wake`'s own immediate call (auto-send on) or the user's
         // explicit Confirm on "Send" (`handle_wake_event`).
         if !wake.mac.is_empty() {
-            let due = wake.sent && wake.last_attempt.is_some_and(|t| now.duration_since(t) >= WAKE_RESEND_INTERVAL);
+            let due = wake.sent
+                && wake
+                    .last_attempt
+                    .is_some_and(|t| now.duration_since(t) >= WAKE_RESEND_INTERVAL);
             if due {
-                Self::send_wake(wake, log);
+                Self::send_wake(wake);
                 changed = true;
             }
         }
@@ -1088,7 +1078,11 @@ impl App {
             changed = true;
         }
 
-        if wake.probe_rx.is_none() && wake.last_probe.is_some_and(|t| now.duration_since(t) >= WAKE_PROBE_INTERVAL) {
+        if wake.probe_rx.is_none()
+            && wake
+                .last_probe
+                .is_some_and(|t| now.duration_since(t) >= WAKE_PROBE_INTERVAL)
+        {
             let (host, port) = (wake.host.clone(), wake.port);
             wake.probe_rx = Some(Self::wake_probe(&self.known_hosts, &self.identity, &host, port));
             wake.last_probe = Some(now);
@@ -1107,7 +1101,9 @@ impl App {
         port: u16,
     ) -> std::sync::mpsc::Receiver<crate::library::GamesLoaded> {
         let known = known_hosts.iter().find(|h| h.host == host && h.port == port);
-        let mgmt_port = known.and_then(|h| h.mgmt_port).unwrap_or(crate::library::DEFAULT_MGMT_PORT);
+        let mgmt_port = known
+            .and_then(|h| h.mgmt_port)
+            .unwrap_or(crate::library::DEFAULT_MGMT_PORT);
         let fingerprint = known.and_then(|h| h.fingerprint);
         crate::library::load_games_async(host.to_string(), port, mgmt_port, identity.clone(), fingerprint)
     }
@@ -1120,7 +1116,7 @@ impl App {
     /// Confirm flips the toggle, sends, or cancels depending on which is
     /// focused. Back always dismisses back to the plain error text
     /// `WakeState::reason` carries, same as Cancel.
-    pub fn handle_wake_event(&mut self, ev: MenuEvent, log: &mut std::fs::File) {
+    pub fn handle_wake_event(&mut self, ev: MenuEvent) {
         let Some(wake) = self.wake.as_mut() else { return };
         // No MAC on record for this host yet — there's nothing to send or automate
         // (see `render_wake`, which hides the toggle/buttons in this case too), so
@@ -1151,7 +1147,7 @@ impl App {
                 wake.focused = if wake.focused == 1 { 2 } else { 1 };
                 self.modal_focus_anim = Some(Instant::now());
             }
-            MenuEvent::Confirm if wake.focused == 1 => Self::send_wake(wake, log),
+            MenuEvent::Confirm if wake.focused == 1 => Self::send_wake(wake),
             MenuEvent::Confirm => {
                 // focused == 2 ("Cancel") — same as Back.
                 self.home_status = self.wake.take().map(|w| w.reason);
@@ -1168,11 +1164,13 @@ impl App {
     /// failure currently propagates uncaught, taking the whole process down — see
     /// `main.rs`'s docs). `main.rs`'s tick loop drains the result via
     /// `drain_launch_check`/`take_ready_launch`. No-ops if a check is already in flight.
-    fn confirm_grid_card(&mut self, idx: usize, log: &mut std::fs::File) {
+    fn confirm_grid_card(&mut self, idx: usize) {
         if self.pending_launch.is_some() {
             return;
         }
-        let Some((host, port)) = self.selected_host.clone() else { return };
+        let Some((host, port)) = self.selected_host.clone() else {
+            return;
+        };
         let Some(known) = self.known_hosts.iter().find(|h| h.host == host && h.port == port) else {
             return;
         };
@@ -1185,7 +1183,7 @@ impl App {
         };
         let mgmt_port = known.mgmt_port.unwrap_or(crate::library::DEFAULT_MGMT_PORT);
         let identity = (self.identity.0.clone(), self.identity.1.clone());
-        let _ = writeln!(log, "launch: checking {host}:{port} is still reachable before connecting…");
+        tracing::debug!("launch: checking {host}:{port} is still reachable before connecting…");
         self.home_status = Some("Checking connection…".into());
         let rx = crate::library::load_games_async(host.clone(), port, mgmt_port, identity, Some(fingerprint));
         self.pending_launch = Some(PendingLaunch {
@@ -1201,9 +1199,13 @@ impl App {
     /// success, stashes the result in `launch_ready` for `main.rs` to pick up via
     /// `take_ready_launch` (dropped instead if the selection has since moved to a
     /// different host). On failure, defers to `handle_library_error`.
-    pub fn drain_launch_check(&mut self, log: &mut std::fs::File) -> bool {
-        let Some(pending) = &self.pending_launch else { return false };
-        let Ok(loaded) = pending.rx.try_recv() else { return false };
+    pub fn drain_launch_check(&mut self) -> bool {
+        let Some(pending) = &self.pending_launch else {
+            return false;
+        };
+        let Ok(loaded) = pending.rx.try_recv() else {
+            return false;
+        };
         let PendingLaunch {
             host,
             port,
@@ -1213,7 +1215,11 @@ impl App {
         } = self.pending_launch.take().expect("just matched Some above");
         match loaded.result {
             Ok(_) => {
-                if self.selected_host.as_ref().is_some_and(|(h, p)| *h == host && *p == port) {
+                if self
+                    .selected_host
+                    .as_ref()
+                    .is_some_and(|(h, p)| *h == host && *p == port)
+                {
                     self.home_status = None;
                     self.launch_ready = Some(ConnectTarget {
                         host,
@@ -1224,8 +1230,8 @@ impl App {
                 }
             }
             Err(e) => {
-                let _ = writeln!(log, "launch check failed ({host}:{port}): {e}");
-                self.handle_library_error(host, port, e, log);
+                tracing::warn!("launch check failed ({host}:{port}): {e}");
+                self.handle_library_error(host, port, e);
             }
         }
         self.sidebar_dirty = true;
@@ -1267,7 +1273,7 @@ impl App {
     /// Handles one menu event on the pairing modal. Two focus zones (`PairingFocus`):
     /// the PIN digit row (blocking SPAKE2 ceremony on `Confirm`) and the "Request
     /// access" button (blocking no-PIN, park-until-approved connect on `Confirm`).
-    pub fn handle_pairing_event(&mut self, ev: MenuEvent, log: &mut std::fs::File) {
+    pub fn handle_pairing_event(&mut self, ev: MenuEvent) {
         if self.pairing_busy {
             // Mid-ceremony, Back cancels (dropping the receiver orphans the
             // worker — its send fails and it exits); everything else is ignored.
@@ -1322,7 +1328,7 @@ impl App {
                     }
                     self.modal_focus_anim = Some(Instant::now());
                 }
-                MenuEvent::Confirm => self.try_pair(log),
+                MenuEvent::Confirm => self.try_pair(),
                 MenuEvent::Back | MenuEvent::Secondary => {} // handled above
             },
             // Left tabs back onto the PIN row; Confirm sends the access request.
@@ -1331,7 +1337,7 @@ impl App {
                     self.pairing_focus = PairingFocus::Pin;
                     self.modal_focus_anim = Some(Instant::now());
                 }
-                MenuEvent::Confirm => self.try_request_access(log),
+                MenuEvent::Confirm => self.try_request_access(),
                 // Up/Down/Right are no-ops here; Back/Secondary were handled above.
                 MenuEvent::Up | MenuEvent::Down | MenuEvent::Right | MenuEvent::Back | MenuEvent::Secondary => {}
             },
@@ -1345,7 +1351,7 @@ impl App {
     /// background thread (this one can block for MINUTES waiting on the approval, so
     /// freezing the UI for it is not an option). The 185s budget matches `run_inner`'s
     /// pending-approval wait, long enough for a human to notice and click.
-    fn try_request_access(&mut self, log: &mut std::fs::File) {
+    fn try_request_access(&mut self) {
         let entry = &self.entries[self.pairing_entry];
         let host = entry.host().to_string();
         let port = entry.port();
@@ -1354,15 +1360,14 @@ impl App {
         let mac = entry.mac().to_vec();
         self.pairing_busy = true;
         self.pairing_status = Some("Requesting access… approve this device on the host".into());
-        let _ = writeln!(log, "requesting access to {host}:{port}");
+        tracing::info!("requesting access to {host}:{port}");
 
         let identity = (self.identity.0.clone(), self.identity.1.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         self.pairing_rx = Some(rx);
         std::thread::spawn(move || {
-            let result =
-                crate::session::request_access(&host, port, identity, std::time::Duration::from_secs(185))
-                    .map_err(|e| format!("Request failed: {e}"));
+            let result = crate::session::request_access(&host, port, identity, std::time::Duration::from_secs(185))
+                .map_err(|e| format!("Request failed: {e}"));
             let _ = tx.send(PairingOutcome {
                 host,
                 port,
@@ -1378,14 +1383,14 @@ impl App {
     /// called each tick from `run_ui_flow` like the other `drain_*`s. Success
     /// persists the host and lands on its game grid; failure re-arms the pairing
     /// modal with the error text.
-    pub fn drain_pairing(&mut self, log: &mut std::fs::File) -> bool {
+    pub fn drain_pairing(&mut self) -> bool {
         let Some(rx) = &self.pairing_rx else { return false };
         let Ok(outcome) = rx.try_recv() else { return false };
         self.pairing_rx = None;
         self.pairing_busy = false;
         match outcome.result {
             Ok(fingerprint) => {
-                let _ = writeln!(log, "paired ok ({}:{}), fingerprint set", outcome.host, outcome.port);
+                tracing::info!("paired ok ({}:{}), fingerprint set", outcome.host, outcome.port);
                 store::upsert_known_host(
                     &mut self.known_hosts,
                     KnownHost {
@@ -1401,10 +1406,10 @@ impl App {
                 self.entries = self.known_hosts.iter().cloned().map(HostEntry::Known).collect();
                 self.sidebar_dirty = true;
                 self.screen = Screen::Home;
-                self.select_host(outcome.host, outcome.port, outcome.mgmt_port, log);
+                self.select_host(outcome.host, outcome.port, outcome.mgmt_port);
             }
             Err(e) => {
-                let _ = writeln!(log, "pairing/request failed: {e}");
+                tracing::warn!("pairing/request failed: {e}");
                 self.pairing_status = Some(e);
             }
         }
@@ -1414,7 +1419,7 @@ impl App {
     /// Direct digit entry (the Magic Remote's number buttons) — types `digit` into
     /// the current PIN slot and auto-advances, like a phone lock-screen PIN pad,
     /// instead of requiring left/right cycling through 0-9 per digit.
-    pub fn enter_pin_digit(&mut self, digit: u8, log: &mut std::fs::File) {
+    pub fn enter_pin_digit(&mut self, digit: u8) {
         if self.pairing_busy {
             return;
         }
@@ -1426,13 +1431,13 @@ impl App {
         if self.pin_digit_index + 1 < self.pin_digits.len() {
             self.pin_digit_index += 1;
         } else {
-            self.try_pair(log);
+            self.try_pair();
         }
     }
 
     /// Starts the PIN pairing ceremony on a background thread (see
     /// `pairing_rx`'s docs — the ceremony blocks, the UI must not).
-    fn try_pair(&mut self, log: &mut std::fs::File) {
+    fn try_pair(&mut self) {
         let entry = &self.entries[self.pairing_entry];
         let host = entry.host().to_string();
         let port = entry.port();
@@ -1442,7 +1447,7 @@ impl App {
         let pin: String = self.pin_digits.iter().map(std::string::ToString::to_string).collect();
         self.pairing_busy = true;
         self.pairing_status = Some("Pairing… confirm the PIN on the host".into());
-        let _ = writeln!(log, "pairing with {host}:{port} (pin len {})", pin.len());
+        tracing::info!("pairing with {host}:{port} (pin len {})", pin.len());
 
         let identity = (self.identity.0.clone(), self.identity.1.clone());
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1708,14 +1713,7 @@ impl App {
     /// the pointer drifting across the screen. Only keyboard/remote navigation or a
     /// click (`handle_mouse_click` below) moves it now. Hover still drives the
     /// close (X) button's highlight, a conventional affordance this excludes.
-    pub fn handle_mouse_motion(
-        &mut self,
-        x: i32,
-        y: i32,
-        screen_w: u32,
-        screen_h: u32,
-        fonts: &ui::Fonts,
-    ) -> bool {
+    pub fn handle_mouse_motion(&mut self, x: i32, y: i32, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> bool {
         match self.screen {
             Screen::Home => {
                 // Home has no close button, but `hover_close` is only ever set by
@@ -1753,7 +1751,11 @@ impl App {
                 self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
             }
             Screen::ForgetHost => {
-                let name = self.host_menu_index.and_then(|i| self.entries.get(i)).map(HostEntry::name).unwrap_or_default();
+                let name = self
+                    .host_menu_index
+                    .and_then(|i| self.entries.get(i))
+                    .map(HostEntry::name)
+                    .unwrap_or_default();
                 let card = Self::forget_host_card_rect(screen_w, screen_h, name, fonts);
                 self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
             }
@@ -1778,7 +1780,6 @@ impl App {
         screen_w: u32,
         screen_h: u32,
         fonts: &ui::Fonts,
-        log: &mut std::fs::File,
     ) -> Option<ConnectTarget> {
         // Re-sync the close-button hover to the click's own position first — a
         // MouseButtonDown can carry a slightly different (x, y) than the last
@@ -1786,7 +1787,7 @@ impl App {
         self.handle_mouse_motion(x, y, screen_w, screen_h, fonts);
         if self.hover_close {
             // Same "what Back means here" as everywhere else — see `back`'s docs.
-            return self.back(log);
+            return self.back();
         }
         // Unlike hover, a click DOES move `home_focus`/`settings_focused` — fresh at
         // the click's own position, so it confirms what was actually clicked rather
@@ -1810,7 +1811,7 @@ impl App {
                     )?;
                     self.home_focus = HomeFocus::Grid(idx);
                 }
-                self.handle_home_event(MenuEvent::Confirm, screen_w, screen_h, log)
+                self.handle_home_event(MenuEvent::Confirm, screen_w, screen_h)
             }
             Screen::Settings => {
                 // An open dropdown has no row grid of its own here — Confirm picks
@@ -1835,13 +1836,13 @@ impl App {
                 let card = Self::pairing_card_rect(screen_w, screen_h, fonts.label);
                 if Self::pairing_request_button_rect(card).contains_point((x, y)) {
                     self.pairing_focus = PairingFocus::RequestAccess;
-                    self.handle_pairing_event(MenuEvent::Confirm, log);
+                    self.handle_pairing_event(MenuEvent::Confirm);
                 }
                 None
             }
             Screen::AddHost => None,
             Screen::Wake => {
-                self.handle_wake_event(MenuEvent::Confirm, log);
+                self.handle_wake_event(MenuEvent::Confirm);
                 None
             }
             Screen::ForgetHost => {
@@ -1872,7 +1873,11 @@ impl App {
         match self.switch_anim {
             Some((t, from_on)) if from_on != target_on => {
                 let f = ui::anim_frac(Some(t), ui::FOCUS_POP);
-                if target_on { f } else { 1.0 - f }
+                if target_on {
+                    f
+                } else {
+                    1.0 - f
+                }
             }
             _ => f32::from(target_on),
         }
@@ -1913,14 +1918,7 @@ impl App {
                 Some(l) => l,
                 None => Painter::new(ui::SIDEBAR_W, screen_h),
             };
-            ui::draw_sidebar(
-                &mut layer,
-                text_cache,
-                fonts,
-                &self.entries,
-                None,
-                screen_h,
-            )?;
+            ui::draw_sidebar(&mut layer, text_cache, fonts, &self.entries, None, screen_h)?;
             self.sidebar_layer = Some(layer);
             self.sidebar_dirty = false;
             self.focused_row_tile = None; // row content may have changed under it
@@ -2011,7 +2009,10 @@ impl App {
                 hover_close: self.hover_close,
             }),
             Screen::ForgetHost => Some(ModalShellKey::ForgetHost {
-                name: self.host_menu_index.and_then(|i| self.entries.get(i)).map(|e| e.name().to_string()),
+                name: self
+                    .host_menu_index
+                    .and_then(|i| self.entries.get(i))
+                    .map(|e| e.name().to_string()),
                 hover_close: self.hover_close,
             }),
             Screen::Home | Screen::AddHost => None,
@@ -2092,7 +2093,10 @@ impl App {
                         )?
                     }
                     Screen::Wake => {
-                        let wake = self.wake.as_ref().expect("focus_key only Some for a Wake with a focusable widget");
+                        let wake = self
+                            .wake
+                            .as_ref()
+                            .expect("focus_key only Some for a Wake with a focusable widget");
                         let card = Self::wake_card_rect(screen_w, screen_h, wake, fonts);
                         if wake.focused == 0 {
                             let rows = ui::wake_rows(self.settings.wol_auto_send);
@@ -2120,9 +2124,11 @@ impl App {
                         }
                     }
                     Screen::Pairing => match self.pairing_focus {
-                        PairingFocus::Pin => {
-                            ui::render_pairing_digit_tile(text_cache, fonts.title, self.pin_digits[self.pin_digit_index])?
-                        }
+                        PairingFocus::Pin => ui::render_pairing_digit_tile(
+                            text_cache,
+                            fonts.title,
+                            self.pin_digits[self.pin_digit_index],
+                        )?,
                         PairingFocus::RequestAccess => {
                             let card = Self::pairing_card_rect(screen_w, screen_h, fonts.label);
                             let btn = Self::pairing_request_button_rect(card);
@@ -2130,7 +2136,11 @@ impl App {
                         }
                     },
                     Screen::ForgetHost => {
-                        let name = self.host_menu_index.and_then(|i| self.entries.get(i)).map(HostEntry::name).unwrap_or_default();
+                        let name = self
+                            .host_menu_index
+                            .and_then(|i| self.entries.get(i))
+                            .map(HostEntry::name)
+                            .unwrap_or_default();
                         let card = Self::forget_host_card_rect(screen_w, screen_h, name, fonts);
                         let content = Self::forget_host_content_rect(card, name, fonts);
                         let rect = ui::confirm_button_rect(content, self.host_menu_focused);
@@ -2192,12 +2202,7 @@ impl App {
     /// params are only for pure geometry — `ui::modal_header_end_y` and
     /// friends — needed to position a modal's focused-widget tile without
     /// re-rendering its header). The GPU executes it (`Compositor::execute`).
-    pub fn draw_list(
-        &self,
-        screen_w: u32,
-        screen_h: u32,
-        fonts: &ui::Fonts,
-    ) -> Vec<DrawCmd> {
+    pub fn draw_list(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Vec<DrawCmd> {
         let mut cmds = Vec::new();
         let grid_x = ui::SIDEBAR_W as i32;
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
@@ -2235,7 +2240,12 @@ impl App {
                 }
                 cmds.push(DrawCmd::Tex {
                     tile: Tile::Card(idx),
-                    dst: Rect::new(r.x() - pad, y - pad, r.width() + 2 * pad as u32, r.height() + 2 * pad as u32),
+                    dst: Rect::new(
+                        r.x() - pad,
+                        y - pad,
+                        r.width() + 2 * pad as u32,
+                        r.height() + 2 * pad as u32,
+                    ),
                     alpha: 0xff,
                 });
             }
@@ -2246,16 +2256,24 @@ impl App {
                 let f = ui::anim_frac(self.focus_anim, ui::FOCUS_POP);
                 let r = ui::grid_card_rect(idx, columns, grid_x, available_w);
                 let y = r.y() - self.grid_scroll;
-                let card_base =
-                    Rect::new(r.x() - pad, y - pad, r.width() + 2 * pad as u32, r.height() + 2 * pad as u32);
+                let card_base = Rect::new(
+                    r.x() - pad,
+                    y - pad,
+                    r.width() + 2 * pad as u32,
+                    r.height() + 2 * pad as u32,
+                );
                 cmds.push(DrawCmd::Tex {
                     tile: Tile::Card(idx),
                     dst: ui::zoom_rect(card_base, f, CARD_GROWTH),
                     alpha: 0xff,
                 });
                 let rp = ui::FOCUS_RING_PAD;
-                let ring_base =
-                    Rect::new(r.x() - rp, y - rp, r.width() + 2 * rp as u32, r.height() + 2 * rp as u32);
+                let ring_base = Rect::new(
+                    r.x() - rp,
+                    y - rp,
+                    r.width() + 2 * rp as u32,
+                    r.height() + 2 * rp as u32,
+                );
                 cmds.push(DrawCmd::Tex {
                     tile: Tile::Ring,
                     dst: ui::zoom_rect(ring_base, f, CARD_GROWTH),
@@ -2283,7 +2301,12 @@ impl App {
             let pad = ui::ROW_TILE_PAD;
             cmds.push(DrawCmd::Tex {
                 tile: Tile::FocusRow,
-                dst: Rect::new(rect.x() - pad, rect.y() - pad, rect.width() + 2 * pad as u32, rect.height() + 2 * pad as u32),
+                dst: Rect::new(
+                    rect.x() - pad,
+                    rect.y() - pad,
+                    rect.width() + 2 * pad as u32,
+                    rect.height() + 2 * pad as u32,
+                ),
                 alpha: 0xff,
             });
         }
@@ -2334,7 +2357,11 @@ impl App {
                     })
                 }
                 Screen::ForgetHost => {
-                    let name = self.host_menu_index.and_then(|i| self.entries.get(i)).map(HostEntry::name).unwrap_or_default();
+                    let name = self
+                        .host_menu_index
+                        .and_then(|i| self.entries.get(i))
+                        .map(HostEntry::name)
+                        .unwrap_or_default();
                     let card = Self::forget_host_card_rect(screen_w, screen_h, name, fonts);
                     let content = Self::forget_host_content_rect(card, name, fonts);
                     Some(ui::confirm_button_rect(content, self.host_menu_focused))
@@ -2343,8 +2370,12 @@ impl App {
             };
             if let Some(rect) = focus_rect {
                 let pad = ui::ROW_TILE_PAD;
-                let base =
-                    Rect::new(rect.x() - pad, rect.y() - pad + dy, rect.width() + 2 * pad as u32, rect.height() + 2 * pad as u32);
+                let base = Rect::new(
+                    rect.x() - pad,
+                    rect.y() - pad + dy,
+                    rect.width() + 2 * pad as u32,
+                    rect.height() + 2 * pad as u32,
+                );
                 // The zoom-in: same GPU-scale-around-center technique as the
                 // grid's card focus pop (see above) — `modal_focus_tile` is
                 // rasterized once at its literal size, never re-rendered for
@@ -2368,7 +2399,12 @@ impl App {
                     let option_rect = ui::dropdown_option_rect(overlay_rect, dd.focused);
                     cmds.push(DrawCmd::Tex {
                         tile: Tile::DropdownFocusOption,
-                        dst: Rect::new(option_rect.x(), option_rect.y() + dy, option_rect.width(), option_rect.height()),
+                        dst: Rect::new(
+                            option_rect.x(),
+                            option_rect.y() + dy,
+                            option_rect.width(),
+                            option_rect.height(),
+                        ),
                         alpha: (255.0 * m) as u8,
                     });
                 }
@@ -2620,7 +2656,15 @@ impl App {
 
         let status = Self::wake_status_text(wake);
         ui::draw_modal_header(
-            painter, text_cache, fonts.title, fonts.label, card, "Host unreachable", ui::WHITE, &status, ui::MUTED,
+            painter,
+            text_cache,
+            fonts.title,
+            fonts.label,
+            card,
+            "Host unreachable",
+            ui::WHITE,
+            &status,
+            ui::MUTED,
         )?;
 
         // No MAC on record — nothing to send or automate, so there's nothing
@@ -2687,7 +2731,12 @@ impl App {
     /// without re-rendering the header.
     fn wake_toggle_rect(card: Rect, wake: &WakeState, fonts: &ui::Fonts) -> Rect {
         let after_status_y = ui::modal_header_end_y(fonts.title, fonts.label, card, &Self::wake_status_text(wake));
-        Rect::new(card.x() + 32, after_status_y + 28, card.width().saturating_sub(64), ui::SETTINGS_ROW_H)
+        Rect::new(
+            card.x() + 32,
+            after_status_y + 28,
+            card.width().saturating_sub(64),
+            ui::SETTINGS_ROW_H,
+        )
     }
 
     /// The Wake/Cancel button row's rect, stacked below the toggle row —
@@ -2760,7 +2809,13 @@ impl App {
     /// without drawing so `prepare_tiles`/`draw_list` can position the
     /// focused-button tile without re-rendering the header.
     fn forget_host_content_rect(card: Rect, name: &str, fonts: &ui::Fonts) -> Rect {
-        let after_subtitle_y = ui::modal_header_end_y(fonts.label, fonts.value, card, &Self::forget_host_subtitle(name));
-        Rect::new(card.x() + 32, after_subtitle_y + 32, card.width().saturating_sub(64), 72)
+        let after_subtitle_y =
+            ui::modal_header_end_y(fonts.label, fonts.value, card, &Self::forget_host_subtitle(name));
+        Rect::new(
+            card.x() + 32,
+            after_subtitle_y + 32,
+            card.width().saturating_sub(64),
+            72,
+        )
     }
 }

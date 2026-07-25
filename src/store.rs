@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-fn app_dir() -> PathBuf {
+pub(crate) fn app_dir() -> PathBuf {
     std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from)
 }
 
@@ -245,9 +245,10 @@ impl SettingsWriter {
 }
 
 /// Test/dev override: a config file dropped alongside sideloading skips straight to
-/// a connect target — see `punktfunk-webos-client` memory notes for why this exists
-/// (no documented way to pass CLI args through a normal SAM launch). Still supported
-/// for quick bring-up testing; the UI flow below is the normal path.
+/// a connect target — predates the finding (see `docs/NOTES.md`) that SAM launch
+/// `params` reach a native app as `argv[1]` JSON on initial launch, which
+/// `logger.rs` uses instead for telemetry. Still supported for quick bring-up
+/// testing; the UI flow below is the normal path.
 pub fn dev_override_connect() -> Option<(String, u16)> {
     let path = Path::new(&app_dir()).join("connect.conf");
     let content = std::fs::read_to_string(path).ok()?;

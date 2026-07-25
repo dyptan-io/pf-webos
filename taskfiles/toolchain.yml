@@ -141,7 +141,8 @@ tasks:
       vars: [TARGET_TASK]
     cmds:
       - >-
-        docker run --rm --platform linux/arm64 -e DEBIAN_FRONTEND=noninteractive {{.DOCKER_MOUNTS}} {{.RUST_IMAGE}}
+        docker run --rm --platform linux/arm64 -e DEBIAN_FRONTEND=noninteractive
+        {{.DOCKER_MOUNTS}} {{.RUST_IMAGE}}
         sh -c '
           apt-get update -qq &&
           apt-get install -y -qq --no-install-recommends apt-utils cmake curl ca-certificates git pkg-config build-essential xz-utils > /dev/null &&

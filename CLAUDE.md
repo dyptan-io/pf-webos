@@ -22,11 +22,15 @@ cross-toolchain is Linux-aarch64-only, so `build`/`check`/`package`/`lint` run i
 - `task build` / `task check` — compile only / `cargo check` only
 - `task lint` / `task fmt` — clippy (Docker) / rustfmt (native)
 - `task deploy TV_HOST=root@<tv-ip>` — build, package, install, launch over SSH
-- `task deploy:log TV_HOST=root@<tv-ip>` — tail `/tmp/punktfunk-webos.log` on the TV
+- `task deploy TV_HOST=... TELEMETRY=auto` (or `TELEMETRY=<dev-host>:<port>`) — same, but the app
+  streams its logs (via `tracing`, see `src/logger.rs`) live to this machine over TCP instead of
+  writing a file on-device — passed at launch via SAM's `params` (argv[1] JSON), no rebuild needed.
+  The task listens locally first and prints lines as they arrive instead of returning.
+  `TELEMETRY_LEVEL=debug|info|warn|error` (default `debug`) sets the minimum level sent.
 
 Set `TV_HOST` in a local `.env` (copy `.env.example`). Run tasks with `task -s` to skip the command
-echo. No test suite — verify via `task deploy` + `deploy:log` on real hardware, or a native
-`cargo check`/`build` (macOS/Windows stay green via a stub `main()`).
+echo. No test suite — verify via `task deploy` (with `TELEMETRY=auto` for live logs) on real
+hardware, or a native `cargo check`/`build` (macOS/Windows stay green via a stub `main()`).
 
 
 ## Architecture

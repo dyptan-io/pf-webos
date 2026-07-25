@@ -9,7 +9,7 @@ version: '3'
 # to just the command's own output (less noise, fewer tokens when read back).
 silent: true
 
-# TV_HOST (used by deploy/deploy:log below) can live in a local, gitignored .env
+# TV_HOST (used by deploy below) can live in a local, gitignored .env
 # instead of being typed on every invocation — see .env.example.
 dotenv: ['.env']
 
@@ -115,12 +115,20 @@ tasks:
   deploy:
     desc: >-
       Build, package, install on a real TV over SSH, and launch it. Usage:
-      task deploy TV_HOST=root@<tv-ip> (or set TV_HOST in .env)
+      task deploy TV_HOST=root@<tv-ip> (or set TV_HOST in .env). Without TELEMETRY,
+      the app just writes a versioned file in its data dir (info-and-above only) —
+      the same as always. Pass TELEMETRY=<host:port> to stream logs live to that
+      address instead (SAM hands launch `params` to a native app as argv[1] JSON on
+      initial launch — see src/logger.rs — no rebuild needed), or TELEMETRY=auto to
+      use this machine's own LAN IP on a random port (printed once the listener is
+      up, in case you need to connect to it manually). TELEMETRY_LEVEL
+      (debug/info/warn/error, default debug) sets the minimum level sent.
     deps: [package]
     requires:
       vars: [TV_HOST]
     vars:
       IPK: dist/io.dyptan.punktfunk.webos_{{.PKG_VERSION}}_arm.ipk
+      TELEMETRY_LEVEL: '{{.TELEMETRY_LEVEL | default "debug"}}'
     cmds:
       - test -f "{{.IPK}}" || exit 1
       - scp "{{.IPK}}" {{.TV_HOST}}:/tmp/
@@ -129,18 +137,30 @@ tasks:
         "luna-send -i -n 1 -f luna://com.webos.appInstallService/dev/install
         '{\"id\":\"io.dyptan.punktfunk.webos\",\"ipkUrl\":\"/tmp/$(basename {{.IPK}})\",\"subscribe\":true}'"
       - sleep 3
-      - >-
-        ssh -tt {{.TV_HOST}}
-        "luna-send -n 1 -f luna://com.webos.applicationManager/launch '{\"id\":\"io.dyptan.punktfunk.webos\"}'"
+      - |
+        set -eu
+        TELEMETRY="{{.TELEMETRY}}"
+        if [ "$TELEMETRY" = "auto" ]; then
+          IP="$(ipconfig getifaddr en0 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+          PORT="$(awk 'BEGIN { srand(); print int(20000 + rand() * 20000) }')"
+          TELEMETRY="${IP}:${PORT}"
+        fi
 
-  deploy:log:
-    desc: >-
-      Tail the app's log file on the TV over SSH. Usage:
-      task deploy:log TV_HOST=root@<tv-ip>
-    requires:
-      vars: [TV_HOST]
-    cmds:
-      - ssh {{.TV_HOST}} "tail -f /tmp/punktfunk-webos.log"
+        PARAMS=""
+        NC_PID=""
+        if [ -n "$TELEMETRY" ]; then
+          PORT="${TELEMETRY##*:}"
+          ( while true; do nc -l "$PORT"; done ) &
+          NC_PID=$!
+          trap 'kill "$NC_PID" 2>/dev/null || true' EXIT
+          sleep 0.5
+          echo "listening on :${PORT} (destination sent to device: $TELEMETRY)" >&2
+          PARAMS=",\"params\":{\"telemetry\":\"$TELEMETRY\",\"telemetry_level\":\"{{.TELEMETRY_LEVEL}}\"}"
+        fi
+        ssh -tt {{.TV_HOST}} "luna-send -n 1 -f luna://com.webos.applicationManager/launch '{\"id\":\"io.dyptan.punktfunk.webos\"${PARAMS}}'"
+        if [ -n "$NC_PID" ]; then
+          wait "$NC_PID"
+        fi
 
   clean:
     desc: Remove everything — dist/, .toolchains/, target/, and the Docker volumes

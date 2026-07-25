@@ -72,7 +72,7 @@ QEMU). Run `task --list` for everything.
 | `task build` / `task check` | Faster inner loop: compile only, or `cargo check` only |
 | `task lint` / `task fmt` | `cargo clippy` / `cargo fmt` |
 | `task deploy TV_HOST=root@<tv-ip>` | Build, package, install, and launch on a real TV over SSH |
-| `task deploy:log TV_HOST=root@<tv-ip>` | Tail the app's log on the TV |
+| `task deploy TV_HOST=... TELEMETRY=auto` | Same, but streams the app's logs live to this machine instead of a file on-device |
 | `task clean` | Remove build output and caches |
 
 Set `TV_HOST` once in a local `.env` (copy `.env.example`) to skip typing it each time. Architecture

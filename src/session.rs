@@ -6,7 +6,6 @@
 //! Audio is drained from the main thread ([`pump_audio_once`]) because
 //! `sdl2::audio::AudioQueue` is `!Send`.
 use std::fmt::Write as _;
-use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -145,12 +144,15 @@ pub fn connect(
     display_w: i32,
     display_h: i32,
     video_backend: VideoBackend,
-    log: &mut std::fs::File,
 ) -> Result<Connected> {
     // VIDEO_CAP_CHACHA20: unconditional — armv7 has no hardware AES, so ChaCha20 is
     // faster. A ≥0.17.2 host picks it up; older hosts ignore the unknown bit.
     let video_caps = quic::VIDEO_CAP_CHACHA20
-        | if hdr_enabled { quic::VIDEO_CAP_10BIT | quic::VIDEO_CAP_HDR } else { 0 };
+        | if hdr_enabled {
+            quic::VIDEO_CAP_10BIT | quic::VIDEO_CAP_HDR
+        } else {
+            0
+        };
     let display_hdr = hdr_enabled.then(cx_display_hdr);
 
     let client = NativeClient::connect(
@@ -174,12 +176,11 @@ pub fn connect(
     .context("connect")?;
     let client = Arc::new(client);
 
-    let fp_hex = client
-        .host_fingerprint
-        .iter()
-        .fold(String::new(), |mut s, b| { let _ = write!(s, "{b:02x}"); s });
-    writeln!(
-        log,
+    let fp_hex = client.host_fingerprint.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    });
+    tracing::info!(
         "connected: codec={} compositor={:?} audio_ch={} color={:?} bitrate_kbps={} \
          decode_latency={} caps=0x{video_caps:02x} fp={fp_hex}",
         client.codec,
@@ -188,12 +189,12 @@ pub fn connect(
         client.color,
         client.resolved_bitrate_kbps,
         client.wants_decode_latency(),
-    )?;
+    );
 
     let resolved_mode = client.mode();
     let fps = resolved_mode.refresh_hz.max(1);
-    let codec = NdlCodec::from_wire(client.codec)
-        .with_context(|| format!("unsupported codec 0x{:02x}", client.codec))?;
+    let codec =
+        NdlCodec::from_wire(client.codec).with_context(|| format!("unsupported codec 0x{:02x}", client.codec))?;
     let app_id = std::env::var("APPID").unwrap_or_else(|_| "io.dyptan.punktfunk.webos".into());
 
     let player = match video_backend {
@@ -210,47 +211,36 @@ pub fn connect(
                 codec,
                 display_w,
                 display_h,
-                log,
             ) {
                 Ok(sf) => {
-                    writeln!(
-                        log,
+                    tracing::info!(
                         "Starfish loaded ({codec:?} {}x{}@{fps}fps, display {display_w}x{display_h})",
-                        resolved_mode.width, resolved_mode.height,
-                    )?;
+                        resolved_mode.width,
+                        resolved_mode.height,
+                    );
                     VideoPlayer::Starfish(sf)
                 }
                 Err(e) => {
-                    writeln!(log, "Starfish load failed ({e:#}) — falling back to NDL")?;
-                    let ndl = NdlVideo::load(
-                        &app_id,
-                        resolved_mode.width as i32,
-                        resolved_mode.height as i32,
-                        codec,
-                    )
-                    .context("NDL load (Starfish fallback)")?;
-                    writeln!(
-                        log,
+                    tracing::warn!("Starfish load failed ({e:#}) — falling back to NDL");
+                    let ndl = NdlVideo::load(&app_id, resolved_mode.width as i32, resolved_mode.height as i32, codec)
+                        .context("NDL load (Starfish fallback)")?;
+                    tracing::info!(
                         "NDL loaded ({codec:?} {}x{}@{fps}fps)",
-                        resolved_mode.width, resolved_mode.height,
-                    )?;
+                        resolved_mode.width,
+                        resolved_mode.height,
+                    );
                     VideoPlayer::Ndl(ndl)
                 }
             }
         }
         VideoBackend::Ndl => {
-            let ndl = NdlVideo::load(
-                &app_id,
-                resolved_mode.width as i32,
-                resolved_mode.height as i32,
-                codec,
-            )
-            .context("NDL load")?;
-            writeln!(
-                log,
+            let ndl = NdlVideo::load(&app_id, resolved_mode.width as i32, resolved_mode.height as i32, codec)
+                .context("NDL load")?;
+            tracing::info!(
                 "NDL loaded ({codec:?} {}x{}@{fps}fps)",
-                resolved_mode.width, resolved_mode.height,
-            )?;
+                resolved_mode.width,
+                resolved_mode.height,
+            );
             VideoPlayer::Ndl(ndl)
         }
     };
@@ -265,26 +255,32 @@ pub fn connect(
     let is_hdr = client.color.is_hdr();
     let initial_meta = is_hdr.then(cx_display_hdr);
     if let Err(e) = player.set_color_info(initial_meta.as_ref(), client.color) {
-        writeln!(log, "{} colour metadata failed: {e:#}", player.backend_name())?;
+        tracing::warn!("{} colour metadata failed: {e:#}", player.backend_name());
     }
-    writeln!(
-        log,
+    tracing::debug!(
         "colour metadata sent: hdr={is_hdr} transfer={} primaries={} matrix={} full_range={}",
-        client.color.transfer, client.color.primaries, client.color.matrix, client.color.full_range,
-    )?;
+        client.color.transfer,
+        client.color.primaries,
+        client.color.matrix,
+        client.color.full_range,
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(StreamStats::default());
     let video_client = client.clone();
     let video_stop = stop.clone();
     let video_stats = stats.clone();
-    let mut video_log = log.try_clone().context("clone log")?;
     let video_thread = std::thread::Builder::new()
         .name("punktfunk-webos-video".into())
-        .spawn(move || video_pump(video_client, player, video_stop, video_stats, is_hdr, &mut video_log))
+        .spawn(move || video_pump(video_client, player, video_stop, video_stats, is_hdr))
         .context("spawn video thread")?;
 
-    Ok(Connected { client, stop, stats, video_thread })
+    Ok(Connected {
+        client,
+        stop,
+        stats,
+        video_thread,
+    })
 }
 
 /// The no-PIN "request access" trust step: open a trust-on-first-use connection
@@ -298,13 +294,12 @@ pub fn connect(
 /// negotiated `mode`/codec are irrelevant here (immediately dropped); a small 720p H.264
 /// request keeps the host from doing needless 4K/HEVC setup for a connection we close at
 /// once. Blocks up to `timeout` (the operator-approval window).
-pub fn request_access(
-    host: &str,
-    port: u16,
-    identity: (String, String),
-    timeout: Duration,
-) -> Result<[u8; 32]> {
-    let mode = Mode { width: 1280, height: 720, refresh_hz: 60 };
+pub fn request_access(host: &str, port: u16, identity: (String, String), timeout: Duration) -> Result<[u8; 32]> {
+    let mode = Mode {
+        width: 1280,
+        height: 720,
+        refresh_hz: 60,
+    };
     let client = NativeClient::connect(
         host,
         port,
@@ -365,7 +360,7 @@ const VENDOR_DECODE_THREAD_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 /// not synchronously within the load call, so this polls `/proc/self/task` rather than
 /// scanning once, and must not block `video_pump` from starting to feed frames while it
 /// does.
-fn spawn_vendor_decode_thread_renicer(mut log: std::fs::File) {
+fn spawn_vendor_decode_thread_renicer() {
     std::thread::spawn(move || {
         let start = Instant::now();
         let mut last_found = start;
@@ -390,13 +385,12 @@ fn spawn_vendor_decode_thread_renicer(mut log: std::fs::File) {
                     last_found = Instant::now();
                     // SAFETY: plain syscall — tid and priority value only, no pointers.
                     if unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -10) } != 0 {
-                        let _ = writeln!(
-                            log,
+                        tracing::warn!(
                             "setpriority(vendor thread {comm}, tid={tid}) failed: {}",
                             std::io::Error::last_os_error()
                         );
                     } else {
-                        let _ = writeln!(log, "reniced vendor decode thread {comm} (tid={tid}) to -10");
+                        tracing::debug!("reniced vendor decode thread {comm} (tid={tid}) to -10");
                     }
                 }
             }
@@ -416,25 +410,18 @@ fn video_pump(
     stop: Arc<AtomicBool>,
     stats: Arc<StreamStats>,
     is_hdr: bool,
-    log: &mut std::fs::File,
 ) {
     client.register_hot_thread();
     for tid in client.hot_thread_ids() {
         // SAFETY: plain syscall — tid and priority value only, no pointers.
         if unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -10) } != 0 {
-            let _ = writeln!(
-                log,
+            tracing::debug!(
                 "setpriority(tid={tid}) failed (expected without CAP_SYS_NICE): {}",
                 std::io::Error::last_os_error()
             );
         }
     }
-    match log.try_clone() {
-        Ok(renicer_log) => spawn_vendor_decode_thread_renicer(renicer_log),
-        Err(e) => {
-            let _ = writeln!(log, "clone log for decode-thread renicer failed: {e:#}");
-        }
-    }
+    spawn_vendor_decode_thread_renicer();
 
     let wants_decode_latency = client.wants_decode_latency();
     let mut last_dropped_seen = client.frames_dropped();
@@ -455,8 +442,7 @@ fn video_pump(
                 stats.frames.store(frames_received, Ordering::Relaxed);
                 if last_heartbeat.elapsed() >= Duration::from_secs(2) {
                     last_heartbeat = Instant::now();
-                    let _ = writeln!(
-                        log,
+                    tracing::debug!(
                         "video: {frames_received} frames, holding={holding}, dropped={}",
                         client.frames_dropped()
                     );
@@ -472,33 +458,28 @@ fn video_pump(
                     holding = true;
                     stats.holding.store(true, Ordering::Relaxed);
                     hold_started = Some(Instant::now());
-                    let _ = writeln!(
-                        log,
+                    tracing::warn!(
                         "loss (gap={gap} dropped={dropped}, frame {}) — freezing",
                         frame.frame_index
                     );
                     let _ = player.flush();
                 }
-                if holding
-                    && last_keyframe_request
-                        .is_none_or(|t| t.elapsed() >= KEYFRAME_REQUEST_MIN_INTERVAL)
-                {
+                if holding && last_keyframe_request.is_none_or(|t| t.elapsed() >= KEYFRAME_REQUEST_MIN_INTERVAL) {
                     if let Err(e) = client.request_keyframe() {
-                        let _ = writeln!(log, "request_keyframe: {e:#}");
+                        tracing::warn!("request_keyframe: {e:#}");
                     }
                     last_keyframe_request = Some(Instant::now());
                 }
 
-                let is_reanchor = frame.flags & u32::from(FLAG_SOF) != 0
-                    || frame.flags & USER_FLAG_RECOVERY_ANCHOR != 0;
+                let is_reanchor =
+                    frame.flags & u32::from(FLAG_SOF) != 0 || frame.flags & USER_FLAG_RECOVERY_ANCHOR != 0;
                 let gave_up = hold_started.is_some_and(|t| t.elapsed() >= HOLD_GIVE_UP);
                 if holding && !is_reanchor && !gave_up {
                     // Still frozen — drop this concealed frame, but fall through to the
                     // HDR poll below instead of `continue`ing past it.
                 } else {
                     if holding {
-                        let _ = writeln!(
-                            log,
+                        tracing::info!(
                             "resuming after {:.0}ms (frame {}, flags=0x{:x}, reanchor={is_reanchor}, gave_up={gave_up})",
                             hold_started.map_or(0.0, |t| t.elapsed().as_secs_f32() * 1000.0),
                             frame.frame_index,
@@ -511,13 +492,13 @@ fn video_pump(
 
                     let pts_ns = frame.pts_ns;
                     let (play_result, feed_elapsed) = player.play(&frame.data, pts_ns);
-                    stats
-                        .feed_us
-                        .store(u32::try_from(feed_elapsed.as_micros()).unwrap_or(u32::MAX), Ordering::Relaxed);
+                    stats.feed_us.store(
+                        u32::try_from(feed_elapsed.as_micros()).unwrap_or(u32::MAX),
+                        Ordering::Relaxed,
+                    );
 
                     if feed_elapsed >= FEED_BACKPRESSURE_WARN {
-                        let _ = writeln!(
-                            log,
+                        tracing::warn!(
                             "{} slow: {:.1}ms (frame {}, pts {:.2}ms)",
                             player.backend_name(),
                             feed_elapsed.as_secs_f32() * 1000.0,
@@ -526,21 +507,16 @@ fn video_pump(
                         );
                     }
                     if wants_decode_latency && play_result.is_ok() {
-                        client.report_decode_us(
-                            u32::try_from(feed_elapsed.as_micros()).unwrap_or(u32::MAX),
-                        );
+                        client.report_decode_us(u32::try_from(feed_elapsed.as_micros()).unwrap_or(u32::MAX));
                     }
                     if let Err(e) = play_result {
-                        let _ = writeln!(
-                            log,
+                        tracing::warn!(
                             "{} error (frame {}, pts {:.2}ms): {e:#}",
                             player.backend_name(),
                             frame.frame_index,
                             pts_ns as f64 / 1_000_000.0,
                         );
-                        if last_keyframe_request
-                            .is_none_or(|t| t.elapsed() >= KEYFRAME_REQUEST_MIN_INTERVAL)
-                        {
+                        if last_keyframe_request.is_none_or(|t| t.elapsed() >= KEYFRAME_REQUEST_MIN_INTERVAL) {
                             let _ = client.request_keyframe();
                             let _ = player.flush();
                             last_keyframe_request = Some(Instant::now());
@@ -553,11 +529,11 @@ fn video_pump(
             Err(punktfunk_core::PunktfunkError::NoFrame) => {
                 if last_heartbeat.elapsed() >= Duration::from_secs(2) {
                     last_heartbeat = Instant::now();
-                    let _ = writeln!(log, "video: {frames_received} frames (idle)");
+                    tracing::debug!("video: {frames_received} frames (idle)");
                 }
             }
             Err(e) => {
-                let _ = writeln!(log, "video pump: {e:#}");
+                tracing::error!("video pump: {e:#}");
                 break;
             }
         }
@@ -565,7 +541,7 @@ fn video_pump(
         if is_hdr {
             if let Ok(meta) = client.next_hdr_meta(Duration::ZERO) {
                 if let Err(e) = player.set_color_info(Some(&meta), client.color) {
-                    let _ = writeln!(log, "{} set_color_info: {e:#}", player.backend_name());
+                    tracing::warn!("{} set_color_info: {e:#}", player.backend_name());
                 }
             }
         }
@@ -574,30 +550,25 @@ fn video_pump(
 
 /// Drains and plays all pending audio packets (non-blocking). Call once per main-loop
 /// tick; runs on the main thread because `sdl2::audio::AudioQueue` is `!Send`.
-pub fn pump_audio_once(
-    client: &NativeClient,
-    audio: &mut crate::audio::AudioPlayer,
-    log: &mut std::fs::File,
-) {
+pub fn pump_audio_once(client: &NativeClient, audio: &mut crate::audio::AudioPlayer) {
     // Logged roughly once/sec (200 packets @ 5ms/frame).
     static PACKET_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     while let Ok(packet) = client.next_audio(Duration::ZERO) {
         match audio.play(&packet.data) {
             Ok((peak, resnapped)) => {
                 if resnapped {
-                    let _ = writeln!(
-                        log,
+                    tracing::debug!(
                         "audio resnapped (queue was >{}ms behind)",
                         crate::audio::MAX_QUEUED_LAG_MS
                     );
                 }
                 let n = PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
                 if n % 200 == 0 {
-                    let _ = writeln!(log, "audio peak: {peak:.4}");
+                    tracing::debug!("audio peak: {peak:.4}");
                 }
             }
             Err(e) => {
-                let _ = writeln!(log, "audio error (seq {}): {e:#}", packet.seq);
+                tracing::warn!("audio error (seq {}): {e:#}", packet.seq);
             }
         }
     }
