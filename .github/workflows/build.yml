@@ -23,6 +23,14 @@ jobs:
         with:
           targets: armv7-unknown-linux-gnueabi
 
+      - name: Cache clippy target
+        uses: actions/cache@v5
+        with:
+          path: target-clippy
+          key: armv7-unknown-linux-gnueabi-clippy-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            armv7-unknown-linux-gnueabi-clippy-
+
       - name: Cache cargo registry/git/target
         uses: Swatinem/rust-cache@v2
         with:
@@ -41,12 +49,10 @@ jobs:
         with:
           version: 3
 
-      # Runs BEFORE the build: the crate carries a curated `[lints.clippy]` set
-      # (see Cargo.toml) that nothing enforced until now — which is exactly how an
-      # `items_after_statements` violation reached main unnoticed. Cheap here, since
-      # the build step below reuses the same cached target dir.
       - name: Lint
         run: task native:lint
+        env:
+          CARGO_TARGET_DIR: target-clippy
 
       - name: Build and package
         run: task native:package
