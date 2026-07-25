@@ -110,6 +110,22 @@ mod real {
         // owns is only actionable if the log says what it was running on.
         crate::device::DeviceInfo::detect().log();
 
+        // A panic on ANY thread otherwise goes only to stderr, which a SAM-launched
+        // native app has no terminal for — the app simply vanishes back to the
+        // launcher with nothing written down. Routing it through `tracing` puts the
+        // message and location in the same log as everything else, which is the
+        // difference between "it crashed" and a diagnosable report. (This catches Rust
+        // panics only; a fault inside the vendor decode libraries kills the process
+        // outright and is visible only as a log that stops mid-session.)
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            tracing::error!(
+                "PANIC on thread {:?}: {info}",
+                std::thread::current().name().unwrap_or("unnamed"),
+            );
+            default_hook(info);
+        }));
+
         // Errors from here on only ever reached stderr, which is invisible for a
         // webOS native app with no attached terminal.
         match run_inner() {
@@ -637,6 +653,7 @@ mod real {
                 display_mode.w,
                 display_mode.h,
                 settings.video_backend,
+                settings.codec,
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -925,8 +942,8 @@ mod real {
                     )?;
                     canvas.present();
                 }
-                // Offloaded audio is drained by the video pump thread instead (see
-                // `session::pump_ndl_audio`) — nothing to do here.
+                // Offloaded audio is drained by its own dedicated thread instead (see
+                // `session::ndl_audio_pump`) — nothing to do here.
                 if let Some(player) = &mut audio_player {
                     session::pump_audio_once(&connected.client, player);
                 }

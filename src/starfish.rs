@@ -152,12 +152,61 @@ pub struct StarfishVideo {
 // SAFETY: owned exclusively by the video-pump thread; raw pointers managed by Starfish.
 unsafe impl Send for StarfishVideo {}
 
+/// Which shape of `StarfishMediaAPIs_load` payload to send.
+///
+/// `Ss4s` is `mariotaku/ss4s`'s webOS 5 SMP payload — the one this client has always
+/// sent, and the one that **works**, including on a G5 running webOS 10.3.
+///
+/// `Modern` exists as a fallback and a cautionary tale. Starfish was believed dead on
+/// webOS 10.3 (`StarfishMediaAPIs_load` returning `true` with LOADCOMPLETED never
+/// arriving), and the platform's own binaries seemed to explain why: NDL — a front-end to
+/// the same playback framework, and working — builds its payload without `contentsType`,
+/// `WEBRTC`, `bufferingCtrInfo`, `seperatedPTS` or `provider`, none of which appear in
+/// `libplayerAPIs.so.1` either. `Modern` is `Ss4s` minus exactly those keys.
+///
+/// **It has never completed a load, and the premise was false.** Every observed failure
+/// had been an **AV1** session; Starfish had simply never been tried with H.265 on this
+/// TV. With H.265 the untouched `Ss4s` payload loads. The real finding was about the
+/// codec, not the schema — see `docs/NOTES.md`. `Modern` is kept, ordered last, because
+/// a fallback reached only when the proven shape fails is free, and some future model may
+/// want it; it should not be promoted without a device that actually loads with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PayloadShape {
+    /// ss4s's webOS 5 SMP payload — verified on a CX.
+    Ss4s,
+    /// The webOS 10-era subset, derived from the platform's own NDL implementation.
+    Modern,
+}
+
+/// Set once [`StarfishVideo::load`] has exhausted every payload shape without a
+/// completed load, cleared when one succeeds.
+///
+/// This exists for **AV1**, which only NDL cannot decode and only Starfish can (see
+/// `docs/NOTES.md`). The codec is negotiated during the handshake, *before* any decoder
+/// opens, so the AV1 advertisement is a bet on Starfish loading later in the same
+/// connect — and on a TV where Starfish never loads, that bet fails identically every
+/// time, costing the user a doomed connect per attempt. Once this run has proven Starfish
+/// won't load, `session::connect` stops advertising AV1 and `ui::codec_options` stops
+/// offering it, so the next attempt simply negotiates HEVC and works.
+///
+/// Deliberately process-lifetime and **not** persisted: it records what was observed in
+/// this run, on this TV, and a stale "unavailable" written to disk would be exactly the
+/// kind of capability table `docs/NOTES.md` argues against.
+static UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Whether a Starfish load has already failed in this process — see [`UNAVAILABLE`].
+pub fn proven_unavailable() -> bool {
+    UNAVAILABLE.load(Ordering::Relaxed)
+}
+
 impl StarfishVideo {
     /// Load Starfish for a video stream. Creates an exported SDL window for
-    /// punch-through rendering, builds the JSON payload with `pauseAtDecodeTime`,
-    /// `maxFrameRate`, and `WEBRTC` low-latency mode, and waits for LOADCOMPLETED.
+    /// punch-through rendering, builds the load payload (see [`PayloadShape`] — both
+    /// shapes are tried, best guess for this webOS release first), and waits for
+    /// LOADCOMPLETED.
     ///
-    /// Returns `Err` if `libplayerAPIs_C.so` is absent (caller falls back to NDL).
+    /// Returns `Err` if `libplayerAPIs_C.so` is absent, or if no payload shape completed
+    /// a load (caller falls back to NDL).
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         app_id: &str,
@@ -167,6 +216,46 @@ impl StarfishVideo {
         codec: NdlCodec,
         display_w: i32,
         display_h: i32,
+    ) -> Result<Self> {
+        // `Ss4s` first, on every webOS release — see `PayloadShape`. An earlier cut
+        // ordered these by webOS major on the theory that a G5 needed the trimmed
+        // payload; on-device that was simply wrong (`Ss4s` loads H.265 fine on webOS
+        // 10.3, `Modern` has never completed a load anywhere), and putting the losing
+        // shape first cost a 4 s timeout on EVERY Starfish session — during which the
+        // host is already streaming, so frames pile up and the bitrate controller reads
+        // the resulting flushes as congestion. A fallback that is only reached when the
+        // proven shape fails costs nothing in the normal case.
+        let shapes = [PayloadShape::Ss4s, PayloadShape::Modern];
+        let mut last_err = None;
+        for shape in shapes {
+            match Self::load_with(app_id, width, height, fps, codec, display_w, display_h, shape) {
+                Ok(sf) => {
+                    tracing::info!("Starfish loaded with the {shape:?} payload shape");
+                    UNAVAILABLE.store(false, Ordering::Relaxed);
+                    return Ok(sf);
+                }
+                Err(e) => {
+                    tracing::warn!("Starfish {shape:?} payload failed: {e:#}");
+                    last_err = Some(e);
+                }
+            }
+        }
+        UNAVAILABLE.store(true, Ordering::Relaxed);
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Starfish load failed with no attempts")))
+    }
+
+    /// One load attempt with a specific payload shape. Cleans up its own API handle and
+    /// exported window on every failure path, so the caller can simply try the next.
+    #[allow(clippy::too_many_arguments)]
+    fn load_with(
+        app_id: &str,
+        width: i32,
+        height: i32,
+        fps: u32,
+        codec: NdlCodec,
+        display_w: i32,
+        display_h: i32,
+        shape: PayloadShape,
     ) -> Result<Self> {
         let fns = StarfishFns::load_library()?;
 
@@ -192,55 +281,89 @@ impl StarfishVideo {
             NdlCodec::Av1 => "AV1",
         };
 
-        // Load payload — mirrors ss4s MakeLoadPayload for the webOS 5 SMP module.
-        let payload = serde_json::json!({
-            "args": [{
-                "mediaTransportType": "BUFFERSTREAM",
-                "option": {
-                    "appId": app_id,
-                    "externalStreamingInfo": {
-                        "contents": {
-                            "codec": {"video": codec_str},
-                            "esInfo": {
-                                "pauseAtDecodeTime": true,
-                                "ptsToDecode": 0,
-                                "seperatedPTS": true
+        let payload = match shape {
+            // ss4s `MakeLoadPayload` for the webOS 5 SMP module, verbatim.
+            PayloadShape::Ss4s => serde_json::json!({
+                "args": [{
+                    "mediaTransportType": "BUFFERSTREAM",
+                    "option": {
+                        "appId": app_id,
+                        "externalStreamingInfo": {
+                            "contents": {
+                                "codec": {"video": codec_str},
+                                "esInfo": {
+                                    "pauseAtDecodeTime": true,
+                                    "ptsToDecode": 0,
+                                    "seperatedPTS": true
+                                },
+                                "format": "RAW",
+                                "provider": "Chrome"
                             },
-                            "format": "RAW",
-                            "provider": "Chrome"
+                            "streamQualityInfo": true,
+                            "audioSync": true,
+                            "streamQualityInfoCorruptedFrame": true,
+                            "streamQualityInfoNonFlushable": true,
+                            "restartStreaming": false,
+                            "bufferingCtrInfo": {
+                                "bufferMaxLevel": 0,
+                                "bufferMinLevel": 0,
+                                "preBufferByte": 0,
+                                "qBufferLevelAudio": 0,
+                                "qBufferLevelVideo": 0,
+                                "srcBufferLevelAudio": {"minimum": 1, "maximum": 32768},
+                                "srcBufferLevelVideo": {"minimum": 1, "maximum": 1048576}
+                            }
                         },
-                        "streamQualityInfo": true,
-                        "audioSync": true,
-                        "streamQualityInfoCorruptedFrame": true,
-                        "streamQualityInfoNonFlushable": true,
-                        "restartStreaming": false,
-                        "bufferingCtrInfo": {
-                            "bufferMaxLevel": 0,
-                            "bufferMinLevel": 0,
-                            "preBufferByte": 0,
-                            "qBufferLevelAudio": 0,
-                            "qBufferLevelVideo": 0,
-                            "srcBufferLevelAudio": {"minimum": 1, "maximum": 32768},
-                            "srcBufferLevelVideo": {"minimum": 1, "maximum": 1048576}
-                        }
-                    },
-                    "transmission": {"contentsType": "WEBRTC"},
-                    "needAudio": false,
-                    "queryPosition": false,
-                    "lowDelayMode": true,
-                    "adaptiveStreaming": {
-                        "audioOnly": false,
-                        "maxWidth": width,
-                        "maxHeight": height,
-                        "maxFrameRate": f64::from(fps)
-                    },
-                    "windowId": window_id_str
-                }
-            }]
-        })
+                        "transmission": {"contentsType": "WEBRTC"},
+                        "needAudio": false,
+                        "queryPosition": false,
+                        "lowDelayMode": true,
+                        "adaptiveStreaming": {
+                            "audioOnly": false,
+                            "maxWidth": width,
+                            "maxHeight": height,
+                            "maxFrameRate": f64::from(fps)
+                        },
+                        "windowId": window_id_str
+                    }
+                }]
+            }),
+            // The same request with every key this platform's own binaries show no
+            // knowledge of removed — see `PayloadShape`. `needAudio` is deliberately
+            // KEPT despite not appearing there: this client decodes audio itself, and a
+            // pipeline that waits for an audio stream that never comes is precisely the
+            // hang being diagnosed, so the risk is asymmetric.
+            PayloadShape::Modern => serde_json::json!({
+                "args": [{
+                    "mediaTransportType": "BUFFERSTREAM",
+                    "option": {
+                        "appId": app_id,
+                        "externalStreamingInfo": {
+                            "contents": {
+                                "codec": {"video": codec_str},
+                                "esInfo": {
+                                    "pauseAtDecodeTime": true,
+                                    "ptsToDecode": 0
+                                },
+                                "format": "RAW"
+                            }
+                        },
+                        "needAudio": false,
+                        "lowDelayMode": true,
+                        "adaptiveStreaming": {
+                            "audioOnly": false,
+                            "maxWidth": width,
+                            "maxHeight": height,
+                            "maxFrameRate": f64::from(fps)
+                        },
+                        "windowId": window_id_str
+                    }
+                }]
+            }),
+        }
         .to_string();
 
-        tracing::debug!("Starfish load payload: {}", &payload[..payload.len().min(512)]);
+        tracing::info!("Starfish load payload ({shape:?}): {payload}");
 
         let payload_cstr = CString::new(payload)?;
 
@@ -262,8 +385,11 @@ impl StarfishVideo {
             bail!("StarfishMediaAPIs_load returned false");
         }
 
-        // Spin-wait for LOADCOMPLETED (cap at 5s).
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Spin-wait for LOADCOMPLETED. 4s rather than 5: two payload shapes are now
+        // tried in sequence, and a load that is going to complete does so in well under
+        // a second — the timeout only bounds how long a *wrong* shape costs, and that
+        // cost is now paid twice before falling back to NDL.
+        let deadline = Instant::now() + Duration::from_secs(4);
         while !load_state.loaded.load(Ordering::Acquire) {
             if Instant::now() > deadline {
                 unsafe {

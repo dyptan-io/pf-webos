@@ -36,6 +36,42 @@ pub struct DeviceInfo {
 const OS_INFO: &str = "/var/run/nyx/os_info.json";
 const DEVICE_INFO: &str = "/var/run/nyx/device_info.json";
 
+/// The platform's real hardware video-decode element — both NDL and Starfish drive it
+/// underneath (see docs/NOTES.md "The two backends are front-ends to the same
+/// pipeline"). Its caps template strings declare exactly what the silicon decodes,
+/// which makes it the authoritative per-model answer to "does this TV do AV1" without
+/// loading a decoder to find out. World-readable under the SAM jail (`-rwxr-xr-x`,
+/// confirmed on a G5).
+const LX_VIDEODEC_PLUGIN: &str = "/usr/lib/gstreamer-1.0/libgstlxvideodec.so";
+
+/// Whether the platform decoder *declares* AV1 (`video/x-av1` in its `GStreamer` caps).
+///
+/// **Declaring it is not the same as being able to stream it, and on the one device
+/// tested it is not enough.** A G5 whose `libgstlxvideodec.so` advertises `video/x-av1`
+/// cannot actually run an AV1 session: through Starfish the load either times out or
+/// completes and then presents a black screen (and twice took the process down with it),
+/// and NDL's implementation has no AV1 at all. So this answers "does the silicon claim
+/// AV1", which turned out to be a much weaker statement than "can this TV play an AV1
+/// stream" — the caller must additionally require
+/// [`crate::store::dev_override_enable_av1`], and the negotiation is opt-in for that
+/// reason. Kept because it is still a necessary condition and a useful diagnostic.
+///
+/// Fails closed: a missing/unreadable plugin reads as "no AV1". Memoized — the file is
+/// ~400 KB and the answer can't change while the process runs.
+pub fn supports_av1() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let needle = b"video/x-av1";
+        let found = std::fs::read(LX_VIDEODEC_PLUGIN)
+            .is_ok_and(|data| data.windows(needle.len()).any(|w| w == needle));
+        tracing::info!(
+            "device: platform decoder {} AV1 ({LX_VIDEODEC_PLUGIN})",
+            if found { "declares" } else { "does not declare" },
+        );
+        found
+    })
+}
+
 /// Pulls `"key": "value"` out of a flat JSON object without a parser — these two files
 /// are flat and machine-generated, and this avoids handing `serde_json` a path that a
 /// hostile-ish filesystem could make large.

@@ -213,6 +213,21 @@ pub struct NdlVideo {
     load_instant: Instant,
     /// Set when the load that succeeded was the audio-enabled one — see [`Self::load`].
     audio_offloaded: bool,
+    /// Serializes every `NDL_Direct*` call in this session.
+    ///
+    /// NDL `DirectMedia` is a **singleton C API** — `NDL_DirectVideoPlay` and
+    /// `NDL_DirectAudioPlay` take no context handle, so there is one implicit pipeline
+    /// per process — and nothing in the SDK header documents it as thread-safe. Until
+    /// the audio-offload drain moved to its own thread (`session::ndl_audio_pump`) both
+    /// planes were fed from the video pump thread, so that question never arose; now
+    /// two threads call in, and "undocumented" has to be read as "not safe".
+    ///
+    /// Cheap by construction: an uncontended lock is a couple of atomics against a
+    /// `play()` that decodes *and* presents a frame, and the only waiter is a 5 ms audio
+    /// packet against a feed that finishes in ~1 ms (`FEED_BACKPRESSURE_WARN` treats
+    /// 20 ms as pathological). Far cheaper than the ≤500 ms head-of-line stall the
+    /// dedicated audio thread exists to remove.
+    ffi: std::sync::Mutex<()>,
 }
 
 impl NdlVideo {
@@ -256,6 +271,7 @@ impl NdlVideo {
                 return Ok(Self {
                     load_instant: Instant::now(),
                     audio_offloaded: true,
+                    ffi: std::sync::Mutex::new(()),
                 });
             }
             // Fall through to a video-only load rather than failing the session: audio
@@ -288,6 +304,7 @@ impl NdlVideo {
         Ok(Self {
             load_instant: Instant::now(),
             audio_offloaded: false,
+            ffi: std::sync::Mutex::new(()),
         })
     }
 
@@ -305,6 +322,7 @@ impl NdlVideo {
     /// `audio::MAX_QUEUED_LAG_MS`).
     pub fn play_audio(&self, packet: &[u8]) -> Result<()> {
         let pts_ms = self.load_instant.elapsed().as_millis() as c_longlong;
+        let _ffi = self.ffi.lock().expect("NDL FFI mutex poisoned");
         // SAFETY: NDL reads `size` bytes synchronously and does not retain the pointer.
         let ret = unsafe {
             NDL_DirectAudioPlay(packet.as_ptr() as *mut c_void, packet.len() as c_uint, pts_ms)
@@ -320,6 +338,7 @@ impl NdlVideo {
     /// PTS is derived from `load_instant` instead (see the [`NdlVideo`] doc comment).
     pub fn play(&self, au: &[u8]) -> Result<()> {
         let pts_ms = self.load_instant.elapsed().as_millis() as c_longlong;
+        let _ffi = self.ffi.lock().expect("NDL FFI mutex poisoned");
         // SAFETY: NDL reads `size` bytes from `buffer` synchronously and does not
         // retain the pointer.
         let ret = unsafe {
@@ -375,6 +394,7 @@ impl NdlVideo {
             matrix_coeffs: c_int::from(color.matrix),
             reserved: [0; 32],
         };
+        let _ffi = self.ffi.lock().expect("NDL FFI mutex poisoned");
         // SAFETY: passed by value; no pointers or aliasing.
         let ret = unsafe { NDL_DirectVideoSetHDRInfo(info) };
         if ret != 0 {
@@ -398,6 +418,7 @@ impl NdlVideo {
     /// query can't be mistaken for an empty queue.
     pub fn render_buffer_length(&self) -> Option<i32> {
         let mut length: c_int = 0;
+        let _ffi = self.ffi.lock().expect("NDL FFI mutex poisoned");
         // SAFETY: `length` is a valid, writable `c_int` for the duration of the call.
         let ret = unsafe { NDL_DirectVideoGetRenderBufferLength(&mut length) };
         (ret == 0).then_some(length)
@@ -423,6 +444,7 @@ impl NdlVideo {
     }
 
     pub fn flush(&self) -> Result<()> {
+        let _ffi = self.ffi.lock().expect("NDL FFI mutex poisoned");
         // SAFETY: no arguments.
         let ret = unsafe { NDL_DirectVideoFlushRenderBuffer() };
         if ret != 0 {

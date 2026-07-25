@@ -2,7 +2,7 @@
 //!
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 use super::*;
-use crate::store::{Settings, VideoBackend};
+use crate::store::{CodecPref, Settings, VideoBackend};
 
 /// Resolution presets — the three the user asked for, matching `pf-console-ui`'s
 /// existing 1080p/1440p/4K entries (a subset of its full list; no 720p/800p here).
@@ -38,13 +38,17 @@ pub const ROW_FRAMERATE: usize = 1;
 pub const ROW_BITRATE: usize = 2;
 pub const ROW_HDR: usize = 3;
 pub const ROW_VIDEO_BACKEND: usize = 4;
-pub const ROW_STATS_OVERLAY: usize = 5;
-pub const ROW_AUDIO: usize = 6;
+/// Directly below Video backend, deliberately: the AV1 option's availability depends
+/// on that row's value (see `codec_options`), and adjacency is what makes the
+/// dependency discoverable without explaining it in copy.
+pub const ROW_CODEC: usize = 5;
+pub const ROW_STATS_OVERLAY: usize = 6;
+pub const ROW_AUDIO: usize = 7;
 /// Not a setting — a link to `Screen::About`. It lives in this list (rather than as
 /// separate chrome) because that is where every other punktfunk client puts the
 /// version + licences, and a `RowKind::Action` row costs nothing extra to render.
-pub const ROW_ABOUT: usize = 7;
-pub const SETTINGS_ROW_COUNT: usize = 8;
+pub const ROW_ABOUT: usize = 8;
+pub const SETTINGS_ROW_COUNT: usize = 9;
 
 /// Cycles `current` to the next/previous value in a preset slice, wrapping.
 pub fn cycle<T: Copy + PartialEq>(options: &[T], current: T, forward: bool) -> T {
@@ -132,6 +136,21 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             danger: false,
         },
         FocusRow {
+            icon: ICON_MONITOR,
+            label: "Codec".into(),
+            // A persisted choice that is no longer offered (AV1 after Starfish proved it
+            // won't load this run) says so, rather than displaying a codec the session
+            // will silently not use — `session::connect` clamps it back to Automatic.
+            value: if codec_options(settings).contains(&settings.codec) {
+                codec_label(settings.codec).into()
+            } else {
+                format!("{} (unavailable)", codec_label(settings.codec))
+            },
+            kind: RowKind::Dropdown,
+            fraction: 0.0,
+            danger: false,
+        },
+        FocusRow {
             icon: ICON_SUN,
             label: "Stats overlay".into(),
             value: if settings.stats_overlay {
@@ -175,6 +194,36 @@ pub fn wake_rows(auto_send: bool) -> Vec<FocusRow> {
     }]
 }
 
+/// The codec choices offered right now — which is why this is a function of the live
+/// `Settings`, not a const: AV1 appears only when the Starfish backend is selected
+/// (NDL's impl can't decode it — docs/NOTES.md) *and* this TV's platform decoder
+/// actually declares AV1 (`device::supports_av1`, probed once per run). Everything
+/// downstream (dropdown, Left/Right cycling, current-index lookup) derives from this
+/// one list, so an unavailable AV1 simply doesn't exist as an option anywhere.
+pub fn codec_options(settings: &Settings) -> Vec<CodecPref> {
+    let mut options = vec![CodecPref::Auto, CodecPref::H264, CodecPref::Hevc];
+    // Four conditions, and AV1 has never satisfied the last one on real hardware — see
+    // `store::dev_override_enable_av1`. The other three stay because each rules out a
+    // distinct way of handing a decoder something it can't present.
+    if crate::store::dev_override_enable_av1()
+        && settings.video_backend == VideoBackend::Starfish
+        && crate::device::supports_av1()
+        && !crate::starfish::proven_unavailable()
+    {
+        options.push(CodecPref::Av1);
+    }
+    options
+}
+
+pub fn codec_label(pref: CodecPref) -> &'static str {
+    match pref {
+        CodecPref::Auto => "Automatic",
+        CodecPref::H264 => "H.264",
+        CodecPref::Hevc => "HEVC",
+        CodecPref::Av1 => "AV1",
+    }
+}
+
 /// Channel counts punktfunk negotiates, and how they read on screen.
 pub const AUDIO_CHANNELS: [(u8, &str); 3] = [(2, "Stereo"), (6, "5.1 surround"), (8, "7.1 surround")];
 
@@ -185,12 +234,15 @@ fn audio_label(channels: u8) -> String {
         .map_or_else(|| format!("{channels} channels"), |(_, s)| (*s).to_string())
 }
 
-/// The option labels for a dropdown row (`Resolution`/`Frame rate`/`Video backend`/`Audio`).
-pub fn dropdown_options(row_index: usize) -> Vec<String> {
+/// The option labels for a dropdown row (`Resolution`/`Frame rate`/`Video backend`/
+/// `Codec`/`Audio`). Takes the live `Settings` because the Codec row's list is
+/// state-dependent (see `codec_options`).
+pub fn dropdown_options(settings: &Settings, row_index: usize) -> Vec<String> {
     match row_index {
         ROW_RESOLUTION => RESOLUTIONS.iter().map(|(w, h, _)| resolution_label(*w, *h)).collect(),
         ROW_FRAMERATE => REFRESH_RATES.iter().map(|hz| format!("{hz} Hz")).collect(),
         ROW_VIDEO_BACKEND => vec!["NDL".into(), "Starfish".into()],
+        ROW_CODEC => codec_options(settings).iter().map(|&p| codec_label(p).to_string()).collect(),
         ROW_AUDIO => AUDIO_CHANNELS.iter().map(|(_, s)| (*s).to_string()).collect(),
         _ => Vec::new(),
     }
@@ -211,6 +263,10 @@ pub fn dropdown_current_index(settings: &Settings, row_index: usize) -> usize {
             VideoBackend::Ndl => 0,
             VideoBackend::Starfish => 1,
         },
+        ROW_CODEC => codec_options(settings)
+            .iter()
+            .position(|&p| p == settings.codec)
+            .unwrap_or(0),
         ROW_AUDIO => AUDIO_CHANNELS
             .iter()
             .position(|(c, _)| *c == settings.audio_channels)
@@ -237,6 +293,17 @@ pub fn apply_dropdown_choice(settings: &mut Settings, row_index: usize, choice_i
                 1 => VideoBackend::Starfish,
                 _ => VideoBackend::Ndl,
             };
+            // AV1 only exists as a choice under Starfish (see `codec_options`) —
+            // switching away must take the stranded preference with it, or it would
+            // silently ride along invisible (no row shows it, connect would clamp it).
+            if settings.video_backend != VideoBackend::Starfish && settings.codec == CodecPref::Av1 {
+                settings.codec = CodecPref::Auto;
+            }
+        }
+        ROW_CODEC => {
+            if let Some(&pref) = codec_options(settings).get(choice_index) {
+                settings.codec = pref;
+            }
         }
         ROW_AUDIO => {
             if let Some((channels, _)) = AUDIO_CHANNELS.get(choice_index) {
@@ -285,6 +352,12 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
             let idx = dropdown_current_index(settings, ROW_VIDEO_BACKEND);
             let next = cycle_index(idx, 2, forward);
             apply_dropdown_choice(settings, ROW_VIDEO_BACKEND, next);
+            true
+        }
+        ROW_CODEC => {
+            let idx = dropdown_current_index(settings, ROW_CODEC);
+            let next = cycle_index(idx, codec_options(settings).len(), forward);
+            apply_dropdown_choice(settings, ROW_CODEC, next);
             true
         }
         ROW_STATS_OVERLAY => {

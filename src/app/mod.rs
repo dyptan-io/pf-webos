@@ -193,9 +193,10 @@ pub(crate) struct PendingLaunch {
     pub(crate) rx: std::sync::mpsc::Receiver<crate::library::GamesLoaded>,
 }
 
-/// An open dropdown on the settings modal (Resolution/Frame rate) — `row` is the
-/// settings row index that opened it (`ui::ROW_RESOLUTION`/`ui::ROW_FRAMERATE`),
-/// `focused` is the highlighted option within `ui::dropdown_options(row)`.
+/// An open dropdown on the settings modal — `row` is the settings row index that
+/// opened it (`ui::ROW_RESOLUTION`/`ui::ROW_FRAMERATE`/`ui::ROW_VIDEO_BACKEND`/
+/// `ui::ROW_CODEC`/`ui::ROW_AUDIO`), `focused` is the highlighted option within
+/// `ui::dropdown_options(settings, row)`.
 pub struct DropdownState {
     pub row: usize,
     pub focused: usize,
@@ -1446,7 +1447,7 @@ impl App {
             let stale = !matches!(&self.dropdown_focus_tile, Some((k, _)) if *k == key);
             if stale {
                 let (_, content) = Self::settings_layout(screen_w, screen_h);
-                let options = ui::dropdown_options(dd.row);
+                let options = ui::dropdown_options(&self.settings, dd.row);
                 let option = options.get(dd.focused).map_or("", String::as_str);
                 let tile = ui::render_dropdown_option_tile(text_cache, fonts.value, option, content.width())?;
                 self.dropdown_focus_tile = Some((key, tile));

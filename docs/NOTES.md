@@ -525,9 +525,159 @@ materially less bitrate for the same quality is therefore the largest remaining 
 lever on this device. It depends on the *host* being able to encode AV1, which is a
 separate question about that machine's GPU.
 
-## Opus offload to NDL + runtime device capability (2026-07-25)
+### Codec picker (2026-07-25)
 
-**Audio can now be decoded by the TV instead of by us**, when the device will take it.
+Settings now has a **Codec** row (Automatic / H.264 / HEVC / AV1). Three things worth
+keeping straight:
+
+- **It is a preference, not a demand.** The wire has both an advertised decode *set* and a
+  soft `preferred_codec`; `resolve_codec` honours the preference only when the host's
+  encoder can produce it, else falls back down its HEVC > AV1 > H.264 ladder. So "H.264"
+  against an HEVC-only host still yields a session (HEVC), never a refusal. H.264 and HEVC
+  were always in the advertised set — the picker is what finally makes the preference
+  reachable. The `connected:` log line carries `offered=`/`preferred=` beside the resolved
+  codec so a "why didn't I get X" report answers itself.
+- **AV1 is triple-gated, and opt-in only**: the row offers it (and `session::connect`
+  advertises it) only when (1) the user explicitly picked it, (2) the Starfish backend is
+  selected — NDL's impl decodes no AV1 despite `NDL_VIDEO_TYPE_AV1` existing in the header
+  (above) — and (3) `device::supports_av1()`: the platform decode element
+  (`/usr/lib/gstreamer-1.0/libgstlxvideodec.so`, world-readable under the SAM jail) contains
+  the `video/x-av1` caps string. That last check is the same inspection that established
+  AV1 support in the first place, done at runtime; it fails closed, and it's what keeps the
+  option off a CX-era panel whose silicon predates AV1. Never advertised un-picked, so the
+  host's precedence ladder can't auto-select a path no one has verified on this panel.
+- **Switching the backend away from Starfish clears a stranded AV1 preference** (in
+  `apply_dropdown_choice`), and `session::connect` clamps it again anyway — the UI rule
+  keeps state honest, the connect clamp covers a hand-edited/stale `settings.json`.
+
+**On-device 2026-07-25, first AV1 attempt — two findings, one of them a freeze.**
+
+- **NDL accepts an AV1 load and then silently presents nothing.** `NDL_DirectMediaLoad`
+  with `kind = 4` returns **success** (`NDL_VIDEO_TYPE_AV1` is in the v2 header even though
+  `libNDL_directmedia_impl.so.1` implements only H264/H265/VP9), every
+  `NDL_DirectVideoPlay` returns success, the frame counter climbs, `frames_dropped` stays
+  0, feed times look normal — and the panel holds **frame one** forever. The stats overlay
+  says a healthy stream; the picture is frozen. This is the video-plane twin of the Opus
+  offload's known limit ("a device that accepts the config and then plays nothing would be
+  silent").
+- **The gate has to live at the decoder, not only in the UI.** The picker offers AV1 only
+  under the Starfish backend — but *selecting* Starfish does not mean Starfish **loads**,
+  and the pre-existing `Starfish load failed → fall back to NDL` path then handed an
+  already-negotiated AV1 stream to NDL. The codec is negotiated during the handshake,
+  which happens **before** any decoder is opened, so by then it is too late to choose
+  differently. `session::ensure_ndl_can_decode` now refuses that combination outright and
+  returns to the menu with an actionable sentence.
+
+### Starfish works on this G5 — it was AV1 that never loaded (corrected 2026-07-25)
+
+**An earlier version of this section claimed Starfish was dead on webOS 10.3. That was
+wrong, and the way it was wrong is worth keeping.** `StarfishMediaAPIs_load` did return
+`true` with LOADCOMPLETED never arriving, every time, across many attempts — but *every
+one of those attempts was an AV1 session*, because AV1 was the codec selected while the
+new picker was being tested. Starfish had never once been tried with H.265 on this TV. It
+loads H.265 fine, with the **untouched ss4s payload**.
+
+The false conclusion then produced a false fix: a `Modern` payload shape was derived from
+the platform binaries (see below) and tried first on webOS ≥ 10. It has never completed a
+load anywhere, while the `Ss4s` shape it was meant to replace loads immediately — and
+ordering it first cost a 4 s timeout on *every* Starfish session, during which the host is
+already streaming, so frames pile up and the bitrate controller reads the resulting
+flushes as congestion. `Ss4s` is now tried first on every release, with `Modern` kept only
+as a never-yet-successful fallback.
+
+Two lessons, both cheap to state and expensive to relearn: a failure mode reproduced "every
+time" is only evidence about the configuration it was reproduced in — the codec was the
+variable nobody was holding still; and derived-from-strings evidence (below) reads as far
+more conclusive than it is.
+
+Cause, as far as the evidence goes: the load payload is ss4s's **webOS 5** shape, and this
+platform does not know parts of it.
+
+The useful source turned out to be **`libNDL_directmedia_impl.so.1`** — NDL is a front-end
+to the same playback framework (above), and NDL *works* on this TV, so the payload it
+builds internally is a known-good webOS 10.3 reference. Its strings are:
+`externalStreamingInfo`, `mediaTransportType`, `esInfo`, `pauseAtDecodeTime`,
+`ptsToDecode`, `lowDelayMode`, `codec`, `windowId`, `adaptiveStreaming`, `appId`,
+`format`, `maxWidth`/`maxHeight`/`maxFrameRate`, `option`.
+
+What we send that appears in **neither** that library nor `libplayerAPIs.so.1`:
+`transmission` / `contentsType` / `"WEBRTC"`, `bufferingCtrInfo`, `seperatedPTS`,
+`provider` / `"Chrome"`, `streamQualityInfo*`, `audioSync`, `restartStreaming`. Prime
+suspect is **`transmission.contentsType = "WEBRTC"`** — an unrecognized mode the pipeline
+may sit in forever, which is exactly the observed symptom. (`BUFFERSTREAM` *is* in
+`libplayerAPIs.so.1`, so `mediaTransportType` is fine. And note `pauseAtDecodeTime` IS
+present in the NDL impl though absent from `libplayerAPIs.so.1` — proof that "absent from
+one binary" was only ever suggestive, as suspected.)
+
+`starfish.rs` therefore has **two payload shapes** (`PayloadShape::Ss4s` /
+`::Modern`, the latter being the ss4s payload minus every key above), and
+`StarfishVideo::load` **tries both** — webOS ≥ 10 gets `Modern` first, older gets `Ss4s`
+first, and either falls through to the other. So the webOS major only orders the attempts;
+it never decides the outcome, keeping the probe-by-attempt discipline while avoiding a
+guaranteed timeout on a correctly-guessed device. The LOADCOMPLETED wait dropped 5s → 4s
+since it is now potentially paid twice. The full payload is logged at INFO per attempt.
+
+**That reasoning was tested and rejected**: `Modern` never loaded, `Ss4s` did. The string
+evidence was real — those keys genuinely are absent from both libraries — but absent keys
+were apparently ignored rather than fatal, so the inference "absent ⇒ rejected ⇒ hang" did
+not hold. Kept here because the analysis is sound method against the wrong hypothesis, and
+because the key inventory is useful if a future release really does change the schema.
+
+(`libplayerAPIs_C.so` in the app's `lib/` is this repo's own shim from
+`src/starfish_c_shim.cpp` — not a platform library, and not the problem.)
+
+### AV1: advertised by the silicon, unusable in practice — now opt-in
+
+The G5's `libgstlxvideodec.so` advertises `video/x-av1` and the host encodes AV1 happily
+(it resolved `codec=4` when asked). Actually playing it failed **three different ways**
+across a handful of attempts: the Starfish load timed out; or it loaded and presented a
+**black screen with frames flowing**; or the process **died outright**. NDL cannot decode
+AV1 at all and accepts it silently (above).
+
+So `device::supports_av1()` — a scan for the decoder's caps string — answers "does the
+silicon claim AV1", which is a much weaker statement than "can this TV play an AV1
+stream", and is **not sufficient to offer the option**. AV1 now additionally requires
+`store::dev_override_enable_av1()` (`$HOME/av1.conf` = `1`), so it is off by default in
+both the picker and the negotiation, alongside three conditions that each rule out a
+distinct way of handing a decoder something it can't present: the Starfish backend
+selected, the decoder declaring AV1, and Starfish not having already failed to load this
+run (`starfish::proven_unavailable()`, process-lifetime, never persisted). The Settings
+row labels a persisted-but-unoffered choice `AV1 (unavailable)` rather than showing a
+codec the session won't use.
+
+The whole negotiation path stays wired, so AV1 is one file away from being testable on a
+model that might do better. It should become a real setting when some TV plays it.
+
+## Opus offload to NDL — OFF BY DEFAULT: it freezes video on webOS 10.3 (2026-07-25)
+
+> **Read this before re-enabling anything below.** Handing NDL the Opus stream stops the
+> **video** plane on an LG G5 (webOS 10.3): the audio-enabled `NDL_DirectMediaLoad`
+> returns success, every `NDL_DirectVideoPlay` returns success, the pump feeds a steady
+> 120 fps with `frames_dropped = 0` — and the panel holds the **first frame** forever.
+> Reproduced three times; disabling the offload and changing nothing else fixes it
+> immediately, confirmed on-device. The offload is now **opt-in** via
+> `$HOME/ndl-audio-offload.conf` = `1` (`store::dev_override_enable_ndl_audio_offload`);
+> the default is video-only NDL + software Opus.
+>
+> Three things worth carrying forward:
+> - **The failure mode is worse than this feature's own docs anticipated.** They warned a
+>   device might accept the config and play no *audio* (point 2 below). What actually
+>   happens is that it also takes *video* down — and since `load` succeeds, the
+>   probe-by-attempt detection has nothing to catch. There is currently **no runtime test**
+>   that distinguishes a TV that offloads audio from one that dies quietly doing it.
+> - **`backlog` is what identified it.** A healthy session shows the render buffer
+>   occasionally at 1-2 frames and the host delivering ~76 fps; the broken one showed
+>   `backlog` pinned at exactly 0 while accepting a rock-steady 120 fps — frames going in
+>   and being discarded, not queued. Neither the frame counter, the drop counter, nor the
+>   feed time distinguishes those two, which is why the stats overlay read perfectly
+>   healthy over a frozen picture. This is the one signal that separates them; the
+>   heartbeat logs it at INFO for that reason.
+> - **It has never been confirmed working on any device**, including the CX it was written
+>   against. Keep it opt-in until some model is verified end-to-end, then promote it.
+
+Everything below documents the mechanism as built, and stays accurate for the opt-in path.
+
+**Audio can be decoded by the TV instead of by us**, when the device will take it.
 `NDL_DIRECTMEDIA_DATA_INFO_T`'s audio union has always had an Opus arm; this client zeroed
 it (tag 0 = no audio) and ran `opus::MSDecoder` + an SDL2 `AudioQueue` instead. On a 2-core
 1.4 GHz G5 that software decode is a more meaningful share of the budget than it was on the
@@ -554,12 +704,20 @@ Three constraints shape the implementation, and all three are load-bearing:
    documents nothing further. That is the most likely reason for a device to reject the
    config — which the fallback above exists to absorb.
 
-Two things fall out of it beyond CPU. The offloaded path is drained by the **video pump
-thread**, not the main loop: the main-thread rule exists only because `sdl2::audio::AudioQueue`
-is `!Send`, and there is no `AudioQueue` on this path — so audio keeps flowing across a
-main-loop stall instead of hitching with it. And feeding both planes off the same
-`load_instant` clock lets NDL sync them itself, where the software path can only resnap its
-own queue after the fact (`audio::MAX_QUEUED_LAG_MS`).
+Two things fall out of it beyond CPU. The offloaded path is drained by a **dedicated audio
+thread** (`session::ndl_audio_pump`; it first lived on the video pump thread — see the
+2026-07-25 smoothness pass below for why that was a defect): the main-thread rule exists
+only because `sdl2::audio::AudioQueue` is `!Send`, and there is no `AudioQueue` on this
+path — so audio keeps flowing across a main-loop stall instead of hitching with it. And
+feeding both planes off the same `load_instant` clock lets NDL sync them itself, where the
+software path can only resnap its own queue after the fact (`audio::MAX_QUEUED_LAG_MS`).
+
+Because two threads then drive one **singleton** C API (`NDL_DirectVideoPlay` /
+`NDL_DirectAudioPlay` take no context handle, and nothing in the header claims
+thread-safety), every `NDL_Direct*` call is serialized behind `NdlVideo::ffi`. That mutex
+is *not* what fixed the freeze above — the freeze reproduced with it in place — but
+"undocumented" has to be read as "not safe", and an uncontended lock is nothing against a
+call that decodes and presents a frame.
 
 ### `src/device.rs`
 
@@ -654,6 +812,55 @@ is deleted rather than left to poison that card for the life of the install.
 
 Rough effect at 365 titles: retained card tiles fall from ~366 to ~40, and decoded covers
 from 365 to the same window — tens of MB rather than hundreds.
+
+## Streaming smoothness pass (2026-07-25)
+
+Three changes out of a full audit of the latency path; each is small but load-bearing.
+
+- **Offloaded audio has its own drain thread** (`session::ndl_audio_pump`). Its first home
+  was the video pump loop, *after* a `next_frame` call that blocks up to 500 ms — so a
+  video drought (host encoder stall, loss hold) chopped audio into ≤500 ms stalls with
+  packets already waiting, and normal-flow packets drained in per-video-frame clumps that
+  all took the same drain-time PTS. Core's `next_audio` docs ask for a dedicated thread
+  outright ("packets arrive every 5 ms"; pull methods are one-thread-per-plane safe).
+  Teardown is the subtle part: `NdlVideo::drop` unloads NDL process-globally, so the
+  handle is now `Arc<NdlVideo>` shared between the two threads — the unload runs at last
+  `Arc` drop, i.e. never before both threads have exited, with no join-ordering to get
+  wrong.
+- **The ABR decode signal now sees the render backlog.** `report_decode_us` fed core's
+  controller the NDL `play()` duration, but NDL's play is decode-and-present in one
+  opaque call — submission time, not decode state. A decoder quietly falling behind
+  buffers internally while the feed stays fast, leaving `abr::DECODE_RISE_US` (built
+  precisely for "decoder saturates before the link") blind here. The reported figure is
+  now `feed_time + render_backlog × frame_period`, with the backlog polled every 250 ms
+  (three samples per ABR report window — per-frame polling would be assuming an NDL call
+  is cheap, the exact mistake warned about above) and cached between polls.
+- **Renice outcomes are now one summarizing info line each** (hot threads and vendor
+  decode threads: "N boosted, M failed"). The open worry was that `setpriority(-10)` needs
+  `CAP_SYS_NICE`, which a plain Dev-Mode SAM jail plausibly withholds — in which case the
+  renice wins recorded in these notes (measured on a *rooted* CX) would not transfer to a
+  Dev-Mode install at all. **Measured 2026-07-25 on the Dev-Mode G5: they do apply** —
+  `hot-thread renice: 2 boosted, 0 failed` and `vendor decode threads: 4 found, 4
+  boosted`. So no unprivileged fallback is needed, and the notes' renice findings stand on
+  a non-rooted install. Keep the lines: this is exactly the question a contention report
+  from an unknown TV has to answer first.
+
+**A "decoder loads after the handshake, so frames pile up" finding was withdrawn after
+measuring a healthy session.** In the frozen sessions the ABR controller walked the
+encoder from 20 Mbps to 6.86 Mbps before a frame was ever decoded — three jump-to-live
+flushes, each read as severe congestion — which looked like a startup-ordering defect
+worth fixing (the backend loads after the handshake, so `video_pump` can't drain until it
+is open; 5.5 s in that session because of the Starfish timeout). **It does not reproduce
+once the stream actually works**: a healthy 62 s session showed `dropped=0` throughout, no
+jump-to-live, no ABR backoff at all, and the rate simply stayed at the negotiated 20 Mbps
+with a 182 Mbps climb ceiling available. The pile-up was a symptom of the freeze (and of
+Starfish's 4-5 s timeout), not an independent bug. What remains is one brief loss/recovery
+~1 s in, caused by core's own 2 Gbps startup capacity probe saturating the link — the
+price of measuring the ceiling, and cheap at one recovery.
+
+Worth keeping as method: the frozen-session logs supported a confident, wrong diagnosis.
+Only a comparison against a known-good session separated "caused by" from "co-occurring
+with".
 
 ## Known gaps / not yet done
 

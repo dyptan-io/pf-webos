@@ -3,8 +3,10 @@
 //! Video runs on a dedicated thread ([`video_pump`]) behind a [`VideoPlayer`] abstraction
 //! over the NDL and Starfish backends.
 //!
-//! Audio is drained from the main thread ([`pump_audio_once`]) because
-//! `sdl2::audio::AudioQueue` is `!Send`.
+//! Audio takes one of two paths: software-decoded audio is drained from the main
+//! thread ([`pump_audio_once`]) because `sdl2::audio::AudioQueue` is `!Send`; the
+//! NDL-offloaded path has its own drain thread ([`ndl_audio_pump`]), decoupled from
+//! both the main loop and the video pump.
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,14 +21,19 @@ use punktfunk_core::quic;
 
 use crate::ndl::{NdlCodec, NdlVideo};
 use crate::starfish::StarfishVideo;
-use crate::store::VideoBackend;
+use crate::store::{CodecPref, VideoBackend};
 
 // ─────────────────────────────────────────────────────────── VideoPlayer ──
 
 /// Unified video-decode backend, selected at connect time via [`VideoBackend`].
+///
+/// The NDL arm is an `Arc` because the audio-offload path shares the handle with a
+/// dedicated audio-drain thread ([`ndl_audio_pump`]): `NdlVideo::drop` unloads NDL
+/// process-globally, so the unload must not happen until *both* threads are done with
+/// it — which is exactly what last-`Arc`-drop gives, with no ordering to get wrong.
 enum VideoPlayer {
     Starfish(StarfishVideo),
-    Ndl(NdlVideo),
+    Ndl(Arc<NdlVideo>),
 }
 
 impl VideoPlayer {
@@ -64,11 +71,12 @@ impl VideoPlayer {
         }
     }
 
-    /// Hands one raw Opus packet to the backend. Only called when `audio_offloaded`.
-    fn play_audio(&self, packet: &[u8]) -> anyhow::Result<()> {
+    /// The shared NDL handle when it took the Opus stream — what the dedicated
+    /// audio-drain thread holds. `None` on Starfish or a video-only NDL load.
+    fn ndl_audio_handle(&self) -> Option<Arc<NdlVideo>> {
         match self {
-            Self::Ndl(ndl) => ndl.play_audio(packet),
-            Self::Starfish(_) => Ok(()),
+            Self::Ndl(ndl) if ndl.audio_offloaded() => Some(ndl.clone()),
+            _ => None,
         }
     }
 
@@ -98,6 +106,9 @@ pub struct Connected {
     /// Kept alive so [`Connected::shutdown`] can join it and ensure `NativeClient::Drop`
     /// (which sends the QUIC close frame) runs to completion before process exit.
     video_thread: std::thread::JoinHandle<()>,
+    /// The dedicated NDL audio-drain thread ([`ndl_audio_pump`]) — present only when
+    /// `audio_offloaded`. Joined by [`Connected::shutdown`] like the video thread.
+    audio_thread: Option<std::thread::JoinHandle<()>>,
     /// Set when NDL accepted the Opus config and is decoding audio itself, so the caller
     /// must NOT also open an SDL2 audio device — see `ndl_audio_config`.
     pub audio_offloaded: bool,
@@ -138,6 +149,9 @@ impl Connected {
     pub fn shutdown(self) {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.video_thread.join();
+        if let Some(audio) = self.audio_thread {
+            let _ = audio.join();
+        }
         drop(self.client);
     }
 }
@@ -154,11 +168,40 @@ impl Connected {
 /// Whether the *device* implements the Opus path at all is a separate question, answered
 /// by probe rather than assumption — see `NdlVideo::load`.
 fn ndl_audio_config(resolved_channels: u8) -> Option<crate::ndl::NdlAudioConfig> {
+    if !crate::store::dev_override_enable_ndl_audio_offload() {
+        return None;
+    }
+    tracing::warn!("NDL audio offload opted in via ndl-audio-offload.conf — known to freeze video on webOS 10.3");
     (resolved_channels == 2).then_some(crate::ndl::NdlAudioConfig {
         channels: 2,
         // punktfunk's audio plane is fixed at 48 kHz (see `audio.rs`'s SAMPLE_RATE).
         sample_rate: 48_000.0,
     })
+}
+
+/// NDL cannot decode AV1 — and it will not say so.
+///
+/// `libNDL_directmedia_impl.so.1` implements H264/H265/VP9 only (docs/NOTES.md), but
+/// `NDL_VIDEO_TYPE_AV1 = 4` exists in the v2 header and `NDL_DirectMediaLoad` **accepts
+/// it**: the load returns success, every `NDL_DirectVideoPlay` returns success, the frame
+/// counters climb, nothing is ever dropped — and the panel holds the first frame forever.
+/// Confirmed on-device 2026-07-25, on a session whose Starfish load timed out and fell
+/// back here carrying an already-negotiated AV1 stream.
+///
+/// That fallback is why a UI-side gate is not sufficient on its own: `Screen::Settings`
+/// only offers AV1 under the Starfish backend, but *selecting* Starfish does not mean
+/// Starfish will **load** (on the G5 under test it times out waiting for LOADCOMPLETED),
+/// and by then the codec is already negotiated — the handshake happens before any decoder
+/// is opened. So the fallback path has to refuse: a named failure the user can act on
+/// beats a silent freeze that reads as a network problem.
+fn ensure_ndl_can_decode(codec: NdlCodec) -> Result<()> {
+    if matches!(codec, NdlCodec::Av1) {
+        anyhow::bail!(
+            "NDL can't decode AV1 on this TV — set Codec back to Automatic in Settings. \
+             (AV1 needs the Starfish backend, which isn't available for this session.)"
+        );
+    }
+    Ok(())
 }
 
 /// Default HDR10 mastering metadata for the LG CX OLED panel.
@@ -197,6 +240,7 @@ pub fn connect(
     display_w: i32,
     display_h: i32,
     video_backend: VideoBackend,
+    codec_pref: CodecPref,
 ) -> Result<Connected> {
     // VIDEO_CAP_CHACHA20: unconditional — armv7 has no hardware AES, so ChaCha20 is
     // faster. A ≥0.17.2 host picks it up; older hosts ignore the unknown bit.
@@ -207,6 +251,43 @@ pub fn connect(
             0
         };
     let display_hdr = hdr_enabled.then(cx_display_hdr);
+
+    // Advertised decode set + soft preference. H.264/HEVC decode on both backends,
+    // always. AV1 is advertised ONLY when the user explicitly picked it, the Starfish
+    // backend is selected (NDL's impl lacks AV1 despite the header's
+    // `NDL_VIDEO_TYPE_AV1` — docs/NOTES.md), and this TV's platform decoder declares
+    // AV1 (`device::supports_av1`). The picker (`ui::codec_options`) enforces the same
+    // three conditions, so the clamp here should never fire — it exists for a stale
+    // settings.json (hand-edited, or written before a backend switch path existed).
+    // Opt-in-only advertisement also means the host's own precedence ladder can never
+    // auto-pick a codec path this client has not verified on its own panel.
+    let starfish_selected = matches!(video_backend, VideoBackend::Starfish);
+    let av1_usable = crate::store::dev_override_enable_av1()
+        && starfish_selected
+        && crate::device::supports_av1()
+        && !crate::starfish::proven_unavailable();
+    let codec_pref = if codec_pref == CodecPref::Av1 && !av1_usable {
+        tracing::warn!(
+            "AV1 preference dropped: opted_in={} starfish_selected={starfish_selected} \
+             decoder_declares_av1={} starfish_proven_unavailable={}",
+            crate::store::dev_override_enable_av1(),
+            crate::device::supports_av1(),
+            crate::starfish::proven_unavailable(),
+        );
+        CodecPref::Auto
+    } else {
+        codec_pref
+    };
+    let mut video_codecs = quic::CODEC_HEVC | quic::CODEC_H264;
+    let preferred_codec = match codec_pref {
+        CodecPref::Auto => 0,
+        CodecPref::H264 => quic::CODEC_H264,
+        CodecPref::Hevc => quic::CODEC_HEVC,
+        CodecPref::Av1 => {
+            video_codecs |= quic::CODEC_AV1;
+            quic::CODEC_AV1
+        }
+    };
 
     let client = NativeClient::connect(
         host,
@@ -220,8 +301,8 @@ pub fn connect(
         // `AudioPlayer::new` is built from the RESOLVED `client.audio_channels`,
         // never from this.
         audio_channels,
-        quic::CODEC_HEVC | quic::CODEC_H264,
-        0, // let the host choose
+        video_codecs,
+        preferred_codec,
         display_hdr,
         0, // client_caps: this client composites the host cursor into the video, not locally
         launch,
@@ -237,7 +318,8 @@ pub fn connect(
         s
     });
     tracing::info!(
-        "connected: codec={} compositor={:?} audio_ch={} color={:?} bitrate_kbps={} \
+        "connected: codec={} (offered=0x{video_codecs:02x} preferred=0x{preferred_codec:02x}) \
+         compositor={:?} audio_ch={} color={:?} bitrate_kbps={} \
          decode_latency={} caps=0x{video_caps:02x} fp={fp_hex}",
         client.codec,
         client.resolved_compositor,
@@ -278,6 +360,8 @@ pub fn connect(
                 }
                 Err(e) => {
                     tracing::warn!("Starfish load failed ({e:#}) — falling back to NDL");
+                    // NOT a fallback NDL can serve for every codec — see its docs.
+                    ensure_ndl_can_decode(codec).with_context(|| format!("Starfish load failed ({e:#})"))?;
                     let ndl = NdlVideo::load(
                         &app_id,
                         resolved_mode.width as i32,
@@ -291,11 +375,16 @@ pub fn connect(
                         resolved_mode.width,
                         resolved_mode.height,
                     );
-                    VideoPlayer::Ndl(ndl)
+                    VideoPlayer::Ndl(Arc::new(ndl))
                 }
             }
         }
         VideoBackend::Ndl => {
+            // Defense in depth: `connect`'s own clamp above already drops an AV1
+            // preference unless Starfish is selected, and AV1 is advertised only when
+            // preferred — so the host cannot pick it for this arm. The guard costs
+            // nothing and the failure it prevents is invisible.
+            ensure_ndl_can_decode(codec)?;
             let ndl = NdlVideo::load(
                 &app_id,
                 resolved_mode.width as i32,
@@ -309,7 +398,7 @@ pub fn connect(
                 resolved_mode.width,
                 resolved_mode.height,
             );
-            VideoPlayer::Ndl(ndl)
+            VideoPlayer::Ndl(Arc::new(ndl))
         }
     };
 
@@ -359,19 +448,34 @@ pub fn connect(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(StreamStats::default());
+    let ndl_audio = player.ndl_audio_handle();
     let video_client = client.clone();
     let video_stop = stop.clone();
     let video_stats = stats.clone();
     let video_thread = std::thread::Builder::new()
         .name("punktfunk-webos-video".into())
-        .spawn(move || video_pump(video_client, player, video_stop, video_stats, is_hdr, audio_offloaded))
+        .spawn(move || video_pump(video_client, player, video_stop, video_stats, is_hdr))
         .context("spawn video thread")?;
+    let audio_thread = match ndl_audio {
+        Some(ndl) => {
+            let audio_client = client.clone();
+            let audio_stop = stop.clone();
+            Some(
+                std::thread::Builder::new()
+                    .name("punktfunk-webos-audio".into())
+                    .spawn(move || ndl_audio_pump(&audio_client, &ndl, &audio_stop))
+                    .context("spawn audio thread")?,
+            )
+        }
+        None => None,
+    };
 
     Ok(Connected {
         client,
         stop,
         stats,
         video_thread,
+        audio_thread,
         audio_offloaded,
     })
 }
@@ -645,6 +749,9 @@ const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const HOLD_GIVE_UP: Duration = Duration::from_secs(2);
 /// Feed calls slower than this suggest decoder backpressure rather than network loss.
 const FEED_BACKPRESSURE_WARN: Duration = Duration::from_millis(20);
+/// How often the pump refreshes NDL's render-buffer depth for the ABR decode signal —
+/// three samples per 750 ms report window; see the fold in [`video_pump`].
+const BACKLOG_POLL: Duration = Duration::from_millis(250);
 
 /// Suffix identifying a `GStreamer` pad-task thread (`"<element-name>:<pad-name>"`,
 /// truncated to the kernel's 15-char `comm` limit) — both the NDL and Starfish vendor
@@ -676,6 +783,7 @@ fn spawn_vendor_decode_thread_renicer() {
     std::thread::spawn(move || {
         let start = Instant::now();
         let mut last_found = start;
+        let mut failed: usize = 0;
         let mut reniced: std::collections::HashSet<i32> = std::collections::HashSet::new();
         loop {
             if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
@@ -697,6 +805,7 @@ fn spawn_vendor_decode_thread_renicer() {
                     last_found = Instant::now();
                     // SAFETY: plain syscall — tid and priority value only, no pointers.
                     if unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -10) } != 0 {
+                        failed += 1;
                         tracing::warn!(
                             "setpriority(vendor thread {comm}, tid={tid}) failed: {}",
                             std::io::Error::last_os_error()
@@ -713,31 +822,58 @@ fn spawn_vendor_decode_thread_renicer() {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        // One summarizing line for the same reason as the hot-thread summary in
+        // `video_pump`: whether the boost applied at all is the install-mode question
+        // a session log has to answer.
+        tracing::info!(
+            "vendor decode threads: {} found, {} boosted",
+            reniced.len(),
+            reniced.len().saturating_sub(failed),
+        );
     });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn video_pump(
-    client: Arc<NativeClient>,
-    player: VideoPlayer,
-    stop: Arc<AtomicBool>,
-    stats: Arc<StreamStats>,
-    is_hdr: bool,
-    audio_offloaded: bool,
-) {
+fn video_pump(client: Arc<NativeClient>, player: VideoPlayer, stop: Arc<AtomicBool>, stats: Arc<StreamStats>, is_hdr: bool) {
     client.register_hot_thread();
+    // Summarized at info, not left as per-tid debug lines: whether these renices work at
+    // all is install-mode-dependent (they need CAP_SYS_NICE or a nonzero RLIMIT_NICE —
+    // present on a rooted install, absent under a plain Dev-Mode SAM jail), and a session
+    // log that doesn't answer "did the priority boost actually apply here" hides the
+    // difference between the two contention regimes docs/NOTES.md's renice findings were
+    // measured under.
+    let (mut reniced, mut failed) = (0u32, 0u32);
     for tid in client.hot_thread_ids() {
         // SAFETY: plain syscall — tid and priority value only, no pointers.
-        if unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -10) } != 0 {
+        if unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -10) } == 0 {
+            reniced += 1;
+        } else {
+            failed += 1;
             tracing::debug!(
-                "setpriority(tid={tid}) failed (expected without CAP_SYS_NICE): {}",
+                "setpriority(tid={tid}) failed: {}",
                 std::io::Error::last_os_error()
             );
         }
     }
+    tracing::info!(
+        "hot-thread renice: {reniced} boosted, {failed} failed{}",
+        if failed > 0 { " (no CAP_SYS_NICE — priorities unchanged)" } else { "" },
+    );
     spawn_vendor_decode_thread_renicer();
 
     let wants_decode_latency = client.wants_decode_latency();
+    // The decode figure reported to core's ABR controller. NDL's `play` is
+    // decode-AND-present in one opaque call, so `feed_elapsed` alone is *submission*
+    // time — a decoder quietly falling behind buffers frames internally and the feed
+    // stays fast, which left the controller's decode-rise signal (`abr::DECODE_RISE_US`,
+    // built precisely for "the decoder saturates before the link does") effectively
+    // blind on this client. The render-buffer backlog IS that standing decode queue, so
+    // it's folded in as `backlog × frame_period`. Polled on a cadence rather than every
+    // frame — three samples per 750 ms ABR report window is plenty, and assuming an NDL
+    // query is cheap enough for per-frame use is exactly the mistake docs/NOTES.md warns
+    // against; between polls the cached depth is reused.
+    let frame_period_us = 1_000_000 / u64::from(client.mode().refresh_hz.max(1));
+    let mut backlog_cached: u64 = 0;
+    let mut last_backlog_poll: Option<Instant> = None;
     let mut last_dropped_seen = client.frames_dropped();
     let mut last_keyframe_request: Option<Instant> = None;
     // Freeze-until-reanchor: while `holding`, frames are skipped rather than fed —
@@ -761,7 +897,14 @@ fn video_pump(
                     // `backlog` separates "the decoder is behind" from "frames are
                     // arriving late" — indistinguishable before this, since play()
                     // decodes and presents in one opaque call.
-                    tracing::debug!(
+                    //
+                    // INFO, not debug: the on-device file sink is INFO-only
+                    // (`logger::resolved_level`), so at debug this line — the one that
+                    // says whether NDL is draining what it is fed — was invisible in
+                    // exactly the situation it exists for, a freeze reported off a
+                    // plain sideloaded run with no telemetry listener. Half a line per
+                    // second is affordable; a second round trip to reproduce is not.
+                    tracing::info!(
                         "video: {frames_received} frames, holding={holding}, dropped={}, backlog={}",
                         client.frames_dropped(),
                         backlog.map_or_else(|| "n/a".to_string(), |b| b.to_string()),
@@ -827,7 +970,17 @@ fn video_pump(
                         );
                     }
                     if wants_decode_latency && play_result.is_ok() {
-                        client.report_decode_us(u32::try_from(feed_elapsed.as_micros()).unwrap_or(u32::MAX));
+                        if last_backlog_poll.is_none_or(|t| t.elapsed() >= BACKLOG_POLL) {
+                            last_backlog_poll = Some(Instant::now());
+                            backlog_cached = player
+                                .render_buffer_length()
+                                .and_then(|b| u64::try_from(b).ok())
+                                .unwrap_or(0);
+                        }
+                        let decode_us = u64::try_from(feed_elapsed.as_micros())
+                            .unwrap_or(u64::MAX)
+                            .saturating_add(backlog_cached.saturating_mul(frame_period_us));
+                        client.report_decode_us(u32::try_from(decode_us).unwrap_or(u32::MAX));
                     }
                     if let Err(e) = play_result {
                         tracing::warn!(
@@ -849,17 +1002,16 @@ fn video_pump(
             Err(punktfunk_core::PunktfunkError::NoFrame) => {
                 if last_heartbeat.elapsed() >= Duration::from_secs(2) {
                     last_heartbeat = Instant::now();
-                    tracing::debug!("video: {frames_received} frames (idle)");
+                    // INFO for the same reason as the main heartbeat above — and this
+                    // arm is the one that says "nothing is arriving at all", which is a
+                    // different fault from "arriving but not presenting".
+                    tracing::info!("video: {frames_received} frames (idle)");
                 }
             }
             Err(e) => {
                 tracing::error!("video pump: {e:#}");
                 break;
             }
-        }
-
-        if audio_offloaded {
-            pump_ndl_audio(&client, &player);
         }
 
         if is_hdr {
@@ -872,16 +1024,41 @@ fn video_pump(
     }
 }
 
-/// Drains raw Opus packets straight into NDL, for the offloaded path.
+/// Drains raw Opus packets straight into NDL on a dedicated thread, for the offloaded
+/// path. (No main-thread constraint applies here — that's `sdl2::audio::AudioQueue`
+/// being `!Send`, and there is no `AudioQueue` on this path.)
 ///
-/// Unlike the software path this does NOT have to run on the main thread — the
-/// main-thread constraint is `sdl2::audio::AudioQueue` being `!Send`, and there is no
-/// `AudioQueue` here. It runs on the video pump thread, which also means audio keeps
-/// flowing across a main-loop stall rather than hitching with it.
-fn pump_ndl_audio(client: &NativeClient, player: &VideoPlayer) {
-    while let Ok(packet) = client.next_audio(Duration::ZERO) {
-        if let Err(e) = player.play_audio(&packet.data) {
-            tracing::warn!("NDL audio error (seq {}): {e:#}", packet.seq);
+/// A dedicated thread, not a drain bolted onto the video pump loop (where this first
+/// lived): there, audio only drained after a `next_frame` call that blocks up to
+/// 500 ms, so a video drought — an encoder stall on the host, a loss hold — chopped
+/// audio into ≤500 ms stalls *with packets already waiting*, and in normal flow
+/// packets drained in per-video-frame clumps that all took the same drain-time PTS.
+/// Core's `next_audio` docs ask for exactly this thread ("packets arrive every 5 ms"),
+/// and its pull methods are one-thread-per-plane safe by contract. Draining within a
+/// scheduler tick of arrival is also what makes `NdlVideo::play_audio`'s
+/// arrival-time PTS stamp accurate.
+///
+/// Teardown safety: this thread holds one of the two `Arc<NdlVideo>` owners, so the
+/// process-global NDL unload in `NdlVideo::drop` cannot run until this thread has
+/// exited — `NDL_DirectAudioPlay` can never race the unload, whichever thread
+/// `Connected::shutdown` happens to join first.
+fn ndl_audio_pump(client: &NativeClient, ndl: &NdlVideo, stop: &AtomicBool) {
+    // Same boost the video pump requests for itself — 5 ms packets are the most
+    // latency-sensitive cadence in the session. Best-effort, like every renice here.
+    // SAFETY: plain syscall — tid 0 (self) and priority value only, no pointers.
+    let _ = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, -10) };
+    while !stop.load(Ordering::Relaxed) {
+        match client.next_audio(Duration::from_millis(100)) {
+            Ok(packet) => {
+                if let Err(e) = ndl.play_audio(&packet.data) {
+                    tracing::warn!("NDL audio error (seq {}): {e:#}", packet.seq);
+                }
+            }
+            Err(punktfunk_core::PunktfunkError::NoFrame) => {}
+            Err(e) => {
+                tracing::info!("audio pump ending: {e:#}");
+                break;
+            }
         }
     }
 }

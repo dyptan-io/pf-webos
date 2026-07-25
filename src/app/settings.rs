@@ -15,7 +15,7 @@ impl App {
         // top of the settings row list.
         if let Some(dd) = self.dropdown.as_mut() {
             let row = dd.row;
-            let len = ui::dropdown_options(row).len().max(1);
+            let len = ui::dropdown_options(&self.settings, row).len().max(1);
             match ev {
                 MenuEvent::Up => dd.focused = if dd.focused == 0 { len - 1 } else { dd.focused - 1 },
                 MenuEvent::Down => dd.focused = (dd.focused + 1) % len,
@@ -56,7 +56,7 @@ impl App {
                     self.settings_writer.save(self.settings);
                     self.open_about();
                 }
-                ui::ROW_RESOLUTION | ui::ROW_FRAMERATE | ui::ROW_VIDEO_BACKEND | ui::ROW_AUDIO => {
+                ui::ROW_RESOLUTION | ui::ROW_FRAMERATE | ui::ROW_VIDEO_BACKEND | ui::ROW_CODEC | ui::ROW_AUDIO => {
                     let focused = ui::dropdown_current_index(&self.settings, self.settings_focused);
                     self.dropdown = Some(DropdownState {
                         row: self.settings_focused,
@@ -165,7 +165,7 @@ impl App {
         }
 
         if let Some(dd) = &self.dropdown {
-            let options = ui::dropdown_options(dd.row);
+            let options = ui::dropdown_options(&self.settings, dd.row);
             let overlay_rect = Self::dropdown_overlay_rect(content, dd.row);
             // `usize::MAX` = no option focused; the focused one is a separate
             // `Tile::DropdownFocusOption` (see `prepare_tiles`).
