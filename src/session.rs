@@ -21,7 +21,7 @@ use punktfunk_core::quic;
 
 use crate::ndl::{NdlCodec, NdlVideo};
 use crate::starfish::StarfishVideo;
-use crate::store::{CodecPref, VideoBackend};
+use crate::store::{CipherPref, CodecPref, VideoBackend};
 
 // ─────────────────────────────────────────────────────────── VideoPlayer ──
 
@@ -242,11 +242,15 @@ pub fn connect(
     video_backend: VideoBackend,
     codec_pref: CodecPref,
 ) -> Result<Connected> {
-    // Negotiate plain AES-128-GCM (the host default): punktfunk-core's `webos-arm-aes`
-    // branch decrypts it with the ARMv8 Crypto Extensions on this 32-bit ARM target, so
-    // AES is now the fast path and we no longer advertise VIDEO_CAP_CHACHA20.
-    let video_caps =
-        if hdr_enabled { quic::VIDEO_CAP_10BIT | quic::VIDEO_CAP_HDR } else { 0 };
+    // `launch_cipher_pref` (see its docs) resolves the `cipher` launch param, i.e.
+    // `task deploy CIPHER=...` — the only way to pick a cipher, no rebuild needed.
+    let video_caps = match crate::store::launch_cipher_pref() {
+        // punktfunk-core's `webos-arm-aes` branch decrypts plain AES-128-GCM with the
+        // ARMv8 Crypto Extensions on this 32-bit ARM target (see docs/NOTES.md), so this
+        // is the fast path and no longer needs VIDEO_CAP_CHACHA20 to be advertised.
+        CipherPref::Aes128Gcm => 0,
+        CipherPref::ChaCha20 => quic::VIDEO_CAP_CHACHA20,
+    } | if hdr_enabled { quic::VIDEO_CAP_10BIT | quic::VIDEO_CAP_HDR } else { 0 };
     let display_hdr = hdr_enabled.then(cx_display_hdr);
 
     // Advertised decode set + soft preference. H.264/HEVC decode on both backends,
@@ -583,8 +587,8 @@ pub struct SpeedProbeResult {
 /// is never touched — the host builds a virtual output, but nothing is decoded or
 /// presented. Blocks; run it on a worker thread.
 ///
-/// **`video_caps` must advertise the same cipher a real session negotiates (plain
-/// AES-128-GCM — see [`connect`]).** `punktfunk-core` counts the delivered bytes this
+/// **The negotiated cipher must match what a real session would use (see [`connect`] and
+/// [`crate::store::CipherPref`]).** `punktfunk-core` counts the delivered bytes this
 /// measurement is derived from *after* AEAD decrypt, so a probe that negotiated a
 /// different cipher would measure a ceiling this CPU can't reach (or can exceed) with the
 /// cipher an actual stream uses — reporting a number no session could ever deliver.
@@ -598,6 +602,12 @@ pub fn run_speed_probe(
     timeout: Duration,
     mut progress: impl FnMut(ProbeOutcome),
 ) -> Result<SpeedProbeResult> {
+    // Same resolution as `connect`, so a `task deploy CIPHER=...` launch param applies
+    // to the speed test too, not just a real stream.
+    let video_caps = match crate::store::launch_cipher_pref() {
+        CipherPref::Aes128Gcm => 0,
+        CipherPref::ChaCha20 => quic::VIDEO_CAP_CHACHA20,
+    };
     let mode = Mode {
         width: 1280,
         height: 720,
@@ -618,7 +628,7 @@ pub fn run_speed_probe(
         // rate disarms core's probe entirely; the value is irrelevant since nothing is
         // decoded here.
         PROBE_SESSION_BITRATE_KBPS,
-        0, // plain AES-128-GCM, same as a real session (see `connect`)
+        video_caps,
         2, // stereo baseline
         quic::CODEC_HEVC | quic::CODEC_H264,
         0,    // no preferred codec
@@ -638,7 +648,7 @@ pub fn run_speed_probe(
         client.codec,
         client.audio_channels,
         client.resolved_bitrate_kbps,
-        0,
+        video_caps,
     );
 
     // Don't burst into a dead plane — see PROBE_WARMUP_CAP. `next_frame` drains the session's

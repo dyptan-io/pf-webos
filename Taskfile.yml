@@ -153,7 +153,10 @@ tasks:
       initial launch — see src/logger.rs — no rebuild needed), or TELEMETRY=auto to
       use this machine's own LAN IP on a random port (printed once the listener is
       up, in case you need to connect to it manually). TELEMETRY_LEVEL
-      (debug/info/warn/error, default debug) sets the minimum level sent.
+      (debug/info/warn/error, default debug) sets the minimum level sent. Pass
+      CIPHER=aes (default) or CIPHER=chacha to pick the negotiated video cipher for this
+      launch (see src/store.rs's `launch_cipher_pref` — same launch-param mechanism as
+      TELEMETRY, no rebuild needed).
     deps: [package]
     requires:
       vars: [TV_HOST]
@@ -177,8 +180,8 @@ tasks:
           TELEMETRY="${IP}:${PORT}"
         fi
 
-        PARAMS=""
         NC_PID=""
+        FIELDS=""
         if [ -n "$TELEMETRY" ]; then
           PORT="${TELEMETRY##*:}"
           ( while true; do nc -l "$PORT"; done ) &
@@ -186,7 +189,17 @@ tasks:
           trap 'kill "$NC_PID" 2>/dev/null || true' EXIT
           sleep 0.5
           echo "listening on :${PORT} (destination sent to device: $TELEMETRY)" >&2
-          PARAMS=",\"params\":{\"telemetry\":\"$TELEMETRY\",\"telemetry_level\":\"{{.TELEMETRY_LEVEL}}\"}"
+          FIELDS="\"telemetry\":\"$TELEMETRY\",\"telemetry_level\":\"{{.TELEMETRY_LEVEL}}\""
+        fi
+        CIPHER="{{.CIPHER}}"
+        if [ -n "$CIPHER" ]; then
+          [ -n "$FIELDS" ] && FIELDS="${FIELDS},"
+          FIELDS="${FIELDS}\"cipher\":\"$CIPHER\""
+          echo "cipher sent to device: $CIPHER" >&2
+        fi
+        PARAMS=""
+        if [ -n "$FIELDS" ]; then
+          PARAMS=",\"params\":{${FIELDS}}"
         fi
         ssh -tt {{.TV_HOST}} "luna-send -n 1 -f luna://com.webos.applicationManager/launch '{\"id\":\"io.dyptan.punktfunk.webos\"${PARAMS}}'"
         if [ -n "$NC_PID" ]; then

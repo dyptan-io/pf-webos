@@ -1,12 +1,16 @@
 //! Headless network speed probe — the app's "Test connection" measurement as a CLI, so it
 //! can be run on-device over Dev-Mode SSH (no TV UI, no display) while watching kernel
 //! counters from the outside. Mirrors `session::run_speed_probe` exactly: a decode-less
-//! `NativeClient` connect advertising `VIDEO_CAP_CHACHA20` (the counters this measurement
-//! reads increment *after* AEAD decrypt, so the probe must pay the same cipher a real
-//! session does), then one host-driven burst polled to completion.
+//! `NativeClient` connect advertising the same cipher a real session would (the counters
+//! this measurement reads increment *after* AEAD decrypt, so the probe must pay the same
+//! cipher a real session does — see `store::CipherPref`), then one host-driven burst
+//! polled to completion.
 //!
 //! Usage:
-//!   pfprobe <host> <port> <cert.pem> <key.pem> <pin-hex-64> [`target_kbps`] [`duration_ms`]
+//!   pfprobe <host> <port> <cert.pem> <key.pem> <pin-hex-64> [`target_kbps`] [`duration_ms`] [`cipher`]
+//!
+//! `cipher` is `aes` (default — plain AES-128-GCM, the ARMv8 Crypto Extensions fast path)
+//! or `chacha` (ChaCha20-Poly1305).
 //!
 //! Prints one `progress:` line per 250 ms poll (live `recv_bytes`) and a final `result:`
 //! line with the host-attested figures. Diagnostics from punktfunk-core (`PUNKTFUNK_PERF=1`
@@ -65,6 +69,11 @@ mod real {
         let pin = parse_pin(&args[5])?;
         let target_kbps: u32 = args.get(6).map_or(Ok(320_000), |s| s.parse()).context("target_kbps")?;
         let duration_ms: u32 = args.get(7).map_or(Ok(3_000), |s| s.parse()).context("duration_ms")?;
+        let video_caps = match args.get(8).map(String::as_str) {
+            None | Some("aes") => 0,
+            Some("chacha") => quic::VIDEO_CAP_CHACHA20,
+            Some(other) => anyhow::bail!("unknown cipher {other:?}, expected \"aes\" or \"chacha\""),
+        };
 
         let mode = Mode { width: 1280, height: 720, refresh_hz: 60 };
         let client = NativeClient::connect(
@@ -74,7 +83,7 @@ mod real {
             CompositorPref::Auto,
             GamepadPref::Auto,
             PROBE_SESSION_BITRATE_KBPS,
-            quic::VIDEO_CAP_CHACHA20,
+            video_caps,
             2,
             quic::CODEC_HEVC | quic::CODEC_H264,
             0,
