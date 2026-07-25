@@ -410,7 +410,7 @@ mod real {
                         }
                     }
                     Screen::Pairing => app.handle_pairing_event(menu_ev),
-                    Screen::Settings => app.handle_settings_event(menu_ev),
+                    Screen::Settings => app.handle_settings_event(menu_ev, display_mode.h as u32),
                     Screen::AddHost => app.handle_add_host_event(menu_ev),
                     Screen::Wake => app.handle_wake_event(menu_ev),
                     Screen::ForgetHost => app.handle_forget_host_event(menu_ev),
@@ -461,8 +461,9 @@ mod real {
             // `tiles_pending` keeps frames flowing while the card window is still being
             // filled a few tiles at a time (see `CARD_BUILD_BUDGET`) — the
             // redraw-on-change loop would otherwise go idle mid-build and leave the rest
-            // of the visible cards blank until the next input.
-            let animating = app.tick_animations() || app.tiles_pending;
+            // of the visible cards blank until the next input. `!grid_reveal_ready` keeps
+            // it flowing the same way while waiting on art still in flight.
+            let animating = app.tick_animations() || app.tiles_pending || !app.grid_reveal_ready;
             if !dirty && !animating {
                 std::thread::sleep(Duration::from_millis(16));
                 continue;

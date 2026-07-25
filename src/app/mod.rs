@@ -83,13 +83,31 @@ const CARD_KEEP_ROWS: i32 = 5;
 /// on a TV with under 2 GB usable. Spreading the work keeps every frame bounded; cards
 /// outside the window are simply not drawn (`Compositor::execute` skips a tile with no
 /// texture), so they appear as they are built rather than blocking the UI.
-const CARD_BUILD_BUDGET: usize = 3;
+///
+/// Only bounds the visible+prefetch window (a few dozen tiles), not the whole library, so
+/// it can be much higher than the original whole-library concern without reintroducing
+/// the freeze. Raised from 3, which took 7-10 frames to fill a 20-30 card window.
+const CARD_BUILD_BUDGET: usize = 10;
+
+/// How long the loading spinner waits for the whole window to become art-ready before
+/// revealing anyway — a fetch that fails (rather than being merely slow) never becomes
+/// ready, so this is what stops `grid_reveal_ready` from blocking forever.
+const SPINNER_MAX_WAIT: Duration = Duration::from_millis(900);
 
 /// How much the grid's focused card (and its ring) grows during
 /// `ui::FOCUS_POP` — see `ui::zoom_rect`.
 pub(crate) const CARD_GROWTH: f32 = 0.028;
 /// How long a modal's fade/slide-in runs.
 pub(crate) const MODAL_FADE: Duration = Duration::from_millis(170);
+/// How long the Settings scrollbar stays at full opacity after a scroll before fading out.
+pub(crate) const SETTINGS_SCROLLBAR_HOLD: Duration = Duration::from_millis(700);
+/// How long the scrollbar's fade-out takes once `SETTINGS_SCROLLBAR_HOLD` elapses.
+pub(crate) const SETTINGS_SCROLLBAR_FADE: Duration = Duration::from_millis(350);
+/// Total lifetime of one scrollbar appearance — hold, then fade to gone.
+pub(crate) const SETTINGS_SCROLL_INDICATOR: Duration =
+    Duration::from_millis(SETTINGS_SCROLLBAR_HOLD.as_millis() as u64 + SETTINGS_SCROLLBAR_FADE.as_millis() as u64);
+/// A few px wider than the scrollbar track so its rounded caps aren't clipped.
+const SETTINGS_SCROLLBAR_TILE_W: u32 = 10;
 
 /// The pairing modal's subtitle — pulled out to a constant since both
 /// `render_pairing` (drawing it) and `Self::pairing_pin_row_y` (measuring its
@@ -213,7 +231,11 @@ pub struct DropdownState {
 /// focus there is `modal_focus_tile`'s job, not this one's.
 #[derive(PartialEq)]
 pub(crate) enum ModalShellKey {
-    Settings(Settings, Option<usize>, bool),
+    Settings {
+        settings: Settings,
+        open_dropdown_row: Option<usize>,
+        hover_close: bool,
+    },
     Wake {
         name: String,
         mac_empty: bool,
@@ -315,6 +337,10 @@ pub struct App {
     /// `store::save_settings` on every adjustment read as input lag.
     pub(crate) settings_writer: store::SettingsWriter,
     pub settings_focused: usize,
+    /// Index of the topmost visible row in the Settings list (see `settings_visible_rows`).
+    pub(crate) settings_scroll: usize,
+    /// When `settings_scroll` last changed — the scrollbar shows briefly after this.
+    pub(crate) settings_scroll_shown_at: Option<Instant>,
     pub dropdown: Option<DropdownState>,
     /// The sidebar row `Screen::ForgetHost` is confirming forgetting — set
     /// alongside `screen = Screen::ForgetHost` (see `App::open_forget_host`),
@@ -419,10 +445,26 @@ pub struct App {
     /// shell (which draws the overlay's option list unfocused); moving the
     /// dropdown's own focus rebuilds only this.
     pub(crate) dropdown_focus_tile: Option<((usize, usize), Painter)>,
+    /// The Settings scrollbar, keyed by `(total rows, visible rows, scroll)` — rebuilt
+    /// only when those change; the fade is a per-frame alpha, not baked into the tile.
+    pub(crate) settings_scrollbar_tile: Option<((usize, usize, usize), Painter)>,
+    /// Every Settings row, unfocused, at full (unscrolled) height — keyed by
+    /// `(settings, open dropdown row)`. Scrolling never invalidates this; see
+    /// `Tile::SettingsRows`'s docs.
+    pub(crate) settings_rows_tile: Option<((Settings, Option<usize>), Painter)>,
     /// Home's status line block, keyed by its text.
     pub(crate) status_tile: Option<(String, Painter)>,
     /// The static "No host selected" hint line.
     pub(crate) nohost_tile: Option<Painter>,
+    /// Whether the grid's initial build for the current library has finished — while
+    /// `false`, the grid shows [`Tile::Spinner`] instead of popping cards in one by one.
+    /// One-shot per library: only `prepare_tiles`'s full-reset branch sets it `false`
+    /// again; later scrolling into a fresh row does not.
+    pub(crate) grid_reveal_ready: bool,
+    /// The rasterized spinner tile, rebuilt every tick it's shown.
+    pub(crate) spinner_tile: Option<Painter>,
+    /// When the grid last became not-ready — feeds the spinner's rotation phase.
+    pub(crate) spinner_since: Option<Instant>,
     // ------------------------------------------------------------ animations --
     /// Grid scroll offset actually rendered this frame (px; 0 = row 0 at
     /// `GRID_TOP_Y`) — eases toward `grid_scroll_target` each tick.
@@ -504,6 +546,8 @@ impl App {
             settings: store::load_settings(),
             settings_writer: store::SettingsWriter::spawn(),
             settings_focused: 0,
+            settings_scroll: 0,
+            settings_scroll_shown_at: None,
             dropdown: None,
             host_menu_index: None,
             host_menu_focused: 1,
@@ -542,8 +586,13 @@ impl App {
             modal_shell_key: None,
             modal_focus_tile: None,
             dropdown_focus_tile: None,
+            settings_scrollbar_tile: None,
+            settings_rows_tile: None,
             status_tile: None,
             nohost_tile: None,
+            grid_reveal_ready: true,
+            spinner_tile: None,
+            spinner_since: None,
             grid_scroll: 0,
             grid_scroll_target: 0,
             focus_anim: None,
@@ -675,7 +724,8 @@ impl App {
                 None
             }
             Screen::Settings => {
-                self.handle_settings_event(MenuEvent::Back);
+                // `Back` never consults `screen_h` (only `Up`/`Down` scroll) — 0 is fine.
+                self.handle_settings_event(MenuEvent::Back, 0);
                 None
             }
             Screen::AddHost => {
@@ -754,6 +804,12 @@ impl App {
         if let Some((t, _)) = self.switch_anim {
             if t.elapsed() >= ui::FOCUS_POP {
                 self.switch_anim = None;
+            }
+            animating = true;
+        }
+        if let Some(t) = self.settings_scroll_shown_at {
+            if t.elapsed() >= SETTINGS_SCROLL_INDICATOR {
+                self.settings_scroll_shown_at = None;
             }
             animating = true;
         }
@@ -932,15 +988,16 @@ impl App {
                 // as everywhere else) already points at; unaffected by this change.
                 if self.dropdown.is_none() {
                     let (_, content) = Self::settings_layout(screen_w, screen_h);
-                    // Clicked empty space within the card (`?`'s early `None`) — nothing to
-                    // focus or confirm.
-                    let i = (0..ui::SETTINGS_ROW_COUNT).find(|&i| {
+                    let visible = Self::settings_visible_rows(screen_h);
+                    // `local` is relative to the visible window; `?` bails if the click
+                    // hit empty space within the card — nothing to focus or confirm.
+                    let local = (0..visible).find(|&i| {
                         let row_y = content.y() + i as i32 * (ui::SETTINGS_ROW_H as i32 + ui::SETTINGS_ROW_GAP);
                         Rect::new(content.x(), row_y, content.width(), ui::SETTINGS_ROW_H).contains_point((x, y))
                     })?;
-                    self.settings_focused = i;
+                    self.settings_focused = self.settings_scroll + local;
                 }
-                self.handle_settings_event(MenuEvent::Confirm);
+                self.handle_settings_event(MenuEvent::Confirm, screen_h);
                 None
             }
             Screen::Pairing => {
@@ -1093,6 +1150,10 @@ impl App {
                 self.card_tiles = std::iter::repeat_with(|| None).take(count).collect();
                 self.grid_dirty = false;
                 self.grid_cards_dirty.clear();
+                // Only a full reset re-arms the spinner — ordinary scrolling into the
+                // prefetch window must not hide the grid again.
+                self.grid_reveal_ready = false;
+                self.spinner_since = None;
             } else {
                 for idx in std::mem::take(&mut self.grid_cards_dirty) {
                     if idx < count {
@@ -1129,8 +1190,18 @@ impl App {
                 }
             }
 
-            let mut built = 0usize;
-            let mut pending = false;
+            // Ready once nothing more can arrive: cover already in `self.art`, or the game
+            // never had one to fetch (no `self.art` entry either way). `idx == 0` (Desktop)
+            // has no `games` entry and is always ready.
+            let art_ready = |idx: usize| {
+                self.games.get(idx.wrapping_sub(1)).is_none_or(|game| {
+                    self.art.contains_key(&game.id) || (game.art.portrait.is_none() && game.art.header.is_none())
+                })
+            };
+
+            // Art-ready cards build first — building one before its cover arrives just
+            // burns a second budget slot re-dirtying it once the cover shows up.
+            let mut to_build = Vec::new();
             for idx in 0..count {
                 let row = row_of(idx);
                 if row < build_lo || row > build_hi {
@@ -1144,6 +1215,12 @@ impl App {
                 if self.card_tiles[idx].is_some() {
                     continue;
                 }
+                to_build.push((idx, art_ready(idx)));
+            }
+            to_build.sort_by_key(|(_, ready)| !ready);
+
+            let mut pending = false;
+            for (built, (idx, _)) in to_build.into_iter().enumerate() {
                 if built >= CARD_BUILD_BUDGET {
                     pending = true;
                     break;
@@ -1154,9 +1231,29 @@ impl App {
                 };
                 self.card_tiles[idx] = Some(tile);
                 updated.push(Tile::Card(idx));
-                built += 1;
             }
             self.tiles_pending = pending;
+
+            // Rechecks the whole window rather than trusting `!pending`, since a card
+            // built earlier can still be waiting behind a re-dirtied sibling; requires
+            // `art_ready` too so a placeholder built this tick can't count as revealed.
+            if !self.grid_reveal_ready {
+                let window_ready = (0..count)
+                    .filter(|&idx| {
+                        let row = row_of(idx);
+                        row >= build_lo && row <= build_hi
+                    })
+                    .all(|idx| self.card_tiles[idx].is_some() && art_ready(idx));
+                let since = *self.spinner_since.get_or_insert_with(Instant::now);
+                self.grid_reveal_ready = window_ready || since.elapsed() >= SPINNER_MAX_WAIT;
+                if self.grid_reveal_ready {
+                    self.spinner_since = None;
+                } else {
+                    self.spinner_tile = Some(ui::render_spinner_tile(since.elapsed().as_secs_f32()));
+                    updated.push(Tile::Spinner);
+                }
+            }
+
             let ring_w = card_w + 2 * ui::FOCUS_RING_PAD as u32;
             if !matches!(&self.ring_tile, Some(p) if p.width() == ring_w) {
                 self.ring_tile = Some(ui::render_focus_ring_tile(card_w, card_h));
@@ -1174,14 +1271,18 @@ impl App {
                 }
                 None => self.status_tile = None,
             }
-        } else if self.nohost_tile.is_none() {
-            self.nohost_tile = Some(ui::render_text_tile(
-                text_cache,
-                fonts.label,
-                "No host selected — pick one from the list, or add one.",
-                ui::MUTED,
-            )?);
-            updated.push(Tile::NoHost);
+        } else {
+            self.grid_reveal_ready = true;
+            self.spinner_since = None;
+            if self.nohost_tile.is_none() {
+                self.nohost_tile = Some(ui::render_text_tile(
+                    text_cache,
+                    fonts.label,
+                    "No host selected — pick one from the list, or add one.",
+                    ui::MUTED,
+                )?);
+                updated.push(Tile::NoHost);
+            }
         }
 
         let modal_open = !matches!(self.screen, Screen::Home);
@@ -1191,11 +1292,11 @@ impl App {
         // (no split focus tile to protect) and just redraws on any
         // `content_dirty` tick, same as every modal did before this split.
         let modal_shell_key = match self.screen {
-            Screen::Settings => Some(ModalShellKey::Settings(
-                self.settings,
-                self.dropdown.as_ref().map(|dd| dd.row),
-                self.hover_close,
-            )),
+            Screen::Settings => Some(ModalShellKey::Settings {
+                settings: self.settings,
+                open_dropdown_row: self.dropdown.as_ref().map(|dd| dd.row),
+                hover_close: self.hover_close,
+            }),
             Screen::Wake => self.wake.as_ref().map(|w| ModalShellKey::Wake {
                 name: w.name.clone(),
                 mac_empty: w.mac.is_empty(),
@@ -1456,6 +1557,35 @@ impl App {
         } else {
             self.dropdown_focus_tile = None;
         }
+
+        if matches!(self.screen, Screen::Settings) {
+            let (_, content) = Self::settings_layout(screen_w, screen_h);
+            let visible = Self::settings_visible_rows(screen_h);
+            let scroll = self.clamped_settings_scroll(screen_h);
+            let key = (ui::SETTINGS_ROW_COUNT, visible, scroll);
+            let stale = !matches!(&self.settings_scrollbar_tile, Some((k, _)) if *k == key);
+            if stale {
+                let tile = ui::render_list_scrollbar_tile(
+                    SETTINGS_SCROLLBAR_TILE_W,
+                    content.height(),
+                    ui::SETTINGS_ROW_COUNT,
+                    visible,
+                    scroll,
+                );
+                self.settings_scrollbar_tile = Some((key, tile));
+                updated.push(Tile::SettingsScrollbar);
+            }
+
+            let dropdown_row = self.dropdown.as_ref().map(|dd| dd.row);
+            let rows_key = (self.settings, dropdown_row);
+            let rows_stale = !matches!(&self.settings_rows_tile, Some((k, _)) if *k == rows_key);
+            if rows_stale {
+                let rows = ui::settings_rows(&self.settings);
+                let tile = ui::render_focus_rows_tile(text_cache, fonts, &rows, content.width(), dropdown_row)?;
+                self.settings_rows_tile = Some((rows_key, tile));
+                updated.push(Tile::SettingsRows);
+            }
+        }
         Ok(updated)
     }
 
@@ -1469,8 +1599,11 @@ impl App {
             Tile::Modal => self.modal_tile.as_ref(),
             Tile::ModalFocusElement => self.modal_focus_tile.as_ref().map(|(_, p)| p),
             Tile::DropdownFocusOption => self.dropdown_focus_tile.as_ref().map(|(_, p)| p),
+            Tile::SettingsScrollbar => self.settings_scrollbar_tile.as_ref().map(|(_, p)| p),
+            Tile::SettingsRows => self.settings_rows_tile.as_ref().map(|(_, p)| p),
             Tile::Status => self.status_tile.as_ref().map(|(_, p)| p),
             Tile::NoHost => self.nohost_tile.as_ref(),
+            Tile::Spinner => self.spinner_tile.as_ref(),
             // Stream-side only (uploaded directly by `run_inner`'s overlay
             // refresh) — never one of App's menu tiles.
             Tile::StatsOverlay | Tile::DisconnectDialog | Tile::DisconnectFocusButton => None,
@@ -1499,6 +1632,18 @@ impl App {
                 cmds.push(DrawCmd::Tex {
                     tile: Tile::NoHost,
                     dst: Rect::new(grid_x + ui::GRID_PAD, ui::GRID_TOP_Y, p.width(), p.height()),
+                    alpha: 0xff,
+                });
+            }
+        } else if !self.grid_reveal_ready {
+            if let Some(p) = &self.spinner_tile {
+                let x = grid_x + (available_w as i32 - p.width() as i32) / 2;
+                // 40% down rather than dead-center, which reads as slightly low on a TV.
+                let area_h = screen_h as i32 - ui::GRID_TOP_Y;
+                let y = ui::GRID_TOP_Y + (area_h - p.height() as i32) * 2 / 5;
+                cmds.push(DrawCmd::Tex {
+                    tile: Tile::Spinner,
+                    dst: Rect::new(x, y, p.width(), p.height()),
                     alpha: 0xff,
                 });
             }
@@ -1560,15 +1705,15 @@ impl App {
                     alpha: (255.0 * f) as u8,
                 });
             }
-            if self.home_status.is_some() {
-                if let Some((_, p)) = &self.status_tile {
-                    let y = screen_h as i32 - ui::GRID_PAD - p.height() as i32;
-                    cmds.push(DrawCmd::Tex {
-                        tile: Tile::Status,
-                        dst: Rect::new(grid_x + ui::GRID_PAD, y, p.width(), p.height()),
-                        alpha: 0xff,
-                    });
-                }
+        }
+        if self.selected_host.is_some() && self.home_status.is_some() {
+            if let Some((_, p)) = &self.status_tile {
+                let y = screen_h as i32 - ui::GRID_PAD - p.height() as i32;
+                cmds.push(DrawCmd::Tex {
+                    tile: Tile::Status,
+                    dst: Rect::new(grid_x + ui::GRID_PAD, y, p.width(), p.height()),
+                    alpha: 0xff,
+                });
             }
         }
 
@@ -1609,6 +1754,27 @@ impl App {
                 dst: Rect::new(0, dy, screen_w, screen_h),
                 alpha: (255.0 * m) as u8,
             });
+            // Settings' card/content/scroll, computed once and reused by every block
+            // below instead of each re-deriving it (they're all pure geometry, but no
+            // reason to repeat the call four times in one frame).
+            let settings_geom = matches!(self.screen, Screen::Settings).then(|| {
+                (
+                    Self::settings_layout(screen_w, screen_h),
+                    self.clamped_settings_scroll(screen_h),
+                )
+            });
+            // The Settings row list: cropped/repositioned straight off its full
+            // (unscrolled) tile — a GPU op, so scrolling never re-rasterizes anything
+            // (see `Tile::SettingsRows`'s docs).
+            if let Some(((_, content), scroll)) = settings_geom {
+                let stride = ui::SETTINGS_ROW_H as i32 + ui::SETTINGS_ROW_GAP;
+                cmds.push(DrawCmd::TexCropped {
+                    tile: Tile::SettingsRows,
+                    src: Rect::new(0, scroll as i32 * stride, content.width(), content.height()),
+                    dst: Rect::new(content.x(), content.y() + dy, content.width(), content.height()),
+                    alpha: (255.0 * m) as u8,
+                });
+            }
             // Whichever modal is open, its one focused widget — a settings/Wake
             // row, a pairing digit/button, or a Forget-host button (see
             // `ModalFocusKey`'s docs) — composites on top of the shell (which
@@ -1618,8 +1784,10 @@ impl App {
             // modal-open animation.
             let focus_rect = match self.screen {
                 Screen::Settings => {
-                    let (_, content) = Self::settings_layout(screen_w, screen_h);
-                    Some(ui::focus_row_rect(content, self.settings_focused))
+                    let ((_, content), scroll) = settings_geom.expect("screen is Screen::Settings");
+                    // `content`'s rows are the scrolled-to-visible window — translate
+                    // the focused row's global index back to a local one.
+                    Some(ui::focus_row_rect(content, self.settings_focused - scroll))
                 }
                 Screen::Wake => self.wake.as_ref().filter(|w| !w.mac.is_empty()).map(|w| {
                     let card = Self::wake_card_rect(screen_w, screen_h, w, fonts);
@@ -1691,10 +1859,9 @@ impl App {
             // top of the shell's unfocused option list at its actual
             // position, so navigating dropdown options needs no modal
             // re-rasterize either.
-            if matches!(self.screen, Screen::Settings) {
+            if let Some(((card, content), scroll)) = settings_geom {
                 if let Some(dd) = &self.dropdown {
-                    let (_, content) = Self::settings_layout(screen_w, screen_h);
-                    let overlay_rect = Self::dropdown_overlay_rect(content, dd.row);
+                    let overlay_rect = Self::dropdown_overlay_rect(content, dd.row - scroll);
                     let option_rect = ui::dropdown_option_rect(overlay_rect, dd.focused);
                     cmds.push(DrawCmd::Tex {
                         tile: Tile::DropdownFocusOption,
@@ -1705,6 +1872,34 @@ impl App {
                             option_rect.height(),
                         ),
                         alpha: (255.0 * m) as u8,
+                    });
+                }
+                // Full opacity for `SETTINGS_SCROLLBAR_HOLD`, then a linear fade over
+                // `SETTINGS_SCROLLBAR_FADE`.
+                let scroll_alpha = self.settings_scroll_shown_at.map_or(0.0, |t| {
+                    let elapsed = t.elapsed();
+                    if elapsed < SETTINGS_SCROLLBAR_HOLD {
+                        1.0
+                    } else {
+                        let fading = (elapsed - SETTINGS_SCROLLBAR_HOLD).as_secs_f32();
+                        1.0 - (fading / SETTINGS_SCROLLBAR_FADE.as_secs_f32()).clamp(0.0, 1.0)
+                    }
+                });
+                if scroll_alpha > 0.0 {
+                    // Sits nearer the card's edge than the row content's, so it doesn't
+                    // overlap a row's dropdown pill/slider/switch. The `26` offset isn't
+                    // derived from `settings_layout`'s 0.62 card-width fraction — re-check
+                    // both if either changes.
+                    let dst = Rect::new(
+                        card.x() + card.width() as i32 - 26,
+                        content.y() + dy,
+                        SETTINGS_SCROLLBAR_TILE_W,
+                        content.height(),
+                    );
+                    cmds.push(DrawCmd::Tex {
+                        tile: Tile::SettingsScrollbar,
+                        dst,
+                        alpha: (255.0 * m * scroll_alpha) as u8,
                     });
                 }
             }

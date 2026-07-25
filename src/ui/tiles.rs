@@ -43,6 +43,37 @@ pub fn render_card_tile(
     Ok(p)
 }
 
+/// Fixed size of the loading spinner drawn over the grid — see `App::grid_reveal_ready`.
+pub const SPINNER_SIZE: u32 = 64;
+
+/// A 12-dot activity indicator. `phase` is seconds elapsed since the spinner started
+/// (`App::spinner_since`) — the lead dot advances continuously, trailing dots fading out.
+pub fn render_spinner_tile(phase: f32) -> Painter {
+    const DOTS: usize = 12;
+    const REVOLUTION_SECS: f32 = 1.4;
+    let size = SPINNER_SIZE;
+    let mut p = Painter::new(size, size);
+    let (cx, cy) = (size as f32 / 2.0, size as f32 / 2.0);
+    let orbit = size as f32 / 2.0 - 6.0;
+    let dot_r = size as f32 / 16.0;
+    let lead = (phase / REVOLUTION_SECS).rem_euclid(1.0);
+    for i in 0..DOTS {
+        let t = i as f32 / DOTS as f32;
+        let angle = t * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+        let (x, y) = (cx + orbit * angle.cos(), cy + orbit * angle.sin());
+        // Distance behind the lead dot, wrapped — farther behind fades more.
+        let behind = (t - lead).rem_euclid(1.0);
+        let alpha = (255.0 * (1.0 - behind)).clamp(40.0, 255.0) as u8;
+        p.fill_circle(
+            x,
+            y,
+            dot_r,
+            Color::RGBA(ACCENT_BRIGHT.r, ACCENT_BRIGHT.g, ACCENT_BRIGHT.b, alpha),
+        );
+    }
+    p
+}
+
 /// Transparent padding around the focus-ring tile (the ring's outer glow pass
 /// sits 6px out + stroke width).
 pub const FOCUS_RING_PAD: i32 = 12;
@@ -105,12 +136,7 @@ pub fn render_focused_row_tile(
 }
 
 /// A single line of text as its own tight transparent tile.
-pub fn render_text_tile(
-    text_cache: &mut TextCache,
-    font: &Font,
-    text: &str,
-    color: Color,
-) -> Result<Painter> {
+pub fn render_text_tile(text_cache: &mut TextCache, font: &Font, text: &str, color: Color) -> Result<Painter> {
     let (w, h) = font.size_of(text).unwrap_or((1, 1));
     let mut p = Painter::new(w.max(1), h.max(1));
     draw_text(&mut p, text_cache, font, text, 0, 0, color)?;
@@ -158,11 +184,7 @@ pub fn render_stats_overlay_tile(font: &Font, lines: &[String]) -> Result<Painte
     let h = (lines.len() as i32 * line_h + 2 * pad) as u32;
     let mut p = Painter::new(w.max(1), h.max(1));
     let mut tc = TextCache::new();
-    p.fill_rounded_rect(
-        Rect::new(0, 0, w, h),
-        14,
-        Color::RGBA(0x14, 0x10, 0x1f, 0xd2),
-    );
+    p.fill_rounded_rect(Rect::new(0, 0, w, h), 14, Color::RGBA(0x14, 0x10, 0x1f, 0xd2));
     for (i, line) in lines.iter().enumerate() {
         // First line (mode/codec header) pops; the measurements below are muted.
         let color = if i == 0 { WHITE } else { MUTED };
@@ -179,8 +201,16 @@ pub fn disconnect_dialog_buttons() -> [ConfirmButton<'static>; 2] {
     [
         // Echoes the question's own verb ("Stop streaming?"), the same way the Forget
         // confirmation's button echoes its title.
-        ConfirmButton { icon: Some(ICON_CLOSE), label: "Stop streaming", color: ERROR_RED },
-        ConfirmButton { icon: None, label: "Cancel", color: WHITE },
+        ConfirmButton {
+            icon: Some(ICON_CLOSE),
+            label: "Stop streaming",
+            color: ERROR_RED,
+        },
+        ConfirmButton {
+            icon: None,
+            label: "Cancel",
+            color: WHITE,
+        },
     ]
 }
 
@@ -224,7 +254,13 @@ pub fn render_disconnect_dialog_shell(screen_w: u32, screen_h: u32, fonts: &Font
     let (title_w, _) = fonts.label.size_of(title).unwrap_or((0, 0));
     let title_x = card.x() + (card.width() as i32 - title_w as i32) / 2;
     draw_text(&mut p, &mut tc, fonts.label, title, title_x, card.y() + 36, WHITE)?;
-    draw_confirm_buttons(&mut p, &mut tc, fonts, content, &disconnect_dialog_buttons(), usize::MAX)?;
+    draw_confirm_buttons(
+        &mut p,
+        &mut tc,
+        fonts,
+        content,
+        &disconnect_dialog_buttons(),
+        usize::MAX,
+    )?;
     Ok(p)
 }
-

@@ -127,6 +127,8 @@ impl App {
                     self.screen = Screen::Settings;
                     self.dropdown = None;
                     self.settings_focused = 0;
+                    self.settings_scroll = 0;
+                    self.settings_scroll_shown_at = None;
                 }
                 HomeFocus::SidebarMenu(i) => self.open_host_menu(i),
                 HomeFocus::Grid(i) => self.confirm_grid_card(i),
@@ -199,7 +201,15 @@ impl App {
         match entry {
             HostEntry::Known(h) if h.fingerprint.is_some() => {
                 let (host, port, mgmt_port) = (h.host, h.port, h.mgmt_port);
-                self.select_host(host, port, mgmt_port);
+                // Re-confirming the already-active host must not refetch — `select_host`
+                // unconditionally clears art/games and re-hits the library API, blinking
+                // every card back to a placeholder for nothing. Just jump focus into the
+                // grid instead. Assumes `mgmt_port`/cert can't change without `(host, port)`.
+                if self.selected_host.as_ref() == Some(&(host.clone(), port)) {
+                    self.home_focus = HomeFocus::Grid(0);
+                } else {
+                    self.select_host(host, port, mgmt_port);
+                }
             }
             _ => self.open_pairing(idx),
         }
@@ -279,7 +289,13 @@ impl App {
                     .and_then(|h| h.fingerprint);
                 // Covers are requested per card as the grid window reaches them (see
                 // `App::prepare_tiles`), not fetched for the whole library up front.
-                self.art_loader = Some(crate::art::ArtLoader::spawn(host, mgmt_port, identity, fingerprint));
+                self.art_loader = Some(crate::art::ArtLoader::spawn(
+                    host,
+                    port,
+                    mgmt_port,
+                    identity,
+                    fingerprint,
+                ));
                 self.games = games;
                 self.home_status = None;
             }
@@ -404,6 +420,7 @@ impl App {
             return;
         };
         let (host, port) = (h.host.clone(), h.port);
+        crate::art::clear_host_cache(&host, port);
         self.known_hosts.retain(|k| !(k.host == host && k.port == port));
         let _ = store::save_known_hosts(&self.known_hosts);
         self.entries = self.known_hosts.iter().cloned().map(HostEntry::Known).collect();

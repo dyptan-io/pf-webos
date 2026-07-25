@@ -148,6 +148,31 @@ pub fn render_focus_row_tile(
     Ok(p)
 }
 
+/// Every row unfocused, as one tile at its own full (unscrolled) height — the
+/// Settings modal's `Tile::SettingsRows`. Scrolling crops/repositions this via a
+/// GPU-side `DrawCmd::TexCropped` instead of re-rasterizing, so this only needs
+/// rebuilding when a value or the open dropdown changes, never on scroll.
+pub fn render_focus_rows_tile(
+    text_cache: &mut TextCache,
+    fonts: &Fonts,
+    rows: &[FocusRow],
+    width: u32,
+    open_dropdown_row: Option<usize>,
+) -> Result<Painter> {
+    let height = rows.len() as u32 * (SETTINGS_ROW_H + SETTINGS_ROW_GAP as u32);
+    let mut p = Painter::new(width, height.max(1));
+    draw_focus_rows(
+        &mut p,
+        text_cache,
+        fonts,
+        rows,
+        usize::MAX,
+        open_dropdown_row,
+        Rect::new(0, 0, width, height),
+    )?;
+    Ok(p)
+}
+
 /// Draws one focus row (icon + label + dropdown pill / slider / modern switch
 /// / nothing, per `RowKind`) into `row_rect`, focused or not — shared by
 /// `draw_focus_rows` (the static, always-unfocused shell) and
@@ -277,7 +302,11 @@ pub fn draw_dropdown_pill(
     painter.stroke_rounded_rect(
         rect,
         radius,
-        if open { ACCENT_BRIGHT } else { Color::RGBA(0xff, 0xff, 0xff, 0x30) },
+        if open {
+            ACCENT_BRIGHT
+        } else {
+            Color::RGBA(0xff, 0xff, 0xff, 0x30)
+        },
         1.5,
     );
     let chevron_size = 20u32;
@@ -325,7 +354,12 @@ pub fn draw_slider_with_thumb(painter: &mut Painter, rect: Rect, fraction: f32, 
 pub fn lerp_color(from: Color, to: Color, frac: f32) -> Color {
     let f = frac.clamp(0.0, 1.0);
     let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * f) as u8;
-    Color::RGBA(lerp(from.r, to.r), lerp(from.g, to.g), lerp(from.b, to.b), lerp(from.a, to.a))
+    Color::RGBA(
+        lerp(from.r, to.r),
+        lerp(from.g, to.g),
+        lerp(from.b, to.b),
+        lerp(from.a, to.a),
+    )
 }
 
 pub const SWITCH_OFF_TRACK: Color = Color::RGBA(0xff, 0xff, 0xff, 0x22);
@@ -351,6 +385,30 @@ pub fn draw_switch(painter: &mut Painter, rect: Rect, frac: f32) {
 /// Row height of one dropdown option — also `render_dropdown_option_tile`'s tile size.
 pub const DROPDOWN_OPTION_H: u32 = 56;
 
+/// A track+thumb along a scrollable list's right edge. `total`/`visible`/`scroll` are row
+/// counts (`visible` <= `total`, `scroll` <= `total - visible`). Rendered into its own
+/// tile so the fade-in/out is a per-frame alpha composite, not a re-rasterize.
+const SCROLLBAR_TRACK_W: u32 = 6;
+
+pub fn render_list_scrollbar_tile(tile_w: u32, tile_h: u32, total: usize, visible: usize, scroll: usize) -> Painter {
+    let mut painter = Painter::new(tile_w, tile_h.max(1));
+    if total <= visible {
+        return painter;
+    }
+    let track_w = SCROLLBAR_TRACK_W.min(tile_w);
+    let track = Rect::new(tile_w as i32 - track_w as i32, 0, track_w, tile_h);
+    painter.fill_rounded_rect(track, track_w as i32 / 2, Color::RGBA(0xff, 0xff, 0xff, 0x14));
+
+    let thumb_h = ((visible as f32 / total as f32) * track.height() as f32).round() as u32;
+    let thumb_h = thumb_h.clamp(24, track.height());
+    let max_thumb_y = track.height().saturating_sub(thumb_h) as f32;
+    let max_scroll = (total - visible).max(1) as f32;
+    let thumb_y = track.y() + ((scroll as f32 / max_scroll) * max_thumb_y).round() as i32;
+    let thumb = Rect::new(track.x(), thumb_y, track_w, thumb_h);
+    painter.fill_rounded_rect(thumb, track_w as i32 / 2, Color::RGBA(0xff, 0xff, 0xff, 0x50));
+    painter
+}
+
 /// Renders a dropdown's options as an overlay list anchored just below the row that
 /// opened it, inside the settings modal card. One shadow/background for the whole
 /// panel and contiguous, same-height rows — like a typical dropdown/picker list —
@@ -365,7 +423,12 @@ pub fn draw_dropdown_overlay(
     focused_index: usize,
     rect: Rect,
 ) -> Result<()> {
-    let bg_rect = Rect::new(rect.x(), rect.y(), rect.width(), options.len() as u32 * DROPDOWN_OPTION_H);
+    let bg_rect = Rect::new(
+        rect.x(),
+        rect.y(),
+        rect.width(),
+        options.len() as u32 * DROPDOWN_OPTION_H,
+    );
     draw_popup_panel(painter, bg_rect, Color::RGBA(0xff, 0xff, 0xff, 0x20));
     for (i, opt) in options.iter().enumerate() {
         let row_rect = dropdown_option_rect(rect, i);
@@ -379,7 +442,12 @@ pub fn draw_dropdown_overlay(
 /// `app.rs`'s `draw_list` (which needs it to position the composited
 /// focused-option tile).
 pub fn dropdown_option_rect(rect: Rect, index: usize) -> Rect {
-    Rect::new(rect.x(), rect.y() + index as i32 * DROPDOWN_OPTION_H as i32, rect.width(), DROPDOWN_OPTION_H)
+    Rect::new(
+        rect.x(),
+        rect.y() + index as i32 * DROPDOWN_OPTION_H as i32,
+        rect.width(),
+        DROPDOWN_OPTION_H,
+    )
 }
 
 /// One dropdown option, focused, as its own tile (no padding needed — unlike
@@ -387,7 +455,12 @@ pub fn dropdown_option_rect(rect: Rect, index: usize) -> Rect {
 /// its row rect) — composited by the GPU over the overlay's unfocused option
 /// list. Moving the dropdown's own focus recomposites just this small tile
 /// instead of re-rasterizing the whole modal.
-pub fn render_dropdown_option_tile(text_cache: &mut TextCache, font_value: &Font, option: &str, width: u32) -> Result<Painter> {
+pub fn render_dropdown_option_tile(
+    text_cache: &mut TextCache,
+    font_value: &Font,
+    option: &str,
+    width: u32,
+) -> Result<Painter> {
     let mut p = Painter::new(width, DROPDOWN_OPTION_H);
     let rect = Rect::new(0, 0, width, DROPDOWN_OPTION_H);
     draw_dropdown_option(&mut p, text_cache, font_value, option, true, rect)?;
@@ -473,7 +546,11 @@ pub fn confirm_row_min_width(font: &Font, buttons: &[ConfirmButton; 2]) -> u32 {
         .iter()
         .map(|b| {
             let label_w = font.size_of(b.label).map_or(0, |(w, _)| w);
-            let leading = if b.icon.is_some() { icon_size + icon_gap as u32 } else { 0 };
+            let leading = if b.icon.is_some() {
+                icon_size + icon_gap as u32
+            } else {
+                0
+            };
             label_w + leading + 2 * side_pad as u32
         })
         .max()
@@ -488,7 +565,12 @@ pub fn confirm_row_min_width(font: &Font, buttons: &[ConfirmButton; 2]) -> u32 {
 pub fn confirm_button_rect(content: Rect, index: usize) -> Rect {
     let gap = CONFIRM_BUTTON_GAP;
     let btn_w = content.width().saturating_sub(gap as u32) / 2;
-    Rect::new(content.x() + index as i32 * (btn_w as i32 + gap), content.y(), btn_w, content.height())
+    Rect::new(
+        content.x() + index as i32 * (btn_w as i32 + gap),
+        content.y(),
+        btn_w,
+        content.height(),
+    )
 }
 
 /// A row of side-by-side buttons for a Yes/No-style confirmation (currently
@@ -587,4 +669,3 @@ pub fn draw_confirm_button(
     )?;
     Ok(())
 }
-
