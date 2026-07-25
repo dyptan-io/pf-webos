@@ -34,11 +34,16 @@ video decode, and webOS packaging.
 - Magic Remote friendly: d-pad navigation, pointer hover/click, number-pad PIN/IP entry, and the
   Red button as a Back/disconnect substitute.
 
+<details>
+<summary><b>Screenshots</b></summary>
+
 <p align="center">
   <img src="assets/screenshots/home.jpg" width="32%" alt="Home / game library">
   <img src="assets/screenshots/host-menu.jpg" width="32%" alt="Host menu">
   <img src="assets/screenshots/settings.jpg" width="32%" alt="Settings">
 </p>
+
+</details>
 
 ## Installing
 
