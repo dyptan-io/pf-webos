@@ -14,8 +14,8 @@
 //! the more useful number for picking a bitrate here (it's what a real session could
 //! actually carry), but it is not a pure link-speed measurement, and the UI says so.
 use super::*;
-use std::time::Instant;
 use sdl2::rect::Rect;
+use std::time::Instant;
 
 use punktfunk_core::client::ProbeOutcome;
 
@@ -33,23 +33,31 @@ const MIN_USEFUL_KBPS: u32 = 2_000;
 pub(crate) enum SpeedTestState {
     Connecting,
     /// The burst is running; `partial` is the latest poll, if any has landed yet.
-    Measuring { partial: Option<ProbeOutcome> },
+    Measuring {
+        partial: Option<ProbeOutcome>,
+    },
     /// `confirmed` is false when the host's end-of-burst report never arrived and the
     /// figure was salvaged from what actually got here (see `session::SpeedProbeResult`).
-    Done { outcome: ProbeOutcome, confirmed: bool },
+    Done {
+        outcome: ProbeOutcome,
+        confirmed: bool,
+    },
     Failed(String),
 }
 
 /// What the worker sends back.
 pub(crate) enum SpeedTestMsg {
     Progress(ProbeOutcome),
-    Done { outcome: Box<ProbeOutcome>, confirmed: bool },
+    Done {
+        outcome: Box<ProbeOutcome>,
+        confirmed: bool,
+    },
     Failed(String),
 }
 
 impl App {
     /// Opens `Screen::SpeedTest` for sidebar entry `idx` and starts the probe.
-    pub(crate) fn open_speed_test(&mut self, idx: usize, log: &mut std::fs::File) {
+    pub(crate) fn open_speed_test(&mut self, idx: usize) {
         let Some(entry) = self.entries.get(idx) else { return };
         let host = entry.host().to_string();
         let port = entry.port();
@@ -67,18 +75,9 @@ impl App {
         self.speed_test = Some(SpeedTestState::Connecting);
         self.speed_test_focused = 0;
         self.screen = Screen::SpeedTest;
-        let _ = writeln!(log, "speed test: connecting to {host}:{port}");
+        tracing::info!("speed test: connecting to {host}:{port}");
 
         let identity = (self.identity.0.clone(), self.identity.1.clone());
-        // The worker needs its own handle: this `&mut File` can't cross the thread
-        // boundary (same reason `discovery::browse` and the video pump each get one).
-        let mut worker_log = match log.try_clone() {
-            Ok(f) => f,
-            Err(e) => {
-                self.speed_test = Some(SpeedTestState::Failed(format!("couldn't open log: {e}")));
-                return;
-            }
-        };
         let (tx, rx) = std::sync::mpsc::channel();
         self.speed_test_rx = Some(rx);
         std::thread::spawn(move || {
@@ -89,7 +88,6 @@ impl App {
                 identity,
                 pin,
                 std::time::Duration::from_secs(20),
-                &mut worker_log,
                 |partial| {
                     let _ = progress_tx.send(SpeedTestMsg::Progress(partial));
                 },
@@ -106,7 +104,7 @@ impl App {
 
     /// Drains the worker's updates, if any — called each tick alongside the other
     /// `drain_*`s. Returns whether anything changed.
-    pub(crate) fn drain_speed_test(&mut self, log: &mut std::fs::File) -> bool {
+    pub(crate) fn drain_speed_test(&mut self) -> bool {
         let Some(rx) = &self.speed_test_rx else { return false };
         let mut changed = false;
         // Drain everything pending, keeping only the latest — a burst of progress polls
@@ -118,18 +116,23 @@ impl App {
                     self.speed_test = Some(SpeedTestState::Measuring { partial: Some(p) });
                 }
                 SpeedTestMsg::Done { outcome, confirmed } => {
-                    let _ = writeln!(
-                        log,
+                    tracing::info!(
                         "speed test: {} kbps, {:.1}% loss, {} bytes in {} ms (confirmed={confirmed})",
-                        outcome.throughput_kbps, outcome.loss_pct, outcome.recv_bytes, outcome.elapsed_ms
+                        outcome.throughput_kbps,
+                        outcome.loss_pct,
+                        outcome.recv_bytes,
+                        outcome.elapsed_ms
                     );
-                    self.speed_test = Some(SpeedTestState::Done { outcome: *outcome, confirmed });
+                    self.speed_test = Some(SpeedTestState::Done {
+                        outcome: *outcome,
+                        confirmed,
+                    });
                     self.speed_test_focused = 0;
                     self.speed_test_rx = None;
                     break;
                 }
                 SpeedTestMsg::Failed(e) => {
-                    let _ = writeln!(log, "speed test failed: {e}");
+                    tracing::warn!("speed test failed: {e}");
                     self.speed_test = Some(SpeedTestState::Failed(e));
                     self.speed_test_rx = None;
                     break;
@@ -184,8 +187,11 @@ impl App {
         ]
     }
 
-    pub(crate) fn handle_speed_test_event(&mut self, ev: MenuEvent, log: &mut std::fs::File) {
-        let done = matches!(self.speed_test, Some(SpeedTestState::Done { .. }) | Some(SpeedTestState::Failed(_)));
+    pub(crate) fn handle_speed_test_event(&mut self, ev: MenuEvent) {
+        let done = matches!(
+            self.speed_test,
+            Some(SpeedTestState::Done { .. }) | Some(SpeedTestState::Failed(_))
+        );
         match ev {
             // Still measuring: Back cancels (dropping the receiver orphans the worker,
             // which tears its own connection down), everything else is ignored.
@@ -212,7 +218,7 @@ impl App {
                     }
                     // Nothing to apply — the primary button is "Retry" (see
                     // `speed_test_apply_label`). Re-run against the same host.
-                    None => self.retry_speed_test(log),
+                    None => self.retry_speed_test(),
                 }
             }
             MenuEvent::Up | MenuEvent::Down | MenuEvent::Secondary => {}
@@ -222,12 +228,12 @@ impl App {
     /// Re-runs the probe against the host this screen was opened for. The host menu's
     /// index is still set (this screen is only ever reached from there), so nothing has
     /// to be stashed separately.
-    pub(crate) fn retry_speed_test(&mut self, log: &mut std::fs::File) {
+    pub(crate) fn retry_speed_test(&mut self) {
         let Some(idx) = self.host_menu_index else {
             self.close_speed_test();
             return;
         };
-        self.open_speed_test(idx, log);
+        self.open_speed_test(idx);
     }
 
     /// Leaves the screen, abandoning any in-flight probe.
@@ -297,7 +303,10 @@ impl App {
 
     pub(crate) fn speed_test_card_rect(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Rect {
         let status = self.speed_test_status();
-        let done = matches!(self.speed_test, Some(SpeedTestState::Done { .. }) | Some(SpeedTestState::Failed(_)));
+        let done = matches!(
+            self.speed_test,
+            Some(SpeedTestState::Done { .. }) | Some(SpeedTestState::Failed(_))
+        );
         Self::simple_modal_card(screen_w, screen_h, |probe| {
             let header_end = ui::modal_header_end_y(fonts.label, fonts.value, probe, &status);
             if done {
@@ -336,7 +345,10 @@ impl App {
             &self.speed_test_status(),
             if failed { ui::ERROR_RED } else { ui::MUTED },
         )?;
-        if matches!(self.speed_test, Some(SpeedTestState::Done { .. }) | Some(SpeedTestState::Failed(_))) {
+        if matches!(
+            self.speed_test,
+            Some(SpeedTestState::Done { .. }) | Some(SpeedTestState::Failed(_))
+        ) {
             let recommended = match &self.speed_test {
                 Some(SpeedTestState::Done { outcome, .. }) => Self::recommended_kbps(outcome),
                 _ => None,

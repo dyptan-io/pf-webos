@@ -3,29 +3,28 @@
 //! centered modals on top of it — modeled on moonlight-tv's actual layout (see
 //! `ui.rs`'s module docs). `ui.rs` owns drawing/input-mapping primitives,
 //! `store.rs` owns persistence, `discovery.rs` owns mDNS.
-use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use sdl2::rect::Rect;
 use tiny_skia::Pixmap;
 
-use crate::library::GameEntry;
 use crate::compositor::{DrawCmd, Tile};
+use crate::library::GameEntry;
 use crate::store::{self, KnownHost, Settings};
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};
 
-mod home;
-mod forget;
-mod wake;
-mod pairing;
-mod settings;
+mod about;
 mod addhost;
 mod edithost;
+mod forget;
+mod home;
 mod hostmenu;
-mod about;
-mod speedtest;
+mod pairing;
 mod reach;
+mod settings;
+mod speedtest;
+mod wake;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -478,16 +477,11 @@ impl Drop for App {
     }
 }
 
-
 impl App {
-    pub fn new(identity: (String, String), log: &mut std::fs::File) -> Self {
+    pub fn new(identity: (String, String)) -> Self {
         let known_hosts = store::load_known_hosts();
         let entries = known_hosts.iter().cloned().map(HostEntry::Known).collect();
-        // A second handle onto the same log file (both just append — see
-        // `main.rs::log_path`) for the mdns background thread to log through, since
-        // it can't share this `&mut File` across threads.
-        let discovery_log = log.try_clone().expect("clone log file handle for mdns thread");
-        let (discovered, discovery_daemon) = match crate::discovery::browse(discovery_log) {
+        let (discovered, discovery_daemon) = match crate::discovery::browse() {
             Some((rx, daemon)) => (rx, Some(daemon)),
             None => (std::sync::mpsc::channel().1, None),
         };
@@ -567,7 +561,7 @@ impl App {
                 .find(|h| h.host == host && h.port == port && h.fingerprint.is_some())
             {
                 let (host, port, mgmt_port) = (h.host.clone(), h.port, h.mgmt_port);
-                app.select_host(host, port, mgmt_port, log);
+                app.select_host(host, port, mgmt_port);
             }
         }
         app
@@ -580,7 +574,7 @@ impl App {
     /// waking host reappears on mDNS and reconnects. Returns whether the sidebar
     /// actually changed — `main.rs`'s render loop uses this to skip a redraw when a
     /// discovery tick found nothing new (see its dirty-flag docs).
-    pub fn drain_discovery(&mut self, log: &mut std::fs::File) -> bool {
+    pub fn drain_discovery(&mut self) -> bool {
         let mut changed = false;
         let mut mac_learned = false;
         let mut woke = None;
@@ -624,7 +618,7 @@ impl App {
             let _ = store::save_known_hosts(&self.known_hosts);
         }
         if let Some((host, port, mgmt_port)) = woke {
-            self.wake_succeeded(host, port, mgmt_port, "mDNS", log);
+            self.wake_succeeded(host, port, mgmt_port, "mDNS");
             changed = true;
         }
         if changed {
@@ -636,11 +630,11 @@ impl App {
     /// Ends an in-flight wake because the host is actually back — whether that was
     /// noticed passively (`drain_discovery` seeing a fresh mDNS resolve) or actively
     /// (`tick_wake`'s reachability probe succeeding). `source` is just for the log line.
-    pub(crate) fn wake_succeeded(&mut self, host: String, port: u16, mgmt_port: Option<u16>, source: &str, log: &mut std::fs::File) {
-        let _ = writeln!(log, "wake succeeded: {host}:{port} back ({source})");
+    pub(crate) fn wake_succeeded(&mut self, host: String, port: u16, mgmt_port: Option<u16>, source: &str) {
+        tracing::info!("wake succeeded: {host}:{port} back ({source})");
         self.wake = None;
         self.screen = Screen::Home;
-        self.select_host(host, port, mgmt_port, log);
+        self.select_host(host, port, mgmt_port);
     }
 
     /// Drains any cover art that's finished decoding since the last tick — called
@@ -668,7 +662,7 @@ impl App {
     /// dispatch: `main.rs`'s Back handling on Home (a no-op there, but routed
     /// through here so the policy lives in one place) and a modal's close (X)
     /// button click (`handle_mouse_click`'s `hover_close` branch below).
-    pub fn back(&mut self, log: &mut std::fs::File) -> Option<ConnectTarget> {
+    pub fn back(&mut self) -> Option<ConnectTarget> {
         match self.screen {
             // Home has nothing to "back out" of (it's the root screen) — Back is a
             // no-op. (It used to be a shortcut straight to Settings, but that made
@@ -676,7 +670,7 @@ impl App {
             // Settings popped right back up.)
             Screen::Home => None,
             Screen::Pairing => {
-                self.handle_pairing_event(MenuEvent::Back, log);
+                self.handle_pairing_event(MenuEvent::Back);
                 None
             }
             Screen::Settings => {
@@ -688,7 +682,7 @@ impl App {
                 None
             }
             Screen::Wake => {
-                self.handle_wake_event(MenuEvent::Back, log);
+                self.handle_wake_event(MenuEvent::Back);
                 None
             }
             Screen::ForgetHost => {
@@ -696,11 +690,11 @@ impl App {
                 None
             }
             Screen::HostMenu => {
-                self.handle_host_menu_event(MenuEvent::Back, log);
+                self.handle_host_menu_event(MenuEvent::Back);
                 None
             }
             Screen::SpeedTest => {
-                self.handle_speed_test_event(MenuEvent::Back, log);
+                self.handle_speed_test_event(MenuEvent::Back);
                 None
             }
             Screen::EditHost => {
@@ -792,13 +786,7 @@ impl App {
     ) -> Rect {
         let w = (screen_w as f32 * SIMPLE_MODAL_WIDTH_FRAC).round() as u32;
         let height = content_height(Rect::new(0, 0, w, 0));
-        ui::modal_card_rect_above_keyboard(
-            screen_w,
-            screen_h,
-            SIMPLE_MODAL_WIDTH_FRAC,
-            height,
-            self.keyboard_shown,
-        )
+        ui::modal_card_rect_above_keyboard(screen_w, screen_h, SIMPLE_MODAL_WIDTH_FRAC, height, self.keyboard_shown)
     }
     /// Updates focus/hover to whatever the Magic Remote's pointer is over.
     /// Returns whether that actually changed anything visible — Magic Remote
@@ -812,14 +800,7 @@ impl App {
     /// the pointer drifting across the screen. Only keyboard/remote navigation or a
     /// click (`handle_mouse_click` below) moves it now. Hover still drives the
     /// close (X) button's highlight, a conventional affordance this excludes.
-    pub fn handle_mouse_motion(
-        &mut self,
-        x: i32,
-        y: i32,
-        screen_w: u32,
-        screen_h: u32,
-        fonts: &ui::Fonts,
-    ) -> bool {
+    pub fn handle_mouse_motion(&mut self, x: i32, y: i32, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> bool {
         match self.screen {
             Screen::Home => {
                 // Home has no close button, but `hover_close` is only ever set by
@@ -857,7 +838,11 @@ impl App {
                 self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
             }
             Screen::ForgetHost => {
-                let name = self.host_menu_index.and_then(|i| self.entries.get(i)).map(HostEntry::name).unwrap_or_default();
+                let name = self
+                    .host_menu_index
+                    .and_then(|i| self.entries.get(i))
+                    .map(HostEntry::name)
+                    .unwrap_or_default();
                 let card = Self::forget_host_card_rect(screen_w, screen_h, name, fonts);
                 self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
             }
@@ -900,7 +885,6 @@ impl App {
         screen_w: u32,
         screen_h: u32,
         fonts: &ui::Fonts,
-        log: &mut std::fs::File,
     ) -> Option<ConnectTarget> {
         // Re-sync the close-button hover to the click's own position first — a
         // MouseButtonDown can carry a slightly different (x, y) than the last
@@ -908,7 +892,7 @@ impl App {
         self.handle_mouse_motion(x, y, screen_w, screen_h, fonts);
         if self.hover_close {
             // Same "what Back means here" as everywhere else — see `back`'s docs.
-            return self.back(log);
+            return self.back();
         }
         // Unlike hover, a click DOES move `home_focus`/`settings_focused` — fresh at
         // the click's own position, so it confirms what was actually clicked rather
@@ -939,7 +923,7 @@ impl App {
                     )?;
                     self.home_focus = HomeFocus::Grid(idx);
                 }
-                self.handle_home_event(MenuEvent::Confirm, screen_w, screen_h, log)
+                self.handle_home_event(MenuEvent::Confirm, screen_w, screen_h)
             }
             Screen::Settings => {
                 // An open dropdown has no row grid of its own here — Confirm picks
@@ -964,12 +948,12 @@ impl App {
                 let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
                 if Self::pairing_request_button_rect(card, fonts).contains_point((x, y)) {
                     self.pairing_focus = PairingFocus::RequestAccess;
-                    self.handle_pairing_event(MenuEvent::Confirm, log);
+                    self.handle_pairing_event(MenuEvent::Confirm);
                 }
                 None
             }
             Screen::Wake => {
-                self.handle_wake_event(MenuEvent::Confirm, log);
+                self.handle_wake_event(MenuEvent::Confirm);
                 None
             }
             Screen::ForgetHost => {
@@ -985,11 +969,11 @@ impl App {
                 let content = ui::list_modal_content_rect(card, fonts, &subtitle, rows);
                 let i = (0..rows).find(|&i| ui::focus_row_rect(content, i).contains_point((x, y)))?;
                 self.menu_focused = i;
-                self.handle_host_menu_event(MenuEvent::Confirm, log);
+                self.handle_host_menu_event(MenuEvent::Confirm);
                 None
             }
             Screen::SpeedTest => {
-                self.handle_speed_test_event(MenuEvent::Confirm, log);
+                self.handle_speed_test_event(MenuEvent::Confirm);
                 None
             }
             // Nothing clickable but the close button (handled above).
@@ -1017,7 +1001,11 @@ impl App {
         match self.switch_anim {
             Some((t, from_on)) if from_on != target_on => {
                 let f = ui::anim_frac(Some(t), ui::FOCUS_POP);
-                if target_on { f } else { 1.0 - f }
+                if target_on {
+                    f
+                } else {
+                    1.0 - f
+                }
             }
             _ => f32::from(target_on),
         }
@@ -1082,8 +1070,7 @@ impl App {
             let stale = !matches!(&self.focused_row_tile, Some((k, _)) if *k == key);
             if stale {
                 let online = self.entries.get(key.0).and_then(|e| self.entry_online(e));
-                let tile =
-                    ui::render_focused_row_tile(text_cache, fonts, &self.entries, key.0, key.1, online)?;
+                let tile = ui::render_focused_row_tile(text_cache, fonts, &self.entries, key.0, key.1, online)?;
                 self.focused_row_tile = Some((key, tile));
                 updated.push(Tile::FocusRow);
             }
@@ -1150,9 +1137,7 @@ impl App {
                 }
                 // Ask for this card's cover as it enters the window, not for the whole
                 // library at once (see `art::ArtLoader`).
-                if let (Some(loader), Some(game)) =
-                    (&mut self.art_loader, self.games.get(idx.wrapping_sub(1)))
-                {
+                if let (Some(loader), Some(game)) = (&mut self.art_loader, self.games.get(idx.wrapping_sub(1))) {
                     loader.request(game);
                 }
                 if self.card_tiles[idx].is_some() {
@@ -1224,7 +1209,10 @@ impl App {
                 hover_close: self.hover_close,
             }),
             Screen::ForgetHost => Some(ModalShellKey::ForgetHost {
-                name: self.host_menu_index.and_then(|i| self.entries.get(i)).map(|e| e.name().to_string()),
+                name: self
+                    .host_menu_index
+                    .and_then(|i| self.entries.get(i))
+                    .map(|e| e.name().to_string()),
                 hover_close: self.hover_close,
             }),
             Screen::HostMenu => Some(ModalShellKey::HostMenu {
@@ -1320,10 +1308,7 @@ impl App {
                     Some(speedtest::SpeedTestState::Done { outcome, .. }) => Self::recommended_kbps(outcome),
                     _ => None,
                 };
-                ModalFocusKey::SpeedTestButton(
-                    self.speed_test_focused,
-                    Self::speed_test_apply_label(recommended),
-                )
+                ModalFocusKey::SpeedTestButton(self.speed_test_focused, Self::speed_test_apply_label(recommended))
             }),
             // Neither has a single focused widget: the address form is one always-active
             // field, and About is a scrolling document.
@@ -1352,7 +1337,10 @@ impl App {
                         )?
                     }
                     Screen::Wake => {
-                        let wake = self.wake.as_ref().expect("focus_key only Some for a Wake with a focusable widget");
+                        let wake = self
+                            .wake
+                            .as_ref()
+                            .expect("focus_key only Some for a Wake with a focusable widget");
                         let card = Self::wake_card_rect(screen_w, screen_h, wake, fonts);
                         if wake.focused == 0 {
                             let rows = ui::wake_rows(self.settings.wol_auto_send);
@@ -1380,9 +1368,11 @@ impl App {
                         }
                     }
                     Screen::Pairing => match self.pairing_focus {
-                        PairingFocus::Pin => {
-                            ui::render_pairing_digit_tile(text_cache, fonts.title, self.pin_digits[self.pin_digit_index])?
-                        }
+                        PairingFocus::Pin => ui::render_pairing_digit_tile(
+                            text_cache,
+                            fonts.title,
+                            self.pin_digits[self.pin_digit_index],
+                        )?,
                         PairingFocus::RequestAccess => {
                             let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
                             let btn = Self::pairing_request_button_rect(card, fonts);
@@ -1390,7 +1380,11 @@ impl App {
                         }
                     },
                     Screen::ForgetHost => {
-                        let name = self.host_menu_index.and_then(|i| self.entries.get(i)).map(HostEntry::name).unwrap_or_default();
+                        let name = self
+                            .host_menu_index
+                            .and_then(|i| self.entries.get(i))
+                            .map(HostEntry::name)
+                            .unwrap_or_default();
                         let card = Self::forget_host_card_rect(screen_w, screen_h, name, fonts);
                         let content = Self::forget_host_content_rect(card, name, fonts);
                         let rect = ui::confirm_button_rect(content, self.host_menu_focused);
@@ -1420,10 +1414,8 @@ impl App {
                     }
                     Screen::SpeedTest => {
                         let card = self.speed_test_card_rect(screen_w, screen_h, fonts);
-                        let rect = ui::confirm_button_rect(
-                            self.speed_test_buttons_rect(card, fonts),
-                            self.speed_test_focused,
-                        );
+                        let rect =
+                            ui::confirm_button_rect(self.speed_test_buttons_rect(card, fonts), self.speed_test_focused);
                         let recommended = match &self.speed_test {
                             Some(speedtest::SpeedTestState::Done { outcome, .. }) => Self::recommended_kbps(outcome),
                             _ => None,
@@ -1489,12 +1481,7 @@ impl App {
     /// params are only for pure geometry — `ui::modal_header_end_y` and
     /// friends — needed to position a modal's focused-widget tile without
     /// re-rendering its header). The GPU executes it (`Compositor::execute`).
-    pub fn draw_list(
-        &self,
-        screen_w: u32,
-        screen_h: u32,
-        fonts: &ui::Fonts,
-    ) -> Vec<DrawCmd> {
+    pub fn draw_list(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Vec<DrawCmd> {
         let mut cmds = Vec::new();
         let grid_x = ui::SIDEBAR_W as i32;
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
@@ -1532,7 +1519,12 @@ impl App {
                 }
                 cmds.push(DrawCmd::Tex {
                     tile: Tile::Card(idx),
-                    dst: Rect::new(r.x() - pad, y - pad, r.width() + 2 * pad as u32, r.height() + 2 * pad as u32),
+                    dst: Rect::new(
+                        r.x() - pad,
+                        y - pad,
+                        r.width() + 2 * pad as u32,
+                        r.height() + 2 * pad as u32,
+                    ),
                     alpha: 0xff,
                 });
             }
@@ -1543,16 +1535,24 @@ impl App {
                 let f = ui::anim_frac(self.focus_anim, ui::FOCUS_POP);
                 let r = ui::grid_card_rect(idx, columns, grid_x, available_w);
                 let y = r.y() - self.grid_scroll;
-                let card_base =
-                    Rect::new(r.x() - pad, y - pad, r.width() + 2 * pad as u32, r.height() + 2 * pad as u32);
+                let card_base = Rect::new(
+                    r.x() - pad,
+                    y - pad,
+                    r.width() + 2 * pad as u32,
+                    r.height() + 2 * pad as u32,
+                );
                 cmds.push(DrawCmd::Tex {
                     tile: Tile::Card(idx),
                     dst: ui::zoom_rect(card_base, f, CARD_GROWTH),
                     alpha: 0xff,
                 });
                 let rp = ui::FOCUS_RING_PAD;
-                let ring_base =
-                    Rect::new(r.x() - rp, y - rp, r.width() + 2 * rp as u32, r.height() + 2 * rp as u32);
+                let ring_base = Rect::new(
+                    r.x() - rp,
+                    y - rp,
+                    r.width() + 2 * rp as u32,
+                    r.height() + 2 * rp as u32,
+                );
                 cmds.push(DrawCmd::Tex {
                     tile: Tile::Ring,
                     dst: ui::zoom_rect(ring_base, f, CARD_GROWTH),
@@ -1584,7 +1584,12 @@ impl App {
             let pad = ui::ROW_TILE_PAD;
             cmds.push(DrawCmd::Tex {
                 tile: Tile::FocusRow,
-                dst: Rect::new(rect.x() - pad, rect.y() - pad, rect.width() + 2 * pad as u32, rect.height() + 2 * pad as u32),
+                dst: Rect::new(
+                    rect.x() - pad,
+                    rect.y() - pad,
+                    rect.width() + 2 * pad as u32,
+                    rect.height() + 2 * pad as u32,
+                ),
                 alpha: 0xff,
             });
         }
@@ -1635,7 +1640,11 @@ impl App {
                     })
                 }
                 Screen::ForgetHost => {
-                    let name = self.host_menu_index.and_then(|i| self.entries.get(i)).map(HostEntry::name).unwrap_or_default();
+                    let name = self
+                        .host_menu_index
+                        .and_then(|i| self.entries.get(i))
+                        .map(HostEntry::name)
+                        .unwrap_or_default();
                     let card = Self::forget_host_card_rect(screen_w, screen_h, name, fonts);
                     let content = Self::forget_host_content_rect(card, name, fonts);
                     Some(ui::confirm_button_rect(content, self.host_menu_focused))
@@ -1659,8 +1668,12 @@ impl App {
             };
             if let Some(rect) = focus_rect {
                 let pad = ui::ROW_TILE_PAD;
-                let base =
-                    Rect::new(rect.x() - pad, rect.y() - pad + dy, rect.width() + 2 * pad as u32, rect.height() + 2 * pad as u32);
+                let base = Rect::new(
+                    rect.x() - pad,
+                    rect.y() - pad + dy,
+                    rect.width() + 2 * pad as u32,
+                    rect.height() + 2 * pad as u32,
+                );
                 // The zoom-in: same GPU-scale-around-center technique as the
                 // grid's card focus pop (see above) — `modal_focus_tile` is
                 // rasterized once at its literal size, never re-rendered for
@@ -1684,7 +1697,12 @@ impl App {
                     let option_rect = ui::dropdown_option_rect(overlay_rect, dd.focused);
                     cmds.push(DrawCmd::Tex {
                         tile: Tile::DropdownFocusOption,
-                        dst: Rect::new(option_rect.x(), option_rect.y() + dy, option_rect.width(), option_rect.height()),
+                        dst: Rect::new(
+                            option_rect.x(),
+                            option_rect.y() + dy,
+                            option_rect.width(),
+                            option_rect.height(),
+                        ),
                         alpha: (255.0 * m) as u8,
                     });
                 }

@@ -7,8 +7,8 @@
 //! else — card geometry, the unfocused shell, the focused-row tile, the focus pop — is
 //! `ui::ListModal`'s, shared with any future list screen.
 use super::*;
-use std::time::Instant;
 use sdl2::rect::Rect;
+use std::time::Instant;
 
 use crate::ui::{self, FocusRow, HostEntry, MenuEvent, Painter};
 
@@ -64,7 +64,10 @@ impl App {
         }
         if saved {
             rows.push((HostAction::Edit, FocusRow::action(ui::ICON_EDIT, "Edit address…")));
-            rows.push((HostAction::Forget, FocusRow::action(ui::ICON_DELETE, "Forget host").danger()));
+            rows.push((
+                HostAction::Forget,
+                FocusRow::action(ui::ICON_DELETE, "Forget host").danger(),
+            ));
         }
         rows
     }
@@ -94,21 +97,27 @@ impl App {
             })
     }
 
-    pub(crate) fn host_menu_card_rect(screen_w: u32, screen_h: u32, fonts: &ui::Fonts, subtitle: &str, rows: usize) -> Rect {
+    pub(crate) fn host_menu_card_rect(
+        screen_w: u32,
+        screen_h: u32,
+        fonts: &ui::Fonts,
+        subtitle: &str,
+        rows: usize,
+    ) -> Rect {
         ui::list_modal_card_rect(screen_w, screen_h, fonts, subtitle, rows)
     }
 
     /// Handles one menu event on the host actions menu. Returns a `ConnectTarget`
     /// only if the chosen action starts a stream directly (it never does today —
     /// Connect goes through the same reachability pre-flight as the grid).
-    pub(crate) fn handle_host_menu_event(&mut self, ev: MenuEvent, log: &mut std::fs::File) {
+    pub(crate) fn handle_host_menu_event(&mut self, ev: MenuEvent) {
         let len = self.host_menu_actions().len();
         if ui::list_nav(&mut self.menu_focused, len, ev) {
             self.modal_focus_anim = Some(Instant::now());
             return;
         }
         match ev {
-            MenuEvent::Confirm => self.confirm_host_menu_row(log),
+            MenuEvent::Confirm => self.confirm_host_menu_row(),
             MenuEvent::Back => {
                 self.host_menu_index = None;
                 self.screen = Screen::Home;
@@ -119,15 +128,17 @@ impl App {
 
     /// Runs the focused row's action. Every arm either leaves for another screen or
     /// closes the menu — nothing stays here having "done something" invisibly.
-    pub(crate) fn confirm_host_menu_row(&mut self, log: &mut std::fs::File) {
+    pub(crate) fn confirm_host_menu_row(&mut self) {
         let actions = self.host_menu_actions();
-        let Some((action, _)) = actions.get(self.menu_focused) else { return };
+        let Some((action, _)) = actions.get(self.menu_focused) else {
+            return;
+        };
         let Some(idx) = self.host_menu_index else { return };
         match action {
             HostAction::Connect => {
                 self.host_menu_index = None;
                 self.screen = Screen::Home;
-                self.confirm_sidebar_host(idx, log);
+                self.confirm_sidebar_host(idx);
             }
             // Straight to the PIN ceremony, even for an already-paired host: re-pairing
             // is the documented recovery when a host's certificate has changed.
@@ -135,7 +146,7 @@ impl App {
                 self.host_menu_index = None;
                 self.open_pairing(idx);
             }
-            HostAction::SpeedTest => self.open_speed_test(idx, log),
+            HostAction::SpeedTest => self.open_speed_test(idx),
             HostAction::Wake => {
                 let Some(entry) = self.entries.get(idx) else { return };
                 let (host, port) = (entry.host().to_string(), entry.port());
@@ -143,7 +154,7 @@ impl App {
                 let name = entry.name().to_string();
                 self.host_menu_index = None;
                 self.screen = Screen::Home;
-                self.start_wake(host, port, mac, format!("Waking {name}…"), log);
+                self.start_wake(host, port, mac, format!("Waking {name}…"));
             }
             HostAction::Edit => self.open_edit_host(idx),
             HostAction::Forget => self.open_forget_host(idx),

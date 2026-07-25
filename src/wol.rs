@@ -5,7 +5,6 @@
 //! A sleeping host has no ARP entry, so the broadcast the core builds (each NIC's
 //! subnet-directed broadcast, plus the limited broadcast) is what actually reaches it;
 //! `last_ip`, when known, is additionally unicast.
-use std::io::Write as _;
 use std::net::Ipv4Addr;
 
 /// Sends a magic packet to every parseable MAC in `macs`. Returns whether at least one
@@ -24,8 +23,8 @@ pub fn wake(macs: &[String], last_ip: Option<Ipv4Addr>) -> bool {
 /// action and its periodic resend while a wake is in flight, so neither has to spell out
 /// the log message itself. `name` is just for a readable log line (the host's display
 /// name), not part of the wake mechanics.
-pub fn wake_and_log(macs: &[String], last_ip: Option<Ipv4Addr>, name: &str, log: &mut std::fs::File) -> bool {
+pub fn wake_and_log(macs: &[String], last_ip: Option<Ipv4Addr>, name: &str) -> bool {
     let ok = wake(macs, last_ip);
-    let _ = writeln!(log, "wake-on-lan: sent to {name} ({} mac(s)), ok={ok}", macs.len());
+    tracing::info!("wake-on-lan: sent to {name} ({} mac(s)), ok={ok}", macs.len());
     ok
 }

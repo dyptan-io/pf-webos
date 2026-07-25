@@ -3,9 +3,9 @@
 //!
 //! Split out of the former single-file `app.rs`; see `super`'s module docs.
 use super::*;
-use std::time::Instant;
 use crate::store::{self};
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent};
+use std::time::Instant;
 
 impl App {
     /// Total sidebar nav positions: host rows + "+ Add host" + "Settings".
@@ -45,13 +45,7 @@ impl App {
 
     /// Handles one menu event on the Home screen (sidebar + grid). Returns a
     /// `ConnectTarget` when a grid card is confirmed.
-    pub fn handle_home_event(
-        &mut self,
-        ev: MenuEvent,
-        screen_w: u32,
-        screen_h: u32,
-        log: &mut std::fs::File,
-    ) -> Option<ConnectTarget> {
+    pub fn handle_home_event(&mut self, ev: MenuEvent, screen_w: u32, screen_h: u32) -> Option<ConnectTarget> {
         let sidebar_len = self.sidebar_len();
         let grid_len = self.grid_len();
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
@@ -123,7 +117,7 @@ impl App {
             },
             MenuEvent::Confirm => match self.home_focus {
                 HomeFocus::Sidebar(i) if i < self.entries.len() => {
-                    self.confirm_sidebar_host(i, log);
+                    self.confirm_sidebar_host(i);
                 }
                 HomeFocus::Sidebar(i) if i == self.entries.len() => {
                     self.add_host = AddHostState::default();
@@ -135,7 +129,7 @@ impl App {
                     self.settings_focused = 0;
                 }
                 HomeFocus::SidebarMenu(i) => self.open_host_menu(i),
-                HomeFocus::Grid(i) => self.confirm_grid_card(i, log),
+                HomeFocus::Grid(i) => self.confirm_grid_card(i),
             },
             // Forgets the focused host (removes its persisted entry/fingerprint —
             // it'll reappear as "not paired" if still discoverable on the LAN).
@@ -154,9 +148,7 @@ impl App {
     /// everything already fits on screen.
     pub(crate) fn max_grid_scroll(&self, columns: usize, available_w: u32, screen_h: u32) -> i32 {
         let viewport_h = screen_h as i32 - ui::GRID_PAD - ui::GRID_TOP_Y;
-        (ui::grid_layer_height(self.grid_len(), columns, available_w) as i32
-            - 2 * ui::GRID_LAYER_PAD
-            - viewport_h)
+        (ui::grid_layer_height(self.grid_len(), columns, available_w) as i32 - 2 * ui::GRID_LAYER_PAD - viewport_h)
             .max(0)
     }
 
@@ -202,12 +194,12 @@ impl App {
         self.grid_scroll_target = next;
         changed
     }
-    pub(crate) fn confirm_sidebar_host(&mut self, idx: usize, log: &mut std::fs::File) {
+    pub(crate) fn confirm_sidebar_host(&mut self, idx: usize) {
         let entry = self.entries[idx].clone();
         match entry {
             HostEntry::Known(h) if h.fingerprint.is_some() => {
                 let (host, port, mgmt_port) = (h.host, h.port, h.mgmt_port);
-                self.select_host(host, port, mgmt_port, log);
+                self.select_host(host, port, mgmt_port);
             }
             _ => self.open_pairing(idx),
         }
@@ -223,7 +215,7 @@ impl App {
     /// time out. `App::new` calls this synchronously-in-spirit-only at startup
     /// too (restoring the last-selected host), so that froze every launch just
     /// the same.
-    pub(crate) fn select_host(&mut self, host: String, port: u16, mgmt_port: Option<u16>, log: &mut std::fs::File) {
+    pub(crate) fn select_host(&mut self, host: String, port: u16, mgmt_port: Option<u16>) {
         let _ = store::save_selected_host(&host, port);
         self.selected_host = Some((host.clone(), port));
         self.home_status = Some("Loading library…".into());
@@ -245,7 +237,7 @@ impl App {
             .find(|h| h.host == host && h.port == port)
             .and_then(|h| h.fingerprint);
         let mgmt_port = mgmt_port.unwrap_or(crate::library::DEFAULT_MGMT_PORT);
-        let _ = writeln!(log, "library: fetching from {host}:{mgmt_port}…");
+        tracing::debug!("library: fetching from {host}:{mgmt_port}…");
         self.games_rx = Some(crate::library::load_games_async(
             host,
             port,
@@ -260,7 +252,7 @@ impl App {
     /// Switching hosts again before a fetch finishes discards its result safely:
     /// `select_host` already replaced `games_rx` with a fresh channel by the time
     /// this could run, so there's nothing here to receive from for the stale one.
-    pub fn drain_games(&mut self, log: &mut std::fs::File) -> bool {
+    pub fn drain_games(&mut self) -> bool {
         let Some(rx) = &self.games_rx else { return false };
         let Ok(loaded) = rx.try_recv() else { return false };
         self.games_rx = None;
@@ -278,7 +270,7 @@ impl App {
                 // and "sweep the whole library". Case-insensitive so casing doesn't
                 // scatter otherwise-adjacent titles.
                 games.sort_by_key(|g| g.title.to_lowercase());
-                let _ = writeln!(log, "library: {} games from {host}:{mgmt_port}", games.len());
+                tracing::info!("library: {} games from {host}:{mgmt_port}", games.len());
                 let identity = (self.identity.0.clone(), self.identity.1.clone());
                 let fingerprint = self
                     .known_hosts
@@ -287,18 +279,13 @@ impl App {
                     .and_then(|h| h.fingerprint);
                 // Covers are requested per card as the grid window reaches them (see
                 // `App::prepare_tiles`), not fetched for the whole library up front.
-                self.art_loader = Some(crate::art::ArtLoader::spawn(
-                    host,
-                    mgmt_port,
-                    identity,
-                    fingerprint,
-                ));
+                self.art_loader = Some(crate::art::ArtLoader::spawn(host, mgmt_port, identity, fingerprint));
                 self.games = games;
                 self.home_status = None;
             }
             Err(e) => {
-                let _ = writeln!(log, "library fetch failed ({host}:{mgmt_port}): {e}");
-                self.handle_library_error(host, port, e, log);
+                tracing::warn!("library fetch failed ({host}:{mgmt_port}): {e}");
+                self.handle_library_error(host, port, e);
             }
         }
         self.grid_dirty = true;
@@ -310,7 +297,7 @@ impl App {
     /// (even with no MAC on record — `start_wake`/`render_wake` just hide the send
     /// controls then); `NotPaired`/`PinMismatch`/`Http` mean the host answered, so
     /// Wake-on-LAN wouldn't help — those stay a plain status line.
-    pub(crate) fn handle_library_error(&mut self, host: String, port: u16, e: crate::library::LibraryError, log: &mut std::fs::File) {
+    pub(crate) fn handle_library_error(&mut self, host: String, port: u16, e: crate::library::LibraryError) {
         let reason = format!("{e} (Desktop is still available.)");
         if matches!(e, crate::library::LibraryError::Unreachable(_)) {
             let mac = self
@@ -319,7 +306,7 @@ impl App {
                 .find(|h| h.host == host && h.port == port)
                 .map(|h| h.mac.clone())
                 .unwrap_or_default();
-            self.start_wake(host, port, mac, reason, log);
+            self.start_wake(host, port, mac, reason);
         } else {
             self.home_status = Some(reason);
         }
@@ -331,11 +318,13 @@ impl App {
     /// failure currently propagates uncaught, taking the whole process down — see
     /// `main.rs`'s docs). `main.rs`'s tick loop drains the result via
     /// `drain_launch_check`/`take_ready_launch`. No-ops if a check is already in flight.
-    pub(crate) fn confirm_grid_card(&mut self, idx: usize, log: &mut std::fs::File) {
+    pub(crate) fn confirm_grid_card(&mut self, idx: usize) {
         if self.pending_launch.is_some() {
             return;
         }
-        let Some((host, port)) = self.selected_host.clone() else { return };
+        let Some((host, port)) = self.selected_host.clone() else {
+            return;
+        };
         let Some(known) = self.known_hosts.iter().find(|h| h.host == host && h.port == port) else {
             return;
         };
@@ -348,7 +337,7 @@ impl App {
         };
         let mgmt_port = known.mgmt_port.unwrap_or(crate::library::DEFAULT_MGMT_PORT);
         let identity = (self.identity.0.clone(), self.identity.1.clone());
-        let _ = writeln!(log, "launch: checking {host}:{port} is still reachable before connecting…");
+        tracing::debug!("launch: checking {host}:{port} is still reachable before connecting…");
         self.home_status = Some("Checking connection…".into());
         let rx = crate::library::load_games_async(host.clone(), port, mgmt_port, identity, Some(fingerprint));
         self.pending_launch = Some(PendingLaunch {
@@ -364,9 +353,13 @@ impl App {
     /// success, stashes the result in `launch_ready` for `main.rs` to pick up via
     /// `take_ready_launch` (dropped instead if the selection has since moved to a
     /// different host). On failure, defers to `handle_library_error`.
-    pub fn drain_launch_check(&mut self, log: &mut std::fs::File) -> bool {
-        let Some(pending) = &self.pending_launch else { return false };
-        let Ok(loaded) = pending.rx.try_recv() else { return false };
+    pub fn drain_launch_check(&mut self) -> bool {
+        let Some(pending) = &self.pending_launch else {
+            return false;
+        };
+        let Ok(loaded) = pending.rx.try_recv() else {
+            return false;
+        };
         let PendingLaunch {
             host,
             port,
@@ -376,7 +369,11 @@ impl App {
         } = self.pending_launch.take().expect("just matched Some above");
         match loaded.result {
             Ok(_) => {
-                if self.selected_host.as_ref().is_some_and(|(h, p)| *h == host && *p == port) {
+                if self
+                    .selected_host
+                    .as_ref()
+                    .is_some_and(|(h, p)| *h == host && *p == port)
+                {
                     self.home_status = None;
                     self.launch_ready = Some(ConnectTarget {
                         host,
@@ -387,8 +384,8 @@ impl App {
                 }
             }
             Err(e) => {
-                let _ = writeln!(log, "launch check failed ({host}:{port}): {e}");
-                self.handle_library_error(host, port, e, log);
+                tracing::warn!("launch check failed ({host}:{port}): {e}");
+                self.handle_library_error(host, port, e);
             }
         }
         self.sidebar_dirty = true;

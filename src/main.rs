@@ -23,6 +23,7 @@ mod gamepad;
 mod keyboard;
 #[cfg(target_os = "linux")]
 mod library;
+mod logger;
 #[cfg(target_os = "linux")]
 mod mouse;
 #[cfg(target_os = "linux")]
@@ -40,8 +41,6 @@ mod wol;
 
 #[cfg(target_os = "linux")]
 mod real {
-    use std::io::Write as _;
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
@@ -88,55 +87,35 @@ mod real {
         }
     }
 
-    /// webOS native apps run with no attached terminal; `dev-manager-desktop`'s log
-    /// viewer reads this file. `/media/developer/apps/usr/palm/applications/<appid>/`
-    /// is the app's own writable directory (falls back to `/tmp` off-device, e.g. when
-    /// smoke-testing this binary on a Linux dev box before packaging).
-    fn log_path() -> PathBuf {
-        std::env::var_os("PUNKTFUNK_WEBOS_LOG_DIR")
-            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
-            .join("punktfunk-webos.log")
-    }
-
     pub fn run() -> Result<()> {
         install_signal_handlers();
-        let log_path = log_path();
-        // Truncate (not append) — this file previously grew unbounded across every
-        // launch for the life of the install; each run's log now starts fresh, and
-        // `task deploy:log` tails it live anyway.
-        let mut log = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&log_path)
-            .with_context(|| format!("open log file {}", log_path.display()))?;
-        writeln!(log, "punktfunk-webos starting")?;
-        // Logged before anything else can fail: a report from a model neither developer
-        // owns is only actionable if the log says what it was running on.
-        crate::device::DeviceInfo::detect().log(&mut log);
-
-        // Without this, punktfunk-core's own `tracing::info!`/`warn!` calls — including the
-        // startup link-capacity probe's measured throughput and the ABR ceiling it derives from
-        // it — are silent no-ops (nothing installs a subscriber by default). A fresh handle to
-        // the same file, not `log.try_clone()`, since this subscriber outlives `run_inner`'s
-        // `&mut log` borrow for the whole process.
-        let tracing_log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .with_context(|| format!("open log file {} for tracing", log_path.display()))?;
+        // Streams to a dev machine when `task deploy TELEMETRY=...` passed a
+        // destination as a launch param; otherwise a versioned file under the app's
+        // own writable directory (falls back to `/tmp` off-device, e.g. when
+        // smoke-testing this binary on a Linux dev box before packaging). `_guard`
+        // owns the background writer thread `non_blocking` spawns — held for the
+        // whole process so logging never blocks a caller (in particular the
+        // video-pump thread) on a slow disk or a dev machine not draining its
+        // telemetry listener fast enough.
+        let app_dir = store::app_dir();
+        let (writer, _guard) = crate::logger::init(&app_dir).context("init logger")?;
         tracing_subscriber::fmt()
-            .with_writer(std::sync::Mutex::new(tracing_log))
+            .with_writer(writer)
             .with_ansi(false)
             .with_target(false)
+            .with_max_level(crate::logger::resolved_level())
             .init();
+        tracing::info!("punktfunk-webos starting");
+        // Logged before anything else can fail: a report from a model neither developer
+        // owns is only actionable if the log says what it was running on.
+        crate::device::DeviceInfo::detect().log();
 
         // Errors from here on only ever reached stderr, which is invisible for a
         // webOS native app with no attached terminal.
-        match run_inner(&mut log) {
+        match run_inner() {
             Ok(()) => Ok(()),
             Err(e) => {
-                let _ = writeln!(log, "error: {e:#}");
+                tracing::error!("error: {e:#}");
                 Err(e)
             }
         }
@@ -204,18 +183,17 @@ mod real {
         display_mode: sdl2::video::DisplayMode,
         fonts: &crate::ui::Fonts,
         initial_status: Option<String>,
-        log: &mut std::fs::File,
     ) -> Result<Option<ConnectOutcome>> {
         // Test/dev override: skip the UI entirely if a connect.conf was dropped
         // alongside sideloading (see store.rs docs) — the UI flow is the normal path.
         // Bypasses the library screen too (`launch: None`, a plain desktop session).
         if let Some((host, port)) = store::dev_override_connect() {
-            writeln!(log, "dev override: connecting to {host}:{port}")?;
+            tracing::info!("dev override: connecting to {host}:{port}");
             return Ok(Some((host, port, None, None)));
         }
 
         canvas.window_mut().show();
-        let mut app = App::new(identity.clone(), log);
+        let mut app = App::new(identity.clone());
         // E.g. "the last connect attempt failed, and here's why" — shown on the
         // Home screen the user just got dropped back onto (see `run_inner`'s
         // connect-error path).
@@ -237,11 +215,10 @@ mod real {
         // Owned handle (it just clones the video subsystem's refcount), so taking it
         // here doesn't hold a borrow on `canvas` for the rest of the loop.
         let text_input = canvas.window().subsystem().text_input();
-        writeln!(
-            log,
+        tracing::info!(
             "on-screen keyboard support: {}",
             text_input.has_screen_keyboard_support()
-        )?;
+        );
         let mut text_input_active = false;
         // Redraw-on-change: this screen has no time-based animation at all (no
         // spinner/blink/marquee), so every pixel that can change only ever changes
@@ -253,25 +230,25 @@ mod real {
         let mut dirty = true;
         let target = 'ui: loop {
             if QUIT_REQUESTED.load(Ordering::Relaxed) {
-                writeln!(log, "SIGTERM/SIGINT received during UI")?;
+                tracing::warn!("SIGTERM/SIGINT received during UI");
                 return Ok(None);
             }
-            dirty |= app.drain_discovery(log);
+            dirty |= app.drain_discovery();
             dirty |= app.drain_art();
-            dirty |= app.drain_games(log);
-            dirty |= app.drain_pairing(log);
-            dirty |= app.drain_speed_test(log);
+            dirty |= app.drain_games();
+            dirty |= app.drain_pairing();
+            dirty |= app.drain_speed_test();
             app.tick_reachability();
             dirty |= app.drain_reachability();
-            dirty |= app.tick_wake(log);
-            dirty |= app.drain_launch_check(log);
+            dirty |= app.tick_wake();
+            dirty |= app.drain_launch_check();
             if let Some(target) = app.take_ready_launch() {
                 break 'ui target;
             }
             for event in events.poll_iter() {
                 use sdl2::event::Event;
                 if let Event::Quit { .. } = event {
-                    writeln!(log, "quit during UI")?;
+                    tracing::info!("quit during UI");
                     return Ok(None);
                 }
                 // The Magic Remote's pointer mode surfaces as a plain SDL2
@@ -280,13 +257,7 @@ mod real {
                 // if the motion actually changed the focused/hovered element,
                 // not on every no-op tick.
                 if let Event::MouseMotion { x, y, .. } = event {
-                    dirty |= app.handle_mouse_motion(
-                        x,
-                        y,
-                        display_mode.w as u32,
-                        display_mode.h as u32,
-                        fonts,
-                    );
+                    dirty |= app.handle_mouse_motion(x, y, display_mode.w as u32, display_mode.h as u32, fonts);
                     continue;
                 }
                 // The Magic Remote's scroll wheel — scrolls the game grid on Home
@@ -304,11 +275,8 @@ mod real {
                         /// Grid px scrolled per wheel detent — about a third of a
                         /// card row, so a few ticks walk one row.
                         const WHEEL_STEP: i32 = 120;
-                        dirty |= app.scroll_grid_by(
-                            -wheel_y * WHEEL_STEP,
-                            display_mode.w as u32,
-                            display_mode.h as u32,
-                        );
+                        dirty |=
+                            app.scroll_grid_by(-wheel_y * WHEEL_STEP, display_mode.w as u32, display_mode.h as u32);
                     }
                     continue;
                 }
@@ -329,7 +297,7 @@ mod real {
                         ..
                     } => {
                         if let Some(target) =
-                            app.handle_mouse_click(x, y, display_mode.w as u32, display_mode.h as u32, fonts, log)
+                            app.handle_mouse_click(x, y, display_mode.w as u32, display_mode.h as u32, fonts)
                         {
                             break 'ui target;
                         }
@@ -342,7 +310,7 @@ mod real {
                     {
                         if let Some(digit) = crate::ui::digit_key_value(k) {
                             match app.screen {
-                                Screen::Pairing => app.enter_pin_digit(digit, log),
+                                Screen::Pairing => app.enter_pin_digit(digit),
                                 Screen::AddHost | Screen::EditHost => app.enter_add_host_digit(digit),
                                 _ => unreachable!(),
                             }
@@ -360,7 +328,7 @@ mod real {
                         match app.screen {
                             Screen::Pairing => {
                                 for d in text.chars().filter_map(|c| c.to_digit(10)) {
-                                    app.enter_pin_digit(d as u8, log);
+                                    app.enter_pin_digit(d as u8);
                                 }
                             }
                             Screen::AddHost | Screen::EditHost => {
@@ -396,10 +364,10 @@ mod real {
                     Event::ControllerDeviceAdded { which, .. } if controller.is_none() => {
                         match game_controller.open(which) {
                             Ok(c) => {
-                                writeln!(log, "controller connected: {}", c.name())?;
+                                tracing::info!("controller connected: {}", c.name());
                                 *controller = Some(c);
                             }
-                            Err(e) => writeln!(log, "controller open failed: {e}")?,
+                            Err(e) => tracing::warn!("controller open failed: {e}"),
                         }
                         None
                     }
@@ -416,27 +384,26 @@ mod real {
                     // routed through `back` anyway so the policy lives in one place.
                     Screen::Home => {
                         if menu_ev == MenuEvent::Back {
-                            if let Some(target) = app.back(log) {
+                            if let Some(target) = app.back() {
                                 break 'ui target;
                             }
-                        } else if let Some(target) = app.handle_home_event(menu_ev, display_mode.w as u32, display_mode.h as u32, log) {
+                        } else if let Some(target) =
+                            app.handle_home_event(menu_ev, display_mode.w as u32, display_mode.h as u32)
+                        {
                             break 'ui target;
                         }
                     }
-                    Screen::Pairing => app.handle_pairing_event(menu_ev, log),
+                    Screen::Pairing => app.handle_pairing_event(menu_ev),
                     Screen::Settings => app.handle_settings_event(menu_ev),
                     Screen::AddHost => app.handle_add_host_event(menu_ev),
-                    Screen::Wake => app.handle_wake_event(menu_ev, log),
+                    Screen::Wake => app.handle_wake_event(menu_ev),
                     Screen::ForgetHost => app.handle_forget_host_event(menu_ev),
-                    Screen::HostMenu => app.handle_host_menu_event(menu_ev, log),
-                    Screen::SpeedTest => app.handle_speed_test_event(menu_ev, log),
+                    Screen::HostMenu => app.handle_host_menu_event(menu_ev),
+                    Screen::SpeedTest => app.handle_speed_test_event(menu_ev),
                     Screen::EditHost => app.handle_edit_host_event(menu_ev),
-                    Screen::About => app.handle_about_event(
-                        menu_ev,
-                        display_mode.w as u32,
-                        display_mode.h as u32,
-                        fonts,
-                    ),
+                    Screen::About => {
+                        app.handle_about_event(menu_ev, display_mode.w as u32, display_mode.h as u32, fonts)
+                    }
                 }
             }
             // Track whether the panel is actually up, not merely whether text input was
@@ -447,7 +414,7 @@ mod real {
             if keyboard_shown != app.keyboard_shown {
                 app.keyboard_shown = keyboard_shown;
                 dirty = true;
-                writeln!(log, "on-screen keyboard shown: {keyboard_shown}")?;
+                tracing::info!("on-screen keyboard shown: {keyboard_shown}");
             }
             // Ask for (or dismiss) the webOS on-screen keyboard as the screen changes —
             // see `text_input_screen`. Edge-triggered: `SDL_StartTextInput` is not
@@ -457,11 +424,7 @@ mod real {
             if wants_text != text_input_active {
                 text_input_active = wants_text;
                 if wants_text {
-                    text_input.set_rect(app.address_field_rect(
-                        display_mode.w as u32,
-                        display_mode.h as u32,
-                        fonts,
-                    ));
+                    text_input.set_rect(app.address_field_rect(display_mode.w as u32, display_mode.h as u32, fonts));
                     text_input.start();
                 } else {
                     text_input.stop();
@@ -471,11 +434,10 @@ mod real {
                 // driver can implement the first without the second — in which case SDL
                 // returns false unconditionally and the address card would never lift.
                 // Logging the pair makes that distinguishable on-device in one run.
-                writeln!(
-                    log,
+                tracing::info!(
                     "text input requested: {wants_text} (keyboard shown: {})",
                     text_input.is_screen_keyboard_shown(canvas.window())
-                )?;
+                );
             }
             // Animations advance every 16ms tick and keep frames flowing on their
             // own; `dirty` (an event/drain changed actual content) additionally
@@ -528,7 +490,7 @@ mod real {
         )))
     }
 
-    fn run_inner(log: &mut std::fs::File) -> Result<()> {
+    fn run_inner() -> Result<()> {
         // Prevents webOS's system launcher from intercepting the Magic Remote's Back
         // key. Must be set before window creation.
         sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
@@ -542,16 +504,17 @@ mod real {
             .game_controller()
             .map_err(|e| anyhow::anyhow!("SDL game controller subsystem: {e}"))?;
         let sdl_audio = sdl.audio().map_err(|e| anyhow::anyhow!("SDL audio subsystem: {e}"))?;
-        writeln!(log, "SDL video subsystem up (driver: {})", video.current_video_driver())?;
+        tracing::info!("SDL video subsystem up (driver: {})", video.current_video_driver());
 
         let display_mode = video
             .current_display_mode(0)
             .map_err(|e| anyhow::anyhow!("current_display_mode: {e}"))?;
-        writeln!(
-            log,
+        tracing::info!(
             "display mode: {}x{}@{}",
-            display_mode.w, display_mode.h, display_mode.refresh_rate
-        )?;
+            display_mode.w,
+            display_mode.h,
+            display_mode.refresh_rate
+        );
 
         let window = video
             .window("punktfunk", display_mode.w as u32, display_mode.h as u32)
@@ -563,7 +526,7 @@ mod real {
             .build()
             .map_err(|e| anyhow::anyhow!("create canvas: {e}"))?;
         let texture_creator = canvas.texture_creator();
-        writeln!(log, "window + canvas created (renderer: {})", canvas.info().name)?;
+        tracing::info!("window + canvas created (renderer: {})", canvas.info().name);
 
         // The pre-stream UI's rendering backend: tiny-skia rasterizes cached
         // widget tiles (see `ui.rs`'s `render_*_tile` helpers), and the GPU
@@ -610,15 +573,14 @@ mod real {
                 display_mode,
                 &fonts,
                 menu_status.take(),
-                log,
             )?
             else {
-                writeln!(log, "punktfunk-webos exiting cleanly")?;
+                tracing::info!("punktfunk-webos exiting cleanly");
                 return Ok(());
             };
 
             let settings = store::load_settings();
-            writeln!(log, "settings: {settings:?}")?;
+            tracing::debug!("settings: {settings:?}");
 
             // `hide()` (the previous approach here, when `set_opacity` fails — confirmed
             // unsupported on this Wayland backend) unmaps the surface entirely, which
@@ -647,11 +609,12 @@ mod real {
             // the host's virtual-display driver rejected a literal "0 Hz" mode request
             // with "the parameter is incorrect") — the settings' own nominal rate (never
             // 0; see store::Settings::default) is what drives the wire value directly.
-            writeln!(
-                log,
+            tracing::info!(
                 "requesting {}x{}@{}",
-                settings.width, settings.height, settings.refresh_hz
-            )?;
+                settings.width,
+                settings.height,
+                settings.refresh_hz
+            );
             let mode = Mode {
                 width: settings.width,
                 height: settings.height,
@@ -674,7 +637,6 @@ mod real {
                 display_mode.w,
                 display_mode.h,
                 settings.video_backend,
-                log,
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -682,13 +644,13 @@ mod real {
                     // rejection, handshake error) used to `?` out of `run_inner`
                     // and take the whole app down — return to the menu with the
                     // reason on screen instead.
-                    writeln!(log, "session connect failed: {e:#}")?;
+                    tracing::error!("session connect failed: {e:#}");
                     sdl.mouse().show_cursor(true);
                     menu_status = Some(format!("Couldn't connect: {}", crate::errors::friendly(&e)));
                     continue;
                 }
             };
-            writeln!(log, "session connected, entering event loop")?;
+            tracing::info!("session connected, entering event loop");
 
             // Skipped entirely when NDL took the Opus stream: opening a second audio
             // device that nothing ever feeds would still claim a PulseAudio sink.
@@ -698,10 +660,10 @@ mod real {
                 match crate::audio::AudioPlayer::new(&sdl_audio, connected.client.audio_channels) {
                     Ok(p) => Some(p),
                     Err(e) => {
-                    // Same no-crash policy as the connect above — including the
-                    // video-side teardown the normal stream exit does, since the
-                    // connect succeeded and loaded a decoder.
-                        writeln!(log, "audio player init failed: {e:#}")?;
+                        // Same no-crash policy as the connect above — including the
+                        // video-side teardown the normal stream exit does, since the
+                        // connect succeeded and loaded a decoder.
+                        tracing::error!("audio player init failed: {e:#}");
                         connected.client.disconnect_quit();
                         connected.shutdown();
                         crate::ndl::quit();
@@ -712,12 +674,11 @@ mod real {
                 }
             };
             if let Some(player) = &audio_player {
-                writeln!(
-                    log,
+                tracing::info!(
                     "SDL audio driver: {}, spec: {:?}",
                     sdl_audio.current_audio_driver(),
                     player.spec()
-                )?;
+                );
             }
 
             let mut scroll_acc = mouse::ScrollAccumulator::default();
@@ -747,7 +708,7 @@ mod real {
             let mut guide_held_since: Option<Instant> = None;
             let outcome = 'running: loop {
                 if QUIT_REQUESTED.load(Ordering::Relaxed) {
-                    writeln!(log, "SIGTERM/SIGINT received — disconnecting before exit")?;
+                    tracing::warn!("SIGTERM/SIGINT received — disconnecting before exit");
                     connected.client.disconnect_quit();
                     break 'running StreamOutcome::Quit;
                 }
@@ -763,10 +724,10 @@ mod real {
                         Event::ControllerDeviceAdded { which, .. } if controller.is_none() => {
                             match game_controller.open(which) {
                                 Ok(c) => {
-                                    writeln!(log, "controller connected: {}", c.name())?;
+                                    tracing::info!("controller connected: {}", c.name());
                                     controller = Some(c);
                                 }
-                                Err(e) => writeln!(log, "controller open failed: {e}")?,
+                                Err(e) => tracing::warn!("controller open failed: {e}"),
                             }
                         }
                         Event::ControllerDeviceRemoved { .. } => {
@@ -778,12 +739,12 @@ mod real {
                         _ if disconnect_dialog.is_some() => {
                             let focus = disconnect_dialog.expect("guarded by is_some above");
                             let nav = match &event {
-                                Event::KeyDown { keycode: Some(k), repeat: false, .. } => {
-                                    crate::ui::menu_event_for_key(*k)
-                                }
-                                Event::ControllerButtonDown { button, .. } => {
-                                    crate::ui::menu_event_for_button(*button)
-                                }
+                                Event::KeyDown {
+                                    keycode: Some(k),
+                                    repeat: false,
+                                    ..
+                                } => crate::ui::menu_event_for_key(*k),
+                                Event::ControllerButtonDown { button, .. } => crate::ui::menu_event_for_button(*button),
                                 _ => None,
                             };
                             match nav {
@@ -793,7 +754,7 @@ mod real {
                                     disconnect_focus_anim = Some(Instant::now());
                                 }
                                 Some(MenuEvent::Confirm) if focus == 0 => {
-                                    writeln!(log, "back — disconnecting to menu")?;
+                                    tracing::info!("back — disconnecting to menu");
                                     connected.client.disconnect_quit();
                                     break 'running StreamOutcome::ReturnToMenu;
                                 }
@@ -820,9 +781,12 @@ mod real {
                         }
                         // Magic Remote Back (0x200003): no scancode, never
                         // forwarded to the host — open the disconnect dialog.
-                        Event::KeyDown { keycode: Some(k), scancode: None, repeat: false, .. }
-                            if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) =>
-                        {
+                        Event::KeyDown {
+                            keycode: Some(k),
+                            scancode: None,
+                            repeat: false,
+                            ..
+                        } if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) => {
                             disconnect_dialog = Some(1);
                             disconnect_shell_dirty = true;
                             disconnect_focus_dirty = true;
@@ -943,8 +907,15 @@ mod real {
                     compositor.execute(
                         &mut canvas,
                         &[
-                            DrawCmd::Fill { rect: full, color: sdl2::pixels::Color::RGBA(0, 0, 0, crate::ui::MODAL_SCRIM.a) },
-                            DrawCmd::Tex { tile: Tile::DisconnectDialog, dst: full, alpha: 0xff },
+                            DrawCmd::Fill {
+                                rect: full,
+                                color: sdl2::pixels::Color::RGBA(0, 0, 0, crate::ui::MODAL_SCRIM.a),
+                            },
+                            DrawCmd::Tex {
+                                tile: Tile::DisconnectDialog,
+                                dst: full,
+                                alpha: 0xff,
+                            },
                             DrawCmd::Tex {
                                 tile: Tile::DisconnectFocusButton,
                                 dst: crate::ui::zoom_rect(base, f, 0.02),
@@ -957,7 +928,7 @@ mod real {
                 // Offloaded audio is drained by the video pump thread instead (see
                 // `session::pump_ndl_audio`) — nothing to do here.
                 if let Some(player) = &mut audio_player {
-                    session::pump_audio_once(&connected.client, player, log);
+                    session::pump_audio_once(&connected.client, player);
                 }
                 // Skipped while the dialog is open — its own redraw above already
                 // owns the canvas this tick.
@@ -972,8 +943,7 @@ mod real {
                     overlay_prev_frames = frames;
                     overlay_prev_at = Instant::now();
                     let mode = connected.client.mode();
-                    let feed_ms =
-                        connected.stats.feed_us.load(Ordering::Relaxed) as f32 / 1000.0;
+                    let feed_ms = connected.stats.feed_us.load(Ordering::Relaxed) as f32 / 1000.0;
                     let holding = connected.stats.holding.load(Ordering::Relaxed);
                     let lines = vec![
                         format!(
@@ -1023,11 +993,11 @@ mod real {
                             )?;
                             canvas.present();
                         }
-                        Err(e) => writeln!(log, "stats overlay render failed: {e:#}")?,
+                        Err(e) => tracing::warn!("stats overlay render failed: {e:#}"),
                     }
                 }
                 if connected.client.is_session_ended() {
-                    writeln!(log, "host ended the session")?;
+                    tracing::info!("host ended the session");
                     break 'running StreamOutcome::ReturnToMenu;
                 }
 
@@ -1048,7 +1018,7 @@ mod real {
             sdl.mouse().show_cursor(true);
             match outcome {
                 StreamOutcome::Quit => {
-                    writeln!(log, "punktfunk-webos exiting cleanly")?;
+                    tracing::info!("punktfunk-webos exiting cleanly");
                     return Ok(());
                 }
                 StreamOutcome::ReturnToMenu => continue,

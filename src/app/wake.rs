@@ -3,11 +3,11 @@
 //!
 //! Split out of the former single-file `app.rs`; see `super`'s module docs.
 use super::*;
-use std::time::Instant;
-use anyhow::Result;
-use sdl2::rect::Rect;
 use crate::store::KnownHost;
 use crate::ui::{self, MenuEvent, Painter};
+use anyhow::Result;
+use sdl2::rect::Rect;
+use std::time::Instant;
 
 impl App {
     /// Enters the "host unreachable — wake it?" flow (see `WakeState`'s docs). With
@@ -16,7 +16,7 @@ impl App {
     /// silently — the prompt only appears if the host still hasn't come back a minute
     /// later (`tick_wake`), which is also the one place that setting can be turned back
     /// off (no separate settings row for it — see `Settings::wol_auto_send`).
-    pub(crate) fn start_wake(&mut self, host: String, port: u16, mac: Vec<String>, reason: String, log: &mut std::fs::File) {
+    pub(crate) fn start_wake(&mut self, host: String, port: u16, mac: Vec<String>, reason: String) {
         let name = self
             .known_hosts
             .iter()
@@ -46,7 +46,7 @@ impl App {
             probe_rx: None,
         };
         if auto {
-            Self::send_wake(&mut wake, log);
+            Self::send_wake(&mut wake);
         } else {
             self.screen = Screen::Wake;
         }
@@ -56,12 +56,12 @@ impl App {
     /// Fires (or re-fires) the magic packet for an in-flight wake, bumping its resend
     /// timer — shared by the modal's explicit "Send" action and `tick_wake`'s periodic
     /// resend.
-    pub(crate) fn send_wake(wake: &mut WakeState, log: &mut std::fs::File) {
+    pub(crate) fn send_wake(wake: &mut WakeState) {
         // Only claim "sent" if a magic packet actually went out — `wake_and_log`
         // returns false on an unparseable MAC / no usable interface, and showing
         // "Sent a wake signal… waiting" for a packet that never left would leave
         // the user waiting on nothing.
-        let sent = crate::wol::wake_and_log(&wake.mac, wake.host.parse().ok(), &wake.name, log);
+        let sent = crate::wol::wake_and_log(&wake.mac, wake.host.parse().ok(), &wake.name);
         let now = Instant::now();
         if sent {
             wake.sent = true;
@@ -82,7 +82,7 @@ impl App {
     /// check can also end a wake independently, whichever notices first. Called every UI
     /// tick; returns whether anything visibly changed (same contract as
     /// `drain_discovery`/`drain_art`).
-    pub fn tick_wake(&mut self, log: &mut std::fs::File) -> bool {
+    pub fn tick_wake(&mut self) -> bool {
         let Some(wake) = &mut self.wake else { return false };
         let now = Instant::now();
         let mut changed = false;
@@ -98,7 +98,7 @@ impl App {
                         .iter()
                         .find(|h| h.host == host && h.port == port)
                         .and_then(|h| h.mgmt_port);
-                    self.wake_succeeded(host, port, mgmt_port, "reachability probe", log);
+                    self.wake_succeeded(host, port, mgmt_port, "reachability probe");
                     return true;
                 }
                 wake.last_probe = Some(now);
@@ -112,9 +112,12 @@ impl App {
         // send is either `start_wake`'s own immediate call (auto-send on) or the user's
         // explicit Confirm on "Send" (`handle_wake_event`).
         if !wake.mac.is_empty() {
-            let due = wake.sent && wake.last_attempt.is_some_and(|t| now.duration_since(t) >= WAKE_RESEND_INTERVAL);
+            let due = wake.sent
+                && wake
+                    .last_attempt
+                    .is_some_and(|t| now.duration_since(t) >= WAKE_RESEND_INTERVAL);
             if due {
-                Self::send_wake(wake, log);
+                Self::send_wake(wake);
                 changed = true;
             }
         }
@@ -126,7 +129,11 @@ impl App {
             changed = true;
         }
 
-        if wake.probe_rx.is_none() && wake.last_probe.is_some_and(|t| now.duration_since(t) >= WAKE_PROBE_INTERVAL) {
+        if wake.probe_rx.is_none()
+            && wake
+                .last_probe
+                .is_some_and(|t| now.duration_since(t) >= WAKE_PROBE_INTERVAL)
+        {
             let (host, port) = (wake.host.clone(), wake.port);
             wake.probe_rx = Some(Self::wake_probe(&self.known_hosts, &self.identity, &host, port));
             wake.last_probe = Some(now);
@@ -145,7 +152,9 @@ impl App {
         port: u16,
     ) -> std::sync::mpsc::Receiver<crate::library::GamesLoaded> {
         let known = known_hosts.iter().find(|h| h.host == host && h.port == port);
-        let mgmt_port = known.and_then(|h| h.mgmt_port).unwrap_or(crate::library::DEFAULT_MGMT_PORT);
+        let mgmt_port = known
+            .and_then(|h| h.mgmt_port)
+            .unwrap_or(crate::library::DEFAULT_MGMT_PORT);
         let fingerprint = known.and_then(|h| h.fingerprint);
         crate::library::load_games_async(host.to_string(), port, mgmt_port, identity.clone(), fingerprint)
     }
@@ -158,7 +167,7 @@ impl App {
     /// Confirm flips the toggle, sends, or cancels depending on which is
     /// focused. Back always dismisses back to the plain error text
     /// `WakeState::reason` carries, same as Cancel.
-    pub fn handle_wake_event(&mut self, ev: MenuEvent, log: &mut std::fs::File) {
+    pub fn handle_wake_event(&mut self, ev: MenuEvent) {
         let Some(wake) = self.wake.as_mut() else { return };
         // No MAC on record for this host yet — there's nothing to send or automate
         // (see `render_wake`, which hides the toggle/buttons in this case too), so
@@ -189,7 +198,7 @@ impl App {
                 wake.focused = if wake.focused == 1 { 2 } else { 1 };
                 self.modal_focus_anim = Some(Instant::now());
             }
-            MenuEvent::Confirm if wake.focused == 1 => Self::send_wake(wake, log),
+            MenuEvent::Confirm if wake.focused == 1 => Self::send_wake(wake),
             MenuEvent::Confirm => {
                 // focused == 2 ("Cancel") — same as Back.
                 self.home_status = self.wake.take().map(|w| w.reason);
@@ -225,7 +234,15 @@ impl App {
 
         let status = Self::wake_status_text(wake);
         ui::draw_modal_header(
-            painter, text_cache, fonts.title, fonts.label, card, Self::wake_title(wake), ui::WHITE, &status, ui::MUTED,
+            painter,
+            text_cache,
+            fonts.title,
+            fonts.label,
+            card,
+            Self::wake_title(wake),
+            ui::WHITE,
+            &status,
+            ui::MUTED,
         )?;
 
         // No MAC on record — nothing to send or automate, so there's nothing
@@ -289,10 +306,7 @@ impl App {
                 wake.name
             )
         } else if wake.sent {
-            format!(
-                "Wake signal sent to {}. Waiting for it to come back online…",
-                wake.name
-            )
+            format!("Wake signal sent to {}. Waiting for it to come back online…", wake.name)
         } else {
             format!("{} isn't responding. It may be powered off or asleep.", wake.name)
         }
@@ -304,7 +318,12 @@ impl App {
     /// without re-rendering the header.
     pub(crate) fn wake_toggle_rect(card: Rect, wake: &WakeState, fonts: &ui::Fonts) -> Rect {
         let after_status_y = ui::modal_header_end_y(fonts.title, fonts.label, card, &Self::wake_status_text(wake));
-        Rect::new(card.x() + 32, after_status_y + 28, card.width().saturating_sub(64), ui::SETTINGS_ROW_H)
+        Rect::new(
+            card.x() + 32,
+            after_status_y + 28,
+            card.width().saturating_sub(64),
+            ui::SETTINGS_ROW_H,
+        )
     }
 
     /// The Wake/Cancel button row's rect, stacked below the toggle row —

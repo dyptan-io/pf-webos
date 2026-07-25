@@ -2,11 +2,11 @@
 //!
 //! Split out of the former single-file `app.rs`; see `super`'s module docs.
 use super::*;
-use std::time::Instant;
-use anyhow::Result;
-use sdl2::rect::Rect;
 use crate::store::{self, KnownHost};
 use crate::ui::{self, HostEntry, MenuEvent, Painter};
+use anyhow::Result;
+use sdl2::rect::Rect;
+use std::time::Instant;
 
 impl App {
     /// Opens the pairing modal for sidebar entry `idx`, resetting the PIN state.
@@ -26,7 +26,7 @@ impl App {
     /// Handles one menu event on the pairing modal. Two focus zones (`PairingFocus`):
     /// the PIN digit row (blocking SPAKE2 ceremony on `Confirm`) and the "Request
     /// access" button (blocking no-PIN, park-until-approved connect on `Confirm`).
-    pub fn handle_pairing_event(&mut self, ev: MenuEvent, log: &mut std::fs::File) {
+    pub fn handle_pairing_event(&mut self, ev: MenuEvent) {
         if self.pairing_busy {
             // Mid-ceremony, Back cancels (dropping the receiver orphans the
             // worker — its send fails and it exits); everything else is ignored.
@@ -85,7 +85,7 @@ impl App {
                         self.modal_focus_anim = Some(Instant::now());
                     }
                 }
-                MenuEvent::Confirm => self.try_pair(log),
+                MenuEvent::Confirm => self.try_pair(),
                 MenuEvent::Back | MenuEvent::Secondary => {} // handled above
             },
             // Left tabs back onto the PIN row; Confirm sends the access request.
@@ -97,7 +97,7 @@ impl App {
                     self.pin_digit_index = 0;
                     self.modal_focus_anim = Some(Instant::now());
                 }
-                MenuEvent::Confirm => self.try_request_access(log),
+                MenuEvent::Confirm => self.try_request_access(),
                 MenuEvent::Up | MenuEvent::Left | MenuEvent::Back | MenuEvent::Secondary => {}
             },
         }
@@ -110,7 +110,7 @@ impl App {
     /// background thread (this one can block for MINUTES waiting on the approval, so
     /// freezing the UI for it is not an option). The 185s budget matches `run_inner`'s
     /// pending-approval wait, long enough for a human to notice and click.
-    pub(crate) fn try_request_access(&mut self, log: &mut std::fs::File) {
+    pub(crate) fn try_request_access(&mut self) {
         let entry = &self.entries[self.pairing_entry];
         let host = entry.host().to_string();
         let port = entry.port();
@@ -119,15 +119,14 @@ impl App {
         let mac = entry.mac().to_vec();
         self.pairing_busy = true;
         self.pairing_status = Some("Requesting access — approve this TV on the host.".into());
-        let _ = writeln!(log, "requesting access to {host}:{port}");
+        tracing::info!("requesting access to {host}:{port}");
 
         let identity = (self.identity.0.clone(), self.identity.1.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         self.pairing_rx = Some(rx);
         std::thread::spawn(move || {
-            let result =
-                crate::session::request_access(&host, port, identity, std::time::Duration::from_secs(185))
-                    .map_err(|e| crate::errors::friendly(&e));
+            let result = crate::session::request_access(&host, port, identity, std::time::Duration::from_secs(185))
+                .map_err(|e| crate::errors::friendly(&e));
             let _ = tx.send(PairingOutcome {
                 host,
                 port,
@@ -143,14 +142,14 @@ impl App {
     /// called each tick from `run_ui_flow` like the other `drain_*`s. Success
     /// persists the host and lands on its game grid; failure re-arms the pairing
     /// modal with the error text.
-    pub fn drain_pairing(&mut self, log: &mut std::fs::File) -> bool {
+    pub fn drain_pairing(&mut self) -> bool {
         let Some(rx) = &self.pairing_rx else { return false };
         let Ok(outcome) = rx.try_recv() else { return false };
         self.pairing_rx = None;
         self.pairing_busy = false;
         match outcome.result {
             Ok(fingerprint) => {
-                let _ = writeln!(log, "paired ok ({}:{}), fingerprint set", outcome.host, outcome.port);
+                tracing::info!("paired ok ({}:{}), fingerprint set", outcome.host, outcome.port);
                 store::upsert_known_host(
                     &mut self.known_hosts,
                     KnownHost {
@@ -166,10 +165,10 @@ impl App {
                 self.entries = self.known_hosts.iter().cloned().map(HostEntry::Known).collect();
                 self.sidebar_dirty = true;
                 self.screen = Screen::Home;
-                self.select_host(outcome.host, outcome.port, outcome.mgmt_port, log);
+                self.select_host(outcome.host, outcome.port, outcome.mgmt_port);
             }
             Err(e) => {
-                let _ = writeln!(log, "pairing/request failed: {e}");
+                tracing::warn!("pairing/request failed: {e}");
                 self.pairing_status = Some(e);
             }
         }
@@ -179,7 +178,7 @@ impl App {
     /// Direct digit entry (the Magic Remote's number buttons) — types `digit` into
     /// the current PIN slot and auto-advances, like a phone lock-screen PIN pad,
     /// instead of requiring left/right cycling through 0-9 per digit.
-    pub fn enter_pin_digit(&mut self, digit: u8, log: &mut std::fs::File) {
+    pub fn enter_pin_digit(&mut self, digit: u8) {
         if self.pairing_busy {
             return;
         }
@@ -191,13 +190,13 @@ impl App {
         if self.pin_digit_index + 1 < self.pin_digits.len() {
             self.pin_digit_index += 1;
         } else {
-            self.try_pair(log);
+            self.try_pair();
         }
     }
 
     /// Starts the PIN pairing ceremony on a background thread (see
     /// `pairing_rx`'s docs — the ceremony blocks, the UI must not).
-    pub(crate) fn try_pair(&mut self, log: &mut std::fs::File) {
+    pub(crate) fn try_pair(&mut self) {
         let entry = &self.entries[self.pairing_entry];
         let host = entry.host().to_string();
         let port = entry.port();
@@ -207,7 +206,7 @@ impl App {
         let pin: String = self.pin_digits.iter().map(std::string::ToString::to_string).collect();
         self.pairing_busy = true;
         self.pairing_status = Some("Pairing — confirm the PIN on the host.".into());
-        let _ = writeln!(log, "pairing with {host}:{port} (pin len {})", pin.len());
+        tracing::info!("pairing with {host}:{port} (pin len {})", pin.len());
 
         let identity = (self.identity.0.clone(), self.identity.1.clone());
         let (tx, rx) = std::sync::mpsc::channel();

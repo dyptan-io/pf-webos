@@ -15,7 +15,6 @@
 //! it and handling failure (see `ndl::NdlVideo::load`'s audio fallback), that is always
 //! the better mechanism; the facts here are for the decisions that can't be probed
 //! cheaply, and for the log line that makes a bug report from an unknown model useful.
-use std::io::Write as _;
 
 /// What this TV reports about itself. Every field is best-effort: a model that doesn't
 /// expose a given source falls back to a safe default rather than failing.
@@ -54,8 +53,8 @@ impl DeviceInfo {
     pub fn detect() -> Self {
         let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
         let os = std::fs::read_to_string(OS_INFO).unwrap_or_default();
-        let webos_major = json_str_field(&os, "webos_release")
-            .and_then(|v| v.split('.').next().and_then(|m| m.parse().ok()));
+        let webos_major =
+            json_str_field(&os, "webos_release").and_then(|v| v.split('.').next().and_then(|m| m.parse().ok()));
         let model = std::fs::read_to_string(DEVICE_INFO)
             .ok()
             .and_then(|t| json_str_field(&t, "product_id"));
@@ -71,9 +70,8 @@ impl DeviceInfo {
     /// This exists so a report from a model neither developer owns is actionable: the
     /// first question about any playback problem is "what is this running on", and
     /// without this line the log answers it only indirectly.
-    pub fn log(&self, log: &mut std::fs::File) {
-        let _ = writeln!(
-            log,
+    pub fn log(&self) {
+        tracing::info!(
             "device: cores={} webos={} model={}",
             self.cores,
             self.webos_major

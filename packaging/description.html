@@ -1,32 +1,34 @@
-<h1>pf-webos</h1>
-<p>A native LG webOS TV client for <a href="https://git.unom.io/unom/punktfunk">punktfunk</a> —
-low-latency desktop and game streaming. Targets webOS 5.x+ (developed and verified live on an
-<strong>LG CX, webOS 5.6</strong>), packaged as a homebrew <code>.ipk</code> and sideloaded via
-<a href="https://github.com/webosbrew/dev-manager-desktop">dev-manager-desktop</a>.</p>
+<div style="font-family: system-ui, -apple-system, sans-serif; line-height: 1.55; width: 100%;">
+  <div style="text-align: center; margin-top: 28px; margin-bottom: 24px;">
+    <img src="https://raw.githubusercontent.com/dyptan-io/pf-webos/main/assets/logo/logo-sidebar.png"
+         alt="punktfunk" width="180">
+    <p style="font-size: 1.1em; color: #6c5bf3; font-weight: 600; margin: 12px 0 0;">
+      Low-latency desktop &amp; game streaming for LG webOS
+    </p>
+  </div>
 
-<p>This client is <strong>based on and depends on</strong> the
-<a href="https://git.unom.io/unom/punktfunk">punktfunk</a> project by
-<strong>Enrico Bühler (<a href="https://unom.io">unom</a>)</strong> — all credit for the protocol,
-FEC/crypto core, and host implementation belongs there. This repo contains only the
-webOS-specific client: an SDL2 UI, NDL DirectMedia hardware video decode, and webOS packaging,
-built directly on the upstream <code>punktfunk-core</code> crate.</p>
+  <p style="text-align: center; margin: 0 0 20px;">
+    <img src="https://raw.githubusercontent.com/dyptan-io/pf-webos/main/assets/screenshots/home.jpg" alt="Home screen" width="960" height="520" style="border-radius: 6px;">
+  </p>
 
-<h2>What it does</h2>
-<ul>
-  <li>Discovers punktfunk hosts on the LAN (mDNS) or lets you add one manually by IP.</li>
-  <li>Pairs with a host via PIN, persists trust across restarts.</li>
-  <li>Configurable resolution (1080p/1440p/4K), frame rate, bitrate (10-150 Mbps slider), and HDR.</li>
-  <li>Shows the host's game library (if it has one) before streaming, so you can launch straight
-    into a specific game instead of a plain desktop session.</li>
-  <li>Hardware H.264/H.265 video decode via webOS's NDL DirectMedia API, audio via
-    SDL2/PulseAudio.</li>
-  <li>Magic Remote friendly: d-pad menu navigation, pointer/mouse hover+click, direct PIN/IP entry
-    via the number pad, and the Red button as a reliable Back/disconnect substitute (the hardware
-    Back button is intercepted by webOS's system launcher).</li>
-</ul>
+  <ul style="padding-left: 1.2em; margin: 0 0 20px;">
+    <li style="margin-bottom: 6px;">Find hosts on your network automatically, or add one by IP; pair once with a PIN.</li>
+    <li style="margin-bottom: 6px;">Choose resolution (1080p/1440p/4K), frame rate, bitrate, and HDR.</li>
+    <li style="margin-bottom: 6px;">Browse the host's game library with cover art and launch straight into a game.</li>
+    <li style="margin-bottom: 6px;">Smooth hardware-accelerated video with low latency.</li>
+    <li style="margin-bottom: 6px;">Control it with the Magic Remote, a gamepad, keyboard, or mouse.</li>
+  </ul>
 
-<h2>License</h2>
-<p>Dual-licensed under
-<a href="https://github.com/dyptan-io/pf-webos/blob/main/LICENSE-MIT">MIT</a> or
-<a href="https://github.com/dyptan-io/pf-webos/blob/main/LICENSE-APACHE">Apache 2.0</a>, matching
-the upstream punktfunk project, at your option.</p>
+  <p style="margin: 0 0 12px;">
+    Needs a <a href="https://git.unom.io/unom/punktfunk" style="color: #6c5bf3;">punktfunk</a> host
+    running on your PC — see the
+    <a href="https://git.unom.io/unom/punktfunk#readme" style="color: #6c5bf3;">host setup guide</a>
+    to get started.
+  </p>
+
+  <p style="font-size: 0.85em; opacity: 0.7; margin: 0;">
+    webOS client by <a href="https://github.com/dyptan-io" style="color: #6c5bf3;">dyptan-io</a>.
+    punktfunk is created by Enrico Bühler (<a href="https://unom.io" style="color: #6c5bf3;">unom</a>).
+    MIT / Apache-2.0.
+  </p>
+</div>
