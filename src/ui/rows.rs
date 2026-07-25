@@ -447,12 +447,46 @@ pub struct ConfirmButton<'a> {
     pub color: Color,
 }
 
+/// Gap between the two buttons in a [`draw_confirm_buttons`] row.
+const CONFIRM_BUTTON_GAP: i32 = 20;
+
+/// A confirm button's interior metrics — icon size, icon-to-label gap, and the
+/// padding at each end — all derived from the label font's line height, which
+/// [`load_font`] already scales by panel height. One place, so the drawing code
+/// and [`confirm_row_min_width`] can never disagree about how much room a label
+/// actually gets.
+fn confirm_button_metrics(font: &Font) -> (u32, i32, i32) {
+    let line_h = font.height().max(1);
+    ((line_h * 2 / 3).max(1) as u32, (line_h / 3).max(1), (line_h / 2).max(1))
+}
+
+/// The narrowest `content` rect that shows both `buttons` labels in full.
+///
+/// A confirmation dialog is as wide as its buttons need to be: the labels are
+/// real words in whatever length they happen to be, and the card's width is a
+/// fraction of the screen, so the two are otherwise unrelated — which is how
+/// "Stop streaming" came to be ellipsized inside a 34%-wide card at 1080p while
+/// fitting at 4K. Callers take the max of this and their own preferred width.
+pub fn confirm_row_min_width(font: &Font, buttons: &[ConfirmButton; 2]) -> u32 {
+    let (icon_size, icon_gap, side_pad) = confirm_button_metrics(font);
+    let widest = buttons
+        .iter()
+        .map(|b| {
+            let label_w = font.size_of(b.label).map_or(0, |(w, _)| w);
+            let leading = if b.icon.is_some() { icon_size + icon_gap as u32 } else { 0 };
+            label_w + leading + 2 * side_pad as u32
+        })
+        .max()
+        .unwrap_or(0);
+    widest * 2 + CONFIRM_BUTTON_GAP as u32
+}
+
 /// Button `index`'s rect within a [`draw_confirm_buttons`] row anchored at
 /// `content` — the one place this side-by-side layout formula lives, shared
 /// by `draw_confirm_buttons` and `app.rs`'s `draw_list` (which needs it to
 /// position the composited focused-button tile).
 pub fn confirm_button_rect(content: Rect, index: usize) -> Rect {
-    let gap = 20i32;
+    let gap = CONFIRM_BUTTON_GAP;
     let btn_w = content.width().saturating_sub(gap as u32) / 2;
     Rect::new(content.x() + index as i32 * (btn_w as i32 + gap), content.y(), btn_w, content.height())
 }
@@ -519,9 +553,7 @@ pub fn draw_confirm_button(
     // button below 4K (~117px of room for ~154px of text at 720p) and ran it past the
     // right edge, because nothing clamped the label either.
     let line_h = fonts.label.height().max(1);
-    let icon_size = (line_h * 2 / 3).max(1) as u32;
-    let icon_gap = (line_h / 3).max(1);
-    let side_pad = (line_h / 2).max(1);
+    let (icon_size, icon_gap, side_pad) = confirm_button_metrics(fonts.label);
 
     // Icon and label are centred as one group, the same way a label without an icon
     // was already centred on its own — and the label is ellipsized to whatever the icon

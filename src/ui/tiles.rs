@@ -189,7 +189,15 @@ pub fn disconnect_dialog_buttons() -> [ConfirmButton<'static>; 2] {
 /// `main.rs` (which needs the button rect, without drawing, to position the
 /// focused-button tile).
 pub fn disconnect_dialog_layout(screen_w: u32, screen_h: u32, font_label: &Font) -> (Rect, Rect) {
-    let card = modal_card_rect(screen_w, screen_h, 0.34, 200);
+    // Wide enough for the buttons' own labels, and never narrower than the 34%
+    // this has always been. The labels are real words at a font size that scales
+    // with the panel, while 34% of the screen knows nothing about either — which
+    // is how "Stop streaming" ended up ellipsized here at 1080p but not at 4K.
+    // Capped at 90% so a hypothetical very long label still leaves a margin
+    // rather than running to the screen edges.
+    let needed = confirm_row_min_width(font_label, &disconnect_dialog_buttons()) + 64;
+    let frac = (needed as f32 / screen_w.max(1) as f32).clamp(0.34, 0.90);
+    let card = modal_card_rect(screen_w, screen_h, frac, 200);
     let content = Rect::new(
         card.x() + 32,
         card.y() + 36 + font_label.height() + 28,
