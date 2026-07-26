@@ -41,11 +41,7 @@ impl App {
             return;
         }
         self.reach_last = Some(Instant::now());
-        let targets: Vec<(String, u16)> = self
-            .entries
-            .iter()
-            .map(|e| (e.host().to_string(), e.port()))
-            .collect();
+        let targets: Vec<(String, u16)> = self.entries.iter().map(|e| (e.host().to_string(), e.port())).collect();
         if targets.is_empty() {
             return;
         }
@@ -99,9 +95,7 @@ impl App {
     /// This entry's last known reachability — `None` until it has been probed once, which
     /// the sidebar draws as "no dot" rather than guessing.
     pub(crate) fn entry_online(&self, entry: &crate::ui::HostEntry) -> Option<bool> {
-        self.reachable
-            .get(&(entry.host().to_string(), entry.port()))
-            .copied()
+        self.reachable.get(&(entry.host().to_string(), entry.port())).copied()
     }
 
     /// Every entry's state, index-aligned with `entries` — what the sidebar renderer takes.

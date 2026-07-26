@@ -40,8 +40,7 @@ mod real {
         anyhow::ensure!(hex.len() == 64, "pin must be 64 hex chars");
         let mut pin = [0u8; 32];
         for (i, byte) in pin.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-                .with_context(|| format!("bad hex at byte {i}"))?;
+            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).with_context(|| format!("bad hex at byte {i}"))?;
         }
         Ok(pin)
     }
@@ -66,7 +65,11 @@ mod real {
         let target_kbps: u32 = args.get(6).map_or(Ok(320_000), |s| s.parse()).context("target_kbps")?;
         let duration_ms: u32 = args.get(7).map_or(Ok(3_000), |s| s.parse()).context("duration_ms")?;
 
-        let mode = Mode { width: 1280, height: 720, refresh_hz: 60 };
+        let mode = Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
         let client = NativeClient::connect(
             host,
             port,
@@ -108,7 +111,9 @@ mod real {
             warm_start.elapsed().as_millis()
         );
 
-        client.request_probe(target_kbps, duration_ms).context("request_probe")?;
+        client
+            .request_probe(target_kbps, duration_ms)
+            .context("request_probe")?;
         let started = Instant::now();
         let deadline = started + Duration::from_millis(u64::from(duration_ms)) + PROBE_REPORT_GRACE;
         loop {

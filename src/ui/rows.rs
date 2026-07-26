@@ -149,9 +149,10 @@ pub fn render_focus_row_tile(
 }
 
 /// Every row unfocused, as one tile at its own full (unscrolled) height — the
-/// Settings modal's `Tile::SettingsRows`. Scrolling crops/repositions this via a
-/// GPU-side `DrawCmd::TexCropped` instead of re-rasterizing, so this only needs
-/// rebuilding when a value or the open dropdown changes, never on scroll.
+/// Settings modal's `Tile::ScrollContent(Screen::Settings)`. Scrolling crops/
+/// repositions this via a GPU-side `DrawCmd::TexCropped` instead of
+/// re-rasterizing, so this only needs rebuilding when a value or the open
+/// dropdown changes, never on scroll.
 pub fn render_focus_rows_tile(
     text_cache: &mut TextCache,
     fonts: &Fonts,

@@ -68,9 +68,7 @@ pub fn connect_message(err: &PunktfunkError) -> String {
 /// verify, i.e. the wrong PIN, which must not be reported as a network problem.
 pub fn pair_message(err: &PunktfunkError) -> String {
     match err {
-        PunktfunkError::Crypto => {
-            "Wrong PIN — check the PIN on the host's Pairing page and try again.".into()
-        }
+        PunktfunkError::Crypto => "Wrong PIN — check the PIN on the host's Pairing page and try again.".into(),
         other => connect_message(other),
     }
 }

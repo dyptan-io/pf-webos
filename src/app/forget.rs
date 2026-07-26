@@ -2,10 +2,10 @@
 //!
 //! Split out of the former single-file `app.rs`; see `super`'s module docs.
 use super::*;
-use std::time::Instant;
+use crate::ui::{self, HostEntry, MenuEvent, Painter};
 use anyhow::Result;
 use sdl2::rect::Rect;
-use crate::ui::{self, HostEntry, MenuEvent, Painter};
+use std::time::Instant;
 
 impl App {
     /// Enters `Screen::ForgetHost` for the sidebar row at `idx` — called from
@@ -129,7 +129,13 @@ impl App {
     /// without drawing so `prepare_tiles`/`draw_list` can position the
     /// focused-button tile without re-rendering the header.
     pub(crate) fn forget_host_content_rect(card: Rect, name: &str, fonts: &ui::Fonts) -> Rect {
-        let after_subtitle_y = ui::modal_header_end_y(fonts.label, fonts.value, card, &Self::forget_host_subtitle(name));
-        Rect::new(card.x() + 32, after_subtitle_y + 32, card.width().saturating_sub(64), 72)
+        let after_subtitle_y =
+            ui::modal_header_end_y(fonts.label, fonts.value, card, &Self::forget_host_subtitle(name));
+        Rect::new(
+            card.x() + 32,
+            after_subtitle_y + 32,
+            card.width().saturating_sub(64),
+            72,
+        )
     }
 }

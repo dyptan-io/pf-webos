@@ -2,10 +2,10 @@
 //!
 //! Split out of the former single-file `app.rs`; see `super`'s module docs.
 use super::*;
-use anyhow::Result;
-use sdl2::rect::Rect;
 use crate::store::{self, KnownHost};
 use crate::ui::{self, HostEntry, MenuEvent, Painter};
+use anyhow::Result;
+use sdl2::rect::Rect;
 
 /// The add-host screen's subtitle. `Screen::EditHost` builds its own — see
 /// `App::address_subtitle`.
@@ -96,7 +96,12 @@ impl App {
         let subtitle = self.address_subtitle();
         let card = self.address_card_rect(screen_w, screen_h, fonts);
         let after_subtitle_y = ui::modal_header_end_y(fonts.label, fonts.value, card, &subtitle);
-        Rect::new(card.x() + 32, after_subtitle_y + 20, card.width().saturating_sub(64), 80)
+        Rect::new(
+            card.x() + 32,
+            after_subtitle_y + 20,
+            card.width().saturating_sub(64),
+            80,
+        )
     }
 
     /// The address form's card rect — shared by the renderer and mouse hit-testing.

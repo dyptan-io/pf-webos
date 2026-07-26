@@ -2,12 +2,11 @@
 //!
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 use super::*;
+use crate::discovery::DiscoveredHost;
+use crate::store::KnownHost;
 use anyhow::Result;
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
-use crate::discovery::DiscoveredHost;
-use crate::store::KnownHost;
-
 
 // Sized for a 10-foot TV viewing distance, not a desktop/phone screen.
 pub const SIDEBAR_W: u32 = 460;
@@ -327,4 +326,3 @@ pub fn draw_utility_row(
     let label = label.trim_start_matches('+').trim();
     draw_sidebar_row(painter, text_cache, fonts, rect, glyph, label, focused, 0)
 }
-

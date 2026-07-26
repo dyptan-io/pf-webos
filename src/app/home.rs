@@ -13,11 +13,12 @@ impl App {
         self.entries.len() + 2
     }
 
-    /// Total grid nav positions: "Desktop" + fetched games. `0` (no cards at all)
-    /// only when no host is selected yet.
+    /// Total grid nav positions: "Desktop" (only once `games_loaded`) + fetched
+    /// games. `0` (no cards at all) only when no host is selected yet, or one's
+    /// selected but hasn't answered a library fetch yet.
     pub(crate) fn grid_len(&self) -> usize {
         if self.selected_host.is_some() {
-            1 + self.games.len()
+            self.card_offset() + self.games.len()
         } else {
             0
         }
@@ -127,8 +128,8 @@ impl App {
                     self.screen = Screen::Settings;
                     self.dropdown = None;
                     self.settings_focused = 0;
-                    self.settings_scroll = 0;
-                    self.settings_scroll_shown_at = None;
+                    self.scroll = ui::ScrollWindow::new();
+                    self.content_window = ui::ContentWindow::new();
                 }
                 HomeFocus::SidebarMenu(i) => self.open_host_menu(i),
                 HomeFocus::Grid(i) => self.confirm_grid_card(i),
@@ -225,6 +226,7 @@ impl App {
         self.selected_host = Some((host.clone(), port));
         self.home_status = Some("Loading library…".into());
         self.games = Vec::new();
+        self.games_loaded = false;
         self.art.clear();
         // Dropping the loader stops its worker (its request channel closes), so a host
         // switch abandons in-flight fetches for the previous library.
@@ -292,6 +294,7 @@ impl App {
                     fingerprint,
                 ));
                 self.games = games;
+                self.games_loaded = true;
                 self.home_status = None;
             }
             Err(e) => {
@@ -309,7 +312,7 @@ impl App {
     /// controls then); `NotPaired`/`PinMismatch`/`Http` mean the host answered, so
     /// Wake-on-LAN wouldn't help — those stay a plain status line.
     pub(crate) fn handle_library_error(&mut self, host: String, port: u16, e: crate::library::LibraryError) {
-        let reason = format!("{e} (Desktop is still available.)");
+        let reason = e.to_string();
         if matches!(e, crate::library::LibraryError::Unreachable(_)) {
             let mac = self
                 .known_hosts
@@ -319,6 +322,9 @@ impl App {
                 .unwrap_or_default();
             self.start_wake(host, port, mac, reason);
         } else {
+            // The host answered — just not with a usable library — so Desktop is a
+            // legitimate fallback here, unlike the `Unreachable` branch above.
+            self.games_loaded = true;
             self.home_status = Some(reason);
         }
     }
@@ -340,10 +346,12 @@ impl App {
             return;
         };
         let Some(fingerprint) = known.fingerprint else { return };
-        let launch = if idx == 0 {
+        let launch = if self.games_loaded && idx == 0 {
             None
         } else {
-            let Some(game) = self.games.get(idx - 1) else { return };
+            let Some(game) = self.games.get(idx - self.card_offset()) else {
+                return;
+            };
             Some(game.id.clone())
         };
         let mgmt_port = known.mgmt_port.unwrap_or(crate::library::DEFAULT_MGMT_PORT);
@@ -422,6 +430,7 @@ impl App {
         if self.selected_host.as_ref() == Some(&(host, port)) {
             self.selected_host = None;
             self.games = Vec::new();
+            self.games_loaded = false;
             self.home_status = None;
             self.home_focus = HomeFocus::Sidebar(0);
         }

@@ -7,7 +7,6 @@ use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 use tiny_skia::Pixmap;
 
-
 /// A slight softening of moonlight-tv's near-square (~2px) tile radius.
 pub const CARD_RADIUS: i32 = 10;
 pub const MODAL_RADIUS: i32 = 20;
@@ -181,4 +180,3 @@ pub fn draw_poster_card(
     }
     Ok(())
 }
-

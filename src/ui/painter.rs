@@ -1,10 +1,12 @@
 //! The anti-aliased software rendering backend every `draw_*` is built from.
 //!
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
-use std::collections::HashMap;
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
-use tiny_skia::{Color as SkColor, FillRule, FilterQuality, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform};
+use std::collections::HashMap;
+use tiny_skia::{
+    Color as SkColor, FillRule, FilterQuality, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform,
+};
 
 // The AA rendering backend: a `tiny_skia::Pixmap` framebuffer plus the handful of
 // primitive ops every higher-level `draw_*` function below is built from. Nothing
@@ -306,4 +308,3 @@ pub fn premultiply_rgba(rgba: &mut [u8]) {
         px[2] = ((u32::from(px[2]) * a) / 255) as u8;
     }
 }
-

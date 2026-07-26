@@ -4,13 +4,17 @@
 //! Every other punktfunk client shows the version here rather than in its navigation
 //! chrome, which is why the sidebar no longer draws it (see `sidebar::draw_sidebar`).
 //!
-//! **Scrolling is by source line, and only the visible window is ever rasterized.**
-//! `THIRD-PARTY-NOTICES.txt` is ~10,000 lines; laying it out in full — or drawing it
-//! through [`TextCache`] — would be a non-starter on this `SoC` (see
-//! `draw_text_uncached`'s docs for the cache side of that). `draw_about_body` walks
-//! forward from the first visible line and stops as soon as it runs past the bottom
-//! of the viewport, so cost per frame is bounded by the viewport height, not by the
-//! document length.
+//! **Scrolling is hardware-accelerated, the same way the Settings modal's row list
+//! is.** `THIRD-PARTY-NOTICES.txt` is ~10,000 source lines — wrapped to the card
+//! width that's more like ~12,000 visual lines, far too tall to bake into one GPU
+//! texture (see `App::scroll_geometry`/`ui::ContentWindow`'s docs on why About needs
+//! a *windowed* content tile where Settings' 9 rows fit in one). [`wrap_document`]
+//! wraps the whole document once, up front, into a flat list of visual lines with a
+//! uniform per-line stride — the unit `ui::ScrollWindow`/`ui::ContentWindow` scroll
+//! over — and [`draw_about_window`] rasterizes only a bounded slice of it at a time
+//! (not through [`TextCache`], which would be a non-starter on this `SoC` for a
+//! document this size — see `draw_text_uncached`'s docs). Scrolling within that
+//! slice is then a pure `DrawCmd::TexCropped`, never a re-rasterize.
 use anyhow::Result;
 use sdl2::rect::Rect;
 
@@ -93,43 +97,55 @@ pub fn about_body_rect(card: Rect, fonts: &Fonts) -> Rect {
 /// so the body rect stays put regardless of what the build stamped in.
 const ABOUT_SUBTITLE_PROBE: &str = "Version 0.0.0+git.00000000";
 
-/// How many source lines fit in `body` at worst (every line unwrapped) — used to
-/// clamp scrolling so the page can't be scrolled past its own end.
-pub fn about_visible_lines(body: Rect, font: &sdl2::ttf::Font) -> usize {
-    let step = (font.height() + LINE_GAP).max(1);
-    (body.height() as i32 / step).max(1) as usize
+/// Stride (px) between two consecutive wrapped visual lines at `font`'s size —
+/// the uniform unit `ui::ScrollWindow`/`ui::ContentWindow` scroll over.
+pub fn about_line_stride(font: &sdl2::ttf::Font) -> i32 {
+    font.height() + LINE_GAP
 }
 
-/// Draws the document from source line `first` until the viewport is full, wrapping
-/// each line to the viewport width. Only the lines actually shown are rasterized —
-/// see the module docs.
-pub fn draw_about_body(
+/// How many wrapped visual lines fit in `body` — used to clamp scrolling so the
+/// page can't be scrolled past its own end.
+pub fn about_visible_lines(body: Rect, font: &sdl2::ttf::Font) -> usize {
+    (body.height() as i32 / about_line_stride(font).max(1)).max(1) as usize
+}
+
+/// Wraps every source `line` to `width`, flattening into one list of visual
+/// lines — a blank source line becomes one blank visual line (preserving its
+/// paragraph gap), and a wrapped one expands to as many entries as it needs.
+/// This is the one-time cost (text measurement, not rasterization) that gives
+/// the whole document a uniform per-line stride, so it can scroll exactly like
+/// Settings' fixed-height rows instead of needing per-source-line bookkeeping.
+pub fn wrap_document(font: &sdl2::ttf::Font, lines: &[&str], width: u32) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            out.push(String::new());
+        } else {
+            // Wrapped, not clipped: this is licence text, and silently truncating it
+            // would hide terms the screen exists to display.
+            out.extend(wrap_text(font, line, width));
+        }
+    }
+    out
+}
+
+/// Draws wrapped visual lines `[start, start+len)` of `lines`, top-aligned at
+/// this painter's own origin — the content tile's local space, which the GPU
+/// compositor then crops/positions from (see `Tile::ScrollContent`'s docs).
+/// Only called when `ui::ContentWindow` (re)bakes a window, not per frame.
+pub fn draw_about_window(
     painter: &mut Painter,
     font: &sdl2::ttf::Font,
-    lines: &[&str],
-    first: usize,
-    body: Rect,
+    lines: &[String],
+    start: usize,
+    len: usize,
 ) -> Result<()> {
-    let step = font.height() + LINE_GAP;
-    let mut y = body.y();
-    let bottom = body.y() + body.height() as i32;
-    for line in lines.iter().skip(first) {
-        if y + font.height() > bottom {
-            break;
-        }
-        if line.trim().is_empty() {
-            y += step;
+    let step = about_line_stride(font);
+    for (i, line) in lines.iter().skip(start).take(len).enumerate() {
+        if line.is_empty() {
             continue;
         }
-        // Wrapped, not clipped: this is licence text, and silently truncating it at the
-        // card edge would hide terms the screen exists to display.
-        for part in wrap_text(font, line, body.width()) {
-            if y + font.height() > bottom {
-                break;
-            }
-            draw_text_uncached(painter, font, &part, body.x(), y, MUTED)?;
-            y += step;
-        }
+        draw_text_uncached(painter, font, line, 0, i as i32 * step, MUTED)?;
     }
     Ok(())
 }

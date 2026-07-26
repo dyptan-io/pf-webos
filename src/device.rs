@@ -62,8 +62,7 @@ pub fn supports_av1() -> bool {
     static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SUPPORTED.get_or_init(|| {
         let needle = b"video/x-av1";
-        let found = std::fs::read(LX_VIDEODEC_PLUGIN)
-            .is_ok_and(|data| data.windows(needle.len()).any(|w| w == needle));
+        let found = std::fs::read(LX_VIDEODEC_PLUGIN).is_ok_and(|data| data.windows(needle.len()).any(|w| w == needle));
         tracing::info!(
             "device: platform decoder {} AV1 ({LX_VIDEODEC_PLUGIN})",
             if found { "declares" } else { "does not declare" },

@@ -149,7 +149,14 @@ impl AudioPlayer {
         }
 
         let peak = self.queue_packet(opus_payload)?;
-        Ok((peak, if underrun { AudioEvent::Underrun } else { AudioEvent::Queued }))
+        Ok((
+            peak,
+            if underrun {
+                AudioEvent::Underrun
+            } else {
+                AudioEvent::Queued
+            },
+        ))
     }
 
     /// Decodes one real packet into the device queue, returning its peak sample.

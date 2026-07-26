@@ -186,7 +186,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
 pub fn wake_rows(auto_send: bool) -> Vec<FocusRow> {
     vec![FocusRow {
         icon: ICON_SETTINGS,
-        label: "Wake automatically in future".into(),
+        label: "Wake automatically".into(),
         value: if auto_send { "On".into() } else { "Off".into() },
         kind: RowKind::Toggle,
         fraction: 0.0,
@@ -242,7 +242,10 @@ pub fn dropdown_options(settings: &Settings, row_index: usize) -> Vec<String> {
         ROW_RESOLUTION => RESOLUTIONS.iter().map(|(w, h, _)| resolution_label(*w, *h)).collect(),
         ROW_FRAMERATE => REFRESH_RATES.iter().map(|hz| format!("{hz} Hz")).collect(),
         ROW_VIDEO_BACKEND => vec!["NDL".into(), "Starfish".into()],
-        ROW_CODEC => codec_options(settings).iter().map(|&p| codec_label(p).to_string()).collect(),
+        ROW_CODEC => codec_options(settings)
+            .iter()
+            .map(|&p| codec_label(p).to_string())
+            .collect(),
         ROW_AUDIO => AUDIO_CHANNELS.iter().map(|(_, s)| (*s).to_string()).collect(),
         _ => Vec::new(),
     }

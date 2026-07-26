@@ -833,7 +833,13 @@ fn spawn_vendor_decode_thread_renicer() {
     });
 }
 
-fn video_pump(client: Arc<NativeClient>, player: VideoPlayer, stop: Arc<AtomicBool>, stats: Arc<StreamStats>, is_hdr: bool) {
+fn video_pump(
+    client: Arc<NativeClient>,
+    player: VideoPlayer,
+    stop: Arc<AtomicBool>,
+    stats: Arc<StreamStats>,
+    is_hdr: bool,
+) {
     client.register_hot_thread();
     // Summarized at info, not left as per-tid debug lines: whether these renices work at
     // all is install-mode-dependent (they need CAP_SYS_NICE or a nonzero RLIMIT_NICE —
@@ -848,15 +854,16 @@ fn video_pump(client: Arc<NativeClient>, player: VideoPlayer, stop: Arc<AtomicBo
             reniced += 1;
         } else {
             failed += 1;
-            tracing::debug!(
-                "setpriority(tid={tid}) failed: {}",
-                std::io::Error::last_os_error()
-            );
+            tracing::debug!("setpriority(tid={tid}) failed: {}", std::io::Error::last_os_error());
         }
     }
     tracing::info!(
         "hot-thread renice: {reniced} boosted, {failed} failed{}",
-        if failed > 0 { " (no CAP_SYS_NICE — priorities unchanged)" } else { "" },
+        if failed > 0 {
+            " (no CAP_SYS_NICE — priorities unchanged)"
+        } else {
+            ""
+        },
     );
     spawn_vendor_decode_thread_renicer();
 

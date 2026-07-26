@@ -284,7 +284,12 @@ mod real {
                     if matches!(app.screen, Screen::About) {
                         /// Licence-wall px per wheel detent — a few lines at a time.
                         const ABOUT_WHEEL_STEP: i32 = 90;
-                        dirty |= app.scroll_about_by(-wheel_y * ABOUT_WHEEL_STEP, fonts);
+                        dirty |= app.scroll_about_by(
+                            -wheel_y * ABOUT_WHEEL_STEP,
+                            display_mode.w as u32,
+                            display_mode.h as u32,
+                            fonts,
+                        );
                         continue;
                     }
                     if matches!(app.screen, Screen::Home) {

@@ -55,4 +55,3 @@ pub const ICON_EDIT: &str = "\u{E3C9}";
 pub const ICON_INFO: &str = "\u{E88E}";
 /// The host row's "more actions" affordance — see `sidebar_menu_button_rect`.
 pub const ICON_MORE: &str = "\u{E5D3}";
-

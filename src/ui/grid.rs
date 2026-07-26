@@ -3,7 +3,6 @@
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 use sdl2::rect::Rect;
 
-
 pub const GRID_PAD: i32 = 32;
 pub const GRID_GAP: i32 = 24;
 pub const GRID_TOP_Y: i32 = 160;
@@ -48,8 +47,7 @@ pub fn hit_test_grid_card(
     if mouse_x < grid_x {
         return None;
     }
-    (0..count)
-        .find(|&i| grid_card_rect(i, columns, grid_x, available_w).contains_point((mouse_x, mouse_y + scroll)))
+    (0..count).find(|&i| grid_card_rect(i, columns, grid_x, available_w).contains_point((mouse_x, mouse_y + scroll)))
 }
 
 /// Headroom above/below the card rows inside the cached grid layer (see
@@ -64,4 +62,3 @@ pub fn grid_layer_height(count: usize, columns: usize, available_w: u32) -> u32 
     let (_, card_h) = grid_card_size(available_w, columns);
     (rows.max(1) as u32 * (card_h + GRID_GAP as u32)) + 2 * GRID_LAYER_PAD as u32
 }
-

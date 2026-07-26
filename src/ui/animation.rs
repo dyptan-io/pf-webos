@@ -1,8 +1,8 @@
 //! Shared animation clocks and the GPU zoom-pop rect math.
 //!
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
-use std::time::{Duration, Instant};
 use sdl2::rect::Rect;
+use std::time::{Duration, Instant};
 
 // Shared by every GPU-scale zoom-pop in the app — the grid's card focus-pop
 // (`app.rs`), every pre-stream modal's focused-widget tile, and the in-stream
@@ -39,4 +39,3 @@ pub fn zoom_rect(base: Rect, frac: f32, growth: f32) -> Rect {
     let th = base.height() as f32 * scale;
     Rect::new((cx - tw / 2.0) as i32, (cy - th / 2.0) as i32, tw as u32, th as u32)
 }
-

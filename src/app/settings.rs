@@ -9,7 +9,7 @@ use std::time::Instant;
 
 impl App {
     /// Handles one menu event on the settings modal. `screen_h` is only used by
-    /// `Up`/`Down` to keep `settings_scroll` following `settings_focused`.
+    /// `Up`/`Down` to keep `self.scroll` following `settings_focused`.
     pub fn handle_settings_event(&mut self, ev: MenuEvent, screen_h: u32) {
         // An open Resolution/Frame rate dropdown intercepts all input until it's
         // closed (by picking an option or backing out) — it's a modal overlay on
@@ -112,27 +112,12 @@ impl App {
         ((available / stride) as usize).clamp(1, ui::SETTINGS_ROW_COUNT)
     }
 
-    /// `settings_scroll` is only re-clamped on `Up`/`Down`, so it can be stale after a
-    /// resize; use this instead of the raw field wherever it's subtracted from a row
-    /// index, to avoid underflow.
-    pub(crate) fn clamped_settings_scroll(&self, screen_h: u32) -> usize {
-        let visible = Self::settings_visible_rows(screen_h);
-        self.settings_scroll.min(ui::SETTINGS_ROW_COUNT.saturating_sub(visible))
-    }
-
-    /// Moves `settings_scroll` just enough to keep `settings_focused` in view, and marks
-    /// the scrollbar to show briefly if the position actually moved.
+    /// Moves the scroll offset just enough to keep `settings_focused` in view, and
+    /// marks the scroll indicator to show briefly if the position actually moved.
     pub(crate) fn scroll_settings_into_view(&mut self, screen_h: u32) {
         let visible = Self::settings_visible_rows(screen_h);
-        let before = self.settings_scroll;
-        if self.settings_focused < self.settings_scroll {
-            self.settings_scroll = self.settings_focused;
-        } else if self.settings_focused >= self.settings_scroll + visible {
-            self.settings_scroll = self.settings_focused + 1 - visible;
-        }
-        if self.settings_scroll != before {
-            self.settings_scroll_shown_at = Some(Instant::now());
-        }
+        self.scroll
+            .scroll_into_view(self.settings_focused, ui::SETTINGS_ROW_COUNT, visible);
     }
 
     /// The settings modal's card/content rects — shared by `render` and mouse
@@ -177,10 +162,10 @@ impl App {
             sdl2::pixels::Color::RGBA(0xff, 0xff, 0xff, 0x1e),
         );
 
-        // The row list itself is drawn separately — see `Tile::SettingsRows` — so
+        // The row list itself is drawn separately — see `Tile::ScrollContent` — so
         // scrolling never re-rasterizes this shell; only a value/dropdown change does.
         // The open dropdown's panel is drawn separately too — see `Tile::DropdownOverlay`
-        // — so it composites *after* `Tile::SettingsRows` instead of being covered by it.
+        // — so it composites *after* `Tile::ScrollContent` instead of being covered by it.
 
         if self.settings.bitrate_kbps > ui::BITRATE_WARN_KBPS {
             ui::draw_text(

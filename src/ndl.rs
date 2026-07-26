@@ -246,13 +246,7 @@ impl NdlVideo {
     /// Caveat worth knowing: this can only detect a load that *fails*. If a device
     /// accepts the config and then produces no sound, that is silent — which is why the
     /// selection is logged loudly by the caller.
-    pub fn load(
-        app_id: &str,
-        width: i32,
-        height: i32,
-        codec: NdlCodec,
-        audio: Option<NdlAudioConfig>,
-    ) -> Result<Self> {
+    pub fn load(app_id: &str, width: i32, height: i32, codec: NdlCodec, audio: Option<NdlAudioConfig>) -> Result<Self> {
         ensure_init(app_id)?;
         let video = NdlVideoInfo {
             width,
@@ -324,9 +318,7 @@ impl NdlVideo {
         let pts_ms = self.load_instant.elapsed().as_millis() as c_longlong;
         let _ffi = self.ffi.lock().expect("NDL FFI mutex poisoned");
         // SAFETY: NDL reads `size` bytes synchronously and does not retain the pointer.
-        let ret = unsafe {
-            NDL_DirectAudioPlay(packet.as_ptr() as *mut c_void, packet.len() as c_uint, pts_ms)
-        };
+        let ret = unsafe { NDL_DirectAudioPlay(packet.as_ptr() as *mut c_void, packet.len() as c_uint, pts_ms) };
         if ret != 0 {
             bail!("NDL_DirectAudioPlay failed: ret={ret} error={}", last_error());
         }
@@ -341,9 +333,7 @@ impl NdlVideo {
         let _ffi = self.ffi.lock().expect("NDL FFI mutex poisoned");
         // SAFETY: NDL reads `size` bytes from `buffer` synchronously and does not
         // retain the pointer.
-        let ret = unsafe {
-            NDL_DirectVideoPlay(au.as_ptr() as *mut c_void, au.len() as c_uint, pts_ms)
-        };
+        let ret = unsafe { NDL_DirectVideoPlay(au.as_ptr() as *mut c_void, au.len() as c_uint, pts_ms) };
         if ret != 0 {
             bail!("NDL_DirectVideoPlay failed: ret={ret} error={}", last_error());
         }

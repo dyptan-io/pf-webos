@@ -2,13 +2,12 @@
 //!
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 use super::*;
-use std::collections::HashMap;
 use anyhow::{Context, Result};
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 use sdl2::ttf::Font;
+use std::collections::HashMap;
 use tiny_skia::{IntSize, Pixmap};
-
 
 /// The bundled Geist family (punktfunk's brand font, the same OTFs every other
 /// punktfunk client ships — copied verbatim from `pf-console-ui/assets/fonts/`;
@@ -206,14 +205,7 @@ pub fn draw_text(
 /// process — on a TV with no eviction path. These lines are drawn at most a couple of
 /// times each (once per scroll position that shows them), so rasterizing fresh is both
 /// cheaper overall and bounded in memory.
-pub fn draw_text_uncached(
-    painter: &mut Painter,
-    font: &Font,
-    text: &str,
-    x: i32,
-    y: i32,
-    color: Color,
-) -> Result<u32> {
+pub fn draw_text_uncached(painter: &mut Painter, font: &Font, text: &str, x: i32, y: i32, color: Color) -> Result<u32> {
     if text.is_empty() {
         return Ok(0);
     }
@@ -266,20 +258,35 @@ pub fn ellipsize(font: &Font, text: &str, max_w: u32) -> String {
 /// Greedily word-wraps `text` into lines no wider than `max_w` px in `font` — for modal
 /// copy that's a full sentence or two (status/explanation text), unlike `ellipsize`'s
 /// single-line truncation for card titles.
+///
+/// Tracks the running line width instead of re-measuring the whole (growing) line on
+/// every word — the original did `font.size_of(&candidate)` on the full prefix each
+/// time, which is O(line length) per word and so O(n²) over a line, cheap for a
+/// sentence but the dominant cost of wrapping About's ~10,000-line document on open
+/// (see `ui::wrap_document`). Assumes negligible word-to-word kerning at the space
+/// boundary, same as every other width-budget calculation in this UI already does.
 pub fn wrap_text(font: &Font, text: &str, max_w: u32) -> Vec<String> {
+    let space_w = font.size_of(" ").map_or(0, |(w, _)| w);
     let mut lines = Vec::new();
     let mut current = String::new();
+    let mut current_w = 0u32;
     for word in text.split_whitespace() {
-        let candidate = if current.is_empty() {
-            word.to_string()
+        let word_w = font.size_of(word).map_or(0, |(w, _)| w);
+        let candidate_w = if current.is_empty() {
+            word_w
         } else {
-            format!("{current} {word}")
+            current_w + space_w + word_w
         };
-        if current.is_empty() || font.size_of(&candidate).map_or(0, |(w, _)| w) <= max_w {
-            current = candidate;
+        if current.is_empty() || candidate_w <= max_w {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+            current_w = candidate_w;
         } else {
             lines.push(std::mem::take(&mut current));
-            current = word.to_string();
+            current.push_str(word);
+            current_w = word_w;
         }
     }
     if !current.is_empty() {
@@ -343,8 +350,26 @@ pub fn draw_modal_header(
     subtitle_color: Color,
 ) -> Result<i32> {
     let (text_x, subtitle_y, max_w) = modal_header_geometry(title_font, card);
-    draw_text(painter, text_cache, title_font, title, text_x, card.y() + 28, title_color)?;
-    draw_text_wrapped(painter, text_cache, subtitle_font, subtitle, text_x, subtitle_y, max_w, subtitle_color, 6)
+    draw_text(
+        painter,
+        text_cache,
+        title_font,
+        title,
+        text_x,
+        card.y() + 28,
+        title_color,
+    )?;
+    draw_text_wrapped(
+        painter,
+        text_cache,
+        subtitle_font,
+        subtitle,
+        text_x,
+        subtitle_y,
+        max_w,
+        subtitle_color,
+        6,
+    )
 }
 
 /// The same `y` [`draw_modal_header`] would return, computed without drawing —
@@ -356,4 +381,3 @@ pub fn modal_header_end_y(title_font: &Font, subtitle_font: &Font, card: Rect, s
     let lines = wrap_text(subtitle_font, subtitle, max_w).len() as i32;
     subtitle_y + lines * (subtitle_font.height() + 6)
 }
-

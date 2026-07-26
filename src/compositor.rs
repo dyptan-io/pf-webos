@@ -14,6 +14,7 @@ use sdl2::rect::Rect;
 use sdl2::render::{BlendMode, Canvas, Texture, TextureCreator};
 use sdl2::video::{Window, WindowContext};
 
+use crate::app::Screen;
 use crate::ui::Painter;
 
 /// Identity of one cached tile/texture. `Card` is keyed by grid index.
@@ -39,7 +40,7 @@ pub enum Tile {
     ModalFocusElement,
     /// An open dropdown's panel + unfocused option list, positioned over the
     /// row that opened it. Its own tile — rather than being baked into
-    /// `Modal`'s shell — so it composites *after* `SettingsRows`, which would
+    /// `Modal`'s shell — so it composites *after* `ScrollContent`, which would
     /// otherwise redraw the rows the panel overlaps on top of it.
     DropdownOverlay,
     /// An open dropdown's focused option, as its own small tile — composited
@@ -51,13 +52,21 @@ pub enum Tile {
     Status,
     /// The "No host selected" hint line.
     NoHost,
-    /// The Settings modal's scroll indicator (`ui::render_list_scrollbar_tile`).
-    SettingsScrollbar,
-    /// Every Settings row, unfocused, at its *unscrolled* position — full row-list
-    /// height, not just the visible window. Scrolling crops/repositions this via
-    /// `DrawCmd::TexCropped` (a GPU op), so it only needs rebuilding when a value or
-    /// the open dropdown changes, never when the list merely scrolls.
-    SettingsRows,
+    /// Whichever modal's scroll position indicator is currently baked
+    /// (`ui::render_list_scrollbar_tile`) — keyed by `Screen` since only one
+    /// modal is ever open at a time, so one keyed pair of variants covers
+    /// every scrollable modal (Settings' row list, About's document, ...)
+    /// instead of two new `Tile` variants per modal. See `App::scroll_geometry`.
+    ScrollIndicator(Screen),
+    /// Whichever modal's scrollable content is currently baked, at its
+    /// *unscrolled* position — for Settings, every row at full row-list
+    /// height; for About, a bounded window of the wrapped document (see
+    /// `ui::ContentWindow` — the whole ~12k-line document is far too tall for
+    /// one GPU texture). Scrolling crops/repositions this via
+    /// `DrawCmd::TexCropped` (a GPU op), so it only needs rebuilding when the
+    /// content itself changes (a value/dropdown, or About's window
+    /// recentering), never when the list merely scrolls within it.
+    ScrollContent(Screen),
     /// The loading spinner shown over the grid while it fills in (`ui::render_spinner_tile`).
     Spinner,
     /// The in-stream stats overlay panel (`ui::render_stats_overlay_tile`).

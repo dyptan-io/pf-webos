@@ -19,7 +19,9 @@ impl App {
     /// current address. No-ops for a discovered-but-unsaved entry (there is nothing
     /// persisted to edit).
     pub(crate) fn open_edit_host(&mut self, idx: usize) {
-        let Some(HostEntry::Known(h)) = self.entries.get(idx) else { return };
+        let Some(HostEntry::Known(h)) = self.entries.get(idx) else {
+            return;
+        };
         self.add_host = AddHostState::from_ip(&h.host);
         self.edit_host_index = Some(idx);
         self.host_menu_index = None;
@@ -49,7 +51,9 @@ impl App {
             return;
         }
         let Some(idx) = self.edit_host_index else { return };
-        let Some(HostEntry::Known(old)) = self.entries.get(idx).cloned() else { return };
+        let Some(HostEntry::Known(old)) = self.entries.get(idx).cloned() else {
+            return;
+        };
         let (host, port) = self.add_host.host_and_port();
         if host == old.host && port == old.port {
             self.edit_host_index = None;

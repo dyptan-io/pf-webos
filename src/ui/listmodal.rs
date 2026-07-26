@@ -31,13 +31,7 @@ const SIDE_PAD: i32 = 32;
 /// The card rect for a list modal with `row_count` rows and this `subtitle` (whose
 /// wrapped height moves everything below it). Mirrors `App::simple_modal_card`'s
 /// probe trick: measure against a zero-height card at the final width, then place it.
-pub fn list_modal_card_rect(
-    screen_w: u32,
-    screen_h: u32,
-    fonts: &Fonts,
-    subtitle: &str,
-    row_count: usize,
-) -> Rect {
+pub fn list_modal_card_rect(screen_w: u32, screen_h: u32, fonts: &Fonts, subtitle: &str, row_count: usize) -> Rect {
     let w = (screen_w as f32 * LIST_MODAL_WIDTH_FRAC).round() as u32;
     let probe = Rect::new(0, 0, w, 0);
     let header_end = modal_header_end_y(fonts.label, fonts.value, probe, subtitle);
@@ -72,7 +66,15 @@ pub fn render_list_modal(
     rows: &[FocusRow],
 ) -> Result<()> {
     draw_modal_header(
-        painter, text_cache, fonts.label, fonts.value, card, title, WHITE, subtitle, MUTED,
+        painter,
+        text_cache,
+        fonts.label,
+        fonts.value,
+        card,
+        title,
+        WHITE,
+        subtitle,
+        MUTED,
     )?;
     let content = list_modal_content_rect(card, fonts, subtitle, rows.len());
     // `usize::MAX` = nothing focused here; see the module docs.

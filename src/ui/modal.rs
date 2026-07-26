@@ -2,11 +2,10 @@
 //!
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 use super::*;
+use anyhow::Result;
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 use sdl2::ttf::Font;
-use anyhow::Result;
-
 
 /// A centered glass card of `(width_frac * screen_w, height)`.
 pub fn modal_card_rect(screen_w: u32, screen_h: u32, width_frac: f32, height: u32) -> Rect {
@@ -71,7 +70,6 @@ pub fn modal_close_rect(card_rect: Rect) -> Rect {
         SIZE,
     )
 }
-
 
 /// A horizontal rule broken by a centred word — the "or" between two mutually exclusive
 /// choices.

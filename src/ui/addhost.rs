@@ -2,7 +2,6 @@
 //!
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 
-
 /// punktfunk's conventional host port (see `store::dev_override_connect`'s
 /// fallback) — fixed and not user-editable, so the add-host screen only ever
 /// has to ask for an IP address.

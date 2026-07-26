@@ -1,37 +1,47 @@
-//! The About & licenses screen's state: which line the document is scrolled to.
+//! The About & licenses screen's state: which visual line the document is
+//! scrolled to.
 //!
 //! Split out of the former single-file `app.rs`; see `super`'s module docs.
-//! Layout and drawing live in `ui::about` — including why only the visible window is
-//! ever rasterized.
+//! Layout and drawing live in `ui::about` — including the wrapped-line/windowed-tile
+//! scheme that makes this screen scroll like Settings' row list (see its module docs).
 use super::*;
 use sdl2::rect::Rect;
 
 use crate::ui::{self, MenuEvent, Painter};
 
 impl App {
-    /// Enters `Screen::About`, building the document on first open (see
-    /// `ui::about_lines`).
+    /// Enters `Screen::About`, building the document's source lines on first open
+    /// (see `ui::about_lines`) — wrapping them to visual lines happens lazily in
+    /// `ensure_about_wrapped`, once a body width is known.
     pub(crate) fn open_about(&mut self) {
         if self.about_lines.is_empty() {
             self.about_lines = ui::about_lines();
         }
-        self.about_scroll = 0;
+        self.scroll = ui::ScrollWindow::new();
+        self.content_window = ui::ContentWindow::new();
         self.screen = Screen::About;
     }
 
-    /// Up/Down scroll by a line, Left/Right by a page. There is nothing focusable on
-    /// this screen, so every event is either scrolling or leaving.
+    /// Up/Down scroll by a visual line, Left/Right by a page. There is nothing
+    /// focusable on this screen, so every event is either scrolling or leaving.
     pub(crate) fn handle_about_event(&mut self, ev: MenuEvent, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) {
-        let page = self.about_page_lines(screen_w, screen_h, fonts);
+        let (total, visible) = self.about_scroll_geometry(screen_w, screen_h, fonts);
         // Keep a couple of lines of the previous screenful visible when paging, so the
         // reader has an anchor rather than a hard cut.
-        let page_step = page.saturating_sub(2).max(1);
-        let max = self.about_lines.len().saturating_sub(1);
+        let page_step = visible.saturating_sub(2).max(1);
         match ev {
-            MenuEvent::Up => self.about_scroll = self.about_scroll.saturating_sub(1),
-            MenuEvent::Down => self.about_scroll = (self.about_scroll + 1).min(max),
-            MenuEvent::Left => self.about_scroll = self.about_scroll.saturating_sub(page_step),
-            MenuEvent::Right => self.about_scroll = (self.about_scroll + page_step).min(max),
+            MenuEvent::Up => {
+                self.scroll.scroll_by(-1, total, visible);
+            }
+            MenuEvent::Down => {
+                self.scroll.scroll_by(1, total, visible);
+            }
+            MenuEvent::Left => {
+                self.scroll.page(page_step, false, total, visible);
+            }
+            MenuEvent::Right => {
+                self.scroll.page(page_step, true, total, visible);
+            }
             // Back returns to Settings, where this screen was opened from — not Home,
             // which would throw away the settings context the user was in.
             MenuEvent::Back | MenuEvent::Confirm => self.screen = Screen::Settings,
@@ -41,30 +51,45 @@ impl App {
 
     /// Scrolls by `dy_px` worth of lines — the Magic Remote's wheel. Returns whether
     /// the position actually moved (drives the redraw).
-    pub(crate) fn scroll_about_by(&mut self, dy_px: i32, fonts: &ui::Fonts) -> bool {
-        let step = (fonts.value.height() + 4).max(1);
+    pub(crate) fn scroll_about_by(&mut self, dy_px: i32, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> bool {
+        let (total, visible) = self.about_scroll_geometry(screen_w, screen_h, fonts);
+        let step = ui::about_line_stride(fonts.value).max(1);
         let lines = dy_px / step;
         if lines == 0 {
             return false;
         }
-        let max = self.about_lines.len().saturating_sub(1);
-        let next = (self.about_scroll as i64 + i64::from(lines)).clamp(0, max as i64) as usize;
-        let changed = next != self.about_scroll;
-        self.about_scroll = next;
-        changed
+        self.scroll.scroll_by(i64::from(lines), total, visible)
     }
 
-    /// How many source lines one screenful holds at the current geometry.
-    pub(crate) fn about_page_lines(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> usize {
+    /// `(total wrapped lines, visible lines)` for the current geometry, ensuring the
+    /// wrapped-line cache (`about_wrapped`) is fresh for this body width first — the
+    /// mutating half of what `App::scroll_geometry` reads back out (`&self`) later in
+    /// the same frame, once `prepare_tiles` has already called this.
+    pub(crate) fn about_scroll_geometry(&mut self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> (usize, usize) {
         let card = ui::about_card_rect(screen_w, screen_h);
         let body = ui::about_body_rect(card, fonts);
-        ui::about_visible_lines(body, fonts.value)
+        self.ensure_about_wrapped(fonts, body.width());
+        let total = self.about_wrapped.as_ref().map_or(0, |(_, v)| v.len());
+        let visible = ui::about_visible_lines(body, fonts.value);
+        (total, visible)
+    }
+
+    /// Wraps the whole document once per body width (see `ui::wrap_document`) — this
+    /// can't happen at `open_about` time since no screen geometry is known yet.
+    pub(crate) fn ensure_about_wrapped(&mut self, fonts: &ui::Fonts, width: u32) {
+        let stale = !matches!(&self.about_wrapped, Some((w, _)) if *w == width);
+        if stale {
+            self.about_wrapped = Some((width, ui::wrap_document(fonts.value, &self.about_lines, width)));
+        }
     }
 
     pub(crate) fn about_card_rect(screen_w: u32, screen_h: u32) -> Rect {
         ui::about_card_rect(screen_w, screen_h)
     }
 
+    /// The shell only — header and card chrome. The document body is its own
+    /// `Tile::ScrollContent(Screen::About)` tile, composited separately (see the
+    /// module docs), so this no longer depends on scroll position at all.
     pub(crate) fn render_about(
         &self,
         painter: &mut Painter,
@@ -86,7 +111,6 @@ impl App {
             &format!("Version {}", ui::VERSION),
             ui::MUTED,
         )?;
-        let body = ui::about_body_rect(card, fonts);
-        ui::draw_about_body(painter, fonts.value, &self.about_lines, self.about_scroll, body)
+        Ok(())
     }
 }

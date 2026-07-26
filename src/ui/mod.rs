@@ -19,38 +19,40 @@
 //! icons are glyphs from a small bundled, subsetted icon font (see the icons
 //! section below and `assets/icons/NOTICE.md`).
 
+mod about;
+mod addhost;
 mod animation;
-mod theme;
-mod input;
-mod painter;
-mod text;
 mod cards;
-mod tiles;
-mod sidebar;
 mod grid;
+mod input;
+mod listmodal;
 mod modal;
+mod painter;
 mod pairing;
 mod rows;
+mod scroll;
 mod settings;
-mod addhost;
-mod listmodal;
-mod about;
+mod sidebar;
+mod text;
+mod theme;
+mod tiles;
 
 // Glob re-exports: every item keeps its original `crate::ui::X` path, so splitting
 // this module needed no changes at any call site in `app.rs`/`main.rs`.
+pub use about::*;
+pub use addhost::*;
 pub use animation::*;
-pub use theme::*;
-pub use input::*;
-pub use painter::*;
-pub use text::*;
 pub use cards::*;
-pub use tiles::*;
-pub use sidebar::*;
 pub use grid::*;
+pub use input::*;
+pub use listmodal::*;
 pub use modal::*;
+pub use painter::*;
 pub use pairing::*;
 pub use rows::*;
+pub use scroll::*;
 pub use settings::*;
-pub use addhost::*;
-pub use listmodal::*;
-pub use about::*;
+pub use sidebar::*;
+pub use text::*;
+pub use theme::*;
+pub use tiles::*;

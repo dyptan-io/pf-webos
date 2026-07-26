@@ -2,7 +2,6 @@
 //!
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 
-
 /// A menu event, already debounced from the raw SDL2 input (keyboard arrows — which
 /// the webOS Magic Remote's d-pad mode surfaces as — and gamepad d-pad both map here).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,4 +125,3 @@ pub fn digit_key_value(keycode: sdl2::keyboard::Keycode) -> Option<u8> {
         _ => return None,
     })
 }
-
