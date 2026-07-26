@@ -225,7 +225,12 @@ impl App {
             return None;
         }
         let (_, card_h) = ui::grid_card_size(available_w, columns);
-        let rows = self.pinned_count.div_ceil(columns.max(1)) as i32;
+        // Row of the last pinned card in absolute grid-index terms (`grid_card_rect`'s
+        // `index / columns`) — not `pinned_count.div_ceil(columns)`, which ignores the
+        // "Desktop" card's leading slot and undercounts by one row whenever pinned_count
+        // is a multiple of columns.
+        let last_idx = self.card_offset() + self.pinned_count - 1;
+        let rows = (last_idx / columns.max(1) + 1) as i32;
         let y = ui::GRID_TOP_Y + rows * (card_h as i32 + ui::GRID_GAP) - ui::GRID_GAP / 2 - self.grid_scroll;
         Some(Rect::new(
             grid_x + ui::GRID_PAD,
