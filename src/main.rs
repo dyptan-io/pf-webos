@@ -200,6 +200,14 @@ mod real {
         fonts: &crate::ui::Fonts,
         initial_status: Option<String>,
     ) -> Result<Option<ConnectOutcome>> {
+        // Target period for this loop's render ticks, animating or not. Each active
+        // (render) iteration used to sleep a flat 16ms *on top of* whatever the tick's own
+        // work cost, so its real period was `work + 16ms` rather than 16ms — at a GIF frame
+        // delay of ~33ms that was enough overshoot to occasionally miss a frame's window
+        // and skip straight to the next one. Pacing off each tick's own start time keeps
+        // the loop at a steady ~60Hz regardless of work cost, which comfortably samples
+        // every 33ms spinner frame.
+        const TICK_BUDGET: Duration = Duration::from_millis(16);
         // Test/dev override: skip the UI entirely if a connect.conf was dropped
         // alongside sideloading (see store.rs docs) — the UI flow is the normal path.
         // Bypasses the library screen too (`launch: None`, a plain desktop session).
@@ -210,6 +218,22 @@ mod real {
 
         canvas.window_mut().show();
         let mut app = App::new(identity.clone());
+        // Upload every spinner frame's GPU texture now, once, rather than letting each
+        // frame's first appearance create it lazily inside the render loop. `upload_raw`
+        // creates a *new* static texture (allocation, not just a pixel copy) the first
+        // time a `Tile::SpinnerFrame(idx)` is seen — done inline during the animation
+        // that meant the first spin cycle stalled once per unique frame, right when the
+        // spinner is supposed to look smooth. `clear_all` (stream handoff) drops these
+        // along with everything else, so this needs redoing on every re-entry here.
+        for (idx, frame) in crate::ui::spinner_frames().iter().enumerate() {
+            compositor.upload_raw(
+                texture_creator,
+                Tile::SpinnerFrame(idx),
+                frame.width,
+                frame.height,
+                &frame.pixels,
+            )?;
+        }
         // E.g. "the last connect attempt failed, and here's why" — shown on the
         // Home screen the user just got dropped back onto (see `run_inner`'s
         // connect-error path).
@@ -245,6 +269,7 @@ mod real {
         // Starts `true` so the first frame always draws.
         let mut dirty = true;
         let target = 'ui: loop {
+            let tick_start = Instant::now();
             if QUIT_REQUESTED.load(Ordering::Relaxed) {
                 tracing::warn!("SIGTERM/SIGINT received during UI");
                 return Ok(None);
@@ -460,17 +485,17 @@ mod real {
                     text_input.is_screen_keyboard_shown(canvas.window())
                 );
             }
-            // Animations advance every 16ms tick and keep frames flowing on their
-            // own; `dirty` (an event/drain changed actual content) additionally
-            // forces stale tiles to re-rasterize.
-            // `tiles_pending` keeps frames flowing while the card window is still being
-            // filled a few tiles at a time (see `CARD_BUILD_BUDGET`) — the
-            // redraw-on-change loop would otherwise go idle mid-build and leave the rest
-            // of the visible cards blank until the next input. `!grid_reveal_ready` keeps
-            // it flowing the same way while waiting on art still in flight.
+            // Three reasons to render another frame:
+            // 1. `dirty`         — an event or drain changed state (tiles need re-rasterizing).
+            // 2. `tiles_pending` — card window still filling in a few tiles at a time.
+            // 3. `!grid_reveal_ready` — spinner is animating (one frame per ~33 ms tick).
+            // The 16ms sleep when none of these holds keeps the SoC idle between frames.
             let animating = app.tick_animations() || app.tiles_pending || !app.grid_reveal_ready;
             if !dirty && !animating {
-                std::thread::sleep(Duration::from_millis(16));
+                let elapsed = tick_start.elapsed();
+                if elapsed < TICK_BUDGET {
+                    std::thread::sleep(TICK_BUDGET - elapsed);
+                }
                 continue;
             }
             let content_dirty = dirty;
@@ -489,8 +514,17 @@ mod real {
                 compositor.drop_tile(tile);
             }
             for tile in updated {
-                if let Some(pm) = app.tile_pixmap(tile) {
-                    compositor.upload(texture_creator, tile, pm)?;
+                match tile {
+                    Tile::SpinnerFrame(idx) => {
+                        if let Some(frame) = crate::ui::spinner_frame(idx) {
+                            compositor.upload_raw(texture_creator, tile, frame.width, frame.height, &frame.pixels)?;
+                        }
+                    }
+                    _ => {
+                        if let Some(pm) = app.tile_pixmap(tile) {
+                            compositor.upload(texture_creator, tile, pm)?;
+                        }
+                    }
                 }
             }
             let cmds = app.draw_list(display_mode.w as u32, display_mode.h as u32, fonts);
@@ -499,7 +533,10 @@ mod real {
             canvas.clear();
             compositor.execute(canvas, &cmds)?;
             canvas.present();
-            std::thread::sleep(Duration::from_millis(16));
+            let elapsed = tick_start.elapsed();
+            if elapsed < TICK_BUDGET {
+                std::thread::sleep(TICK_BUDGET - elapsed);
+            }
         };
         if text_input_active {
             text_input.stop();
@@ -618,6 +655,11 @@ mod real {
             canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
             canvas.clear();
             canvas.present();
+            // Release all UI GPU textures (spinner frames, card art, sidebar …)
+            // before the stream takes the GPU. The compositor is re-populated
+            // from scratch when the user returns to the menu.
+            tracing::debug!("releasing all compositor textures for stream handoff");
+            compositor.clear_all();
             // The system draws its own cursor (a real SDL2 cursor this fork loads from
             // `/usr/share/im/...` — confirmed via `SDL_waylandwebos_cursor.c`) tracking
             // the physical remote directly; the host draws a second, independent one

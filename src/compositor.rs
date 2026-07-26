@@ -67,11 +67,11 @@ pub enum Tile {
     /// content itself changes (a value/dropdown, or About's window
     /// recentering), never when the list merely scrolls within it.
     ScrollContent(Screen),
-    /// The loading spinner shown over the grid while it fills in
-    /// (`ui::render_spinner_tile`) — rebuilt every tick it's shown, but that's just
-    /// an index pick + small `Pixmap` copy (frames are decoded at build time), so
-    /// one reused tile is cheap enough.
-    Spinner,
+    /// One spinner frame's GPU texture, keyed by frame index within the GIF.
+    /// Frames are uploaded at most once (see `Compositor::upload_raw`) and held
+    /// in VRAM for the duration of the UI session; `clear_all` reclaims them
+    /// when a stream starts.
+    SpinnerFrame(usize),
     /// The in-stream stats overlay panel (`ui::render_stats_overlay_tile`).
     StatsOverlay,
     /// The in-stream disconnect-confirmation dialog's shell — card, title,
@@ -104,9 +104,8 @@ pub enum DrawCmd {
 
 pub struct Compositor {
     textures: HashMap<Tile, Texture>,
-    /// Reused un-premultiply staging buffer (tiny-skia pixmaps are premultiplied;
-    /// SDL's `BlendMode::Blend` expects straight alpha — converted once per
-    /// *upload*, never per frame).
+    /// Reused staging buffer for the premultiplied → straight-alpha conversion
+    /// performed once per `upload` call (never per frame).
     staging: Vec<u8>,
 }
 
@@ -116,6 +115,31 @@ impl Compositor {
             textures: HashMap::new(),
             staging: Vec::new(),
         }
+    }
+
+    /// Uploads straight-RGBA8 bytes directly into a new static GPU texture for
+    /// `tile`. No-ops if `tile` is already cached — caller only needs to push it
+    /// to `updated` the first time.
+    pub fn upload_raw(
+        &mut self,
+        creator: &TextureCreator<WindowContext>,
+        tile: Tile,
+        w: u32,
+        h: u32,
+        rgba_straight: &[u8],
+    ) -> Result<()> {
+        if self.textures.contains_key(&tile) {
+            return Ok(());
+        }
+        let mut tex = creator
+            .create_texture_static(PixelFormatEnum::RGBA32, w, h)
+            .map_err(|e| anyhow::anyhow!("create texture {tile:?} {w}x{h}: {e}"))?;
+        let pitch = w as usize * 4;
+        tex.update(None, rgba_straight, pitch)
+            .map_err(|e| anyhow::anyhow!("upload {tile:?}: {e}"))?;
+        tex.set_blend_mode(BlendMode::Blend);
+        self.textures.insert(tile, tex);
+        Ok(())
     }
 
     /// Creates/updates `tile`'s texture from a freshly rasterized painter.
@@ -166,19 +190,30 @@ impl Compositor {
         Ok(())
     }
 
+    /// Destroys every cached GPU texture at once.
+    ///
+    /// Call this when the UI is no longer visible (e.g. stream start) so all
+    /// VRAM held by the compositor is returned to the driver in one shot.
+    /// Safe to call with an empty map.
+    pub fn clear_all(&mut self) {
+        // SAFETY: `unsafe_textures` detaches each `Texture` from its creator's
+        // lifetime, making the owner responsible for destruction. We drain the
+        // map so nothing can reach these textures again, then destroy each one
+        // exactly once. Same invariant as `drop_tile`.
+        for (_, tex) in self.textures.drain() {
+            unsafe { tex.destroy() };
+        }
+    }
+
     /// Drops `tile`'s GPU texture, if it has one.
     ///
-    /// Needed because card tiles are now windowed: a texture for a card scrolled far out
-    /// of view is pure retained memory, and with `unsafe_textures` a `Texture` is not
-    /// freed by dropping the map entry alone — the SDL object must be destroyed. Safe to
-    /// call for a tile that was never uploaded.
+    /// Needed because card tiles are windowed: a texture for a card scrolled far
+    /// out of view is pure retained VRAM, and with `unsafe_textures` a `Texture`
+    /// is not freed by dropping the map entry — the SDL object must be destroyed.
+    /// Safe to call for a tile that was never uploaded.
     pub fn drop_tile(&mut self, tile: Tile) {
         if let Some(tex) = self.textures.remove(&tile) {
-            // SAFETY: `unsafe_textures` detaches a `Texture` from its `TextureCreator`'s
-            // lifetime, making destruction the owner's responsibility. This texture came
-            // from `self`'s own creator, is removed from the map above so nothing can
-            // reach it again, and every draw goes through `execute`, which only ever
-            // borrows from that same map.
+            // SAFETY: see `clear_all`.
             unsafe { tex.destroy() };
         }
     }

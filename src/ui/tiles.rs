@@ -44,90 +44,79 @@ pub fn render_card_tile(
 }
 
 /// The animated loading spinner (purple, from
-/// lottiefiles.com/free-animation/purple-spinner-peYjszu1K5, exported as
-/// `assets/logo/punktfunk-spinner.gif`), decoded at build time by `build.rs`'s
-/// `build_spinner_frames` — no GIF/LZW decode on-device. Layout: `u32` width,
-/// `u32` height, `u32` frame count, then per frame a `u32` delay in milliseconds
-/// followed by `width * height * 4` bytes of premultiplied RGBA8, at the GIF's
-/// native size (no resize).
-static SPINNER_FRAMES_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/spinner_frames.bin"));
+/// lottiefiles.com/free-animation/purple-spinner-peYjszu1K5, embedded as
+/// `assets/logo/punktfunk-spinner.gif`).
+static SPINNER_GIF_BYTES: &[u8] = include_bytes!("../../assets/logo/punktfunk-spinner.gif");
 
-/// One pre-decoded spinner frame and how long it stays on screen.
-struct SpinnerFrame {
-    pixmap: Pixmap,
-    delay: std::time::Duration,
+/// One decoded spinner frame (straight RGBA8) and how long it stays on screen.
+pub struct SpinnerFrame {
+    pub width: u32,
+    pub height: u32,
+    pub delay: std::time::Duration,
+    pub pixels: Vec<u8>,
 }
 
-/// Parses `SPINNER_FRAMES_BLOB` once. Just slicing already-decoded bytes into
-/// `Pixmap`s — no image decode, no resize, cheap enough to not need a background
-/// warm-up thread.
-fn spinner_frames() -> &'static [SpinnerFrame] {
+/// Decodes `SPINNER_GIF_BYTES` once into pre-decoded straight RGBA8 frames.
+pub fn spinner_frames() -> &'static [SpinnerFrame] {
     static FRAMES: std::sync::OnceLock<Vec<SpinnerFrame>> = std::sync::OnceLock::new();
     FRAMES.get_or_init(|| {
-        let mut data = SPINNER_FRAMES_BLOB;
-        let Some((width_bytes, rest)) = data.split_first_chunk::<4>() else {
+        use image::{codecs::gif::GifDecoder, AnimationDecoder};
+        let Ok(decoder) = GifDecoder::new(std::io::Cursor::new(SPINNER_GIF_BYTES)) else {
             return Vec::new();
         };
-        data = rest;
-        let Some((height_bytes, rest)) = data.split_first_chunk::<4>() else {
+        let Ok(raw_frames) = decoder.into_frames().collect::<image::ImageResult<Vec<_>>>() else {
             return Vec::new();
         };
-        data = rest;
-        let Some((count_bytes, rest)) = data.split_first_chunk::<4>() else {
-            return Vec::new();
-        };
-        data = rest;
-        let width = u32::from_le_bytes(*width_bytes);
-        let height = u32::from_le_bytes(*height_bytes);
-        let count = u32::from_le_bytes(*count_bytes) as usize;
-        let Some(size) = tiny_skia::IntSize::from_wh(width, height) else {
-            return Vec::new();
-        };
-        let frame_bytes = (width * height * 4) as usize;
-        let mut frames = Vec::with_capacity(count);
-        for _ in 0..count {
-            let Some((delay_bytes, rest)) = data.split_first_chunk::<4>() else {
-                break;
-            };
-            let delay = std::time::Duration::from_millis(u32::from_le_bytes(*delay_bytes).into());
-            if rest.len() < frame_bytes {
-                break;
-            }
-            let (pixels, rest) = rest.split_at(frame_bytes);
-            data = rest;
-            let Some(pixmap) = Pixmap::from_vec(pixels.to_vec(), size) else {
-                break;
-            };
-            frames.push(SpinnerFrame { pixmap, delay });
+        let mut frames = Vec::with_capacity(raw_frames.len());
+        for frame in raw_frames {
+            let (w, h) = frame.buffer().dimensions();
+            let (numer, denom) = frame.delay().numer_denom_ms();
+            let raw_delay = numer.checked_div(denom).unwrap_or(0);
+            // Clamp ultra-fast or unset delays to ~30 FPS (33 ms) so the
+            // animation stays smooth without busy-looping the render thread.
+            let delay_ms = if raw_delay < 20 { 33 } else { raw_delay };
+            let delay = std::time::Duration::from_millis(u64::from(delay_ms));
+            let pixels = frame.into_buffer().into_raw();
+            frames.push(SpinnerFrame {
+                width: w,
+                height: h,
+                delay,
+                pixels,
+            });
         }
         frames
     })
 }
 
-/// The spinner frame showing `phase` seconds after the spinner started
-/// (`App::spinner_since`), looped over the animation's total duration. Frames are
-/// already decoded (build time, see `SPINNER_FRAMES_BLOB`), so this is just an
-/// index pick + one small `Pixmap` copy — cheap enough to rebuild every tick the
-/// spinner is shown, no per-frame GPU texture caching needed. `1x1` (invisible)
-/// if the embedded blob is somehow empty.
-pub fn render_spinner_tile(phase: f32) -> Painter {
+/// Returns `SpinnerFrame` at index `idx`, or `None` when the GIF decoded to zero frames.
+pub fn spinner_frame(idx: usize) -> Option<&'static SpinnerFrame> {
+    spinner_frames().get(idx)
+}
+
+/// Returns the frame index and reference for `phase` seconds after the spinner started.
+/// Falls back to a 1×1 transparent dummy if the GIF decoded to zero frames.
+pub fn spinner_frame_at(phase: f32) -> (usize, &'static SpinnerFrame) {
     let frames = spinner_frames();
-    let Some(first) = frames.first() else {
-        return Painter::new(1, 1);
-    };
-    let total: std::time::Duration = frames.iter().map(|f| f.delay).sum();
-    let mut elapsed = std::time::Duration::from_secs_f32(phase.max(0.0)).as_nanos() % total.as_nanos().max(1);
-    let mut frame = first;
-    for f in frames {
-        if elapsed < f.delay.as_nanos() {
-            frame = f;
-            break;
+    if let Some(first) = frames.first() {
+        let total: std::time::Duration = frames.iter().map(|f| f.delay).sum();
+        let mut elapsed = std::time::Duration::from_secs_f32(phase.max(0.0)).as_nanos() % total.as_nanos().max(1);
+        for (idx, f) in frames.iter().enumerate() {
+            if elapsed < f.delay.as_nanos() {
+                return (idx, f);
+            }
+            elapsed -= f.delay.as_nanos();
         }
-        elapsed -= f.delay.as_nanos();
+        (0, first)
+    } else {
+        static DUMMY: std::sync::OnceLock<SpinnerFrame> = std::sync::OnceLock::new();
+        let dummy = DUMMY.get_or_init(|| SpinnerFrame {
+            width: 1,
+            height: 1,
+            delay: std::time::Duration::from_millis(100),
+            pixels: vec![0, 0, 0, 0],
+        });
+        (0, dummy)
     }
-    let mut p = Painter::new(frame.pixmap.width(), frame.pixmap.height());
-    p.draw_pixmap(0, 0, &frame.pixmap);
-    p
 }
 
 /// Transparent padding around the focus-ring tile (the ring's outer glow pass

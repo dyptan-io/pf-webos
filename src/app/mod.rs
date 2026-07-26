@@ -86,8 +86,15 @@ const CARD_KEEP_ROWS: i32 = 5;
 ///
 /// Only bounds the visible+prefetch window (a few dozen tiles), not the whole library, so
 /// it can be much higher than the original whole-library concern without reintroducing
-/// the freeze. Raised from 3, which took 7-10 frames to fill a 20-30 card window.
-const CARD_BUILD_BUDGET: usize = 2;
+/// the freeze.
+///
+/// Lowered from 2 to 1 after on-device telemetry (`TELEMETRY=auto`) during the loading
+/// spinner showed `prepare_tiles` costing 60-165ms per tick — several times the ~33ms the
+/// spinner's own GIF frame needs — with the cost squarely in `render_card_tile`'s text
+/// rasterization (cold `TextCache`/`FreeType`, expensive on this armv7 softfloat target,
+/// not the windowed bookkeeping around it). One card per tick roughly halves the
+/// worst-case stall at the cost of taking twice as many ticks to fill the window.
+const CARD_BUILD_BUDGET: usize = 1;
 
 /// How long the loading spinner waits for the whole window to become art-ready before
 /// revealing anyway — a fetch that fails (rather than being merely slow) never becomes
@@ -515,13 +522,13 @@ pub struct App {
     /// The static "No host selected" hint line.
     pub(crate) nohost_tile: Option<Painter>,
     /// Whether the grid's initial build for the current library has finished — while
-    /// `false`, the grid shows the loading spinner (`Tile::Spinner`) instead of
+    /// `false`, the grid shows the loading spinner (`Tile::SpinnerFrame`) instead of
     /// popping cards in one by one. One-shot per library: only `prepare_tiles`'s
     /// full-reset branch sets it `false` again; later scrolling into a fresh row
     /// does not.
     pub(crate) grid_reveal_ready: bool,
-    /// The rasterized spinner tile, rebuilt every tick it's shown.
-    pub(crate) spinner_tile: Option<Painter>,
+    /// The active spinner frame index shown while grid is loading.
+    pub(crate) spinner_frame: Option<usize>,
     /// When the grid last became not-ready — feeds the spinner's rotation phase.
     pub(crate) spinner_since: Option<Instant>,
     // ------------------------------------------------------------ animations --
@@ -653,7 +660,7 @@ impl App {
             status_tile: None,
             nohost_tile: None,
             grid_reveal_ready: true,
-            spinner_tile: None,
+            spinner_frame: None,
             spinner_since: None,
             grid_scroll: 0,
             grid_scroll_target: 0,
@@ -676,6 +683,13 @@ impl App {
                 app.select_host(host, port, mgmt_port);
             }
         }
+        // Decodes the spinner GIF now, off the render thread, so the LZW/frame-compose
+        // cost lands here instead of stalling the first `draw_list` call that needs a
+        // frame (right when the grid starts loading — the worst possible moment for a
+        // render-thread hitch). `spinner_frames`'s `OnceLock` makes this a pure warm-up:
+        // harmless if the spinner is drawn before this thread finishes, redundant work
+        // (never a race) if it finishes first.
+        std::thread::spawn(ui::spinner_frames);
         app
     }
 
@@ -1225,6 +1239,7 @@ impl App {
                 // prefetch window must not hide the grid again.
                 self.grid_reveal_ready = false;
                 self.spinner_since = None;
+                self.spinner_frame = None;
             } else {
                 for idx in std::mem::take(&mut self.grid_cards_dirty) {
                     if idx < count {
@@ -1322,9 +1337,13 @@ impl App {
                 self.grid_reveal_ready = window_ready || since.elapsed() >= SPINNER_MAX_WAIT;
                 if self.grid_reveal_ready {
                     self.spinner_since = None;
+                    self.spinner_frame = None;
                 } else {
-                    self.spinner_tile = Some(ui::render_spinner_tile(since.elapsed().as_secs_f32()));
-                    updated.push(Tile::Spinner);
+                    let (frame_idx, _) = ui::spinner_frame_at(since.elapsed().as_secs_f32());
+                    if self.spinner_frame != Some(frame_idx) {
+                        self.spinner_frame = Some(frame_idx);
+                        updated.push(Tile::SpinnerFrame(frame_idx));
+                    }
                 }
             }
 
@@ -1766,10 +1785,13 @@ impl App {
             Tile::ScrollContent(_) => self.scroll_content_tile.as_ref().map(|(_, p)| p),
             Tile::Status => self.status_tile.as_ref().map(|(_, p)| p),
             Tile::NoHost => self.nohost_tile.as_ref(),
-            Tile::Spinner => self.spinner_tile.as_ref(),
-            // Stream-side only (uploaded directly by `run_inner`'s overlay
-            // refresh) — never one of App's menu tiles.
-            Tile::StatsOverlay | Tile::DisconnectDialog | Tile::DisconnectFocusButton => None,
+            // `SpinnerFrame` is uploaded directly from its raw decoded pixels (see
+            // `main.rs`), never rasterized as a `Painter`; the rest are stream-side only
+            // (uploaded directly by `run_inner`'s overlay refresh) — never one of App's
+            // menu tiles.
+            Tile::SpinnerFrame(_) | Tile::StatsOverlay | Tile::DisconnectDialog | Tile::DisconnectFocusButton => {
+                None
+            }
         }
     }
 
@@ -1799,17 +1821,17 @@ impl App {
                 });
             }
         } else if !self.grid_reveal_ready {
-            if let Some(p) = &self.spinner_tile {
-                let x = grid_x + (available_w as i32 - p.width() as i32) / 2;
-                // 40% down rather than dead-center, which reads as slightly low on a TV.
-                let area_h = screen_h as i32 - ui::GRID_TOP_Y;
-                let y = ui::GRID_TOP_Y + (area_h - p.height() as i32) * 2 / 5;
-                cmds.push(DrawCmd::Tex {
-                    tile: Tile::Spinner,
-                    dst: Rect::new(x, y, p.width(), p.height()),
-                    alpha: 0xff,
-                });
-            }
+            let phase = self.spinner_since.map_or(0.0, |s| s.elapsed().as_secs_f32());
+            let (idx, frame) = ui::spinner_frame_at(phase);
+            let x = grid_x + (available_w as i32 - frame.width as i32) / 2;
+            // 40% down rather than dead-center, which reads as slightly low on a TV.
+            let area_h = screen_h as i32 - ui::GRID_TOP_Y;
+            let y = ui::GRID_TOP_Y + (area_h - frame.height as i32) * 2 / 5;
+            cmds.push(DrawCmd::Tex {
+                tile: Tile::SpinnerFrame(idx),
+                dst: Rect::new(x, y, frame.width, frame.height),
+                alpha: 0xff,
+            });
         } else {
             let count = self.grid_len();
             let focused = match self.home_focus {

@@ -97,7 +97,7 @@ rustls = { version = "0.23", features = ["ring"] }
 # no system libjpeg/libpng dependency to find on-device. No "gif" feature here — the
 # animated loading spinner is decoded at build time instead (see
 # `[build-dependencies]` below and `build.rs`'s `build_spinner_frames`).
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 # The whole pre-stream UI's rendering backend (ui.rs) — a pure-Rust software
 # rasterizer (anti-aliased fills/strokes, real box-blurred shadows), replacing the
 # previous hand-rolled per-scanline SDL2 2D primitives (no Skia/Vulkan available on
@@ -110,11 +110,6 @@ tiny-skia = { version = "0.12", default-features = false, features = ["std"] }
 # transitive dependency (punktfunk-core itself uses `libc::gettid` for its hot-thread
 # registry), pulled in directly since we call our own libc function against those ids.
 libc = "0.2"
-
-[build-dependencies]
-# GIF decode for `build.rs`'s spinner-frame precompute — host-side only, so its
-# LZW/color-quant cost never runs on-device.
-image = { version = "0.25", default-features = false, features = ["gif"] }
 
 [profile.release]
 # The per-packet hot loops this client actually burns CPU in — AEAD decrypt, FEC
