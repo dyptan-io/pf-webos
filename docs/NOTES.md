@@ -150,7 +150,14 @@ a host-side capture/encode throughput question, not this client. See
   app. aurora-tv/moonlight-tv/Kodi all only read it. Panel scan-out is fixed at the system level.
 - **Magic Remote Back requires `SDL_WEBOS_ACCESS_POLICY_KEYS_BACK`** set before window creation (else
   the launcher intercepts it). With it, Back arrives as `keycode = 2097155` (`WEBOS_BACK_KEYCODE` in
-  `ui.rs`), caught via raw `i32` compare → `MenuEvent::Back`.
+  `ui.rs`), caught via raw `i32` compare → `MenuEvent::Back`. Same story for a connected HID
+  keyboard's Windows/Meta key (`SDL_WEBOS_ACCESS_POLICY_KEYS_HOME`/`_META`) and a gamepad's Guide
+  button (`SDL_WEBOS_ACCESS_POLICY_KEYS_GUIDE`) — all three otherwise background the app into the
+  launcher instead of reaching SDL2. The `KEYS_*` hints alone stop the *key event* from
+  backgrounding the app but the launcher's card-switcher ribbon overlay is gated separately —
+  also needs `SDL_WEBOS_ACCESS_POLICY_RIBBON=false` (paired the same way in aurora-tv's `app.c`)
+  or it can still pop over the foregrounded app. (Hint names confirmed via `strings` on a real
+  `webosbrew/SDL-webOS` `libSDL2-2.0.so.0`, not from any header available in this repo.)
 - **A hidden/unmapped window gets no pointer input.** Don't `.hide()` the stream-time window (that
   broke Magic Remote pointer → host-mouse forwarding). Keep it mapped and cleared fully transparent
   (`RGBA(0,0,0,0)`) each frame so the NDL plane shows through — same as aurora-tv.

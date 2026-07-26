@@ -551,13 +551,20 @@ mod real {
 
     fn run_inner() -> Result<()> {
         // Prevents webOS's system launcher from intercepting the Magic Remote's Back
-        // key, and a connected HID keyboard's Windows/Meta key (which webOS otherwise
-        // treats as its own Home shortcut, backgrounding the app into the launcher —
-        // see `keyboard.rs`'s LGui/RGui mapping, which needs these to actually reach
-        // the app instead). Must be set before window creation.
+        // key, a connected HID keyboard's Windows/Meta key, and a gamepad's Guide
+        // button (which webOS otherwise treats as its own Home shortcut, backgrounding
+        // the app into the launcher — see `keyboard.rs`'s LGui/RGui mapping and
+        // `gamepad.rs`'s BTN_GUIDE mapping, which need these to actually reach the app
+        // instead). Must be set before window creation.
         sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
         sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_HOME", "true");
         sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_META", "true");
+        sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_GUIDE", "true");
+        // The Home-equivalent hints above stop the key itself from backgrounding the
+        // app, but webOS's card-switcher ribbon overlay is gated separately — without
+        // this it can still pop the launcher UI on top even though the app stays
+        // foregrounded (confirmed pairing in aurora-tv's app.c).
+        sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_RIBBON", "false");
         // Linear texture filtering (SDL defaults to nearest) — the focus pop
         // scales card textures slightly, which shimmers without it.
         sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "1");
