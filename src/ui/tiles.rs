@@ -43,34 +43,106 @@ pub fn render_card_tile(
     Ok(p)
 }
 
-/// Fixed size of the loading spinner drawn over the grid — see `App::grid_reveal_ready`.
-pub const SPINNER_SIZE: u32 = 64;
+/// The animated loading spinner (purple, from
+/// lottiefiles.com/free-animation/purple-spinner-peYjszu1K5, exported as
+/// `assets/logo/punktfunk-spinner.gif`), decoded at build time by `build.rs`'s
+/// `build_spinner_frames` — no GIF/LZW decode on-device. Layout: `u32` width,
+/// `u32` height, `u32` frame count, then per frame a `u32` delay in milliseconds
+/// followed by `width * height * 4` bytes of premultiplied RGBA8, at the GIF's
+/// native size (no resize).
+static SPINNER_FRAMES_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/spinner_frames.bin"));
 
-/// A 12-dot activity indicator. `phase` is seconds elapsed since the spinner started
-/// (`App::spinner_since`) — the lead dot advances continuously, trailing dots fading out.
-pub fn render_spinner_tile(phase: f32) -> Painter {
-    const DOTS: usize = 12;
-    const REVOLUTION_SECS: f32 = 1.4;
-    let size = SPINNER_SIZE;
-    let mut p = Painter::new(size, size);
-    let (cx, cy) = (size as f32 / 2.0, size as f32 / 2.0);
-    let orbit = size as f32 / 2.0 - 6.0;
-    let dot_r = size as f32 / 16.0;
-    let lead = (phase / REVOLUTION_SECS).rem_euclid(1.0);
-    for i in 0..DOTS {
-        let t = i as f32 / DOTS as f32;
-        let angle = t * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
-        let (x, y) = (cx + orbit * angle.cos(), cy + orbit * angle.sin());
-        // Distance behind the lead dot, wrapped — farther behind fades more.
-        let behind = (t - lead).rem_euclid(1.0);
-        let alpha = (255.0 * (1.0 - behind)).clamp(40.0, 255.0) as u8;
-        p.fill_circle(
-            x,
-            y,
-            dot_r,
-            Color::RGBA(ACCENT_BRIGHT.r, ACCENT_BRIGHT.g, ACCENT_BRIGHT.b, alpha),
-        );
+/// One pre-decoded spinner frame and how long it stays on screen.
+struct SpinnerFrame {
+    pixmap: Pixmap,
+    delay: std::time::Duration,
+}
+
+/// Parses `SPINNER_FRAMES_BLOB` once. Just slicing already-decoded bytes into
+/// `Pixmap`s — no image decode, no resize, cheap enough to not need a background
+/// warm-up thread.
+fn spinner_frames() -> &'static [SpinnerFrame] {
+    static FRAMES: std::sync::OnceLock<Vec<SpinnerFrame>> = std::sync::OnceLock::new();
+    FRAMES.get_or_init(|| {
+        let mut data = SPINNER_FRAMES_BLOB;
+        let Some((width_bytes, rest)) = data.split_first_chunk::<4>() else {
+            return Vec::new();
+        };
+        data = rest;
+        let Some((height_bytes, rest)) = data.split_first_chunk::<4>() else {
+            return Vec::new();
+        };
+        data = rest;
+        let Some((count_bytes, rest)) = data.split_first_chunk::<4>() else {
+            return Vec::new();
+        };
+        data = rest;
+        let width = u32::from_le_bytes(*width_bytes);
+        let height = u32::from_le_bytes(*height_bytes);
+        let count = u32::from_le_bytes(*count_bytes) as usize;
+        let Some(size) = tiny_skia::IntSize::from_wh(width, height) else {
+            return Vec::new();
+        };
+        let frame_bytes = (width * height * 4) as usize;
+        let mut frames = Vec::with_capacity(count);
+        for _ in 0..count {
+            let Some((delay_bytes, rest)) = data.split_first_chunk::<4>() else {
+                break;
+            };
+            let delay = std::time::Duration::from_millis(u32::from_le_bytes(*delay_bytes).into());
+            if rest.len() < frame_bytes {
+                break;
+            }
+            let (pixels, rest) = rest.split_at(frame_bytes);
+            data = rest;
+            let Some(pixmap) = Pixmap::from_vec(pixels.to_vec(), size) else {
+                break;
+            };
+            frames.push(SpinnerFrame { pixmap, delay });
+        }
+        frames
+    })
+}
+
+/// Number of decoded spinner frames — `0` if the embedded blob is somehow empty.
+pub fn spinner_frame_count() -> usize {
+    spinner_frames().len()
+}
+
+/// Which spinner frame is showing `phase` seconds after the spinner started
+/// (`App::spinner_since`), looped over the animation's total duration. `0` if
+/// there are no frames — callers should check `spinner_frame_count()` first.
+pub fn spinner_frame_index_for(phase: f32) -> usize {
+    let frames = spinner_frames();
+    if frames.is_empty() {
+        return 0;
     }
+    let total: std::time::Duration = frames.iter().map(|f| f.delay).sum();
+    if total.is_zero() {
+        return 0;
+    }
+    let mut elapsed = std::time::Duration::from_secs_f32(phase.max(0.0)).as_nanos() % total.as_nanos();
+    for (i, frame) in frames.iter().enumerate() {
+        if elapsed < frame.delay.as_nanos() {
+            return i;
+        }
+        elapsed -= frame.delay.as_nanos();
+    }
+    frames.len() - 1
+}
+
+/// Frame `index` as its own tile. Each frame gets its own `Tile::SpinnerFrame`
+/// GPU texture, built and uploaded once (`App::prepare_tiles` only calls this
+/// the first time the spinner shows, for every frame up front) — after that,
+/// picking a different frame each tick is just a texture-select `DrawCmd::Tex`,
+/// no CPU rasterization or re-upload. `1x1` (invisible) if `index` is out of
+/// range.
+pub fn render_spinner_frame_tile(index: usize) -> Painter {
+    let Some(frame) = spinner_frames().get(index) else {
+        return Painter::new(1, 1);
+    };
+    let mut p = Painter::new(frame.pixmap.width(), frame.pixmap.height());
+    p.draw_pixmap(0, 0, &frame.pixmap);
     p
 }
 

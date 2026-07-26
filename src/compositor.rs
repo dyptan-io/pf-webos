@@ -67,8 +67,11 @@ pub enum Tile {
     /// content itself changes (a value/dropdown, or About's window
     /// recentering), never when the list merely scrolls within it.
     ScrollContent(Screen),
-    /// The loading spinner shown over the grid while it fills in (`ui::render_spinner_tile`).
-    Spinner,
+    /// One frame of the loading spinner shown over the grid while it fills in
+    /// (`ui::render_spinner_frame_tile`) — each frame is its own persistent GPU
+    /// texture, uploaded once; animating just switches which one `App::draw_list`
+    /// draws, no per-tick re-rasterization or re-upload.
+    SpinnerFrame(usize),
     /// The in-stream stats overlay panel (`ui::render_stats_overlay_tile`).
     StatsOverlay,
     /// The in-stream disconnect-confirmation dialog's shell — card, title,

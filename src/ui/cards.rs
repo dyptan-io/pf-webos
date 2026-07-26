@@ -132,6 +132,12 @@ pub fn draw_poster_card(
 
     let strip_h = (fonts.value.height() + 16).min(r.height() as i32 / 3);
     match art {
+        // Already stretched to this card size by `art::ArtLoader` (see
+        // `art::resize_pixmap`) — a plain blit, not `draw_pixmap_scaled`. Falls back
+        // to scaling if a pixmap ever arrives at some other size.
+        Some(pixmap) if pixmap.width() == r.width() && pixmap.height() == r.height() => {
+            painter.draw_pixmap(r.x(), r.y(), pixmap);
+        }
         Some(pixmap) => {
             painter.draw_pixmap_scaled(r, pixmap);
         }

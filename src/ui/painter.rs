@@ -3,6 +3,7 @@
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use tiny_skia::{
     Color as SkColor, FillRule, FilterQuality, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform,
@@ -67,12 +68,6 @@ pub fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<
 /// version did.
 pub struct Painter {
     pixmap: Pixmap,
-    /// Rendered (padded, box-blurred) shadow shapes, keyed by the params that
-    /// fully determine their pixels — every card of a given size/style shares
-    /// one entry instead of re-running the blur every dirty frame. Small and
-    /// bounded: the UI only ever draws a handful of distinct card sizes
-    /// (poster cards, sidebar rows, modals).
-    shadow_cache: HashMap<ShadowKey, Pixmap>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -84,11 +79,21 @@ pub struct ShadowKey {
     opacity: u8,
 }
 
+thread_local! {
+    /// Rendered (padded, box-blurred) shadow shapes, keyed by the params that fully
+    /// determine their pixels — shared process-wide, not a `Painter` field: every
+    /// grid card gets its own fresh `Painter` (`render_card_tile` calls
+    /// `Painter::new` per card), so a cache on `Painter` itself would never hit past
+    /// the first card of a build. `thread_local` (not a plain `static`) is safe here
+    /// without `unsafe`/atomics since every `Painter` is built on the single
+    /// SDL/render thread.
+    static SHADOW_CACHE: RefCell<HashMap<ShadowKey, Pixmap>> = RefCell::new(HashMap::new());
+}
+
 impl Painter {
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             pixmap: Pixmap::new(width.max(1), height.max(1)).expect("nonzero framebuffer size"),
-            shadow_cache: HashMap::new(),
         }
     }
 
@@ -183,23 +188,27 @@ impl Painter {
             blur_bits: blur.to_bits(),
             opacity,
         };
-        let shape = match self.shadow_cache.entry(key) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let Some(shape) = render_shadow_shape(rect.width(), rect.height(), radius, pad, blur, opacity) else {
-                    return;
-                };
-                e.insert(shape)
-            }
-        };
-        self.pixmap.draw_pixmap(
-            rect.x() - pad + dx.round() as i32,
-            rect.y() - pad + dy.round() as i32,
-            shape.as_ref(),
-            &PixmapPaint::default(),
-            Transform::identity(),
-            None,
-        );
+        SHADOW_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let shape = match cache.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let Some(shape) = render_shadow_shape(rect.width(), rect.height(), radius, pad, blur, opacity)
+                    else {
+                        return;
+                    };
+                    e.insert(shape)
+                }
+            };
+            self.pixmap.draw_pixmap(
+                rect.x() - pad + dx.round() as i32,
+                rect.y() - pad + dy.round() as i32,
+                shape.as_ref(),
+                &PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
+        });
     }
 
     pub fn draw_pixmap(&mut self, x: i32, y: i32, src: &Pixmap) {

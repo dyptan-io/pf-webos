@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
-use tiny_skia::{IntSize, Pixmap};
+use tiny_skia::{FilterQuality, IntSize, Pixmap, PixmapPaint, Transform};
 
 use crate::library::GameEntry;
 use crate::ui::premultiply_rgba;
@@ -136,6 +136,36 @@ fn read_raw_cache(path: &std::path::Path) -> Option<Pixmap> {
     Pixmap::from_vec(pixels, size)
 }
 
+/// Stretches `src` to exactly `(w, h)` on this background thread, before delivery,
+/// so `draw_poster_card` can just blit the result (no per-card-build scaling —
+/// the bilinear resize is real cost on the armv7 softfloat target). `None` only if
+/// `w`/`h` is somehow zero, in which case the caller keeps the unresized art.
+fn resize_pixmap(src: &Pixmap, w: u32, h: u32) -> Option<Pixmap> {
+    let mut dst = Pixmap::new(w, h)?;
+    let (sw, sh) = (src.width() as f32, src.height() as f32);
+    if sw <= 0.0 || sh <= 0.0 {
+        return None;
+    }
+    let transform = Transform::from_scale(w as f32 / sw, h as f32 / sh);
+    let paint = PixmapPaint {
+        quality: FilterQuality::Bilinear,
+        ..PixmapPaint::default()
+    };
+    dst.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
+    Some(dst)
+}
+
+/// `worker`'s fixed, per-host config — bundled to keep its arg count sane.
+struct WorkerConfig {
+    host: String,
+    mgmt_port: u16,
+    identity: (String, String),
+    fingerprint: Option<[u8; 32]>,
+    dir: PathBuf,
+    card_w: u32,
+    card_h: u32,
+}
+
 /// Background fetcher/decoder. Requests go in, decoded covers come out; both ends are
 /// non-blocking for the UI thread.
 pub struct ArtLoader {
@@ -148,20 +178,33 @@ pub struct ArtLoader {
 
 impl ArtLoader {
     /// `port` is the host's identity port (matches `store::KnownHost::port`); `mgmt_port`
-    /// is what's actually dialed to fetch art.
+    /// is what's actually dialed to fetch art. `card_w`/`card_h` is the grid's current
+    /// card size (see `ui::grid_card_size`) — every cover is stretched to exactly this
+    /// before delivery (see `resize_pixmap`).
     pub fn spawn(
         host: String,
         port: u16,
         mgmt_port: u16,
         identity: (String, String),
         fingerprint: Option<[u8; 32]>,
+        card_w: u32,
+        card_h: u32,
     ) -> Self {
         let (tx_req, rx_req) = std::sync::mpsc::channel::<ArtRequest>();
         let (tx_done, rx_done) = std::sync::mpsc::channel::<ArtLoaded>();
         let dir = cache_dir(&host, port);
+        let config = WorkerConfig {
+            host,
+            mgmt_port,
+            identity,
+            fingerprint,
+            dir,
+            card_w,
+            card_h,
+        };
         std::thread::Builder::new()
             .name("punktfunk-webos-art".into())
-            .spawn(move || worker(&host, mgmt_port, &identity, fingerprint, &dir, &rx_req, &tx_done))
+            .spawn(move || worker(&config, &rx_req, &tx_done))
             .expect("spawn art-loader thread");
         Self {
             tx: tx_req,
@@ -207,15 +250,17 @@ impl ArtLoader {
     }
 }
 
-fn worker(
-    host: &str,
-    mgmt_port: u16,
-    identity: &(String, String),
-    fingerprint: Option<[u8; 32]>,
-    dir: &std::path::Path,
-    rx: &Receiver<ArtRequest>,
-    tx: &Sender<ArtLoaded>,
-) {
+fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoaded>) {
+    let WorkerConfig {
+        host,
+        mgmt_port,
+        identity,
+        fingerprint,
+        dir,
+        card_w,
+        card_h,
+    } = config;
+    let (host, mgmt_port, fingerprint, card_w, card_h) = (host.as_str(), *mgmt_port, *fingerprint, *card_w, *card_h);
     let _ = std::fs::create_dir_all(dir);
     // One mTLS agent reused for every fetch — a fresh `ureq::Agent` per cover means a
     // fresh TCP+TLS handshake including client-cert auth, real avoidable cost that scales
@@ -229,7 +274,8 @@ fn worker(
     while let Ok(req) = rx.recv() {
         let raw_cached = raw_cache_path(dir, &req.game_id);
         if let Some(pixmap) = read_raw_cache(&raw_cached) {
-            if deliver(tx, req.game_id, pixmap).is_err() {
+            let sized = resize_pixmap(&pixmap, card_w, card_h).unwrap_or(pixmap);
+            if deliver(tx, req.game_id, sized).is_err() {
                 return;
             }
             continue;
@@ -288,7 +334,8 @@ fn worker(
             continue;
         };
         write_raw_cache(&raw_cached, &pixmap);
-        if deliver(tx, req.game_id, pixmap).is_err() {
+        let sized = resize_pixmap(&pixmap, card_w, card_h).unwrap_or(pixmap);
+        if deliver(tx, req.game_id, sized).is_err() {
             return;
         }
     }
