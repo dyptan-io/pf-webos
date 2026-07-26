@@ -104,43 +104,27 @@ fn spinner_frames() -> &'static [SpinnerFrame] {
     })
 }
 
-/// Number of decoded spinner frames — `0` if the embedded blob is somehow empty.
-pub fn spinner_frame_count() -> usize {
-    spinner_frames().len()
-}
-
-/// Which spinner frame is showing `phase` seconds after the spinner started
-/// (`App::spinner_since`), looped over the animation's total duration. `0` if
-/// there are no frames — callers should check `spinner_frame_count()` first.
-pub fn spinner_frame_index_for(phase: f32) -> usize {
+/// The spinner frame showing `phase` seconds after the spinner started
+/// (`App::spinner_since`), looped over the animation's total duration. Frames are
+/// already decoded (build time, see `SPINNER_FRAMES_BLOB`), so this is just an
+/// index pick + one small `Pixmap` copy — cheap enough to rebuild every tick the
+/// spinner is shown, no per-frame GPU texture caching needed. `1x1` (invisible)
+/// if the embedded blob is somehow empty.
+pub fn render_spinner_tile(phase: f32) -> Painter {
     let frames = spinner_frames();
-    if frames.is_empty() {
-        return 0;
-    }
-    let total: std::time::Duration = frames.iter().map(|f| f.delay).sum();
-    if total.is_zero() {
-        return 0;
-    }
-    let mut elapsed = std::time::Duration::from_secs_f32(phase.max(0.0)).as_nanos() % total.as_nanos();
-    for (i, frame) in frames.iter().enumerate() {
-        if elapsed < frame.delay.as_nanos() {
-            return i;
-        }
-        elapsed -= frame.delay.as_nanos();
-    }
-    frames.len() - 1
-}
-
-/// Frame `index` as its own tile. Each frame gets its own `Tile::SpinnerFrame`
-/// GPU texture, built and uploaded once (`App::prepare_tiles` only calls this
-/// the first time the spinner shows, for every frame up front) — after that,
-/// picking a different frame each tick is just a texture-select `DrawCmd::Tex`,
-/// no CPU rasterization or re-upload. `1x1` (invisible) if `index` is out of
-/// range.
-pub fn render_spinner_frame_tile(index: usize) -> Painter {
-    let Some(frame) = spinner_frames().get(index) else {
+    let Some(first) = frames.first() else {
         return Painter::new(1, 1);
     };
+    let total: std::time::Duration = frames.iter().map(|f| f.delay).sum();
+    let mut elapsed = std::time::Duration::from_secs_f32(phase.max(0.0)).as_nanos() % total.as_nanos().max(1);
+    let mut frame = first;
+    for f in frames {
+        if elapsed < f.delay.as_nanos() {
+            frame = f;
+            break;
+        }
+        elapsed -= f.delay.as_nanos();
+    }
     let mut p = Painter::new(frame.pixmap.width(), frame.pixmap.height());
     p.draw_pixmap(0, 0, &frame.pixmap);
     p
