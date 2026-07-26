@@ -47,6 +47,33 @@ pub struct KnownHost {
     /// can't be woken, so `app.rs` falls back to the plain unreachable message.
     #[serde(default)]
     pub mac: Vec<String>,
+    /// Up to `MAX_PINNED_GAMES` pinned `GameEntry::id`s for this host, in pin order.
+    /// `#[serde(default)]` so an older `known-hosts.json` still loads.
+    #[serde(default)]
+    pub pinned: Vec<String>,
+}
+
+/// Max games pinned to one host's always-visible grid row at once.
+pub const MAX_PINNED_GAMES: usize = 5;
+
+impl KnownHost {
+    pub fn is_pinned(&self, game_id: &str) -> bool {
+        self.pinned.iter().any(|id| id == game_id)
+    }
+
+    /// Toggles `game_id`'s pinned state. Returns `false` (no-op) when pinning
+    /// would exceed `MAX_PINNED_GAMES`.
+    pub fn toggle_pin(&mut self, game_id: &str) -> bool {
+        if let Some(i) = self.pinned.iter().position(|id| id == game_id) {
+            self.pinned.remove(i);
+            true
+        } else if self.pinned.len() < MAX_PINNED_GAMES {
+            self.pinned.push(game_id.to_string());
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn known_hosts_path() -> PathBuf {
@@ -79,7 +106,8 @@ pub fn save_known_hosts(hosts: &[KnownHost]) -> Result<()> {
 /// Upserts by `(host, port)`, keeping the existing fingerprint if the new record
 /// doesn't have one (a fresh mDNS discovery shouldn't clobber a paired fingerprint) —
 /// same reasoning for `mac`, learned separately (see `App::drain_discovery`) and not
-/// necessarily known again at the point something else re-upserts this host.
+/// necessarily known again at the point something else re-upserts this host, and for
+/// `pinned` — re-pair/rediscovery must not wipe out already-pinned games.
 pub fn upsert_known_host(hosts: &mut Vec<KnownHost>, mut new: KnownHost) {
     if let Some(existing) = hosts.iter_mut().find(|h| h.host == new.host && h.port == new.port) {
         if new.fingerprint.is_none() {
@@ -87,6 +115,9 @@ pub fn upsert_known_host(hosts: &mut Vec<KnownHost>, mut new: KnownHost) {
         }
         if new.mac.is_empty() {
             new.mac.clone_from(&existing.mac);
+        }
+        if new.pinned.is_empty() {
+            new.pinned.clone_from(&existing.pinned);
         }
         *existing = new;
     } else {

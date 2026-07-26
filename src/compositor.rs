@@ -28,6 +28,9 @@ pub enum Tile {
     Card(usize),
     /// The shared focus-ring glow (all cards are the same size).
     Ring,
+    /// The pin-state badge composited over the focused grid card's top-right
+    /// corner — `true` = pinned. Shared by every card, like `Ring`.
+    PinBadge(bool),
     /// The active modal, full-screen with transparent surroundings.
     Modal,
     /// Whichever modal's single focused, zoom-animated widget is currently

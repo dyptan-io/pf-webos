@@ -48,7 +48,7 @@ mod real {
     use punktfunk_core::config::Mode;
     use sdl2::controller::GameController;
 
-    use crate::app::{App, Screen};
+    use crate::app::{App, HomeFocus, Screen};
     use crate::compositor::{Compositor, DrawCmd, Tile};
     use crate::gamepad;
     use crate::keyboard;
@@ -202,6 +202,10 @@ mod real {
     /// the host, so the gamepad's only route to the dialog is this deliberate hold.
     const GUIDE_HOLD: Duration = Duration::from_secs(2);
 
+    /// How long OK must be held on a focused Home game card to pin/unpin it instead
+    /// of launching it — see `run_ui_flow`'s interception.
+    const PIN_HOLD: Duration = Duration::from_millis(500);
+
     /// webOS ships a real on-screen keyboard, and the SDL fork this app links wires it
     /// up (`SDL_waylandwebos_osk.c` in `webosbrew/SDL-webOS`, driving `zwp_text_input_v3`)
     /// — but only for an app that actually asks for text input. Nothing here ever called
@@ -322,6 +326,9 @@ mod real {
         // press dispatches Back exactly once no matter how SDL reports (or
         // misreports) repeats for it.
         let mut menu_back_down = false;
+        // Hold-to-pin on Home (see `PIN_HOLD`): `Some((pressed_at, focus_at_press))`
+        // while OK is held on a pinnable card; tap vs. hold is decided on release.
+        let mut pin_held: Option<(Instant, HomeFocus)> = None;
         let mut stick_nav = crate::ui::StickMenuNav::default();
         // Owned handle (it just clones the video subsystem's refcount), so taking it
         // here doesn't hold a borrow on `canvas` for the rest of the loop.
@@ -421,6 +428,60 @@ mod real {
                             app.scroll_grid_by(-wheel_y * WHEEL_STEP, display_mode.w as u32, display_mode.h as u32);
                     }
                     continue;
+                }
+                // Hold-to-pin: OK on a focused Home game card pins/unpins past
+                // `PIN_HOLD`, or launches on a quick tap — resolved entirely on
+                // release so the two outcomes can't both fire. `MenuEvent` has no
+                // press/release notion, so this intercepts the raw SDL event: a
+                // Confirm-mapped KeyDown/ControllerButtonDown on a pinnable card
+                // starts the hold and is swallowed rather than dispatched immediately.
+                if matches!(app.screen, Screen::Home) && app.focused_game_id().is_some() {
+                    // Also matches OS auto-repeat KeyDowns while held, so a repeat
+                    // can't fall through to the dispatch below and launch mid-hold.
+                    let confirm_down = matches!(
+                        event,
+                        Event::KeyDown { keycode: Some(k), .. }
+                            if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Confirm)
+                    ) || matches!(
+                        event,
+                        Event::ControllerButtonDown { button, .. }
+                            if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Confirm)
+                    );
+                    if confirm_down {
+                        if pin_held.is_none() {
+                            pin_held = Some((Instant::now(), app.home_focus));
+                        }
+                        continue;
+                    }
+                }
+                let ends_hold = matches!(
+                    event,
+                    Event::KeyUp { keycode: Some(k), .. }
+                        if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Confirm)
+                ) || matches!(
+                    event,
+                    Event::ControllerButtonUp { button, .. }
+                        if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Confirm)
+                );
+                if ends_hold {
+                    if let Some((since, focus)) = pin_held.take() {
+                        dirty = true;
+                        if !matches!(app.screen, Screen::Home) || focus != app.home_focus {
+                            // Screen or focus changed mid-hold — act on neither.
+                        } else if since.elapsed() < PIN_HOLD {
+                            // A quick tap: the press never dispatched, so do it now.
+                            if app
+                                .handle_home_event(MenuEvent::Confirm, display_mode.w as u32, display_mode.h as u32)
+                                .is_some()
+                            {
+                                break 'ui;
+                            }
+                        } else {
+                            // Held past the threshold: toggle the pin, never launch.
+                            app.toggle_focused_pin(display_mode.w as u32, display_mode.h as u32);
+                        }
+                        continue; // this press was ours (tap or hold) — swallow the release
+                    }
                 }
                 // Any other event might change what's on screen (focus/hover, a typed
                 // digit, a screen transition) — simplest to mark dirty for all of
@@ -552,6 +613,7 @@ mod real {
                     Screen::About => {
                         app.handle_about_event(menu_ev, display_mode.w as u32, display_mode.h as u32, fonts)
                     }
+                    Screen::PinLimit => app.handle_pin_limit_event(menu_ev),
                 }
             }
             // Track whether the panel is actually up, not merely whether text input was

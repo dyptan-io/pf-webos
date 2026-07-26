@@ -133,6 +133,22 @@ pub fn render_focus_ring_tile(w: u32, h: u32) -> Painter {
     p
 }
 
+/// Diameter of the pin-state badge composited over the focused grid/pinned
+/// card's top-right corner (see `Tile::PinBadge`).
+pub const PIN_BADGE_SIZE: u32 = 28;
+
+/// The pin-state badge: a dark backing disc (for contrast over bright cover
+/// art) with a smaller dot on top — white when pinned, muted grey when not.
+/// One shared tile per state, like `render_focus_ring_tile`.
+pub fn render_pin_badge_tile(pinned: bool) -> Painter {
+    let d = PIN_BADGE_SIZE;
+    let mut p = Painter::new(d, d);
+    let c = d as f32 / 2.0;
+    p.fill_circle(c, c, c, Color::RGBA(0x00, 0x00, 0x00, 0x70));
+    p.fill_circle(c, c, c * 0.42, if pinned { WHITE } else { MUTED });
+    p
+}
+
 /// Transparent padding around a focused-row tile, generous enough for a
 /// row's shadow bleed (~20px) plus, for rows that still bake their own ~2%
 /// inflate (sidebar rows — see [`draw_selectable`]), that growth too.

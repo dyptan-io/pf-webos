@@ -159,6 +159,7 @@ impl App {
                         fingerprint: Some(fingerprint),
                         mgmt_port: outcome.mgmt_port,
                         mac: outcome.mac,
+                        pinned: Vec::new(),
                     },
                 );
                 let _ = store::save_known_hosts(&self.known_hosts);

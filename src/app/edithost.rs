@@ -74,6 +74,7 @@ impl App {
                 fingerprint: old.fingerprint,
                 mgmt_port: old.mgmt_port,
                 mac: old.mac.clone(),
+                pinned: old.pinned.clone(),
             },
         );
         let _ = store::save_known_hosts(&self.known_hosts);

@@ -147,11 +147,92 @@ impl App {
         }
         None
     }
+
+    /// The `GameEntry::id` of the currently focused grid card, or `None` for the
+    /// sidebar or the "Desktop" card — neither is pinnable.
+    pub(crate) fn focused_game_id(&self) -> Option<&str> {
+        match self.home_focus {
+            HomeFocus::Grid(idx) if !(self.games_loaded && idx == 0) => {
+                self.games.get(idx - self.card_offset()).map(|g| g.id.as_str())
+            }
+            HomeFocus::Grid(_) | HomeFocus::Sidebar(_) | HomeFocus::SidebarMenu(_) => None,
+        }
+    }
+
+    /// Toggles the focused card's pinned state, persists, re-sorts pinned games to
+    /// the front, and keeps focus on the same game. Opens the pin-limit alert
+    /// instead of pinning past `store::MAX_PINNED_GAMES`.
+    pub(crate) fn toggle_focused_pin(&mut self, screen_w: u32, screen_h: u32) {
+        let Some(id) = self.focused_game_id().map(str::to_string) else {
+            return;
+        };
+        let Some((host, port)) = self.selected_host.clone() else {
+            return;
+        };
+        let Some(known) = self.known_hosts.iter_mut().find(|h| h.host == host && h.port == port) else {
+            return;
+        };
+        if !known.toggle_pin(&id) {
+            // At MAX_PINNED_GAMES already — explain instead of a silent no-op.
+            self.open_pin_limit();
+            return;
+        }
+        let _ = store::save_known_hosts(&self.known_hosts);
+        self.reorder_games_by_pin();
+        if let Some(new_pos) = self.games.iter().position(|g| g.id == id) {
+            let idx = new_pos + self.card_offset();
+            self.home_focus = HomeFocus::Grid(idx);
+            let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
+            let columns = ui::grid_columns(available_w);
+            self.ensure_grid_visible(idx, columns, screen_w, screen_h);
+        }
+    }
+
+    /// Re-sorts `games` so the selected host's pinned games lead (in pin order,
+    /// `pinned_count` entries), the rest keeping their previous order. A pinned id
+    /// the host no longer reports is just dropped. Called on library (re)load and
+    /// on every pin toggle.
+    pub(crate) fn reorder_games_by_pin(&mut self) {
+        let pinned_ids = self
+            .selected_host
+            .as_ref()
+            .and_then(|(h, p)| self.known_hosts.iter().find(|k| k.host == *h && k.port == *p))
+            .map(|k| k.pinned.clone())
+            .unwrap_or_default();
+        let mut pinned = Vec::new();
+        for id in &pinned_ids {
+            if let Some(pos) = self.games.iter().position(|g| &g.id == id) {
+                pinned.push(self.games.remove(pos));
+            }
+        }
+        self.pinned_count = pinned.len();
+        pinned.append(&mut self.games);
+        self.games = pinned;
+        self.grid_dirty = true;
+    }
+
     /// `grid_card_rect`, translated by the current scroll offset — every
     /// draw-list card position starts from this.
     pub(crate) fn scrolled_card_rect(&self, idx: usize, columns: usize, grid_x: i32, available_w: u32) -> Rect {
         let r = ui::grid_card_rect(idx, columns, grid_x, available_w);
         Rect::new(r.x(), r.y() - self.grid_scroll, r.width(), r.height())
+    }
+
+    /// The divider between pinned games and the rest, scrolled like any other
+    /// grid content — `None` when nothing's pinned.
+    pub(crate) fn pinned_separator_rect(&self, columns: usize, grid_x: i32, available_w: u32) -> Option<Rect> {
+        if self.pinned_count == 0 {
+            return None;
+        }
+        let (_, card_h) = ui::grid_card_size(available_w, columns);
+        let rows = self.pinned_count.div_ceil(columns.max(1)) as i32;
+        let y = ui::GRID_TOP_Y + rows * (card_h as i32 + ui::GRID_GAP) - ui::GRID_GAP / 2 - self.grid_scroll;
+        Some(Rect::new(
+            grid_x + ui::GRID_PAD,
+            y,
+            available_w.saturating_sub(2 * ui::GRID_PAD as u32),
+            1,
+        ))
     }
 
     /// The largest useful `grid_scroll` for the current library/layout — 0 when
@@ -233,6 +314,7 @@ impl App {
         self.selected_host = Some((host.clone(), port));
         self.home_status = Some("Loading library…".into());
         self.games = Vec::new();
+        self.pinned_count = 0;
         self.games_loaded = false;
         self.art.clear();
         // Dropping the loader stops its worker (its request channel closes), so a host
@@ -306,6 +388,7 @@ impl App {
                 self.games = games;
                 self.games_loaded = true;
                 self.home_status = None;
+                self.reorder_games_by_pin();
             }
             Err(e) => {
                 tracing::warn!("library fetch failed ({host}:{mgmt_port}): {e}");

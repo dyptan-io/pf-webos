@@ -21,6 +21,7 @@ mod forget;
 mod home;
 mod hostmenu;
 mod pairing;
+mod pinlimit;
 mod reach;
 mod settings;
 mod speedtest;
@@ -53,6 +54,9 @@ pub enum Screen {
     /// Per-host network speed test (`HostMenu` -> "Test network speed"), measuring over
     /// the real data plane. See `app::speedtest`.
     SpeedTest,
+    /// "You can only pin 5 games" — a single-OK-button alert, reached from Home
+    /// when `App::toggle_focused_pin` hits `store::MAX_PINNED_GAMES`. See `app::pinlimit`.
+    PinLimit,
 }
 
 /// What the pairing modal's input is aimed at: the PIN digit row, or the
@@ -107,6 +111,8 @@ pub(crate) const CARD_GROWTH: f32 = 0.028;
 /// How much the launched card grows over `ui::LAUNCH_FADE` — same `zoom_rect`
 /// technique as `CARD_GROWTH`, just a bigger scale for the launch flourish.
 pub(crate) const LAUNCH_GROWTH: f32 = 3.5;
+/// Inset from the focused card's top-right corner for the pin-state badge.
+const PIN_BADGE_MARGIN: i32 = 10;
 /// How long a modal's fade/slide-in runs.
 pub(crate) const MODAL_FADE: Duration = Duration::from_millis(170);
 /// How long a scroll indicator (Settings' row list, About's document, ...) stays
@@ -211,7 +217,9 @@ pub enum HomeFocus {
     /// continues to the grid, Left returns to the row. This replaced a hold-OK gesture:
     /// the actions existed but nothing on screen advertised them.
     SidebarMenu(usize),
-    /// Index into the grid: `0` is "Desktop", `1..` are `games`.
+    /// Index into the grid: `0` is "Desktop", `1..` are `games` — pinned games
+    /// (see `App::pinned_count`) sort to the front of `games` but are otherwise
+    /// plain grid cards, scrolling with everything else.
     Grid(usize),
 }
 
@@ -365,6 +373,10 @@ pub struct App {
     /// selected (or restored from `store::load_selected_host` at startup).
     pub selected_host: Option<(String, u16)>,
     pub games: Vec<GameEntry>,
+    /// How many of `games`' leading entries are the selected host's pinned games —
+    /// `App::reorder_games_by_pin` keeps `games[0..pinned_count]` in pin order.
+    /// Recomputed on every library (re)load and pin toggle.
+    pub(crate) pinned_count: usize,
     /// Whether the current host has actually answered a library fetch — gates the
     /// fixed "Desktop" grid card (see `card_offset`), which has no reason to show
     /// before the host is confirmed reachable. Reset to `false` on every
@@ -493,6 +505,9 @@ pub struct App {
     pub(crate) evicted_tiles: Vec<Tile>,
     /// The shared focus-ring glow tile (one per card size).
     pub(crate) ring_tile: Option<Painter>,
+    /// The shared pin-state badge tiles — `[unpinned, pinned]`, built once (they
+    /// don't depend on card size), composited over whichever card is focused.
+    pub(crate) pin_badge_tiles: Option<[Painter; 2]>,
     /// The focused sidebar row's tile, keyed by row index.
     pub(crate) focused_row_tile: Option<((usize, bool), Painter)>,
     /// The active modal rasterized full-screen (transparent surroundings);
@@ -614,6 +629,7 @@ impl App {
             home_focus: HomeFocus::Sidebar(0),
             selected_host: None,
             games: Vec::new(),
+            pinned_count: 0,
             games_loaded: false,
             games_rx: None,
             home_status: None,
@@ -662,6 +678,7 @@ impl App {
             grid_cards_dirty: Vec::new(),
             evicted_tiles: Vec::new(),
             ring_tile: None,
+            pin_badge_tiles: None,
             focused_row_tile: None,
             modal_tile: None,
             modal_shell_key: None,
@@ -847,6 +864,10 @@ impl App {
                 self.screen = Screen::Settings;
                 None
             }
+            Screen::PinLimit => {
+                self.handle_pin_limit_event(MenuEvent::Back);
+                None
+            }
         }
     }
     /// Advances every live animation one tick — the eased scroll, the focus pop,
@@ -1013,6 +1034,10 @@ impl App {
                 let card = self.speed_test_card_rect(screen_w, screen_h, fonts);
                 self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
             }
+            Screen::PinLimit => {
+                let card = Self::pin_limit_card_rect(screen_w, screen_h, fonts);
+                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
+            }
         }
     }
 
@@ -1126,6 +1151,12 @@ impl App {
                 self.handle_speed_test_event(MenuEvent::Confirm);
                 None
             }
+            // A click anywhere but the close button (handled above) dismisses it,
+            // same as the one OK button would — there's nothing else on this card.
+            Screen::PinLimit => {
+                self.handle_pin_limit_event(MenuEvent::Confirm);
+                None
+            }
             // Nothing clickable but the close button (handled above).
             Screen::AddHost | Screen::EditHost | Screen::About => None,
         }
@@ -1138,6 +1169,13 @@ impl App {
     /// grid index before indexing into `games`.
     pub(crate) fn card_offset(&self) -> usize {
         usize::from(self.games_loaded)
+    }
+
+    /// The `KnownHost` record backing `selected_host`, if any — shared by every
+    /// pin-related lookup (the focused card's badge, `toggle_focused_pin`).
+    pub(crate) fn selected_known_host(&self) -> Option<&KnownHost> {
+        let (host, port) = self.selected_host.as_ref()?;
+        self.known_hosts.iter().find(|h| h.host == *host && h.port == *port)
     }
 
     /// The title of grid card `idx` (0 = the fixed "Desktop" card, when shown — see
@@ -1339,6 +1377,14 @@ impl App {
             }
             self.tiles_pending = pending;
 
+            // The pin-state badge tiles — built once, composited over the focused
+            // card in `draw_list` rather than baked into individual card tiles.
+            if self.pin_badge_tiles.is_none() {
+                self.pin_badge_tiles = Some([ui::render_pin_badge_tile(false), ui::render_pin_badge_tile(true)]);
+                updated.push(Tile::PinBadge(false));
+                updated.push(Tile::PinBadge(true));
+            }
+
             // Rechecks the whole window rather than trusting `!pending`, since a card
             // built earlier can still be waiting behind a re-dirtied sibling; requires
             // `art_ready` too so a placeholder built this tick can't count as revealed.
@@ -1443,8 +1489,10 @@ impl App {
             }),
             // `EditHost` joins `AddHost` in having no shell key: its typed-digit
             // display has no separate focus tile to protect, so it just redraws on
-            // any `content_dirty` tick.
-            Screen::Home | Screen::AddHost | Screen::EditHost => None,
+            // any `content_dirty` tick. `PinLimit` has nothing that changes at all
+            // once open (a fixed message + one always-focused button), so the same
+            // "just redraw on `content_dirty`" fallback is fine for it too.
+            Screen::Home | Screen::AddHost | Screen::EditHost | Screen::PinLimit => None,
         };
         let modal_stale = if modal_shell_key.is_some() {
             self.modal_tile.is_none() || self.modal_shell_key != modal_shell_key
@@ -1479,6 +1527,7 @@ impl App {
                 Screen::EditHost => self.render_edit_host(&mut p, text_cache, fonts, screen_w, screen_h)?,
                 Screen::About => self.render_about(&mut p, text_cache, fonts, screen_w, screen_h)?,
                 Screen::SpeedTest => self.render_speed_test(&mut p, text_cache, fonts, screen_w, screen_h)?,
+                Screen::PinLimit => self.render_pin_limit(&mut p, text_cache, fonts, screen_w, screen_h)?,
             }
             self.modal_tile = Some(p);
             updated.push(Tile::Modal);
@@ -1521,8 +1570,9 @@ impl App {
                 ModalFocusKey::SpeedTestButton(self.speed_test_focused, Self::speed_test_apply_label(recommended))
             }),
             // Neither has a single focused widget: the address form is one always-active
-            // field, and About is a scrolling document.
-            Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About => None,
+            // field, About is a scrolling document, and `PinLimit`'s one button is
+            // always drawn focused directly in `render_pin_limit`.
+            Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About | Screen::PinLimit => None,
         };
         if let Some(key) = focus_key {
             // Also stale on every tick of an in-flight `switch_anim`: the knob's
@@ -1640,7 +1690,7 @@ impl App {
                             rect.height(),
                         )?
                     }
-                    Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About => {
+                    Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About | Screen::PinLimit => {
                         unreachable!("focus_key checked above")
                     }
                 };
@@ -1793,6 +1843,10 @@ impl App {
             Tile::FocusRow => self.focused_row_tile.as_ref().map(|(_, p)| p),
             Tile::Card(i) => self.card_tiles.get(i).and_then(|t| t.as_ref()),
             Tile::Ring => self.ring_tile.as_ref(),
+            Tile::PinBadge(pinned) => self
+                .pin_badge_tiles
+                .as_ref()
+                .map(|[unpinned, pinned_tile]| if pinned { pinned_tile } else { unpinned }),
             Tile::Modal => self.modal_tile.as_ref(),
             Tile::ModalFocusElement => self.modal_focus_tile.as_ref().map(|(_, p)| p),
             Tile::DropdownOverlay => self.dropdown_overlay_tile.as_ref().map(|(_, p)| p),
@@ -1872,6 +1926,17 @@ impl App {
                     alpha: 0xff,
                 });
             }
+            // The divider between pinned games and the rest — scrolled with
+            // everything else (there's no separate fixed region), so it's just
+            // another rect at its own scrolled position, culled the same way.
+            if let Some(sep) = self.pinned_separator_rect(columns, grid_x, available_w) {
+                if sep.y() >= 0 && sep.y() <= screen_h as i32 {
+                    cmds.push(DrawCmd::Fill {
+                        rect: sep,
+                        color: sdl2::pixels::Color::RGBA(0xff, 0xff, 0xff, 0x20),
+                    });
+                }
+            }
             if let Some(idx) = focused {
                 // The focus pop: the GPU scales the (unfocused) card tile up
                 // around its center as the pop progresses, with the shared ring
@@ -1901,6 +1966,26 @@ impl App {
                     dst: ui::zoom_rect(ring_base, f, CARD_GROWTH),
                     alpha: (255.0 * f) as u8,
                 });
+                // The pin-state badge — only on the focused card, and only for a
+                // real game (not the "Desktop" card, which can't be pinned).
+                if !(self.games_loaded && idx == 0) {
+                    let is_pinned = self
+                        .games
+                        .get(idx - self.card_offset())
+                        .is_some_and(|game| self.selected_known_host().is_some_and(|h| h.is_pinned(&game.id)));
+                    let badge = ui::PIN_BADGE_SIZE;
+                    let badge_base = Rect::new(
+                        r.x() + r.width() as i32 - badge as i32 - PIN_BADGE_MARGIN,
+                        r.y() + PIN_BADGE_MARGIN,
+                        badge,
+                        badge,
+                    );
+                    cmds.push(DrawCmd::Tex {
+                        tile: Tile::PinBadge(is_pinned),
+                        dst: ui::zoom_rect(badge_base, f, CARD_GROWTH),
+                        alpha: 0xff,
+                    });
+                }
             }
         }
         if self.selected_host.is_some() && self.home_status.is_some() {
@@ -2071,7 +2156,7 @@ impl App {
                     let card = self.speed_test_card_rect(screen_w, screen_h, fonts);
                     ui::confirm_button_rect(self.speed_test_buttons_rect(card, fonts), self.speed_test_focused)
                 }),
-                Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About => None,
+                Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About | Screen::PinLimit => None,
             };
             if let Some(rect) = focus_rect {
                 let pad = ui::ROW_TILE_PAD;
