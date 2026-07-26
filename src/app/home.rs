@@ -147,6 +147,13 @@ impl App {
         }
         None
     }
+    /// `grid_card_rect`, translated by the current scroll offset — every
+    /// draw-list card position starts from this.
+    pub(crate) fn scrolled_card_rect(&self, idx: usize, columns: usize, grid_x: i32, available_w: u32) -> Rect {
+        let r = ui::grid_card_rect(idx, columns, grid_x, available_w);
+        Rect::new(r.x(), r.y() - self.grid_scroll, r.width(), r.height())
+    }
+
     /// The largest useful `grid_scroll` for the current library/layout — 0 when
     /// everything already fits on screen.
     pub(crate) fn max_grid_scroll(&self, columns: usize, available_w: u32, screen_h: u32) -> i32 {
@@ -368,6 +375,7 @@ impl App {
             fingerprint,
             launch,
             rx,
+            idx,
         });
     }
 
@@ -387,6 +395,7 @@ impl App {
             port,
             fingerprint,
             launch,
+            idx,
             ..
         } = self.pending_launch.take().expect("just matched Some above");
         match loaded.result {
@@ -397,6 +406,7 @@ impl App {
                     .is_some_and(|(h, p)| *h == host && *p == port)
                 {
                     self.home_status = None;
+                    self.launch_anim_idx = Some(idx);
                     self.launch_ready = Some(ConnectTarget {
                         host,
                         port,
@@ -410,8 +420,11 @@ impl App {
                 self.handle_library_error(host, port, e);
             }
         }
+        // Not `grid_dirty`: this is a reachability probe only (`loaded.games` is
+        // discarded), so the grid's contents haven't changed — marking it dirty
+        // would rebuild every card tile and re-arm the loading spinner right as
+        // the launch zoom is about to start.
         self.sidebar_dirty = true;
-        self.grid_dirty = true;
         true
     }
 

@@ -57,9 +57,69 @@ mod real {
     use crate::store;
     use crate::ui::MenuEvent;
 
-    /// What `run_ui_flow` resolved: host, port, the pinned fingerprint (`None` for a
-    /// fresh TOFU connect), and an optional library entry id to launch into.
-    type ConnectOutcome = (String, u16, Option<[u8; 32]>, Option<String>);
+    /// What `run_ui_flow` resolved: a `session::connect` already running on its own
+    /// thread (started as soon as the target was confirmed, so it overlaps the
+    /// launch zoom/fade instead of running after it — see `spawn_connect`), plus
+    /// the settings it was started with.
+    type ConnectOutcome = (std::thread::JoinHandle<Result<session::Connected>>, store::Settings);
+
+    /// Starts `session::connect` on its own thread and returns immediately — the
+    /// caller joins it once it's actually needed (after the launch animation, or
+    /// straight away for the dev-override path). Letting connect run alongside the
+    /// launch animation means a fast local handshake often finishes before the
+    /// animation does, so the stream starts the instant it ends instead of after.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_connect(
+        identity: (String, String),
+        host: String,
+        port: u16,
+        fp: Option<[u8; 32]>,
+        launch: Option<String>,
+        settings: store::Settings,
+        display_w: i32,
+        display_h: i32,
+    ) -> Result<std::thread::JoinHandle<Result<session::Connected>>> {
+        std::thread::Builder::new()
+            .name("punktfunk-webos-connect".into())
+            .spawn(move || {
+                // SDL2/Wayland reports refresh_rate=0 in some launch contexts
+                // (confirmed: the host's virtual-display driver rejected a literal
+                // "0 Hz" mode request with "the parameter is incorrect") — the
+                // settings' own nominal rate (never 0; see `store::Settings::default`)
+                // is what drives the wire value directly.
+                let mode = Mode {
+                    width: settings.width,
+                    height: settings.height,
+                    refresh_hz: settings.refresh_hz,
+                };
+                tracing::info!(
+                    "requesting {}x{}@{}",
+                    settings.width,
+                    settings.height,
+                    settings.refresh_hz
+                );
+                session::connect(
+                    &host,
+                    port,
+                    mode,
+                    settings.bitrate_kbps,
+                    settings.hdr_enabled,
+                    settings.audio_channels,
+                    identity,
+                    fp,
+                    launch,
+                    // The host PARKS an unpinned/TOFU connect until an operator approves it —
+                    // matching clients/session's PENDING_APPROVAL_WAIT convention, not the
+                    // plain 15s handshake budget (too short for a human to notice and click).
+                    Duration::from_secs(185),
+                    display_w,
+                    display_h,
+                    settings.video_backend,
+                    settings.codec,
+                )
+            })
+            .context("spawn connect thread")
+    }
 
     /// Set by [`handle_term_signal`], read by both event loops below as an extra
     /// "should we quit" condition alongside SDL's own `Event::Quit`. webOS can ask a
@@ -213,7 +273,18 @@ mod real {
         // Bypasses the library screen too (`launch: None`, a plain desktop session).
         if let Some((host, port)) = store::dev_override_connect() {
             tracing::info!("dev override: connecting to {host}:{port}");
-            return Ok(Some((host, port, None, None)));
+            let settings = store::load_settings();
+            let handle = spawn_connect(
+                identity.clone(),
+                host,
+                port,
+                None,
+                None,
+                settings,
+                display_mode.w,
+                display_mode.h,
+            )?;
+            return Ok(Some((handle, settings)));
         }
 
         canvas.window_mut().show();
@@ -268,7 +339,11 @@ mod real {
         // unconditionally every 16ms forever, even sitting on an untouched menu.
         // Starts `true` so the first frame always draws.
         let mut dirty = true;
-        let target = 'ui: loop {
+        // Set once the reachability check passes — `spawn_connect` is already
+        // running by then, so this just carries its handle out of the loop for
+        // `run_inner` to join once the launch animation finishes.
+        let mut connect_handle: Option<ConnectOutcome> = None;
+        'ui: loop {
             let tick_start = Instant::now();
             if QUIT_REQUESTED.load(Ordering::Relaxed) {
                 tracing::warn!("SIGTERM/SIGINT received during UI");
@@ -283,8 +358,29 @@ mod real {
             dirty |= app.drain_reachability();
             dirty |= app.tick_wake();
             dirty |= app.drain_launch_check();
-            if let Some(target) = app.take_ready_launch() {
-                break 'ui target;
+            // Reachability check passed — start connecting now, in parallel with the
+            // launch zoom/fade, so a fast handshake finishes before the animation
+            // does rather than only starting once it's done.
+            if app.launch_ready.is_some() && connect_handle.is_none() {
+                app.launch_anim = Some(Instant::now());
+                dirty = true;
+                if let Some(target) = app.take_ready_launch() {
+                    let settings = store::load_settings();
+                    let handle = spawn_connect(
+                        identity.clone(),
+                        target.host,
+                        target.port,
+                        Some(target.fingerprint),
+                        target.launch,
+                        settings,
+                        display_mode.w,
+                        display_mode.h,
+                    )?;
+                    connect_handle = Some((handle, settings));
+                }
+            }
+            if app.launch_anim.is_some_and(|t| t.elapsed() >= crate::ui::LAUNCH_FADE) {
+                break 'ui;
             }
             for event in events.poll_iter() {
                 use sdl2::event::Event;
@@ -342,10 +438,13 @@ mod real {
                         y,
                         ..
                     } => {
-                        if let Some(target) =
-                            app.handle_mouse_click(x, y, display_mode.w as u32, display_mode.h as u32, fonts)
+                        // A grid-card click resolves via `confirm_grid_card`'s async check
+                        // above, same as a remote Confirm — never a target directly here.
+                        if app
+                            .handle_mouse_click(x, y, display_mode.w as u32, display_mode.h as u32, fonts)
+                            .is_some()
                         {
-                            break 'ui target;
+                            break 'ui;
                         }
                         continue;
                     }
@@ -430,13 +529,16 @@ mod real {
                     // routed through `back` anyway so the policy lives in one place.
                     Screen::Home => {
                         if menu_ev == MenuEvent::Back {
-                            if let Some(target) = app.back() {
-                                break 'ui target;
+                            if app.back().is_some() {
+                                break 'ui;
                             }
-                        } else if let Some(target) =
-                            app.handle_home_event(menu_ev, display_mode.w as u32, display_mode.h as u32)
+                        // Same async path as the mouse click above — a grid-card
+                        // Confirm never resolves to a target directly here.
+                        } else if app
+                            .handle_home_event(menu_ev, display_mode.w as u32, display_mode.h as u32)
+                            .is_some()
                         {
-                            break 'ui target;
+                            break 'ui;
                         }
                     }
                     Screen::Pairing => app.handle_pairing_event(menu_ev),
@@ -537,16 +639,11 @@ mod real {
             if elapsed < TICK_BUDGET {
                 std::thread::sleep(TICK_BUDGET - elapsed);
             }
-        };
+        }
         if text_input_active {
             text_input.stop();
         }
-        Ok(Some((
-            target.host,
-            target.port,
-            Some(target.fingerprint),
-            target.launch,
-        )))
+        Ok(connect_handle)
     }
 
     fn run_inner() -> Result<()> {
@@ -621,7 +718,7 @@ mod real {
         let mut menu_status: Option<String> = None;
 
         loop {
-            let Some((host, port, fp, launch)) = run_ui_flow(
+            let Some((connect_thread, settings)) = run_ui_flow(
                 &mut canvas,
                 &mut compositor,
                 &texture_creator,
@@ -637,8 +734,6 @@ mod real {
                 tracing::info!("punktfunk-webos exiting cleanly");
                 return Ok(());
             };
-
-            let settings = store::load_settings();
             tracing::debug!("settings: {settings:?}");
 
             // `hide()` (the previous approach here, when `set_opacity` fails — confirmed
@@ -669,40 +764,10 @@ mod real {
             // same standard SDL2 API on any platform, not webOS-specific).
             sdl.mouse().show_cursor(false);
 
-            // SDL2/Wayland reports refresh_rate=0 in some launch contexts (confirmed:
-            // the host's virtual-display driver rejected a literal "0 Hz" mode request
-            // with "the parameter is incorrect") — the settings' own nominal rate (never
-            // 0; see store::Settings::default) is what drives the wire value directly.
-            tracing::info!(
-                "requesting {}x{}@{}",
-                settings.width,
-                settings.height,
-                settings.refresh_hz
-            );
-            let mode = Mode {
-                width: settings.width,
-                height: settings.height,
-                refresh_hz: settings.refresh_hz,
-            };
-            let connected = match session::connect(
-                &host,
-                port,
-                mode,
-                settings.bitrate_kbps,
-                settings.hdr_enabled,
-                settings.audio_channels,
-                identity.clone(),
-                fp,
-                launch,
-                // The host PARKS an unpinned/TOFU connect until an operator approves it —
-                // matching clients/session's PENDING_APPROVAL_WAIT convention, not the
-                // plain 15s handshake budget (too short for a human to notice and click).
-                Duration::from_secs(185),
-                display_mode.w,
-                display_mode.h,
-                settings.video_backend,
-                settings.codec,
-            ) {
+            // Already running (started back in `run_ui_flow`, overlapping the launch
+            // zoom/fade) — joining just waits out whatever's left of the handshake,
+            // which for a fast local connect is often nothing at all.
+            let connected = match connect_thread.join().expect("connect thread panicked") {
                 Ok(c) => c,
                 Err(e) => {
                     // A failed connect (host went down in the race, codec/launch

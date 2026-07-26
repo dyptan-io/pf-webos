@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 /// pre-stream modal's focused widget, and the disconnect dialog's button.
 pub const FOCUS_POP: Duration = Duration::from_millis(140);
 
+/// How long the launch zoom/fade-to-black runs once a grid card is confirmed
+/// — the card keeps zooming for the whole span, not just its start.
+pub const LAUNCH_FADE: Duration = Duration::from_millis(600);
+
 /// Cubic ease-out for the animation fractions below.
 pub fn ease(f: f32) -> f32 {
     1.0 - (1.0 - f).powi(3)

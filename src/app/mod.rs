@@ -104,6 +104,9 @@ const SPINNER_MAX_WAIT: Duration = Duration::from_millis(900);
 /// How much the grid's focused card (and its ring) grows during
 /// `ui::FOCUS_POP` — see `ui::zoom_rect`.
 pub(crate) const CARD_GROWTH: f32 = 0.028;
+/// How much the launched card grows over `ui::LAUNCH_FADE` — same `zoom_rect`
+/// technique as `CARD_GROWTH`, just a bigger scale for the launch flourish.
+pub(crate) const LAUNCH_GROWTH: f32 = 3.5;
 /// How long a modal's fade/slide-in runs.
 pub(crate) const MODAL_FADE: Duration = Duration::from_millis(170);
 /// How long a scroll indicator (Settings' row list, About's document, ...) stays
@@ -231,6 +234,9 @@ pub(crate) struct PendingLaunch {
     pub(crate) fingerprint: [u8; 32],
     pub(crate) launch: Option<String>,
     pub(crate) rx: std::sync::mpsc::Receiver<crate::library::GamesLoaded>,
+    /// The confirmed card, so `launch_anim` zooms the right one even if focus
+    /// has since moved elsewhere on the grid.
+    pub(crate) idx: usize,
 }
 
 /// An open dropdown on the settings modal — `row` is the settings row index that
@@ -381,6 +387,11 @@ pub struct App {
     /// `take_ready_launch` and starts the stream. Separate from `pending_launch`
     /// since that's cleared as soon as a result arrives, before `main.rs` can act.
     pub(crate) launch_ready: Option<ConnectTarget>,
+    /// Started once `launch_ready` is set — the launch zoom/fade `main.rs` plays
+    /// before breaking into the stream. See `ui::LAUNCH_FADE`.
+    pub(crate) launch_anim: Option<Instant>,
+    /// Which grid card `launch_anim` zooms — set alongside `launch_ready`.
+    pub(crate) launch_anim_idx: Option<usize>,
     pub settings: Settings,
     /// Persists `settings` off the UI thread — see its docs on why a blocking
     /// `store::save_settings` on every adjustment read as input lag.
@@ -611,6 +622,8 @@ impl App {
             card_size: (0, 0),
             pending_launch: None,
             launch_ready: None,
+            launch_anim: None,
+            launch_anim_idx: None,
             settings: store::load_settings(),
             settings_writer: store::SettingsWriter::spawn(),
             settings_focused: 0,
@@ -869,6 +882,9 @@ impl App {
             if t.elapsed() >= MODAL_FADE {
                 self.modal_anim = None;
             }
+            animating = true;
+        }
+        if self.launch_anim.is_some_and(|t| t.elapsed() < ui::LAUNCH_FADE) {
             animating = true;
         }
         if let Some(t) = self.modal_focus_anim {
@@ -1789,9 +1805,7 @@ impl App {
             // `main.rs`), never rasterized as a `Painter`; the rest are stream-side only
             // (uploaded directly by `run_inner`'s overlay refresh) — never one of App's
             // menu tiles.
-            Tile::SpinnerFrame(_) | Tile::StatsOverlay | Tile::DisconnectDialog | Tile::DisconnectFocusButton => {
-                None
-            }
+            Tile::SpinnerFrame(_) | Tile::StatsOverlay | Tile::DisconnectDialog | Tile::DisconnectFocusButton => None,
         }
     }
 
@@ -1843,16 +1857,15 @@ impl App {
                 if Some(idx) == focused {
                     continue; // drawn last, on top of its neighbors
                 }
-                let r = ui::grid_card_rect(idx, columns, grid_x, available_w);
-                let y = r.y() - self.grid_scroll;
-                if y + r.height() as i32 + pad < 0 || y - pad > screen_h as i32 {
+                let r = self.scrolled_card_rect(idx, columns, grid_x, available_w);
+                if r.y() + r.height() as i32 + pad < 0 || r.y() - pad > screen_h as i32 {
                     continue; // culled — fully off-screen at this scroll offset
                 }
                 cmds.push(DrawCmd::Tex {
                     tile: Tile::Card(idx),
                     dst: Rect::new(
                         r.x() - pad,
-                        y - pad,
+                        r.y() - pad,
                         r.width() + 2 * pad as u32,
                         r.height() + 2 * pad as u32,
                     ),
@@ -1864,11 +1877,10 @@ impl App {
                 // around its center as the pop progresses, with the shared ring
                 // tile fading in over it at the same scale.
                 let f = ui::anim_frac(self.focus_anim, ui::FOCUS_POP);
-                let r = ui::grid_card_rect(idx, columns, grid_x, available_w);
-                let y = r.y() - self.grid_scroll;
+                let r = self.scrolled_card_rect(idx, columns, grid_x, available_w);
                 let card_base = Rect::new(
                     r.x() - pad,
-                    y - pad,
+                    r.y() - pad,
                     r.width() + 2 * pad as u32,
                     r.height() + 2 * pad as u32,
                 );
@@ -1880,7 +1892,7 @@ impl App {
                 let rp = ui::FOCUS_RING_PAD;
                 let ring_base = Rect::new(
                     r.x() - rp,
-                    y - rp,
+                    r.y() - rp,
                     r.width() + 2 * rp as u32,
                     r.height() + 2 * rp as u32,
                 );
@@ -2139,6 +2151,23 @@ impl App {
                     }
                 }
             }
+        }
+        // The launch transition: the confirmed card zooms in around its own
+        // center (same `zoom_rect` technique as the focus pop, so its aspect
+        // ratio never changes) while a black scrim blends in over it, both driven
+        // by the same clock — the card keeps zooming for the whole fade.
+        if let (Some(t), Some(idx)) = (self.launch_anim, self.launch_anim_idx) {
+            let f = ui::anim_frac(Some(t), ui::LAUNCH_FADE);
+            let base = self.scrolled_card_rect(idx, columns, grid_x, available_w);
+            cmds.push(DrawCmd::Tex {
+                tile: Tile::Card(idx),
+                dst: ui::zoom_rect(base, f, LAUNCH_GROWTH),
+                alpha: 0xff,
+            });
+            cmds.push(DrawCmd::Fill {
+                rect: Rect::new(0, 0, screen_w, screen_h),
+                color: sdl2::pixels::Color::RGBA(0, 0, 0, (255.0 * f) as u8),
+            });
         }
         cmds
     }
