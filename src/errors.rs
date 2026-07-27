@@ -4,10 +4,8 @@
 //! the same wording every other punktfunk client shows — rather than depending on that
 //! crate (see `session.rs`'s module docs for why this client can't).
 //!
-//! Without this, every failure in this app rendered as a Rust `Debug`/`Display` string:
-//! a host already streaming to someone else read as `connect: Rejected(Busy)` on a 65"
-//! screen. The information was all there; it just wasn't in a form anyone should have to
-//! decode.
+//! Without this, failures rendered as Debug strings (e.g., "connect: Rejected(Busy)").
+//! This translates them to user-facing sentences.
 use punktfunk_core::reject::RejectReason;
 use punktfunk_core::PunktfunkError;
 
@@ -49,8 +47,7 @@ pub fn reject_message(reason: RejectReason) -> String {
     }
 }
 
-/// Why a connect/probe attempt failed. Distinguishes a deliberate host rejection from
-/// transport trouble, so an unreachable network is never reported as a refusal.
+/// Why connect/probe failed (distinguishes rejection from transport trouble).
 pub fn connect_message(err: &PunktfunkError) -> String {
     match err {
         PunktfunkError::Rejected(reason) => reject_message(*reason),
@@ -64,8 +61,7 @@ pub fn connect_message(err: &PunktfunkError) -> String {
     }
 }
 
-/// Why a PIN pairing ceremony failed — `Crypto` here means the SPAKE2 proof didn't
-/// verify, i.e. the wrong PIN, which must not be reported as a network problem.
+/// Why PIN pairing failed (Crypto = wrong PIN, not network problem).
 pub fn pair_message(err: &PunktfunkError) -> String {
     match err {
         PunktfunkError::Crypto => "Wrong PIN — check the PIN on the host's Pairing page and try again.".into(),
@@ -73,8 +69,7 @@ pub fn pair_message(err: &PunktfunkError) -> String {
     }
 }
 
-/// Pulls a `PunktfunkError` back out of an `anyhow` chain so the sentences above can be
-/// used on results that have already been `.context()`-wrapped.
+/// Extract `PunktfunkError` from anyhow chain for user-facing messages.
 pub fn friendly(err: &anyhow::Error) -> String {
     err.downcast_ref::<PunktfunkError>()
         .map_or_else(|| format!("{err:#}"), connect_message)

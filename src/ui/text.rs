@@ -1,6 +1,4 @@
-//! Font loading, the rasterized-text cache, and text/icon drawing.
-//!
-//! Split out of the former single-file `ui.rs`; see `super`'s module docs.
+//! Font loading, text/icon cache and drawing (Geist + icon font).
 use super::*;
 use anyhow::{Context, Result};
 use sdl2::pixels::Color;
@@ -9,17 +7,12 @@ use sdl2::ttf::Font;
 use std::collections::HashMap;
 use tiny_skia::{IntSize, Pixmap};
 
-/// The bundled Geist family (punktfunk's brand font, the same OTFs every other
-/// punktfunk client ships — copied verbatim from `pf-console-ui/assets/fonts/`;
-/// license in `assets/fonts/Geist-OFL.txt`). Embedded like the icon font, so
-/// nothing needs staging alongside the `.ipk`.
+/// Bundled Geist family (punktfunk brand font); embedded so no asset staging needed.
 pub static GEIST_REGULAR: &[u8] = include_bytes!("../../assets/fonts/Geist-Regular.otf");
 pub static GEIST_MEDIUM: &[u8] = include_bytes!("../../assets/fonts/Geist-Medium.otf");
 pub static GEIST_SEMIBOLD: &[u8] = include_bytes!("../../assets/fonts/Geist-SemiBold.otf");
 
-/// Which Geist weight to load. (Geist-Bold.otf also sits in `assets/fonts/`,
-/// unembedded — add a variant if a Bold use appears; the logo lockup that
-/// briefly used it is real artwork now, not text.)
+/// Geist weight to load (Bold unembedded; add variant if needed).
 #[derive(Clone, Copy)]
 pub enum FontWeight {
     Regular,
@@ -27,22 +20,17 @@ pub enum FontWeight {
     SemiBold,
 }
 
-/// The app's UI fonts, bundled so the many functions needing several of them
-/// take one `&Fonts` instead of threading each separately. Borrow-only — the
-/// fonts are owned in `main.rs`'s `run_inner` for the whole menu/stream cycle
-/// (see `load_font`), so this never needs storing anywhere.
+/// App UI fonts bundled for convenience (borrow-only, owned in `main.rs::run_inner`).
 pub struct Fonts<'a, 'ttf> {
     pub label: &'a Font<'ttf, 'static>,
     pub value: &'a Font<'ttf, 'static>,
     pub title: &'a Font<'ttf, 'static>,
     pub icon: &'a Font<'ttf, 'static>,
-    /// Smallest weight — currently just the stats overlay's Green-button hint.
+    /// Smallest weight (stats overlay Green-button hint).
     pub caption: &'a Font<'ttf, 'static>,
 }
 
-/// Loads a bundled Geist weight at a size proportional to the display height
-/// (design reference: a 720px-tall reference screen —
-/// `size = design_size * height / 720`).
+/// Load Geist weight at size proportional to display height (720px reference).
 pub fn load_font(
     ttf: &sdl2::ttf::Sdl2TtfContext,
     height_px: u32,
@@ -60,20 +48,13 @@ pub fn load_font(
         .map_err(|e| anyhow::anyhow!("load_font (Geist): {e}"))
 }
 
-/// The bundled icon font's raw bytes (see the icons section above) — embedded into
-/// the binary at compile time, so there's no install-time asset to stage/ship
-/// alongside the `.ipk` and no runtime path to resolve.
+/// Icon font bytes, embedded at compile time (no asset staging or runtime path needed).
 pub static ICON_FONT_BYTES: &[u8] = include_bytes!("../../assets/icons/MaterialIcons-subset.ttf");
 
-/// The punktfunk logo lockup (mark + FUNK wordmark) — rasterized from the brand's
-/// actual vector artwork (`assets/logo/punktfunk-logo-dark.svg`, the dark/no-border
-/// variant) at the sidebar's exact display size, so it draws 1:1 with no scaling.
-/// See `assets/logo/NOTICE.md` for regeneration.
+/// Punktfunk logo (rasterized at sidebar size, 1:1 no scaling). See assets/logo/NOTICE.md.
 pub static LOGO_PNG: &[u8] = include_bytes!("../../assets/logo/logo-sidebar.png");
 
-/// Decodes the embedded logo once, lazily (premultiplied, ready to composite).
-/// `None` only if the embedded PNG were somehow invalid — the sidebar then just
-/// draws without a logo rather than failing.
+/// Decode embedded logo once, lazily (premultiplied, ready to composite). None if PNG invalid.
 pub fn logo_pixmap() -> Option<&'static Pixmap> {
     static LOGO: std::sync::OnceLock<Option<Pixmap>> = std::sync::OnceLock::new();
     LOGO.get_or_init(|| {

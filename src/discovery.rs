@@ -1,7 +1,4 @@
-//! LAN host discovery via mDNS — mirrors `pf-client-core::discovery`'s shape
-//! (`_punktfunk._udp` advert, same TXT keys) but as our own direct `mdns-sd`
-//! dependency rather than depending on `pf-client-core` itself (see `session.rs`
-//! docs for why: its Cargo.toml would drag in FFmpeg/PipeWire for our target too).
+//! LAN discovery via mDNS (_punktfunk._udp). Direct mdns-sd dep to avoid pf-client-core's FFmpeg/PipeWire.
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 
 #[derive(Clone, Debug)]
@@ -9,31 +6,14 @@ pub struct DiscoveredHost {
     pub name: String,
     pub addr: String,
     pub port: u16,
-    /// The management API's port, from the mDNS `mgmt` TXT — `None` if the host
-    /// doesn't advertise one (falls back to `library::DEFAULT_MGMT_PORT`).
+    /// Management API port from mDNS (None → `library::DEFAULT_MGMT_PORT`).
     pub mgmt_port: Option<u16>,
-    /// Wake-on-LAN MAC(s) (`aa:bb:cc:dd:ee:ff`) from the mDNS `mac` TXT
-    /// (comma-separated) — learned while the host is awake and advertising, and
-    /// persisted onto the matching known host so it can be woken later once it
-    /// goes offline (see `app::App::drain_discovery`). Empty if not advertised.
+    /// Wake-on-LAN MACs from mDNS (learned while awake, persisted to `KnownHost`).
     pub mac: Vec<String>,
 }
 
-/// Browse continuously. The spawned thread does NOT reliably exit just because the
-/// returned `Receiver<DiscoveredHost>` is dropped: only a `ServiceEvent::ServiceResolved`
-/// checks `tx.send(..).is_err()` to notice that and stop — every other event kind
-/// (in practice, an endless stream of `SearchStarted`) loops forever regardless,
-/// burning a thread's worth of CPU/network activity for the rest of the process's
-/// life. Confirmed live: `mdns: SearchStarted(...)` kept appearing throughout active
-/// game-streaming sessions, well after the menu (and its `App`) was long gone. The
-/// returned `ServiceDaemon` handle is `Clone` and lets a caller call `shutdown()`
-/// explicitly once discovery is no longer needed (see `App`'s `Drop` impl) — that
-/// unblocks the thread's `receiver.recv()` promptly instead of waiting on a lucky
-/// future resolution event. Every failure/event point here is logged via `tracing`,
-/// since this previously failed completely silently: a `ServiceDaemon::new()`/
-/// `browse()` error, or every non-`ServiceResolved` event, was just dropped with no
-/// trace, making "no hosts showed up" undiagnosable from the log alone (was it a
-/// permissions/socket failure, wrong interface, or genuinely nothing advertising?).
+/// Browse continuously; returns (Receiver, `ServiceDaemon`). Thread won't exit until `ServiceDaemon::shutdown()`
+/// called explicitly — mdns-sd's `SearchStarted` events loop forever. Failure points logged via tracing.
 pub fn browse() -> Option<(std::sync::mpsc::Receiver<DiscoveredHost>, ServiceDaemon)> {
     let (tx, rx) = std::sync::mpsc::channel();
     let daemon = ServiceDaemon::new()
@@ -61,8 +41,7 @@ pub fn browse() -> Option<(std::sync::mpsc::Receiver<DiscoveredHost>, ServiceDae
                         continue;
                     }
                 };
-                // IPv4 only, same policy as the other clients — the core dials
-                // `format!("{host}:{port}").parse::<SocketAddr>()` over IPv4.
+                // IPv4 only (same as other clients)
                 let Some(addr) = info
                     .get_addresses_v4()
                     .iter()

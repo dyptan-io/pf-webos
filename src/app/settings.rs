@@ -84,13 +84,7 @@ impl App {
         }
     }
 
-    /// Adjusts settings row `row` in memory (see `ui::adjust_setting`) — the
-    /// one place `Left`/`Right`/`Confirm` all funnel through. Not persisted
-    /// here; `handle_settings_event`'s `Back` arm saves once when the whole
-    /// Settings screen closes. For a `Toggle` row this also starts
-    /// `switch_anim`, capturing the value it's about to flip *from* so the
-    /// switch's render can slide the knob from there instead of snapping to
-    /// the new state.
+    /// Adjusts row in memory; persisted on `Back` (not per-keystroke). Starts `switch_anim` for toggle slides.
     pub(crate) fn apply_setting_adjust(&mut self, row: usize, forward: bool) {
         let toggled_from = match row {
             ui::ROW_HDR => Some(self.settings.hdr_enabled),
@@ -103,8 +97,7 @@ impl App {
             }
         }
     }
-    /// How many settings rows fit on screen at once, so the card scrolls instead of
-    /// overflowing a 1080p-class panel. Clamped to `[1, SETTINGS_ROW_COUNT]`.
+    /// Settings rows visible on screen (1080p card scrolls if needed).
     pub(crate) fn settings_visible_rows(screen_h: u32) -> usize {
         let stride = ui::SETTINGS_ROW_H + ui::SETTINGS_ROW_GAP as u32;
         // 200 header/footer padding (mirrors `settings_layout`) + 160 edge margin.
@@ -112,17 +105,14 @@ impl App {
         ((available / stride) as usize).clamp(1, ui::SETTINGS_ROW_COUNT)
     }
 
-    /// Moves the scroll offset just enough to keep `settings_focused` in view, and
-    /// marks the scroll indicator to show briefly if the position actually moved.
+    /// Scrolls `settings_focused` into view; updates scroll indicator.
     pub(crate) fn scroll_settings_into_view(&mut self, screen_h: u32) {
         let visible = Self::settings_visible_rows(screen_h);
         self.scroll
             .scroll_into_view(self.settings_focused, ui::SETTINGS_ROW_COUNT, visible);
     }
 
-    /// The settings modal's card/content rects — shared by `render` and mouse
-    /// hit-testing so they can never disagree. `content`'s height spans only the
-    /// visible row window (`settings_visible_rows`), not the full row list.
+    /// Settings card and content rects (shared by render and hit-test).
     pub(crate) fn settings_layout(screen_w: u32, screen_h: u32) -> (Rect, Rect) {
         let visible = Self::settings_visible_rows(screen_h);
         let content_h = visible as u32 * (ui::SETTINGS_ROW_H + ui::SETTINGS_ROW_GAP as u32);

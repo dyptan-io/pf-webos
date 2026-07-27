@@ -1,19 +1,15 @@
-//! Focus rings, selectable cards, and the game-grid poster card.
-//!
-//! Split out of the former single-file `ui.rs`; see `super`'s module docs.
+//! Focus rings, selectable cards, game-grid poster card.
 use super::*;
 use anyhow::Result;
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 use tiny_skia::Pixmap;
 
-/// A slight softening of moonlight-tv's near-square (~2px) tile radius.
+/// Card corner radius (softened from moonlight-tv's ~2px).
 pub const CARD_RADIUS: i32 = 10;
 pub const MODAL_RADIUS: i32 = 20;
 
-/// Approximates moonlight-tv's 102%/99% focus/press zoom (a real `transform_zoom`
-/// isn't worth a transform pipeline here) by inflating the drawn rect a few percent
-/// from its own center when focused.
+/// Approximate moonlight-tv's 2% focus zoom by inflating rect from center.
 pub fn inflate(rect: Rect, focused: bool) -> Rect {
     if !focused {
         return rect;
@@ -28,19 +24,12 @@ pub fn inflate(rect: Rect, focused: bool) -> Rect {
     )
 }
 
-/// A soft, real drop shadow (see [`Painter::fill_shadow`]) — matches the reference's
-/// shadowed-card look.
+/// Soft drop shadow matching moonlight-tv's card look.
 pub fn draw_card_shadow(painter: &mut Painter, rect: Rect, radius: i32) {
     painter.fill_shadow(rect, radius, 3.0, 5.0, SHADOW_BLUR, 0x60);
 }
 
-/// moonlight-tv's focus cue is an outline ring offset outward from the tile, not a
-/// filled/background change — bright accent blue, invisible unless focused. Two
-/// passes at increasing offset/decreasing alpha approximate a soft glow. Only
-/// `draw_poster_card` (game/Desktop grid selection) uses this — every other
-/// selectable row/button relies on [`draw_selectable`]'s zoom, focus-only card,
-/// and text-color change instead, per an explicit request to drop rings
-/// everywhere except game selection.
+/// Focus ring: outline offset outward (moonlight-tv style). Used only for game grid selection.
 pub fn draw_focus_ring(painter: &mut Painter, rect: Rect, radius: i32) {
     let passes = [(3, 0xff), (6, 0x60)];
     for (offset, alpha) in passes {
@@ -55,12 +44,7 @@ pub fn draw_focus_ring(painter: &mut Painter, rect: Rect, radius: i32) {
     }
 }
 
-/// Draws a plain surface card for a text-entry field (PIN/IP digit boxes) — always
-/// visible, so every slot reads as "a box you can fill in", not just the current
-/// one — shadow and `SURFACE` fill, zoom-inflated slightly when focused. Returns
-/// the (possibly zoom-inflated) rect actually drawn, so callers can center content
-/// inside it. Selectable rows/buttons use [`draw_selectable`] instead, which only
-/// paints the box when focused.
+/// Draw text-entry card (PIN/IP boxes); always visible, zoom when focused.
 pub fn draw_card(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
     let r = inflate(rect, focused);
     draw_card_shadow(painter, r, CARD_RADIUS);
@@ -68,10 +52,7 @@ pub fn draw_card(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
     r
 }
 
-/// Same card as [`draw_card`], but only painted when focused — an unfocused
-/// row/button has no background at all. Used by every selectable row/button
-/// (sidebar, Wake, confirm) except settings rows, which use
-/// [`draw_selectable_fixed`] instead (see its docs).
+/// Card painted only when focused (no background for unfocused). Used by rows/buttons.
 pub fn draw_selectable(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
     let r = inflate(rect, focused);
     if focused {

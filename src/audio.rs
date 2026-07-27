@@ -12,35 +12,15 @@ const SAMPLES_PER_FRAME: usize = 240;
 /// Max channels punktfunk ever negotiates (7.1) — sizes the scratch decode buffer.
 const MAX_CHANNELS: usize = 8;
 
-/// Requested SDL device buffer, in sample frames (~10.7ms at 48kHz). Left at
-/// `samples: None`, SDL2 picks "~46ms rounded up to a power of two"
-/// (`prepare_audiospec` in `SDL_audio.c`) — 4096 frames at 48kHz, ~85ms of built-in
-/// output latency before a single network/queue delay is even counted. 512 keeps a
-/// couple of 5ms audio frames of slack against main.rs's pump cadence while cutting
-/// that fixed latency by ~75ms. The obtained spec is logged at session start
-/// (main.rs), so what the driver actually granted is verifiable on-device.
+/// Device buffer: 512 frames keeps slack vs pump cadence, cuts latency by ~75ms.
+/// Obtained spec logged at session start for on-device verification.
 const DEVICE_BUFFER_FRAMES: u16 = 512;
 
-/// Soft ceiling on SDL-queued (pre-device) audio: above this, an incoming packet is
-/// **dropped** instead of queued, and the queue is allowed to drain at realtime.
-///
-/// This is the gentle half of the latency bound. The causes of a growing queue — a
-/// post-network-stall burst (punktfunk-core delivering its backlog at once) or slow
-/// host/TV sample-clock drift — both need *something* discarded, because a realtime
-/// stream never drains a standing queue on its own. Discarding one 5 ms packet is a far
-/// smaller artifact than [`MAX_QUEUED_LAG_MS`]'s full clear, and at 5 ms per drop the
-/// queue walks back down quickly.
-///
-/// This exists because the hard clear was audible: on-device logs showed five
-/// `audio resnapped` events in a few minutes of streaming, each one a ~100 ms silence —
-/// reported as intermittent crackling.
+/// Soft ceiling on SDL-queued audio: above this, drop packets to let queue drain.
+/// WHY: full clear at `MAX_QUEUED_LAG_MS` was audible (100ms silence). Drops are ~5ms.
 pub const SOFT_QUEUED_LAG_MS: u32 = 60;
 
-/// Hard bound on SDL-queued audio — a backstop, not the normal mechanism.
-///
-/// With [`SOFT_QUEUED_LAG_MS`] dropping packets above 60 ms this should now be
-/// unreachable in steady state; it stays as protection against a burst large enough to
-/// arrive between two pump ticks. Clearing costs one audible blip but restores sync.
+/// Hard bound: backstop against burst between pump ticks. Clear costs one audible blip.
 pub const MAX_QUEUED_LAG_MS: u32 = 100;
 
 /// What [`AudioPlayer::play`] did with a packet — reported so the caller can log the
@@ -68,9 +48,7 @@ pub struct AudioPlayer {
 }
 
 impl AudioPlayer {
-    /// `channels` is the host-resolved `NativeClient::audio_channels` (2/6/8) — the
-    /// client MUST build its decoder from this, never its own request (see
-    /// `punktfunk_core::client::NativeClient::audio_channels` docs).
+    /// `channels` is host-resolved (client MUST build decoder from this, not own request).
     pub fn new(sdl_audio: &sdl2::AudioSubsystem, channels: u8) -> Result<Self> {
         let layout = layout_for(channels, false);
         let decoder = opus::MSDecoder::new(SAMPLE_RATE, layout.streams, layout.coupled, layout.mapping)
@@ -98,26 +76,13 @@ impl AudioPlayer {
         self.queue.spec()
     }
 
-    /// Decodes one Opus packet (concealing any lost before it) and queues the PCM.
-    ///
-    /// `seq` is the packet's wire sequence. punktfunk's audio datagrams carry **no FEC**,
-    /// so a lost 5 ms packet used to play out as a hard gap — an audible click. Core ships
-    /// `AudioGapTracker` for exactly this ("shared by every platform decoder"); this client
-    /// was the one that never used it. Missing packets are now synthesized with libopus
-    /// packet-loss concealment (`decode_float` with empty input maps to a NULL data
-    /// pointer, which is libopus's PLC entry point) before the real packet is decoded,
-    /// turning clicks into an inaudible interpolation.
-    ///
-    /// Returns the decoded frame's peak absolute sample — diagnostic for telling "silent
-    /// input" from "output path not reaching the speaker" — and what happened to the
-    /// packet ([`AudioEvent`]).
+    /// Decodes Opus packet (with PLC for losses) and queues PCM.
+    /// Returns peak sample (diagnostic for silent input vs speaker failure) + `AudioEvent`.
     pub fn play(&mut self, seq: u32, opus_payload: &[u8]) -> Result<(f32, AudioEvent)> {
         let bytes_per_ms = SAMPLE_RATE / 1000 * self.channels as u32 * std::mem::size_of::<f32>() as u32;
         let queued = self.queue.size();
 
-        // An empty device queue means the audio device already ran dry — the gap has
-        // happened. Reported so a stall on the feeding thread is distinguishable from the
-        // over-full cases below; the two have opposite remedies.
+        // WHY: empty queue detects stall on feeding thread (opposite remedy from over-full).
         let underrun = queued == 0;
 
         if queued > bytes_per_ms * MAX_QUEUED_LAG_MS {
@@ -126,10 +91,7 @@ impl AudioPlayer {
             return Ok((0.0, AudioEvent::Resnapped));
         }
         if queued > bytes_per_ms * SOFT_QUEUED_LAG_MS {
-            // Dropped, but still fed to the decoder: Opus is a stateful codec, and
-            // skipping a packet outright would leave the decoder's state behind the
-            // stream and corrupt what follows. Decode, advance the gap tracker, discard
-            // the samples.
+            // WHY: decode anyway (stateful codec); skip would corrupt state and follow-up.
             let _ = self.gaps.missing_before(seq);
             let mut pcm = [0f32; SAMPLES_PER_FRAME * MAX_CHANNELS];
             let _ = self.decoder.decode_float(opus_payload, &mut pcm, false);

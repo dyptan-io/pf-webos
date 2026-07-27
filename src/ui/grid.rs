@@ -1,6 +1,4 @@
-//! Game-grid geometry: columns, card rects, hit testing, scroll extent.
-//!
-//! Split out of the former single-file `ui.rs`; see `super`'s module docs.
+//! Game-grid geometry: columns, rects, hit testing, scroll extent.
 use sdl2::rect::Rect;
 
 pub const GRID_PAD: i32 = 32;
@@ -8,10 +6,7 @@ pub const GRID_GAP: i32 = 24;
 pub const GRID_TOP_Y: i32 = 160;
 pub const CARD_MIN_W: u32 = 220;
 
-/// Extra vertical gap, on top of the normal `GRID_GAP`, inserted once between
-/// the pinned front block and the "rest" section below it — so pinned cards
-/// read as a visually separate group. `App::pinned_separator_rect` draws its
-/// thin divider centered in this gap.
+/// Extra gap between pinned and rest sections (makes pinned cards visually separate).
 pub const PINNED_SECTION_GAP: i32 = 32;
 
 /// `clamp(2, available_w / (min_card_w + gap), 5)` — moonlight-tv's own formula.
@@ -20,7 +15,7 @@ pub fn grid_columns(available_w: u32) -> usize {
     cols.clamp(2, 5) as usize
 }
 
-/// 3:4 portrait aspect, matching moonlight-tv's box-art tiles.
+/// Card size in 3:4 portrait aspect (moonlight-tv's box-art style).
 pub fn grid_card_size(available_w: u32, columns: usize) -> (u32, u32) {
     let usable = available_w.saturating_sub(2 * GRID_PAD as u32);
     let gaps = (columns as u32).saturating_sub(1) * GRID_GAP as u32;
@@ -38,9 +33,7 @@ pub fn grid_card_rect(index: usize, columns: usize, grid_x: i32, available_w: u3
     Rect::new(x, y, card_w, card_h)
 }
 
-/// `scroll` is the grid's current vertical scroll offset in px (see
-/// `App::grid_scroll`) — card rects live in unscrolled layout space, so the
-/// pointer's y is translated into that space before testing.
+/// Hit test grid card (translate pointer Y to unscrolled layout space).
 pub fn hit_test_grid_card(
     mouse_x: i32,
     mouse_y: i32,
@@ -56,13 +49,10 @@ pub fn hit_test_grid_card(
     (0..count).find(|&i| grid_card_rect(i, columns, grid_x, available_w).contains_point((mouse_x, mouse_y + scroll)))
 }
 
-/// Headroom above/below the card rows inside the cached grid layer (see
-/// `App::grid_layer`), so row 0's shadow and the last row's shadow tail have
-/// somewhere to land instead of clipping at the layer edge.
+/// Headroom for card shadows in cached grid layer (prevents clipping).
 pub const GRID_LAYER_PAD: i32 = 24;
 
-/// Total pixel height of the cached grid layer for `count` cards: all rows plus
-/// the shadow headroom above and below.
+/// Cached grid layer height (all rows + shadow headroom).
 pub fn grid_layer_height(count: usize, columns: usize, available_w: u32) -> u32 {
     let rows = count.div_ceil(columns.max(1));
     let (_, card_h) = grid_card_size(available_w, columns);

@@ -8,7 +8,7 @@ use sdl2::rect::Rect;
 use sdl2::ttf::Font;
 use tiny_skia::Pixmap;
 
-// ------------------------------------------------------------------ GPU tiles --
+// ---------------------------------GPU tiles-----------------------------------
 // The compositor path (see `compositor.rs` + `App::prepare_tiles`): widgets are
 // rasterized by tiny-skia into standalone padded tiles ONCE (keeping the AA/soft
 // shadow look), then composed per frame by the GPU — position, scroll, the focus
@@ -18,9 +18,7 @@ use tiny_skia::Pixmap;
 /// blur 14) fits inside the tile instead of clipping at its edge.
 pub const CARD_TILE_PAD: i32 = 20;
 
-/// One grid card pre-composited into its own padded transparent tile, drawn
-/// unfocused — the focused look is the GPU scaling this same tile up slightly
-/// plus the shared [`render_focus_ring_tile`] composited over it.
+/// Grid card as padded tile (unfocused). GPU scales + composites focus ring.
 pub fn render_card_tile(
     text_cache: &mut TextCache,
     fonts: &Fonts,
@@ -72,8 +70,7 @@ pub fn spinner_frames() -> &'static [SpinnerFrame] {
             let (w, h) = frame.buffer().dimensions();
             let (numer, denom) = frame.delay().numer_denom_ms();
             let raw_delay = numer.checked_div(denom).unwrap_or(0);
-            // Clamp ultra-fast or unset delays to ~30 FPS (33 ms) so the
-            // animation stays smooth without busy-looping the render thread.
+            // WHY: clamp to ~30 FPS min to avoid busy-looping the render thread.
             let delay_ms = if raw_delay < 20 { 33 } else { raw_delay };
             let delay = std::time::Duration::from_millis(u64::from(delay_ms));
             let pixels = frame.into_buffer().into_raw();
@@ -123,9 +120,7 @@ pub fn spinner_frame_at(phase: f32) -> (usize, &'static SpinnerFrame) {
 /// sits 6px out + stroke width).
 pub const FOCUS_RING_PAD: i32 = 12;
 
-/// The focus-ring glow for a `(w, h)` card, in its own transparent tile — one
-/// shared tile serves every card (they're all the same size), scaled by the GPU
-/// together with the focused card and faded in via texture alpha.
+/// Focus-ring glow as shared tile (all cards same size). GPU scales + fades.
 pub fn render_focus_ring_tile(w: u32, h: u32) -> Painter {
     let pad = FOCUS_RING_PAD;
     let mut p = Painter::new(w + 2 * pad as u32, h + 2 * pad as u32);
@@ -137,9 +132,7 @@ pub fn render_focus_ring_tile(w: u32, h: u32) -> Painter {
 /// card's top-right corner (see `Tile::PinBadge`).
 pub const PIN_BADGE_SIZE: u32 = 28;
 
-/// The pinned badge: a dark backing disc (for contrast over bright cover art)
-/// with a muted `ICON_PIN` glyph on top. Only ever drawn on a card that *is*
-/// pinned, so there's a single shared tile, like `render_focus_ring_tile`.
+/// Pinned badge: dark disc with PIN icon. Single shared tile.
 pub fn render_pin_badge_tile(text_cache: &mut TextCache, icon_font: &Font) -> Result<Painter> {
     let d = PIN_BADGE_SIZE;
     let mut p = Painter::new(d, d);
@@ -151,21 +144,11 @@ pub fn render_pin_badge_tile(text_cache: &mut TextCache, icon_font: &Font) -> Re
     Ok(p)
 }
 
-/// Transparent padding around a focused-row tile, generous enough for a
-/// row's shadow bleed (~20px) plus, for rows that still bake their own ~2%
-/// inflate (sidebar rows — see [`draw_selectable`]), that growth too.
-/// Settings rows animate their zoom via GPU scale instead (see
-/// [`draw_selectable_fixed`]) and so don't need the second allowance, but
-/// share this same constant for simplicity.
+/// Padding for row tile shadow + sidebar inflate. Settings rows use GPU scale.
 pub const ROW_TILE_PAD: i32 = 28;
 
-/// Sidebar row `index`, focused, as its own padded transparent tile — composited
-/// by the GPU over the focus-free sidebar layer. Mirrors `draw_sidebar`'s row
-/// order (hosts, "+ Add host", bottom-pinned "Settings"); all three row kinds
-/// share one rect size, so the tile dimensions are constant.
-/// `menu_focused` picks out the row's ⋯ actions button instead of the row body: both
-/// states reuse this one tile (the row still renders focused either way), so moving
-/// between a host and its actions button costs one small re-rasterize, not a modal.
+/// Focused sidebar row as padded tile. `menu_focused` flags the actions button.
+/// Both button states reuse one tile; moving between them costs one re-rasterize.
 pub fn render_focused_row_tile(
     text_cache: &mut TextCache,
     fonts: &Fonts,
@@ -229,24 +212,14 @@ pub fn render_wrapped_text_tile(
 /// bunch once all four counters hit multiple digits.
 pub const STATS_OVERLAY_REF_LINE: &str = "Drop 99  FEC 99  hold yes  buf 99";
 
-/// The in-stream stats overlay panel: a translucent brand-dark rounded card with
-/// one line of text per stat, plus a small Green-button hint pinned to the
-/// bottom in a dimmer, smaller caption font. Rebuilt at the overlay's ~2Hz
-/// refresh with a THROWAWAY `TextCache` — the numeric lines change every
-/// refresh, so a persistent cache would only accumulate dead entries for the
-/// whole stream's duration.
-///
-/// Width is FIXED — measured from `STATS_OVERLAY_REF_LINE` plus a safety margin,
-/// not from the live content — so the right-anchored panel keeps a constant left
-/// edge instead of jittering horizontally as the numbers change digit count.
-/// Lines are ellipsized to the inner width as a further safety, so an unexpectedly
-/// long line can never overflow the card. `lines[0]` (the mode/codec header) is
-/// the only one that pops; the rest are muted.
+/// In-stream stats overlay: translucent card with stat lines + Green-button hint.
+/// Width is FIXED (measured from `STATS_OVERLAY_REF_LINE`) so panel doesn't jitter
+/// as numbers change digit count. `lines[0]` is highlighted; rest muted.
 pub fn render_stats_overlay_tile(font: &Font, caption_font: &Font, lines: &[String], hint: &str) -> Result<Painter> {
     let pad = 18i32;
-    let safety = 16u32; // extra slack past the reference width, so nothing touches the edge
+    let safety = 16u32;
     let line_h = font.height() + 6;
-    let hint_h = caption_font.height() + 8; // includes a gap above it
+    let hint_h = caption_font.height() + 8;
     let inner_w = font.size_of(STATS_OVERLAY_REF_LINE).map_or(0, |(w, _)| w) + safety;
     let w = inner_w + 2 * pad as u32;
     let h = (lines.len() as i32 * line_h + hint_h + 2 * pad) as u32;
@@ -265,13 +238,9 @@ pub fn render_stats_overlay_tile(font: &Font, caption_font: &Font, lines: &[Stri
     Ok(p)
 }
 
-/// The Stop/Cancel button pair — shared by the shell and the
-/// focused-button tile (`render_confirm_button_tile`), so their
-/// `ConfirmButton` data can't drift apart.
+/// Stop/Cancel button pair for shell and focused-button tile.
 pub fn disconnect_dialog_buttons() -> [ConfirmButton<'static>; 2] {
     [
-        // Echoes the question's own verb ("Stop streaming?"), the same way the Forget
-        // confirmation's button echoes its title.
         ConfirmButton {
             icon: Some(ICON_CLOSE),
             label: "Stop streaming",
@@ -285,17 +254,9 @@ pub fn disconnect_dialog_buttons() -> [ConfirmButton<'static>; 2] {
     ]
 }
 
-/// The disconnect dialog's card rect and its button row's rect — the one
-/// place this layout lives, shared by `render_disconnect_dialog_shell` and
-/// `main.rs` (which needs the button rect, without drawing, to position the
-/// focused-button tile).
+/// Disconnect dialog card + button row rects (shared with main.rs for layout).
 pub fn disconnect_dialog_layout(screen_w: u32, screen_h: u32, font_label: &Font) -> (Rect, Rect) {
-    // Wide enough for the buttons' own labels, and never narrower than the 34%
-    // this has always been. The labels are real words at a font size that scales
-    // with the panel, while 34% of the screen knows nothing about either — which
-    // is how "Stop streaming" ended up ellipsized here at 1080p but not at 4K.
-    // Capped at 90% so a hypothetical very long label still leaves a margin
-    // rather than running to the screen edges.
+    // Width: at least 34%, enough for button labels, capped at 90% for margin.
     let needed = confirm_row_min_width(font_label, &disconnect_dialog_buttons()) + 64;
     let frac = (needed as f32 / screen_w.max(1) as f32).clamp(0.34, 0.90);
     let card = modal_card_rect(screen_w, screen_h, frac, 200);
@@ -308,14 +269,8 @@ pub fn disconnect_dialog_layout(screen_w: u32, screen_h: u32, font_label: &Font)
     (card, content)
 }
 
-/// The in-stream disconnect-confirmation dialog's shell: card, title, and
-/// both confirm buttons unfocused — full-screen sized like `App`'s
-/// `Tile::Modal` so `main.rs` can place it at `(0, 0)`. No backdrop dim baked
-/// in — `main.rs` draws that as its own compositor `Fill`, same as
-/// `App::draw_list` scrims `Tile::Modal`. The actually focused button
-/// composites on top as its own small, zoom-animated tile (see
-/// `render_confirm_button_tile`) — same shell/focus-tile split as every other
-/// modal in the app.
+/// Disconnect dialog shell (full-screen): card + title + unfocused buttons.
+/// Focused button composites on top as own small tile (shell/focus-tile split).
 pub fn render_disconnect_dialog_shell(screen_w: u32, screen_h: u32, fonts: &Fonts) -> Result<Painter> {
     let mut p = Painter::new(screen_w, screen_h);
     let mut tc = TextCache::new();

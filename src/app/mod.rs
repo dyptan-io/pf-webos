@@ -1,8 +1,5 @@
-//! The pre-stream UI flow: a persistent Home screen (sidebar of known hosts +
-//! detail grid of the selected host's games) with Pairing/Settings/Add-host as
-//! centered modals on top of it — modeled on moonlight-tv's actual layout (see
-//! `ui.rs`'s module docs). `ui.rs` owns drawing/input-mapping primitives,
-//! `store.rs` owns persistence, `discovery.rs` owns mDNS.
+//! Pre-stream UI: Home screen (sidebar + game grid) with modals (Pairing/Settings/Add-host).
+//! `ui.rs` owns drawing/input-mapping, `store.rs` owns persistence, `discovery.rs` owns mDNS.
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -34,242 +31,106 @@ pub enum Screen {
     Pairing,
     Settings,
     AddHost,
-    /// "This configured host is unreachable — send it a Wake-on-LAN signal?" — see
-    /// `WakeState`'s docs.
     Wake,
-    /// "Forget this host?" — a centered Forget/Cancel confirmation, reached from
-    /// `HostMenu`. Which host is `App::host_menu_index`.
     ForgetHost,
-    /// Per-host actions (connect / pair / speed test / wake / edit / forget), opened
-    /// by a long-press of OK on a sidebar host row (see `main.rs`'s hold-timer).
-    /// This is the extension point for anything new that acts on one host — adding
-    /// an action is one row in `App::host_menu_rows` plus one arm in
-    /// `App::confirm_host_menu_row`. Which host is `App::host_menu_index`.
     HostMenu,
-    /// Editing an existing host's address (`HostMenu` -> "Edit host"), sharing the
-    /// add-host entry widget. Which host is `App::edit_host_index`.
     EditHost,
-    /// About & licenses — the build version, this app's licence, and the generated
-    /// third-party notices. Reached from Settings.
     About,
-    /// Per-host network speed test (`HostMenu` -> "Test network speed"), measuring over
-    /// the real data plane. See `app::speedtest`.
     SpeedTest,
-    /// Per-host Wake-on-LAN settings (`HostMenu` -> the ⋯ on "Wake host"), currently
-    /// just the auto-send toggle. Which host is `App::host_menu_index`, same as the
-    /// menu it opens from. See `app::wakesettings`.
     WakeSettings,
-    /// "You can only pin 5 games" — a single-OK-button alert, reached from Home
-    /// when `App::toggle_focused_pin` hits `store::MAX_PINNED_GAMES`. See `app::pinlimit`.
     PinLimit,
 }
 
-/// What the pairing modal's input is aimed at: the PIN digit row, or the
-/// "Request access" (no-PIN, approve-on-host) button below it. The digit row
-/// consumes all four arrows (Left/Right move between digits, Up/Down spin the
-/// value), so the button is reached by tabbing Right past the last digit, by the
-/// Magic Remote pointer, or by the Secondary shortcut — see `handle_pairing_event`.
+/// Pairing modal's focused input: PIN row or "Request access" button.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PairingFocus {
     Pin,
     RequestAccess,
 }
 
-/// Rows of cards kept rasterized beyond the viewport in each direction. Small enough to
-/// bound memory, large enough that a d-pad row step or a wheel notch lands on a card that
-/// is already built.
+/// Rows beyond viewport kept rasterized (prevents scroll stalls).
 const CARD_PREFETCH_ROWS: i32 = 2;
-/// Rows beyond which a built tile is dropped. Deliberately larger than
-/// `CARD_PREFETCH_ROWS` — the hysteresis is what stops a card oscillating between built
-/// and evicted when the scroll position sits right on a boundary.
+/// Rows beyond which tiles are dropped. Hysteresis prevents eviction oscillation.
 const CARD_KEEP_ROWS: i32 = 5;
-/// Card tiles rasterized *and uploaded* per frame.
-///
-/// This is the fix for a large library freezing the client. The previous code built every
-/// tile in the library in a single pass the moment the grid went dirty: at 1080p a card is
-/// ~260x346, so a 365-title library meant ~366 tiny-skia rasterizations and ~366 GPU
-/// texture uploads back to back, plus ~169 MB of `Pixmap` retained — in a 32-bit process
-/// on a TV with under 2 GB usable. Spreading the work keeps every frame bounded; cards
-/// outside the window are simply not drawn (`Compositor::execute` skips a tile with no
-/// texture), so they appear as they are built rather than blocking the UI.
-///
-/// Only bounds the visible+prefetch window (a few dozen tiles), not the whole library, so
-/// it can be much higher than the original whole-library concern without reintroducing
-/// the freeze.
-///
-/// Lowered from 2 to 1 after on-device telemetry (`TELEMETRY=auto`) during the loading
-/// spinner showed `prepare_tiles` costing 60-165ms per tick — several times the ~33ms the
-/// spinner's own GIF frame needs — with the cost squarely in `render_card_tile`'s text
-/// rasterization (cold `TextCache`/`FreeType`, expensive on this armv7 softfloat target,
-/// not the windowed bookkeeping around it). One card per tick roughly halves the
-/// worst-case stall at the cost of taking twice as many ticks to fill the window.
+/// Cards rasterized per frame. Lowered from 2→1 due to text rasterization cost
+/// (cold TextCache/FreeType on armv7 softfloat). Bounds memory and keeps frame time steady.
 const CARD_BUILD_BUDGET: usize = 1;
 
-/// How long the loading spinner waits for the whole window to become art-ready before
-/// revealing anyway — a fetch that fails (rather than being merely slow) never becomes
-/// ready, so this is what stops `grid_reveal_ready` from blocking forever.
+/// Loading spinner timeout: failed fetches never become ready, so cap the wait.
 const SPINNER_MAX_WAIT: Duration = Duration::from_millis(900);
 
-/// How much the grid's focused card (and its ring) grows during
-/// `ui::FOCUS_POP` — see `ui::zoom_rect`.
 pub(crate) const CARD_GROWTH: f32 = 0.028;
-/// How much the launched card grows over `ui::LAUNCH_FADE` — same `zoom_rect`
-/// technique as `CARD_GROWTH`, just a bigger scale for the launch flourish.
 pub(crate) const LAUNCH_GROWTH: f32 = 3.5;
-/// Inset from the focused card's top-right corner for the pin-state badge.
 const PIN_BADGE_MARGIN: i32 = 10;
-/// How long a pin/unpin toggle's fly-to-new-position animation runs — see
-/// `App::pin_move_anim`.
 pub(crate) const PIN_MOVE_ANIM: Duration = Duration::from_millis(380);
-/// How long a card's zoom-in runs when it first appears — see
-/// `CardTile::pop_since`.
 pub(crate) const CARD_POP: Duration = Duration::from_millis(300);
-/// How far below full size a card starts that zoom-in — see `ui::pop_in_rect`.
 pub(crate) const CARD_POP_SHRINK: f32 = 0.14;
-/// How long a modal's fade/slide-in runs.
 pub(crate) const MODAL_FADE: Duration = Duration::from_millis(170);
-/// How long a scroll indicator (Settings' row list, About's document, ...) stays
-/// at full opacity after a scroll before fading out.
 pub(crate) const SCROLL_INDICATOR_HOLD: Duration = Duration::from_millis(700);
-/// How long the indicator's fade-out takes once `SCROLL_INDICATOR_HOLD` elapses.
 pub(crate) const SCROLL_INDICATOR_FADE: Duration = Duration::from_millis(350);
-/// Total lifetime of one scroll indicator appearance — hold, then fade to gone.
 pub(crate) const SCROLL_INDICATOR_LIFETIME: Duration =
     Duration::from_millis(SCROLL_INDICATOR_HOLD.as_millis() as u64 + SCROLL_INDICATOR_FADE.as_millis() as u64);
-/// A few px wider than the indicator's track so its rounded caps aren't clipped.
+/// Wider than track for rounded caps not to clip.
 const SCROLL_INDICATOR_TILE_W: u32 = 10;
 
-/// Wrapped-visual-lines worth of the About document baked into one content
-/// tile at a time (see `ui::ContentWindow`) — comfortably more than one
-/// screenful in each direction so ordinary scrolling almost never triggers a
-/// rebuild, while staying well under any plausible GLES2 max-texture-height
-/// for this content's pixel width. Each rebuild renders every line in the
-/// window uncached (`ui::draw_about_window` — see its docs on why), so this
-/// is also a direct knob on how long one rebuild's hitch runs; kept smaller
-/// than a "whole screen of slack" budget would otherwise be, so a rebuild
-/// stays a brief blip rather than a rasterize-120-lines stall.
+/// About document window size (lines). Balances GPU texture height limit vs rebuild hitch.
 const ABOUT_WINDOW_BUDGET: usize = 80;
-/// How close to the baked window's edge (in visual lines) the scroll position
-/// must get before the window re-centers around it.
+/// Margin (lines) before recentering the baked window.
 const ABOUT_WINDOW_MARGIN: usize = 16;
 
-/// The pairing modal's subtitle — pulled out to a constant since both
-/// `render_pairing` (drawing it) and `Self::pairing_pin_row_y` (measuring its
-/// wrapped height, without drawing, to position the PIN row) need the exact
-/// same string.
+/// Pairing modal subtitle (also used for height measurement).
 pub(crate) const PAIRING_SUBTITLE: &str = "Two ways to pair with this host — either one works.";
 
-/// Shared card width for the four simple confirmation-style modals (Pairing,
-/// `AddHost`, Wake, `ForgetHost`) — they used to each pick their own width
-/// too (0.34-0.46 of screen width), which read as an inconsistent set of
-/// window sizes popping up over Home. Height is deliberately *not* shared:
-/// each of the four fits its own card to its own content (see
-/// `pairing_card_rect`'s docs) rather than guessing one height that has to
-/// fit all four (a fixed guess is exactly what clipped Wake's buttons once
-/// its content changed). Settings is not one of these four at all: its row
-/// list is real, variable content that needs the room, not a single
-/// confirmation.
+/// Shared width for Pairing/AddHost/Wake/ForgetHost (consistent window sizing).
 pub(crate) const SIMPLE_MODAL_WIDTH_FRAC: f32 = 0.40;
 
-/// How often the magic packet is re-sent while a wake is in flight, and — the same
-/// moment, for a silent auto-send — how long it stays silent before showing the wake
-/// prompt: a minute of retrying without the host coming back is the point at which the
-/// user should be looking at it rather than at an unexplained grid. See `App::tick_wake`.
+/// WOL packet resend interval; silent-mode timeout before showing prompt.
 pub(crate) const WAKE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
-
-/// How often `App::tick_wake` actively re-checks reachability, independent of the WOL
-/// timers above and of whether a MAC is even on record.
+/// Reachability recheck interval (independent of WOL timers).
 pub(crate) const WAKE_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 
-/// State for the "configured host is unreachable — wake it?" flow: both the interactive
-/// prompt (`Screen::Wake`) and the silent background wait behind an auto-send live here,
-/// distinguished by `silent`. Entered from `App::start_wake` whenever a known/paired
-/// host's library fetch fails as genuinely unreachable, replacing the old plain grid
-/// error message in every case — even with no MAC on record, where `render_wake` just
-/// hides the send controls instead.
-///
-/// Whether the packet goes out silently is `KnownHost::wol_auto`, edited per host from
-/// the host menu's Wake row (⋯ → `Screen::WakeSettings`). It used to be a global
-/// `Settings` flag toggled *inside this prompt*, which meant the only way to reach the
-/// setting was to have a host fail on you first.
+/// Wake-on-LAN flow state: both interactive prompt and silent background wait.
 pub struct WakeState {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) name: String,
     pub(crate) mac: Vec<String>,
-    /// The original library error, restored into `home_status` if the user backs out
-    /// without sending — so declining the prompt looks exactly like it did before this
-    /// flow existed.
+    /// Original library error, restored on back-out.
     pub(crate) reason: String,
-    /// Focus on the modal: `0` = the "Wake host" button, `1` = "Cancel" (see
-    /// `render_wake`, mirroring `Screen::ForgetHost`'s shell/buttons split).
     pub(crate) focused: usize,
-    /// Whether a packet has gone out for the current wait window.
     pub(crate) sent: bool,
-    /// How many magic packets have actually gone out for this wait (the initial send
-    /// plus `tick_wake`'s resends) — only shown, in `wake_home_status`, so a silent
-    /// wait visibly progresses instead of sitting on one unchanging line.
+    /// Packet count; shown so silent wait visibly progresses.
     pub(crate) attempts: u32,
-    /// When the current wait window started (its first send).
     pub(crate) since: Option<Instant>,
-    /// When the last magic packet went out — drives both the resend and, for a silent
-    /// wait, the moment the prompt appears (one `WAKE_RETRY_INTERVAL`, same clock).
     pub(crate) last_attempt: Option<Instant>,
-    /// `true` while this wait is running quietly because `KnownHost::wol_auto` fired it
-    /// with no prompt shown. `App::tick_wake` flips it (and shows the prompt) once
-    /// `WAKE_RETRY_INTERVAL` has passed since the last packet with the host still
-    /// unreachable — once shown, it stays shown-or-dismissed rather than re-popping.
+    /// `true` while running silently (auto-send before prompt shown).
     pub(crate) silent: bool,
-    /// When the last active reachability probe went out — see `App::tick_wake`.
     pub(crate) last_probe: Option<Instant>,
-    /// An in-flight reachability probe, if one is currently out.
     pub(crate) probe_rx: Option<std::sync::mpsc::Receiver<crate::library::GamesLoaded>>,
 }
 
-/// Which pane of Home currently has focus, and where within it.
+/// Home screen focus location.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum HomeFocus {
-    /// Index into the sidebar: `0..entries.len()` are host rows,
-    /// `entries.len()` is "+ Add host", `entries.len() + 1` is "Settings".
     Sidebar(usize),
-    /// The ⋯ actions button on host row `usize` (always a host row — the utility rows
-    /// have no actions button). Reached by pressing Right on the row; Right again
-    /// continues to the grid, Left returns to the row. This replaced a hold-OK gesture:
-    /// the actions existed but nothing on screen advertised them.
     SidebarMenu(usize),
-    /// Index into the grid, not a plain offset into `games` — the pinned front
-    /// block (pinned games, plus "Desktop" if it's pinned too) occupies whole
-    /// rows on its own, so the index skips over any empty padding after a
-    /// partial pinned row before the "rest" section resumes (see
-    /// `App::grid_card_at`).
     Grid(usize),
 }
 
-/// What's shown at a grid index — either the fixed "Desktop" card or a game.
-/// Both are pinnable (see `store::DESKTOP_PIN_ID`); see `App::grid_card_at`.
+/// Grid card: Desktop or game (both pinnable).
 pub(crate) enum GridCard<'a> {
     Desktop,
     Game(&'a GameEntry),
 }
 
-/// One rasterized grid card, with the clock for its zoom-in.
+/// Rasterized grid card with its zoom-in clock.
 pub(crate) struct CardTile {
     pub(crate) tile: Painter,
-    /// When this card started zooming up to full size. Cards land a few per tick
-    /// as their art arrives (`CARD_BUILD_BUDGET`), so each runs its own clock and
-    /// a filling grid ripples in. `None` behind the loading spinner — nothing
-    /// built there is visible yet, so `prepare_tiles` stamps them all together
-    /// when `grid_reveal_ready` flips.
+    /// When card started zooming in. `None` while behind loading spinner.
     pub(crate) pop_since: Option<Instant>,
 }
 
-/// The Home grid's shape at one column count: the pinned front block leads
-/// (pinned games, preceded by "Desktop" when it's pinned too), then the "rest"
-/// (unpinned "Desktop", then unpinned games). The front block owns whole rows,
-/// so a partial last row leaves empty padding — indices in it map to no card at
-/// all — and the rest resumes at `unpinned_start`. Built by `App::grid_layout`;
-/// takes `games` per call so callers can hold it across a `&mut self` borrow of
-/// an unrelated field.
+/// Grid layout shape: pinned block (owns whole rows) + rest section (padding-aware).
 #[derive(Clone, Copy)]
 pub(crate) struct GridLayout {
     pinned_count: usize,
@@ -307,8 +168,7 @@ impl GridLayout {
         games.get(self.pinned_count + rest_pos).map(GridCard::Game)
     }
 
-    /// `card_at`, keeping only real games — `None` for "Desktop" as well as for
-    /// padding, since neither has cover art or a `games` entry.
+    /// Like `card_at` but only games (not Desktop or padding).
     pub(crate) fn game_at<'a>(&self, games: &'a [GameEntry], idx: usize) -> Option<&'a GameEntry> {
         match self.card_at(games, idx)? {
             GridCard::Game(g) => Some(g),
@@ -329,52 +189,35 @@ impl GridLayout {
     }
 }
 
-/// What the user picked to stream to, once they confirm a grid card.
+/// Stream connection target.
 pub struct ConnectTarget {
     pub host: String,
     pub port: u16,
     pub fingerprint: [u8; 32],
-    /// A library entry's id (`"steam:570"`) to launch into, or `None` for a plain
-    /// desktop session — see `crate::library`.
+    /// Library entry id to launch, or `None` for desktop.
     pub launch: Option<String>,
 }
 
-/// A grid-card confirm that's still waiting on its pre-flight reachability check
-/// before actually handing its `ConnectTarget` off to start a stream — see
-/// `App::confirm_grid_card`/`App::drain_launch_check`.
+/// Pending launch awaiting pre-flight reachability check.
 pub(crate) struct PendingLaunch {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) fingerprint: [u8; 32],
     pub(crate) launch: Option<String>,
-    /// The card's display title ("Desktop" or the game's), for the status bar —
-    /// resolving it here keeps `drain_launch_check` off the grid geometry it would
-    /// otherwise need (a column count) just to name the thing it's starting.
     pub(crate) title: String,
     pub(crate) rx: std::sync::mpsc::Receiver<crate::library::GamesLoaded>,
-    /// The confirmed card, so `launch_anim` zooms the right one even if focus
-    /// has since moved elsewhere on the grid.
+    /// Card index for `launch_anim`.
     pub(crate) idx: usize,
 }
 
-/// An open dropdown on the settings modal — `row` is the settings row index that
-/// opened it (`ui::ROW_RESOLUTION`/`ui::ROW_FRAMERATE`/`ui::ROW_VIDEO_BACKEND`/
-/// `ui::ROW_CODEC`/`ui::ROW_AUDIO`), `focused` is the highlighted option within
-/// `ui::dropdown_options(settings, row)`.
+/// Open dropdown on settings modal.
 pub struct DropdownState {
     pub row: usize,
     pub focused: usize,
 }
 
-/// What each modal's shell (every widget drawn unfocused, see `modal_tile`'s
-/// docs) actually depends on — a value change invalidates it, but a pure
-/// focus move must not, or the shell re-rasterizes (screen-sized) on every
-/// single d-pad press regardless of the zoom-pop this whole mechanism exists
-/// to make cheap. One enum since only one modal is ever open at a time.
-/// Deliberately excludes whichever field only the *focused* widget's own
-/// `ModalFocusKey` tracks (e.g. Settings excludes `settings_focused` itself,
-/// the dropdown's focused option, Pairing excludes `pin_digit_index`) — moving
-/// focus there is `modal_focus_tile`'s job, not this one's.
+/// Each modal's shell content keys. Value changes invalidate the shell;
+/// pure focus moves don't (that's `ModalFocusKey`'s job).
 #[derive(PartialEq)]
 pub(crate) enum ModalShellKey {
     Settings {
@@ -398,22 +241,12 @@ pub(crate) enum ModalShellKey {
         name: Option<String>,
         hover_close: bool,
     },
-    /// The row list is derived purely from the host entry, so its identity plus the
-    /// row count is enough to know the shell's pixels — the focused row is tracked
-    /// separately by `ModalFocusKey::MenuRow`.
     HostMenu {
         name: String,
         subtitle: String,
         rows: usize,
         hover_close: bool,
     },
-    /// The document itself never changes, and its scroll position no longer lives
-    /// in this shell at all — the body is its own `Tile::ScrollContent(Screen::About)`
-    /// tile, cropped/positioned by the GPU same as Settings' row list. So this shell
-    /// is invalidated only by the same thing every other shell already excludes
-    /// focus/scroll for: nothing screen-specific here at all.
-    /// One toggle whose state is the only thing on the card that can change (the
-    /// title names the host, which can't change while this is open).
     WakeSettings {
         title: String,
         auto: bool,
@@ -428,51 +261,28 @@ pub(crate) enum ModalShellKey {
     },
 }
 
-/// Identifies whichever single widget `App::modal_focus_tile` currently holds
-/// — every modal screen (Settings/Wake/Pairing/ForgetHost) has exactly one
-/// focused, zoom-animated widget at a time, and only one modal is ever open at
-/// once, so one key type + one tile slot covers all of them instead of a
-/// separate copy of this machinery per modal. Each variant carries whatever
-/// that modal's focused widget's content actually depends on, so a value
-/// change on it (not just a focus move) invalidates the tile too — e.g.
-/// `SettingsRow` carries the whole `Settings` snapshot so dragging the
-/// bitrate slider updates live (see the settings-focus-tile bug this fixed).
+/// Focused widget in the open modal. Each variant carries its content,
+/// so value changes (not just focus moves) invalidate the tile.
 #[derive(PartialEq)]
 pub(crate) enum ModalFocusKey {
     SettingsRow(usize, Settings),
-    /// `Screen::WakeSettings`' auto-send switch, carrying its state so flipping it
-    /// re-bakes the tile.
     WakeToggle(bool),
     WakeButton(usize),
     PairingDigit(usize, u8),
     PairingButton,
     ForgetButton(usize),
-    /// The speed test's focused button. Carries its label because the primary button's
-    /// text is derived from the measurement — and because a bare index would compare
-    /// equal to `ForgetButton`'s, letting a stale tile survive a screen change.
+    /// Carries label to prevent stale tiles across screen changes.
     SpeedTestButton(usize, String),
-    /// Any `ListModal`-based screen's focused row. Carries the row's label as well as
-    /// its index so a row list that changes shape under a fixed index (e.g. "Wake
-    /// host" appearing once a MAC is learned) still invalidates the tile, plus whether
-    /// focus is on the row's ⋯ button rather than its body (the tile draws that
-    /// highlight, so it isn't a mere focus move — see `FocusRow::menu`).
+    /// Carries label+menu flag for row list shape changes and ⋯ state.
     MenuRow(usize, String, bool),
 }
 
-/// What invalidates whichever modal's `Tile::ScrollContent(Screen)` is currently
-/// baked (see `App::scroll_content_tile`) — one variant per screen that has
-/// overflowing content. Paired with its `Screen` in the tile's staleness key, so
-/// switching between two scrollable modals always rebuilds (there's only ever
-/// one baked content tile, same "one modal open at a time" rationale as
-/// `ModalFocusKey`).
+/// Scrollable modal content keys. Paired with Screen for staleness checks.
 #[derive(Clone, PartialEq)]
 pub(crate) enum ScrollContentKey {
-    /// Settings' row list — the whole `Settings` snapshot plus which row's
-    /// dropdown (if any) is open, mirroring `ModalFocusKey::SettingsRow`.
+    /// Settings row list + open dropdown row.
     Settings(Settings, Option<usize>),
-    /// About's document window — the wrapped-line index its content tile
-    /// currently starts at (see `ui::ContentWindow`). The document itself
-    /// never changes, so this is the only thing that invalidates it.
+    /// About window's start line.
     About(usize),
 }
 
@@ -480,65 +290,34 @@ pub struct App {
     pub screen: Screen,
     pub known_hosts: Vec<KnownHost>,
     pub discovered: std::sync::mpsc::Receiver<crate::discovery::DiscoveredHost>,
-    /// `None` if `discovery::browse` couldn't even start (`ServiceDaemon::new` failed —
-    /// `discovered` is then a permanently-empty channel, harmless for `drain_discovery`'s
-    /// `try_recv` loop). `Some` lets `Drop` shut the background mDNS thread down explicitly
-    /// instead of relying on `discovered` being dropped — dropping the receiver alone doesn't
-    /// reliably stop it (see `discovery::browse`'s docs), and it was confirmed still burning
-    /// CPU/network well into active game-streaming sessions, long after this `App` was gone.
+    /// `None` if mDNS daemon didn't start. `Some` lets Drop shut it down explicitly.
     pub(crate) discovery_daemon: Option<mdns_sd::ServiceDaemon>,
     pub entries: Vec<HostEntry>,
     pub home_focus: HomeFocus,
-    /// The sidebar host whose games are shown in the grid — `None` until one is
-    /// selected (or restored from `store::load_selected_host` at startup).
     pub selected_host: Option<(String, u16)>,
     pub games: Vec<GameEntry>,
-    /// How many of `games`' leading entries are the selected host's pinned games —
-    /// `App::reorder_games_by_pin` keeps `games[0..pinned_count]` in pin order.
-    /// Recomputed on every library (re)load and pin toggle.
+    /// Leading pinned-game entries; kept in pin order.
     pub(crate) pinned_count: usize,
-    /// Whether the current host has actually answered a library fetch — gates the
-    /// fixed "Desktop" grid card (see `card_offset`), which has no reason to show
-    /// before the host is confirmed reachable. Reset to `false` on every
-    /// `select_host`; set once `drain_games`/`handle_library_error` hears back.
+    /// Host answered library fetch (gates Desktop card).
     pub(crate) games_loaded: bool,
-    /// In-flight `library::fetch_games` call, if any — see `select_host`/`drain_games`.
     pub(crate) games_rx: Option<std::sync::mpsc::Receiver<crate::library::GamesLoaded>>,
-    /// Library loading/error message shown in the grid area in place of cards.
     pub home_status: Option<String>,
-    /// Decoded cover art, keyed by `GameEntry::id` — a `tiny_skia::Pixmap` composited
-    /// straight into the frame `Painter`; see `art.rs` docs on why no separate
-    /// GPU-texture-building step is needed here.
+    /// Cover art pixmaps by game id.
     pub art: std::collections::HashMap<String, Pixmap>,
     pub(crate) art_loader: Option<crate::art::ArtLoader>,
-    /// The grid's current card size, refreshed every `prepare_tiles` call — read by
-    /// `select_host`'s `ArtLoader::spawn` so covers arrive pre-stretched to fit.
+    /// Current grid card size (updated in `prepare_tiles`).
     pub(crate) card_size: (u32, u32),
     pub(crate) pending_launch: Option<PendingLaunch>,
-    /// Set by `drain_launch_check` on success — `main.rs` picks it up via
-    /// `take_ready_launch` and starts the stream. Separate from `pending_launch`
-    /// since that's cleared as soon as a result arrives, before `main.rs` can act.
     pub(crate) launch_ready: Option<ConnectTarget>,
-    /// Started once `launch_ready` is set — the launch zoom/fade `main.rs` plays
-    /// before breaking into the stream. See `ui::LAUNCH_FADE`.
     pub(crate) launch_anim: Option<Instant>,
-    /// Which grid card `launch_anim` zooms — set alongside `launch_ready`.
     pub(crate) launch_anim_idx: Option<usize>,
     pub settings: Settings,
-    /// Persists `settings` off the UI thread — see its docs on why a blocking
-    /// `store::save_settings` on every adjustment read as input lag.
+    /// Persists settings off UI thread to avoid blocking.
     pub(crate) settings_writer: store::SettingsWriter,
     pub settings_focused: usize,
-    /// Offset/fade-in bookkeeping for whichever modal's content currently
-    /// overflows its viewport (Settings' row list, About's document) — shared
-    /// across screens since only one modal is ever open at a time, same
-    /// rationale as `modal_focus_tile`. Reset whenever a scrollable modal is
-    /// (re)opened (see `open_about`, `Screen::Settings`'s entry in `home.rs`).
+    /// Scroll state for overflowing modal content.
     pub(crate) scroll: ui::ScrollWindow,
-    /// Which slice of a too-long-for-one-texture document (About's) is
-    /// currently baked into `scroll_content_tile` — see `ui::ContentWindow`.
-    /// Settings never windows (its whole row list always fits one tile), so
-    /// this is only ever meaningfully non-trivial for `Screen::About`.
+    /// Window slice of baked About document.
     pub(crate) content_window: ui::ContentWindow,
     pub dropdown: Option<DropdownState>,
     /// The sidebar row `Screen::ForgetHost` is confirming forgetting — set

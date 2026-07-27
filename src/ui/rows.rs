@@ -73,8 +73,7 @@ impl FocusRow {
         self
     }
 
-    /// Gives this row a ⋯ actions button (see [`FocusRow::menu`]); `focused` is
-    /// whether the button, rather than the row body, currently has focus.
+    /// Adds a ⋯ actions button; `focused` indicates button vs row focus.
     pub fn with_menu(mut self, focused: bool) -> Self {
         self.menu = Some(focused);
         self
@@ -88,11 +87,8 @@ pub const SETTINGS_ROW_H: u32 = 92;
 pub const SETTINGS_ROW_GAP: i32 = 8;
 pub const SETTINGS_ICON_SIZE: u32 = 30;
 
-/// Row `index`'s rect within a modal's `content_rect` (the modal card's
-/// interior, below its title/divider) — the one place this stacked-row layout
-/// formula lives, shared by `draw_focus_rows` and `app.rs`'s `draw_list`
-/// (which needs it to position the composited focused-row tile), for both the
-/// settings modal's row list and the Wake modal's two rows.
+/// Row `index`'s rect within a modal's content area — used by `draw_focus_rows`
+/// and `app.rs`'s `draw_list` to position the focused-row tile.
 pub fn focus_row_rect(content_rect: Rect, index: usize) -> Rect {
     let y = content_rect.y() + index as i32 * (SETTINGS_ROW_H as i32 + SETTINGS_ROW_GAP);
     Rect::new(content_rect.x(), y, content_rect.width(), SETTINGS_ROW_H)
@@ -104,13 +100,9 @@ pub fn focus_row_rect(content_rect: Rect, index: usize) -> Rect {
 /// shifts or appears to resize as the label's digit count changes.
 pub const SLIDER_VALUE_SLOT_W: i32 = 150;
 
-/// Draws a modal's focus-row list inside `content_rect` — icon + label on the
-/// left, a dropdown pill / slider / modern switch on the right — shared by the
-/// settings modal (`settings_rows`) and the Wake modal (`wake_rows`). Only the
-/// focused row gets a background card (see [`draw_selectable`]); an unfocused
-/// row is bare. Every row here renders at its normal, un-zoomed size — the
-/// focused row's zoom-in is a GPU animation applied on top (`app.rs`'s
-/// `draw_list`), not baked into this rasterized layer.
+/// Draws a modal's focus-row list inside `content_rect` — icon + label left,
+/// control right. Only the focused row gets a background card; others bare.
+/// Rows render at normal size; focused zoom is a GPU animation in `app.rs`.
 pub fn draw_focus_rows(
     painter: &mut Painter,
     text_cache: &mut TextCache,
@@ -137,13 +129,9 @@ pub fn draw_focus_rows(
     Ok(())
 }
 
-/// A modal's focused row, as its own padded transparent tile — composited by
-/// the GPU over its shell (which draws every row unfocused via
-/// `draw_focus_rows`, see its docs). Mirrors `render_focused_row_tile`'s
-/// sidebar equivalent: moving row focus recomposites this small tile instead of
-/// re-rasterizing the whole modal. `switch_frac` (see `draw_switch`) lets the
-/// caller animate a `Toggle` row's knob slide independently of everything else
-/// on the row.
+/// Renders one focused row as a tile, composited over the shell. Moving focus
+/// recomposites this tile instead of re-rasterizing the whole modal.
+/// `switch_frac` animates a `Toggle` row's knob independently.
 pub fn render_focus_row_tile(
     text_cache: &mut TextCache,
     fonts: &Fonts,
@@ -162,11 +150,8 @@ pub fn render_focus_row_tile(
     Ok(p)
 }
 
-/// Every row unfocused, as one tile at its own full (unscrolled) height — the
-/// Settings modal's `Tile::ScrollContent(Screen::Settings)`. Scrolling crops/
-/// repositions this via a GPU-side `DrawCmd::TexCropped` instead of
-/// re-rasterizing, so this only needs rebuilding when a value or the open
-/// dropdown changes, never on scroll.
+/// All rows unfocused as one tile. GPU-side `DrawCmd::TexCropped` handles
+/// scrolling without re-rasterizing on each scroll event.
 pub fn render_focus_rows_tile(
     text_cache: &mut TextCache,
     fonts: &Fonts,
@@ -188,15 +173,9 @@ pub fn render_focus_rows_tile(
     Ok(p)
 }
 
-/// Draws one focus row (icon + label + dropdown pill / slider / modern switch
-/// / nothing, per `RowKind`) into `row_rect`, focused or not — shared by
-/// `draw_focus_rows` (the static, always-unfocused shell) and
-/// `render_focus_row_tile` (the single focused row, recomposited on its own
-/// when focus moves or its `Toggle` control animates). `row_rect` is always
-/// drawn at its literal, un-zoomed size (see [`draw_selectable`]'s docs on why
-/// the zoom lives elsewhere). `dropdown_open` is independent of `focused`: a
-/// `Dropdown` row's pill only gets its bright outline while *its own* dropdown
-/// is actually expanded, not merely while the row has keyboard focus.
+/// Draws one focus row (icon + label + control per `RowKind`) at normal size.
+/// `dropdown_open` is independent of `focused` — pill brightens only when the
+/// dropdown overlay itself is expanded, not on row focus alone.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_focus_row(
     painter: &mut Painter,
@@ -217,8 +196,7 @@ pub fn draw_focus_row(
         SETTINGS_ICON_SIZE,
         SETTINGS_ICON_SIZE,
     );
-    // A destructive row keeps its warning colour whether focused or not — the point is
-    // that it reads as dangerous *before* it's the thing about to be confirmed.
+    // WHY: destructive rows stay red even unfocused — to signal danger before confirm.
     let fg = if row.danger {
         ERROR_RED
     } else if focused {
@@ -280,11 +258,9 @@ pub fn draw_focus_row(
             );
             draw_switch(painter, switch, switch_frac);
         }
-        // No control at all — Confirm on the row is the action. `value`, when set,
-        // is a muted right-aligned hint (an address, a state), never interactive.
+        // Action rows have no control; `value` is a muted hint only, never interactive.
         RowKind::Action => {
             if !row.value.is_empty() {
-                // A ⋯ button occupies the same right edge, so the hint stops short of it.
                 let menu_w = row.menu.map_or(0, |_| SIDEBAR_MENU_BTN as i32 + 10);
                 let value_w = fonts.value.size_of(&row.value).map_or(0, |(w, _)| w);
                 draw_text(
@@ -305,10 +281,8 @@ pub fn draw_focus_row(
     Ok(())
 }
 
-/// A rounded pill button showing the current dropdown value + a small chevron
-/// (`ICON_CHEVRON_DOWN`, replacing a hand-drawn triangle — see the icons section).
-/// `open` gets the bright outline only while this pill's own dropdown overlay
-/// is actually expanded — not while the row merely has keyboard focus.
+/// A rounded pill showing the dropdown value + chevron. Gets bright outline only
+/// when the dropdown overlay itself is expanded.
 pub fn draw_dropdown_pill(
     painter: &mut Painter,
     text_cache: &mut TextCache,
@@ -352,8 +326,7 @@ pub fn draw_dropdown_pill(
     Ok(())
 }
 
-/// A round-thumbed slider track, shadowed knob (matches the reference's
-/// slider-knob-shadow theme touch).
+/// Slider track with round-thumbed, shadowed knob.
 pub fn draw_slider_with_thumb(painter: &mut Painter, rect: Rect, fraction: f32, focused: bool) {
     let track_h = rect.height();
     painter.fill_rounded_rect(rect, track_h as i32 / 2, Color::RGBA(0xff, 0xff, 0xff, 0x22));
@@ -369,8 +342,7 @@ pub fn draw_slider_with_thumb(painter: &mut Painter, rect: Rect, fraction: f32, 
     painter.fill_circle(cx, cy, thumb_r, if focused { WHITE } else { MUTED });
 }
 
-/// Linear interpolation between two colors (including alpha), `frac` clamped
-/// to `0.0..=1.0` — used to cross-fade the switch track color as it slides.
+/// Lerp between two colors; used for switch track cross-fade.
 pub fn lerp_color(from: Color, to: Color, frac: f32) -> Color {
     let f = frac.clamp(0.0, 1.0);
     let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * f) as u8;
@@ -384,11 +356,8 @@ pub fn lerp_color(from: Color, to: Color, frac: f32) -> Color {
 
 pub const SWITCH_OFF_TRACK: Color = Color::RGBA(0xff, 0xff, 0xff, 0x22);
 
-/// A modern sliding pill switch (iOS/Android-style) — accent-filled track with
-/// the knob at the right when on, muted track with the knob at the left when
-/// off. `frac` (0.0 = off, 1.0 = on) lerps the knob position and track color
-/// between those two states, so a toggle flip can animate as a slide instead
-/// of an instant snap — pass a static `0.0`/`1.0` for an unanimated switch.
+/// Modern sliding pill switch. `frac` (0.0=off, 1.0=on) lerps position & color
+/// for smooth animation; pass static 0.0/1.0 for immediate toggle.
 pub fn draw_switch(painter: &mut Painter, rect: Rect, frac: f32) {
     let frac = frac.clamp(0.0, 1.0);
     let radius = rect.height() as i32 / 2;
@@ -405,9 +374,8 @@ pub fn draw_switch(painter: &mut Painter, rect: Rect, frac: f32) {
 /// Row height of one dropdown option — also `render_dropdown_option_tile`'s tile size.
 pub const DROPDOWN_OPTION_H: u32 = 56;
 
-/// A track+thumb along a scrollable list's right edge. `total`/`visible`/`scroll` are row
-/// counts (`visible` <= `total`, `scroll` <= `total - visible`). Rendered into its own
-/// tile so the fade-in/out is a per-frame alpha composite, not a re-rasterize.
+/// Scrollbar track+thumb. Rendered as own tile so fade-in/out is alpha
+/// composite, not re-rasterization.
 const SCROLLBAR_TRACK_W: u32 = 6;
 
 pub fn render_list_scrollbar_tile(tile_w: u32, tile_h: u32, total: usize, visible: usize, scroll: usize) -> Painter {
@@ -429,12 +397,8 @@ pub fn render_list_scrollbar_tile(tile_w: u32, tile_h: u32, total: usize, visibl
     painter
 }
 
-/// Renders a dropdown's options as an overlay list anchored just below the row that
-/// opened it, inside the settings modal card. One shadow/background for the whole
-/// panel and contiguous, same-height rows — like a typical dropdown/picker list —
-/// rather than every row being its own floating `draw_card` (which used to stack a
-/// drop shadow under each option a few px apart from its neighbors, reading as a
-/// stray smear between rows instead of a clean list).
+/// Renders dropdown options as an overlay list anchored below the opener row.
+/// One panel background+shadow instead of per-row cards to avoid shadow smearing.
 pub fn draw_dropdown_overlay(
     painter: &mut Painter,
     text_cache: &mut TextCache,
@@ -457,10 +421,7 @@ pub fn draw_dropdown_overlay(
     Ok(())
 }
 
-/// Option `index`'s rect within a dropdown overlay anchored at `rect` — the one
-/// place this layout formula lives, shared by `draw_dropdown_overlay` and
-/// `app.rs`'s `draw_list` (which needs it to position the composited
-/// focused-option tile).
+/// Option `index`'s rect within a dropdown overlay.
 pub fn dropdown_option_rect(rect: Rect, index: usize) -> Rect {
     Rect::new(
         rect.x(),
@@ -470,11 +431,8 @@ pub fn dropdown_option_rect(rect: Rect, index: usize) -> Rect {
     )
 }
 
-/// One dropdown option, focused, as its own tile (no padding needed — unlike
-/// the settings-row focus tile, this highlight has no shadow/zoom overflowing
-/// its row rect) — composited by the GPU over the overlay's unfocused option
-/// list. Moving the dropdown's own focus recomposites just this small tile
-/// instead of re-rasterizing the whole modal.
+/// Renders one focused dropdown option as a tile, composited over the overlay.
+/// Moving focus recomposites just this tile instead of re-rasterizing.
 pub fn render_dropdown_option_tile(
     text_cache: &mut TextCache,
     font_value: &Font,
@@ -487,10 +445,7 @@ pub fn render_dropdown_option_tile(
     Ok(p)
 }
 
-/// Draws one dropdown option (highlight when focused + its label) into
-/// `row_rect` — shared by `draw_dropdown_overlay` (the static, always-unfocused
-/// list) and `render_dropdown_option_tile` (the single focused option,
-/// recomposited on its own when the dropdown's focus moves).
+/// Draws one dropdown option (highlighted if focused) at normal size.
 pub fn draw_dropdown_option(
     painter: &mut Painter,
     text_cache: &mut TextCache,
@@ -520,20 +475,14 @@ pub fn draw_dropdown_option(
     Ok(())
 }
 
-/// The floating-panel chrome shared by every popup menu drawn over Home/the
-/// modals — a shadowed, near-black rounded panel with a colored border.
-/// Extracted from [`draw_dropdown_overlay`], which used to carry its own copy
-/// of this same triple (shadow, fill, stroke).
+/// Common popup panel chrome: shadowed dark background with colored border.
 pub fn draw_popup_panel(painter: &mut Painter, rect: Rect, border_color: Color) {
     draw_card_shadow(painter, rect, CARD_RADIUS);
     painter.fill_rounded_rect(rect, CARD_RADIUS, Color::RGBA(0x17, 0x11, 0x28, 0xf6));
     painter.stroke_rounded_rect(rect, CARD_RADIUS, border_color, 1.5);
 }
 
-/// One button in a [`draw_confirm_buttons`] row — `color` is that button's own
-/// identity color, shown at full strength only while it has focus (unfocused
-/// buttons dim to [`MUTED`], the same "unfocused = muted" convention every
-/// other focusable row in this UI already uses).
+/// Confirm button with identity color (full when focused, dimmed when not).
 pub struct ConfirmButton<'a> {
     pub icon: Option<&'a str>,
     pub label: &'a str,
@@ -543,23 +492,14 @@ pub struct ConfirmButton<'a> {
 /// Gap between the two buttons in a [`draw_confirm_buttons`] row.
 const CONFIRM_BUTTON_GAP: i32 = 20;
 
-/// A confirm button's interior metrics — icon size, icon-to-label gap, and the
-/// padding at each end — all derived from the label font's line height, which
-/// [`load_font`] already scales by panel height. One place, so the drawing code
-/// and [`confirm_row_min_width`] can never disagree about how much room a label
-/// actually gets.
+/// Confirm button metrics derived from label font height — keeps sizing consistent
+/// between drawing and measurement.
 fn confirm_button_metrics(font: &Font) -> (u32, i32, i32) {
     let line_h = font.height().max(1);
     ((line_h * 2 / 3).max(1) as u32, (line_h / 3).max(1), (line_h / 2).max(1))
 }
 
-/// The narrowest `content` rect that shows both `buttons` labels in full.
-///
-/// A confirmation dialog is as wide as its buttons need to be: the labels are
-/// real words in whatever length they happen to be, and the card's width is a
-/// fraction of the screen, so the two are otherwise unrelated — which is how
-/// "Stop streaming" came to be ellipsized inside a 34%-wide card at 1080p while
-/// fitting at 4K. Callers take the max of this and their own preferred width.
+/// Minimum content width to show both button labels in full without ellipsis.
 pub fn confirm_row_min_width(font: &Font, buttons: &[ConfirmButton; 2]) -> u32 {
     let (icon_size, icon_gap, side_pad) = confirm_button_metrics(font);
     let widest = buttons
@@ -578,10 +518,7 @@ pub fn confirm_row_min_width(font: &Font, buttons: &[ConfirmButton; 2]) -> u32 {
     widest * 2 + CONFIRM_BUTTON_GAP as u32
 }
 
-/// Button `index`'s rect within a [`draw_confirm_buttons`] row anchored at
-/// `content` — the one place this side-by-side layout formula lives, shared
-/// by `draw_confirm_buttons` and `app.rs`'s `draw_list` (which needs it to
-/// position the composited focused-button tile).
+/// Button `index`'s rect within a confirm button row.
 pub fn confirm_button_rect(content: Rect, index: usize) -> Rect {
     let gap = CONFIRM_BUTTON_GAP;
     let btn_w = content.width().saturating_sub(gap as u32) / 2;
@@ -593,13 +530,8 @@ pub fn confirm_button_rect(content: Rect, index: usize) -> Rect {
     )
 }
 
-/// A row of side-by-side buttons for a Yes/No-style confirmation (currently
-/// just the "Forget this host?" dialog's Forget/Cancel pair, but not written
-/// specifically for that) — an optional leading icon and a label colored by
-/// that button's own identity when focused, or [`MUTED`] otherwise.
-/// `focused_index` picks which of `buttons` has focus; every button renders
-/// at its normal, un-zoomed size (see [`draw_selectable_fixed`]'s docs on why
-/// the zoom lives elsewhere, in `app.rs`'s `draw_list`).
+/// Draws a row of confirm buttons. `focused_index` selects which button has focus.
+/// Buttons render at normal size; zoom is applied in `app.rs`'s compositing.
 pub fn draw_confirm_buttons(
     painter: &mut Painter,
     text_cache: &mut TextCache,
@@ -615,10 +547,7 @@ pub fn draw_confirm_buttons(
     Ok(())
 }
 
-/// One focused confirm button, as its own padded transparent tile —
-/// composited by the GPU over the shell (which draws every button unfocused
-/// via `draw_confirm_buttons`, see its docs). Mirrors `render_focus_row_tile`'s
-/// settings-row equivalent.
+/// Renders one focused button as a tile, composited over the shell.
 pub fn render_confirm_button_tile(
     text_cache: &mut TextCache,
     fonts: &Fonts,
@@ -633,10 +562,7 @@ pub fn render_confirm_button_tile(
     Ok(p)
 }
 
-/// Draws one confirm button into `rect`, focused or not — shared by
-/// `draw_confirm_buttons` (the static, always-unfocused shell) and
-/// `render_confirm_button_tile` (the single focused button, recomposited on
-/// its own when focus moves).
+/// Draws one confirm button at normal size, focused or not.
 pub fn draw_confirm_button(
     painter: &mut Painter,
     text_cache: &mut TextCache,

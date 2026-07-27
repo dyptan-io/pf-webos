@@ -12,9 +12,7 @@ use std::time::Instant;
 
 use crate::ui::{self, FocusRow, HostEntry, MenuEvent, Painter};
 
-/// One actionable entry in the host menu. Kept as an explicit enum rather than a bare
-/// row index so the conditional rows (Wake only with a MAC on record, Edit/Forget only
-/// for a saved host) can't silently shift what a given index means.
+/// Host action (enum instead of bare index so conditional rows don't silently shift indices).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostAction {
     Connect,
@@ -26,8 +24,7 @@ pub(crate) enum HostAction {
 }
 
 impl App {
-    /// Enters `Screen::HostMenu` for the sidebar row at `idx` — from that row's ⋯
-    /// button, by pointer or by focusing it with Right (see `HomeFocus::SidebarMenu`).
+    /// Opens host menu for sidebar row `idx` (⋯ button, pointer, or Right key).
     pub(crate) fn open_host_menu(&mut self, idx: usize) {
         self.host_menu_index = Some(idx);
         self.menu_focused = 0;
@@ -35,16 +32,14 @@ impl App {
         self.screen = Screen::HostMenu;
     }
 
-    /// Whether the focused row has a ⋯ button to move onto (only "Wake host" does).
+    /// Whether focused row's ⋯ button exists (only "Wake host" has one).
     pub(crate) fn host_menu_row_has_dots(&self) -> bool {
         self.host_menu_actions()
             .get(self.menu_focused)
             .is_some_and(|(a, _)| *a == HostAction::Wake)
     }
 
-    /// The menu's rows, paired with what each one does. Conditional on the host's
-    /// state: a discovered-but-never-saved host has nothing to edit or forget, and a
-    /// host whose Wake-on-LAN MAC has never been seen advertised can't be woken.
+    /// Menu rows and actions; conditional on host state (saved/discovered, has MAC).
     pub(crate) fn host_menu_actions(&self) -> Vec<(HostAction, FocusRow)> {
         let Some(entry) = self.host_menu_index.and_then(|i| self.entries.get(i)) else {
             return Vec::new();
@@ -124,9 +119,7 @@ impl App {
         ui::list_modal_card_rect(screen_w, screen_h, fonts, subtitle, rows)
     }
 
-    /// Handles one menu event on the host actions menu. Returns a `ConnectTarget`
-    /// only if the chosen action starts a stream directly (it never does today —
-    /// Connect goes through the same reachability pre-flight as the grid).
+    /// Handles host menu events; may return `ConnectTarget` (currently never does).
     pub(crate) fn handle_host_menu_event(&mut self, ev: MenuEvent) {
         let len = self.host_menu_actions().len();
         if ui::list_nav(&mut self.menu_focused, len, ev) {
@@ -157,8 +150,7 @@ impl App {
         }
     }
 
-    /// Runs the focused row's action. Every arm either leaves for another screen or
-    /// closes the menu — nothing stays here having "done something" invisibly.
+    /// Runs focused row's action; every arm navigates away or closes menu.
     pub(crate) fn confirm_host_menu_row(&mut self) {
         let actions = self.host_menu_actions();
         let Some((action, _)) = actions.get(self.menu_focused) else {

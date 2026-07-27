@@ -1,18 +1,10 @@
-//! The About & licenses screen's state: which visual line the document is
-//! scrolled to.
-//!
-//! Split out of the former single-file `app.rs`; see `super`'s module docs.
-//! Layout and drawing live in `ui::about` — including the wrapped-line/windowed-tile
-//! scheme that makes this screen scroll like Settings' row list (see its module docs).
 use super::*;
 use sdl2::rect::Rect;
 
 use crate::ui::{self, MenuEvent, Painter};
 
 impl App {
-    /// Enters `Screen::About`, building the document's source lines on first open
-    /// (see `ui::about_lines`) — wrapping them to visual lines happens lazily in
-    /// `ensure_about_wrapped`, once a body width is known.
+    /// Lazy-initialize about lines on first open.
     pub(crate) fn open_about(&mut self) {
         if self.about_lines.is_empty() {
             self.about_lines = ui::about_lines();
@@ -22,12 +14,10 @@ impl App {
         self.screen = Screen::About;
     }
 
-    /// Up/Down scroll by a visual line, Left/Right by a page. There is nothing
-    /// focusable on this screen, so every event is either scrolling or leaving.
+    /// Navigate: Up/Down scroll by line, Left/Right by page.
     pub(crate) fn handle_about_event(&mut self, ev: MenuEvent, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) {
         let (total, visible) = self.about_scroll_geometry(screen_w, screen_h, fonts);
-        // Keep a couple of lines of the previous screenful visible when paging, so the
-        // reader has an anchor rather than a hard cut.
+        // Page step with anchor: show last few lines of previous page
         let page_step = visible.saturating_sub(2).max(1);
         match ev {
             MenuEvent::Up => {
@@ -42,15 +32,13 @@ impl App {
             MenuEvent::Right => {
                 self.scroll.page(page_step, true, total, visible);
             }
-            // Back returns to Settings, where this screen was opened from — not Home,
-            // which would throw away the settings context the user was in.
+            // Return to Settings (not Home) to preserve settings context
             MenuEvent::Back | MenuEvent::Confirm => self.screen = Screen::Settings,
             MenuEvent::Secondary => {}
         }
     }
 
-    /// Scrolls by `dy_px` worth of lines — the Magic Remote's wheel. Returns whether
-    /// the position actually moved (drives the redraw).
+    /// Scroll by pixels (Magic Remote wheel).
     pub(crate) fn scroll_about_by(&mut self, dy_px: i32, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> bool {
         let (total, visible) = self.about_scroll_geometry(screen_w, screen_h, fonts);
         let step = ui::about_line_stride(fonts.value).max(1);
@@ -61,10 +49,7 @@ impl App {
         self.scroll.scroll_by(i64::from(lines), total, visible)
     }
 
-    /// `(total wrapped lines, visible lines)` for the current geometry, ensuring the
-    /// wrapped-line cache (`about_wrapped`) is fresh for this body width first — the
-    /// mutating half of what `App::scroll_geometry` reads back out (`&self`) later in
-    /// the same frame, once `prepare_tiles` has already called this.
+    /// Total and visible line counts.
     pub(crate) fn about_scroll_geometry(&mut self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> (usize, usize) {
         let card = ui::about_card_rect(screen_w, screen_h);
         let body = ui::about_body_rect(card, fonts);
@@ -74,8 +59,7 @@ impl App {
         (total, visible)
     }
 
-    /// Wraps the whole document once per body width (see `ui::wrap_document`) — this
-    /// can't happen at `open_about` time since no screen geometry is known yet.
+    /// Defer text wrapping until width is known.
     pub(crate) fn ensure_about_wrapped(&mut self, fonts: &ui::Fonts, width: u32) {
         let stale = !matches!(&self.about_wrapped, Some((w, _)) if *w == width);
         if stale {

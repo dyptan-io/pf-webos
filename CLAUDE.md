@@ -39,3 +39,7 @@ Set `TV_HOST` in `.env` (copy `.env.example`). Run with `task -s` to skip echo. 
 **Networking**: `discovery.rs` (mDNS) and `library.rs` (mTLS game-library REST) are standalone impls (not via `pf-client-core`) to avoid its dep tree. `art.rs` background-fetches/decodes cover art.
 
 **Toolchain notes**: soft-float override in `.cargo/config.toml` (biggest perf fix), glibc shims in `src/glibc_compat_shim.c` + `build.rs`, bundled `webosbrew/SDL-webOS` fork. Don't re-derive — read `docs/NOTES.md` first.
+
+## Code comments
+
+**Write only when necessary**: Do not write comments that repeat what the code obviously does. Write concise comments that explain WHY (non-obvious invariants, platform workarounds, subtle constraints).

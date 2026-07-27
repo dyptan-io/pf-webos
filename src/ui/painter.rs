@@ -1,6 +1,4 @@
-//! The anti-aliased software rendering backend every `draw_*` is built from.
-//!
-//! Split out of the former single-file `ui.rs`; see `super`'s module docs.
+//! Anti-aliased software rendering backend (`tiny_skia` Pixmap framebuffer).
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 use std::cell::RefCell;
@@ -9,24 +7,11 @@ use tiny_skia::{
     Color as SkColor, FillRule, FilterQuality, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform,
 };
 
-// The AA rendering backend: a `tiny_skia::Pixmap` framebuffer plus the handful of
-// primitive ops every higher-level `draw_*` function below is built from. Nothing
-// past this section touches SDL2 rendering at all — `Font`/`Surface` still come
-// from `SDL2_ttf` (text metrics/rasterization; see the text/font section), but the
-// actual pixels always end up composited into this same buffer.
-
 pub fn sk_color(c: Color) -> SkColor {
     SkColor::from_rgba8(c.r, c.g, c.b, c.a)
 }
 
-/// A flat-color `Paint` — every fill/stroke in this module uses one of these and
-/// nothing fancier (no gradients/patterns needed for this UI).
-///
-/// Anti-aliasing off: tiny-skia dispatches to a genuinely separate, cheaper
-/// scan-conversion path when `anti_alias` is off (`scan::path::fill_path`/
-/// `scan::fill_rect` vs. the `_aa` variants) — measured on real webOS hardware,
-/// worth a real (if modest, ~15-25%) chunk of render time on larger fills like the
-/// Settings modal card. See docs/NOTES.md's "UI performance, round 2" entry.
+/// Flat-color paint (no gradients/patterns). Anti-aliasing off for cheaper scan-conversion (~15-25% faster).
 pub fn solid_paint(color: Color) -> Paint<'static> {
     let mut paint = Paint::default();
     paint.set_color(sk_color(color));
@@ -34,12 +19,8 @@ pub fn solid_paint(color: Color) -> Paint<'static> {
     paint
 }
 
-/// Builds a rounded-rect as a Bezier path — tiny-skia (unlike full Skia) has no
-/// built-in rounded-rect primitive. `k` is the standard cubic-Bezier
-/// circular-arc-approximation constant. Falls back to a plain rect once `radius`
-/// clamps to ~0.
+/// Rounded-rect as Bezier path (`tiny_skia` has no built-in); falls back to plain rect if radius ~0.
 pub fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
-    /// The standard cubic-Bezier circular-arc-approximation constant.
     const K: f32 = 0.552_284_7;
 
     let r = radius.max(0.0).min(w / 2.0).min(h / 2.0);

@@ -130,14 +130,8 @@ impl HostEntry {
     }
 }
 
-/// Draws the whole sidebar: a flat `SIDEBAR_BG` panel, a "punktfunk" wordmark at
-/// the top, one row per host (icon reflects paired/not-paired), a trailing
-/// "+ Add host" row, and "Settings" pinned to the very bottom of the panel (see
-/// `settings_row_rect`) rather than following on from the host list — it stays
-/// put regardless of how many hosts are known, instead of drifting down the
-/// screen as the list grows. `focused_index` is `Some` only when the sidebar
-/// itself has focus (see `app.rs`'s `HomeFocus`). `selected_index` highlights
-/// the currently-selected host row to indicate it's the active/connected host.
+/// Draws sidebar: flat panel + logo + host rows + "Add host" + Settings (bottom-pinned).
+/// `selected_index` highlights the active/connected host.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_sidebar(
     painter: &mut Painter,
@@ -151,12 +145,7 @@ pub fn draw_sidebar(
     screen_h: u32,
 ) -> Result<()> {
     painter.fill_rect(Rect::new(0, 0, SIDEBAR_W, screen_h), SIDEBAR_BG);
-    // The real brand lockup (mark + FUNK wordmark), from the actual logo
-    // artwork — see `logo_pixmap`. The bundled asset is exported at exactly
-    // its on-screen display size (rendered fresh from
-    // `punktfunk-logo-dark.svg` at that size, not a scaled copy of a smaller
-    // export — see its NOTICE.md), so this draws it 1:1, no runtime scaling
-    // in either direction. Centered horizontally.
+    // Logo is 1:1 (no runtime scaling); bundled at exact display size.
     if let Some(logo) = logo_pixmap() {
         let logo_x = (SIDEBAR_W as i32 - logo.width() as i32) / 2;
         painter.draw_pixmap(logo_x, 32, logo);
@@ -188,10 +177,7 @@ pub fn draw_sidebar(
     )?;
 
     let settings_rect = settings_row_rect(screen_h);
-    // The build version deliberately does NOT live here any more: every other
-    // punktfunk client shows it on its About/licenses screen, not in the nav
-    // chrome, and this sidebar is navigation. See `ui::about::VERSION`, surfaced
-    // by `Screen::About` (reached from Settings).
+    // Version moved to About screen (not sidebar nav chrome); see ui::about::VERSION.
     painter.fill_rect(
         Rect::new(settings_rect.x(), settings_rect.y() - 14, settings_rect.width(), 1),
         Color::RGBA(0xff, 0xff, 0xff, 0x1a),
@@ -208,14 +194,8 @@ pub fn draw_sidebar(
     Ok(())
 }
 
-/// Shared layout for every sidebar row (host rows and the "+ Add host"/
-/// "Settings" utility rows alike): a left-aligned icon and a label, both
-/// colored by focus, plus the [`draw_selectable`] card that only appears
-/// (zoomed in, see [`inflate`]) once focused — an unfocused row has no
-/// background at all. `selected` adds a subtle background when not focused.
-/// Host rows and utility rows used to each carry their own near-identical copy
-/// of this (differing only by accident of drift, in icon size/padding, not by
-/// design).
+/// Sidebar row layout: left-aligned icon + label, focus-colored.
+/// `selected` adds subtle background when unfocused.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_sidebar_row(
     painter: &mut Painter,
@@ -239,10 +219,8 @@ pub fn draw_sidebar_row(
     );
     let color = if focused { WHITE } else { MUTED };
     draw_icon(painter, text_cache, fonts.icon, icon_rect, glyph, color)?;
-    // Ellipsized to the row's real text width (icon + paddings subtracted) — a
-    // long mDNS hostname used to run past the row/panel edge.
+    // Ellipsized to prevent overflow; reserve_right prevents running under ⋯ button.
     let text_x = icon_pad + icon_size as i32 + 16;
-    // `reserve_right` keeps a long hostname from running underneath the ⋯ button.
     let max_w = drawn.width().saturating_sub(text_x as u32 + 20 + reserve_right);
     let label = ellipsize(fonts.label, label, max_w);
     draw_text(
@@ -257,13 +235,8 @@ pub fn draw_sidebar_row(
     Ok(())
 }
 
-/// A host row, including its always-visible ⋯ actions button.
-///
-/// The button is drawn on *every* host row, not just the focused one: it exists to
-/// advertise that per-host actions are there at all. (It replaced a hold-OK gesture,
-/// which worked but nothing on screen ever said so.) `menu_focused` highlights the
-/// button itself — the row can be focused with the button not, and vice versa.
-/// `selected` adds a subtle background to indicate the currently-active host.
+/// Host row with ⋯ actions button (drawn on every row to advertise actions exist).
+/// `menu_focused` highlights the button; `selected` indicates active host.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_host_row(
     painter: &mut Painter,

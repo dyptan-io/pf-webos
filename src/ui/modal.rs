@@ -1,6 +1,3 @@
-//! Shared modal-card geometry: the card rect, its surface, its close button.
-//!
-//! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 use super::*;
 use anyhow::Result;
 use sdl2::pixels::Color;
@@ -8,6 +5,7 @@ use sdl2::rect::Rect;
 use sdl2::ttf::Font;
 
 /// A centered glass card of `(width_frac * screen_w, height)`.
+/// Centered glass card.
 pub fn modal_card_rect(screen_w: u32, screen_h: u32, width_frac: f32, height: u32) -> Rect {
     let w = (screen_w as f32 * width_frac).round() as u32;
     let x = (screen_w as i32 - w as i32) / 2;
@@ -53,13 +51,13 @@ pub fn modal_card_rect_above_keyboard(
     Rect::new(x, y, w, height)
 }
 
+/// Draw the modal card surface.
 pub fn draw_modal_card(painter: &mut Painter, rect: Rect) {
     draw_card_shadow(painter, rect, MODAL_RADIUS);
     painter.fill_rounded_rect(rect, MODAL_RADIUS, SIDEBAR_BG);
     painter.stroke_rounded_rect(rect, MODAL_RADIUS, Color::RGBA(0xff, 0xff, 0xff, 0x18), 1.5);
 }
 
-/// The modal close (X) button rect, top-right inset of `card_rect`.
 pub fn modal_close_rect(card_rect: Rect) -> Rect {
     const SIZE: u32 = 44;
     const MARGIN: i32 = 20;
@@ -78,6 +76,7 @@ pub fn modal_close_rect(card_rect: Rect) -> Rect {
 /// enough: without a visual break the two blocks read as *steps*, i.e. "fill in the PIN,
 /// then press the button". The rule makes the exclusivity structural rather than something
 /// the user has to read and remember.
+/// Horizontal rule with centered word (e.g., "or" between two exclusive options).
 pub fn draw_or_divider(
     painter: &mut Painter,
     text_cache: &mut TextCache,
@@ -110,10 +109,6 @@ pub fn draw_or_divider(
     Ok(())
 }
 
-/// A filled, accent-coloured action button — the visually primary choice on a card that
-/// offers more than one. Everything else in this UI uses the surface-card treatment, where
-/// focus alone supplies the emphasis; a genuinely preferred option needs to read as
-/// preferred *before* it is focused.
 pub fn draw_primary_button(
     painter: &mut Painter,
     text_cache: &mut TextCache,

@@ -1,8 +1,5 @@
-//! Maps SDL2 `GameController` events to punktfunk's wire `InputEvent`s. Per-transition
-//! events (`GamepadButton`/`GamepadAxis`), not the `GamepadState` snapshot form — the
-//! snapshot is only sent to hosts that advertise support for it, and we don't yet track
-//! that host capability flag here, so per-transition is the universally-compatible
-//! choice (see `punktfunk_core::input` docs).
+//! Maps SDL2 `GameController` events to punktfunk wire `InputEvents`.
+//! Per-transition events (universally compatible).
 use punktfunk_core::input::{gamepad, InputEvent, InputKind};
 use sdl2::controller::{Axis, Button};
 

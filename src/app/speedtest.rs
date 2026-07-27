@@ -7,12 +7,8 @@
 //! drained each UI tick. Backing out drops the receiver, which orphans the worker — its
 //! next send fails and it exits, tearing its own connection down.
 //!
-//! What the number means on *this* client is worth being precise about, because it is
-//! not quite what the desktop clients report. `punktfunk-core` counts delivered bytes
-//! after AEAD decrypt, so the figure is end-to-end *deliverable goodput* — bounded by
-//! whichever of the link and this TV's own decrypt throughput gives out first. That is
-//! the more useful number for picking a bitrate here (it's what a real session could
-//! actually carry), but it is not a pure link-speed measurement, and the UI says so.
+//! Measured throughput is end-to-end deliverable goodput (after AEAD decrypt),
+//! not pure link speed. Bounds useful for bitrate picking on this TV.
 use super::*;
 use sdl2::rect::Rect;
 use std::time::Instant;
@@ -36,8 +32,7 @@ pub(crate) enum SpeedTestState {
     Measuring {
         partial: Option<ProbeOutcome>,
     },
-    /// `confirmed` is false when the host's end-of-burst report never arrived and the
-    /// figure was salvaged from what actually got here (see `session::SpeedProbeResult`).
+    /// `confirmed` is false if host's end-of-burst report didn't arrive.
     Done {
         outcome: ProbeOutcome,
         confirmed: bool,
@@ -62,9 +57,7 @@ impl App {
         let host = entry.host().to_string();
         let port = entry.port();
         let name = entry.name().to_string();
-        // A saved host is measured against its pinned fingerprint; an unpaired one is
-        // probed trust-on-first-use and, unlike a real connect, nothing is persisted
-        // from it — a bandwidth number doesn't justify a trust decision.
+        // Saved host: pinned fingerprint. Unpaired: TOFU (no persistence on test).
         let pin = self
             .known_hosts
             .iter()
@@ -107,8 +100,7 @@ impl App {
     pub(crate) fn drain_speed_test(&mut self) -> bool {
         let Some(rx) = &self.speed_test_rx else { return false };
         let mut changed = false;
-        // Drain everything pending, keeping only the latest — a burst of progress polls
-        // between two UI ticks should cost one redraw, not one per message.
+        // WHY: keep only latest; burst between ticks costs one redraw, not per-message.
         while let Ok(msg) = rx.try_recv() {
             changed = true;
             match msg {
@@ -150,28 +142,18 @@ impl App {
             return None;
         }
         let raw = outcome.throughput_kbps / RECOMMEND_DENOMINATOR * RECOMMEND_NUMERATOR;
-        // Whole Mbps, then clamped: the slider only moves in `BITRATE_STEP_KBPS` steps
-        // between these bounds, so recommending anything outside them is a value the
-        // user could never actually see selected.
+        // Whole Mbps, clamped to slider bounds (BITRATE_STEP_KBPS steps).
         let whole_mbps = (raw / 1000).max(1) * 1000;
         Some(whole_mbps.clamp(ui::BITRATE_MIN_KBPS, ui::BITRATE_MAX_KBPS))
     }
 
-    /// The primary button's label, owned by the caller — `ConfirmButton` borrows its
-    /// label, and this one is built from the measurement rather than being a constant.
-    ///
-    /// With no recommendation (a failed test, or one that delivered too little to derive
-    /// a bitrate from) the primary action is *Retry*, not "Close" — an earlier version
-    /// fell back to the literal "Close" here and rendered two identical Close buttons
-    /// side by side, on precisely the path where the user most needs something to do.
+    /// Primary button label (built from measurement, not constant).
+    /// No recommendation → "Retry" (not Close) to give user action on low throughput.
     pub(crate) fn speed_test_apply_label(recommended: Option<u32>) -> String {
         recommended.map_or_else(|| "Retry".to_string(), |kbps| format!("Use {} Mbps", kbps / 1000))
     }
 
-    /// The buttons for a finished test: apply the recommendation, or just close. Takes
-    /// the primary label by reference so nothing has to be leaked to satisfy
-    /// `ConfirmButton`'s borrow (this is built per render, unlike every other
-    /// confirm-button pair in the app, which are compile-time constants).
+    /// Finished test buttons (apply recommendation or close). Built per-render.
     pub(crate) fn speed_test_buttons(apply_label: &str) -> [ui::ConfirmButton<'_>; 2] {
         [
             ui::ConfirmButton {
@@ -193,8 +175,7 @@ impl App {
             Some(SpeedTestState::Done { .. }) | Some(SpeedTestState::Failed(_))
         );
         match ev {
-            // Still measuring: Back cancels (dropping the receiver orphans the worker,
-            // which tears its own connection down), everything else is ignored.
+            // Back cancels (drops receiver → orphans worker → tears connection).
             MenuEvent::Back => self.close_speed_test(),
             _ if !done => {}
             MenuEvent::Left | MenuEvent::Right => {
@@ -216,8 +197,6 @@ impl App {
                         self.settings_writer.save(self.settings);
                         self.close_speed_test();
                     }
-                    // Nothing to apply — the primary button is "Retry" (see
-                    // `speed_test_apply_label`). Re-run against the same host.
                     None => self.retry_speed_test(),
                 }
             }

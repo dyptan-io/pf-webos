@@ -1,16 +1,5 @@
-//! Picks where `tracing` writes: a TCP stream to a dev machine when `task deploy`
-//! passed a `telemetry` destination at launch, otherwise a versioned file under the
-//! app's own writable directory (see `store.rs`'s module docs on that directory).
-//! Call sites everywhere else just use plain `tracing::info!`/`warn!`/`debug!`/
-//! `error!` — no handle to thread through; see `main.rs::run` for the one-time
-//! subscriber setup this feeds.
-//!
-//! The destination is read from `argv[1]` at runtime, not baked in at compile time:
-//! webOS's SAM launch passes the `params` object given to
-//! `luna://com.webos.applicationManager/launch` to a native app as a JSON-encoded
-//! first command-line argument on initial launch (confirmed in the webOS OSE native
-//! app docs) — so `task deploy TELEMETRY=<host:port>` just threads it through that
-//! `luna-send` call instead of requiring a rebuild per destination.
+//! Routes `tracing` to TCP (dev machine) or log file. Destination from argv[1] at
+//! runtime (webOS SAM passes launch `params` as JSON argv), not compile-time.
 use std::io::Write;
 use std::net::TcpStream;
 use std::path::Path;
@@ -19,28 +8,20 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-/// Matches `ui.rs`'s version marker: `PKG_VERSION` is threaded in at Docker build
-/// time by the Taskfile (`Cargo.toml` itself stays a fixed `0.0.1`); falls back to
-/// `CARGO_PKG_VERSION` for a plain native `cargo build`.
+/// `PKG_VERSION` from Docker/Taskfile; falls back to `CARGO_PKG_VERSION`.
 const VERSION: &str = match option_env!("PKG_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
 
-/// `argv[1]`'s shape, as SAM hands it to a native app on initial launch — see this
-/// module's docs. Both fields optional: a plain launch (no `params`, or a `params`
-/// with neither key — e.g. a future unrelated use of `params`) just means "no
-/// telemetry", not a parse error.
+/// argv[1] shape from SAM; both fields optional (no error if missing).
 #[derive(Deserialize, Default)]
 struct LaunchParams {
-    /// `host:port` of the dev machine's listener.
     telemetry: Option<String>,
-    /// `debug`/`info`/`warn`/`error` — parsed via `tracing::Level`'s own `FromStr`.
     telemetry_level: Option<String>,
 }
 
-/// Parsed once (argv doesn't change over the process lifetime) and cached — every
-/// caller below reads through this instead of re-parsing.
+/// Cache launch params once; argv doesn't change over process lifetime.
 fn launch_params() -> &'static LaunchParams {
     static PARAMS: OnceLock<LaunchParams> = OnceLock::new();
     PARAMS.get_or_init(|| {
@@ -55,8 +36,7 @@ fn telemetry_addr() -> Option<&'static str> {
     launch_params().telemetry.as_deref().filter(|s| !s.is_empty())
 }
 
-/// Defaults to `debug` — a configured TCP sink is an explicit opt-in for a dev
-/// session, so send everything unless told otherwise.
+/// Default to debug; TCP is opt-in for dev, so send everything by default.
 fn telemetry_level() -> tracing::Level {
     launch_params()
         .telemetry_level
@@ -65,11 +45,7 @@ fn telemetry_level() -> tracing::Level {
         .unwrap_or(tracing::Level::DEBUG)
 }
 
-/// Where log lines actually go — a plain `Write` impl handed to
-/// `tracing_appender::non_blocking`, which owns the buffering/background-thread
-/// dispatch (see `main.rs::run`) so a slow disk or a dev machine not draining its
-/// listener fast enough never blocks the caller, in particular the video-pump
-/// thread.
+/// Log destination (file or TCP). Non-blocking dispatch prevents blocking video pump.
 enum Sink {
     File(std::fs::File),
     Tcp(TcpStream),
@@ -91,10 +67,7 @@ impl Write for Sink {
     }
 }
 
-/// Truncate (not append) — this file previously grew unbounded across every launch
-/// for the life of the install; each run's log now starts fresh. Info-and-above
-/// only (no debug) so on-device disk usage stays bounded across ordinary
-/// sideloaded runs with no telemetry destination configured.
+/// Truncate log file per run (was unbounded). Info-only to bound disk usage without telemetry.
 fn open_file(app_dir: &Path) -> Result<Sink> {
     let path = app_dir.join(format!("punktfunk-webos-{VERSION}.log"));
     let file = std::fs::OpenOptions::new()
@@ -106,11 +79,7 @@ fn open_file(app_dir: &Path) -> Result<Sink> {
     Ok(Sink::File(file))
 }
 
-/// `app_dir` is the app's own writable directory (`store::app_dir()`).
-///
-/// A configured address that's unreachable (dev machine off the network, `task
-/// deploy` exited before this launch) falls back to the file sink rather than
-/// failing the whole app over what's meant to be a dev convenience.
+/// Open TCP or file sink; fall back to file if unreachable (dev convenience, not critical).
 fn open_sink(app_dir: &Path) -> Result<Sink> {
     if let Some(addr) = telemetry_addr() {
         if let Ok(stream) = TcpStream::connect(addr) {
@@ -120,9 +89,7 @@ fn open_sink(app_dir: &Path) -> Result<Sink> {
     open_file(app_dir)
 }
 
-/// The level the installed subscriber should filter at — `debug` (or whatever
-/// `telemetry_level` was given) when a telemetry address was configured, `info`
-/// for the plain on-device file (see `open_file`'s docs on why).
+/// Subscriber filter level: debug if telemetry configured, info for on-device file.
 pub fn resolved_level() -> tracing::Level {
     if telemetry_addr().is_some() {
         telemetry_level()
@@ -131,10 +98,7 @@ pub fn resolved_level() -> tracing::Level {
     }
 }
 
-/// Builds the writer `main.rs::run` installs into `tracing_subscriber::fmt()`.
-/// Returns the `non_blocking` writer plus its `WorkerGuard` — the guard must be
-/// kept alive for the process lifetime (dropping it stops the background writer
-/// thread and flushes whatever's queued).
+/// Build non-blocking writer for `tracing_subscriber`. Guard must stay alive for process lifetime.
 pub fn init(
     app_dir: &Path,
 ) -> Result<(

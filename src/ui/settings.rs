@@ -1,21 +1,17 @@
-//! Settings-screen data: presets, row indices, and the row list/adjust logic.
-//!
-//! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 use super::*;
 use crate::store::{CodecPref, Settings, VideoBackend};
 
-/// Resolution presets — the three the user asked for, matching `pf-console-ui`'s
-/// existing 1080p/1440p/4K entries (a subset of its full list; no 720p/800p here).
+/// User-requested presets: 1080p, 1440p, 4K.
 pub const RESOLUTIONS: [(u32, u32, &str); 3] = [
     (1920, 1080, "1920 x 1080"),
     (2560, 1440, "2560 x 1440"),
     (3840, 2160, "3840 x 2160"),
 ];
 
-/// Framerate presets — sent to the host as the exact wire refresh rate.
+/// Sent to host as exact wire refresh rate.
 pub const REFRESH_RATES: [u32; 3] = [30, 60, 120];
 
-/// Bitrate slider range/step, in kbps — the user's explicit ask ("10-200 Mbps max").
+/// Slider range: 10-200 Mbps, 5 Mbps steps.
 pub const BITRATE_MIN_KBPS: u32 = 10_000;
 pub const BITRATE_MAX_KBPS: u32 = 200_000;
 pub const BITRATE_STEP_KBPS: u32 = 5_000;
@@ -26,13 +22,10 @@ pub const BITRATE_STEP_KBPS: u32 = 5_000;
 /// or climbing every ~750ms. A fixed Mbps number, however carefully picked, never adapts to a link
 /// that degrades mid-session — this does.
 pub const BITRATE_AUTOMATIC: u32 = 0;
-/// Above this, stability drops off on typical Wi-Fi — shown as an amber
-/// caution, matching the reference's settings pane (not a hard cap, the
-/// slider still allows up to `BITRATE_MAX_KBPS`).
+/// Above this, shown as amber caution (not a hard cap).
 pub const BITRATE_WARN_KBPS: u32 = 150_000;
 
-/// Settings-modal row indices — shared by `settings_rows`, `adjust_setting`, and
-/// `app.rs`'s event handling so the mapping only lives in one place.
+/// Row indices for settings modal.
 pub const ROW_RESOLUTION: usize = 0;
 pub const ROW_FRAMERATE: usize = 1;
 pub const ROW_BITRATE: usize = 2;
@@ -50,7 +43,7 @@ pub const ROW_AUDIO: usize = 7;
 pub const ROW_ABOUT: usize = 8;
 pub const SETTINGS_ROW_COUNT: usize = 9;
 
-/// Cycles `current` to the next/previous value in a preset slice, wrapping.
+/// Cycle through options, wrapping.
 pub fn cycle<T: Copy + PartialEq>(options: &[T], current: T, forward: bool) -> T {
     let idx = options.iter().position(|&o| o == current).unwrap_or(0);
     let len = options.len();
@@ -184,10 +177,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
     ]
 }
 
-/// The per-host Wake settings modal's rows (`Screen::WakeSettings`, opened from the
-/// ⋯ on the host menu's Wake row) — just the auto-send toggle today. A `FocusRow`
-/// list so it draws and zoom-animates through the exact same `draw_focus_rows`/
-/// `render_focus_row_tile` machinery as every other list modal.
+/// Wake settings modal rows.
 pub fn wake_settings_rows(auto_send: bool) -> Vec<FocusRow> {
     vec![FocusRow {
         icon: ICON_POWER,
@@ -230,7 +220,7 @@ pub fn codec_label(pref: CodecPref) -> &'static str {
     }
 }
 
-/// Channel counts punktfunk negotiates, and how they read on screen.
+/// Supported channel counts.
 pub const AUDIO_CHANNELS: [(u8, &str); 3] = [(2, "Stereo"), (6, "5.1 surround"), (8, "7.1 surround")];
 
 fn audio_label(channels: u8) -> String {
@@ -240,9 +230,7 @@ fn audio_label(channels: u8) -> String {
         .map_or_else(|| format!("{channels} channels"), |(_, s)| (*s).to_string())
 }
 
-/// The option labels for a dropdown row (`Resolution`/`Frame rate`/`Video backend`/
-/// `Codec`/`Audio`). Takes the live `Settings` because the Codec row's list is
-/// state-dependent (see `codec_options`).
+/// Dropdown labels for a row. Codec list depends on `video_backend`.
 pub fn dropdown_options(settings: &Settings, row_index: usize) -> Vec<String> {
     match row_index {
         ROW_RESOLUTION => RESOLUTIONS.iter().map(|(w, h, _)| resolution_label(*w, *h)).collect(),
@@ -257,7 +245,7 @@ pub fn dropdown_options(settings: &Settings, row_index: usize) -> Vec<String> {
     }
 }
 
-/// Which option index in `dropdown_options(row_index)` matches the current setting.
+/// Current dropdown index for a row's setting.
 pub fn dropdown_current_index(settings: &Settings, row_index: usize) -> usize {
     match row_index {
         ROW_RESOLUTION => RESOLUTIONS
@@ -323,8 +311,7 @@ pub fn apply_dropdown_choice(settings: &mut Settings, row_index: usize, choice_i
     }
 }
 
-/// Applies a left/right adjustment to `settings` for the given settings-row index.
-/// Returns `true` if it changed.
+/// Apply left/right adjustment to a setting row. Returns true if changed.
 pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) -> bool {
     match row_index {
         ROW_RESOLUTION => {

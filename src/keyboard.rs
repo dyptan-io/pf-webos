@@ -1,10 +1,5 @@
-//! Maps SDL2 keyboard events to punktfunk's wire `InputEvent`s. The webOS Magic
-//! Remote's 5-way pad surfaces as plain SDL2 `Keycode::Up/Down/Left/Right` (same as
-//! any desktop arrow key), forwarded to the host as real key presses during a stream
-//! so directional navigation drives the host UI instead of only the local menu (see
-//! `ui::menu_event_for_key`, used pre-stream for the same keycodes). USB keyboards
-//! connected to the TV are handled the same way via SDL2 scancodes (physical key
-//! positions) so the host receives QWERTY-positional VKs regardless of layout.
+//! Maps SDL2 keyboard events to punktfunk wire `InputEvents`.
+//! Magic Remote 5-way pad → arrow keys. USB keyboards → QWERTY-positional VKs.
 use punktfunk_core::input::{InputEvent, InputKind};
 use sdl2::keyboard::Scancode;
 

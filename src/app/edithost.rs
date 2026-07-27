@@ -1,13 +1,5 @@
-//! Editing a saved host's address, reusing the add-host entry widget.
-//!
-//! Split out of the former single-file `app.rs`; see `super`'s module docs.
-//!
-//! Only the address is editable. The port is fixed (`ui::FIXED_HOST_PORT`), and the
-//! name/fingerprint/MAC are all *learned* rather than typed — the fingerprint in
-//! particular must survive an address change untouched, since it identifies the host's
-//! certificate, not where it happens to sit on the network. Editing an address is
-//! exactly the case where a paired host moved (new DHCP lease) and re-pairing would be
-//! the wrong remedy.
+//! Editing a saved host's address (reuses add-host widget). Fingerprint survives address
+//! changes unchanged since it identifies the certificate, not the network location.
 use super::*;
 use sdl2::rect::Rect;
 
@@ -15,9 +7,7 @@ use crate::store;
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};
 
 impl App {
-    /// Enters `Screen::EditHost` for the sidebar row at `idx`, pre-filled with its
-    /// current address. No-ops for a discovered-but-unsaved entry (there is nothing
-    /// persisted to edit).
+    /// Open `EditHost` for sidebar row; pre-filled with current address. No-op for unsaved entries.
     pub(crate) fn open_edit_host(&mut self, idx: usize) {
         let Some(HostEntry::Known(h)) = self.entries.get(idx) else {
             return;
@@ -28,8 +18,7 @@ impl App {
         self.screen = Screen::EditHost;
     }
 
-    /// Same key handling as the add-host modal — Left/Right stand in for
-    /// backspace/"next octet", Confirm commits once four octets are present.
+    /// Handle menu event. Left/Right stand in for backspace; Confirm commits with 4 octets.
     pub(crate) fn handle_edit_host_event(&mut self, ev: MenuEvent) {
         match ev {
             MenuEvent::Left => self.add_host.backspace(),
@@ -43,9 +32,7 @@ impl App {
         }
     }
 
-    /// Rewrites the edited host's address in place, keeping everything that identifies
-    /// it (name, fingerprint, management port, MAC). No-ops on a still-partial address,
-    /// same as `confirm_add_host`.
+    /// Rewrite address in-place, keeping identity (fingerprint, `mgmt_port`, MAC). No-op if partial.
     pub(crate) fn confirm_edit_host(&mut self) {
         if !self.add_host.is_complete() {
             return;
@@ -61,9 +48,7 @@ impl App {
             return;
         }
 
-        // Drop the old record and upsert under the new address, carrying the identity
-        // fields across — `upsert_known_host` keys on `(host, port)`, so a moved host
-        // would otherwise leave its stale entry behind alongside the new one.
+        // Drop old record before upsert to avoid stale entry (upsert_known_host keys on (host, port))
         self.known_hosts.retain(|k| !(k.host == old.host && k.port == old.port));
         store::upsert_known_host(
             &mut self.known_hosts,
@@ -81,7 +66,7 @@ impl App {
         let _ = store::save_known_hosts(&self.known_hosts);
         self.entries = self.known_hosts.iter().cloned().map(HostEntry::Known).collect();
 
-        // The selection follows the host to its new address rather than being dropped.
+        // Keep selection updated to new address
         if self.selected_host.as_ref() == Some(&(old.host.clone(), old.port)) {
             self.selected_host = Some((host.clone(), port));
         }

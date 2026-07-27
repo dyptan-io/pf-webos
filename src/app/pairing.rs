@@ -1,6 +1,3 @@
-//! The pairing modal: PIN entry and the no-PIN request-access ceremony.
-//!
-//! Split out of the former single-file `app.rs`; see `super`'s module docs.
 use super::*;
 use crate::store::{self, KnownHost};
 use crate::ui::{self, HostEntry, MenuEvent, Painter};
@@ -9,9 +6,7 @@ use sdl2::rect::Rect;
 use std::time::Instant;
 
 impl App {
-    /// Opens the pairing modal for sidebar entry `idx`, resetting the PIN state.
-    /// Shared by `confirm_sidebar_host` (an unpaired host confirmed from the sidebar)
-    /// and the host menu's explicit "Pair with PIN…" row.
+    /// Open pairing modal and reset PIN state.
     pub(crate) fn open_pairing(&mut self, idx: usize) {
         self.pairing_entry = idx;
         self.pin_digits = [0; 4];
@@ -23,9 +18,7 @@ impl App {
         self.screen = Screen::Pairing;
     }
 
-    /// Handles one menu event on the pairing modal. Two focus zones (`PairingFocus`):
-    /// the PIN digit row (blocking SPAKE2 ceremony on `Confirm`) and the "Request
-    /// access" button (blocking no-PIN, park-until-approved connect on `Confirm`).
+    /// Handle pairing events (PIN row or Request Access button).
     pub fn handle_pairing_event(&mut self, ev: MenuEvent) {
         if self.pairing_busy {
             // Mid-ceremony, Back cancels (dropping the receiver orphans the
@@ -103,13 +96,7 @@ impl App {
         }
     }
 
-    /// The no-PIN pairing path: connect trust-on-first-use (presenting our identity so
-    /// the host operator sees this device), which the host PARKS until the operator
-    /// approves it in the host UI, then pin the now-verified fingerprint and land on the
-    /// host's game grid — the same success path as `try_pair`, and likewise run on a
-    /// background thread (this one can block for MINUTES waiting on the approval, so
-    /// freezing the UI for it is not an option). The 185s budget matches `run_inner`'s
-    /// pending-approval wait, long enough for a human to notice and click.
+    /// No-PIN path: request access (park), then pin fingerprint. 185s timeout.
     pub(crate) fn try_request_access(&mut self) {
         let entry = &self.entries[self.pairing_entry];
         let host = entry.host().to_string();
@@ -138,10 +125,7 @@ impl App {
         });
     }
 
-    /// Drains a finished background pairing/request-access ceremony, if any —
-    /// called each tick from `run_ui_flow` like the other `drain_*`s. Success
-    /// persists the host and lands on its game grid; failure re-arms the pairing
-    /// modal with the error text.
+    /// Drain finished pairing; persist on success, show error on failure.
     pub fn drain_pairing(&mut self) -> bool {
         let Some(rx) = &self.pairing_rx else { return false };
         let Ok(outcome) = rx.try_recv() else { return false };
@@ -180,9 +164,7 @@ impl App {
         true
     }
 
-    /// Direct digit entry (the Magic Remote's number buttons) — types `digit` into
-    /// the current PIN slot and auto-advances, like a phone lock-screen PIN pad,
-    /// instead of requiring left/right cycling through 0-9 per digit.
+    /// Number button entry; auto-advances like phone PIN pad.
     pub fn enter_pin_digit(&mut self, digit: u8) {
         if self.pairing_busy {
             return;
@@ -199,8 +181,7 @@ impl App {
         }
     }
 
-    /// Starts the PIN pairing ceremony on a background thread (see
-    /// `pairing_rx`'s docs — the ceremony blocks, the UI must not).
+    /// Start PIN pairing on background thread (30s timeout).
     pub(crate) fn try_pair(&mut self) {
         let entry = &self.entries[self.pairing_entry];
         let host = entry.host().to_string();
@@ -240,12 +221,7 @@ impl App {
     }
 }
 
-/// Every y-position on the pairing card, derived once.
-///
-/// The card presents two *alternatives*, not two steps, so the layout is: primary
-/// action, an "or" rule, then the fallback. Computing it in one place keeps the
-/// renderer, the mouse hit-test, `prepare_tiles` and `draw_list` from drifting apart —
-/// four call sites that previously each rebuilt their own slice of this arithmetic.
+/// All y-positions on pairing card, computed once (keeps renderer, hit-test, and tile prep in sync).
 pub(crate) struct PairingLayout {
     pub(crate) button: Rect,
     pub(crate) button_caption_y: i32,
@@ -257,9 +233,8 @@ pub(crate) struct PairingLayout {
     pub(crate) content: Rect,
 }
 
-/// Height of the primary "Request access" button.
+/// Request access button height and card side inset.
 const PAIRING_BUTTON_H: u32 = 64;
-/// Side inset of the card's inner column.
 const PAIRING_MARGIN: i32 = 40;
 
 impl App {
@@ -288,9 +263,7 @@ impl App {
         }
     }
 
-    /// The pairing modal's card rect — shared by `render_pairing` and mouse hit-testing.
-    /// Sized from the same layout the renderer uses, plus room for an up-to-two-line
-    /// failure status.
+    /// Card rect, sized from layout plus room for up-to-two-line status.
     pub(crate) fn pairing_card_rect(screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Rect {
         Self::simple_modal_card(screen_w, screen_h, |probe| {
             let l = Self::pairing_layout(probe, fonts);
@@ -299,12 +272,12 @@ impl App {
         })
     }
 
-    /// The "Request access" button's rect.
+    /// Request access button rect.
     pub(crate) fn pairing_request_button_rect(card: Rect, fonts: &ui::Fonts) -> Rect {
         Self::pairing_layout(card, fonts).button
     }
 
-    /// The PIN row's top `y`.
+    /// PIN row top y-position.
     pub(crate) fn pairing_pin_row_y(card: Rect, fonts: &ui::Fonts) -> i32 {
         Self::pairing_layout(card, fonts).pin_y
     }
@@ -390,7 +363,7 @@ impl App {
         Ok(())
     }
 
-    /// One centred caption line — the two option labels either side of the "or" rule.
+    /// Centred caption line (option labels on either side of "or" rule).
     fn draw_centred_caption(
         painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,

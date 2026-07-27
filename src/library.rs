@@ -20,13 +20,8 @@ use ureq::unversioned::transport::{
 /// older host with no mgmt TXT at all) fall back here.
 pub const DEFAULT_MGMT_PORT: u16 = 47990;
 
-/// Cover-art paths for a title — each is a host-relative path (e.g.
-/// `/api/v1/library/art/steam:570/portrait`), fetched through the same mTLS-pinned
-/// management API `fetch_games` uses, not an external URL the client hits directly
-/// (the host proxies Steam CDN/custom art itself — see `punktfunk-host::library`).
-/// `art.rs` prefers `portrait` for the grid, falling back to `header`. `hero`/
-/// `logo` mirror the host's full wire shape (a future detail/hero view could use
-/// them) but nothing here reads them yet.
+/// Cover-art paths for a title (host-relative, fetched via mTLS).
+/// art.rs prefers `portrait`, falls back to `header`. `hero`/`logo` unused.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[allow(dead_code)]
 pub struct Artwork {
@@ -43,8 +38,6 @@ pub struct Artwork {
 pub struct GameEntry {
     pub id: String,
     pub title: String,
-    /// `#[serde(default)]` so an older host that omits art still decodes — the grid
-    /// just falls back to its placeholder card.
     #[serde(default)]
     pub art: Artwork,
 }
@@ -80,19 +73,12 @@ fn base_url(addr: &str, mgmt_port: u16) -> String {
     }
 }
 
-/// Builds one mTLS `ureq::Agent`, reusable across many requests to the same host
-/// (`ureq::Agent` owns a connection pool — reusing one instance keeps a TCP+TLS
-/// connection alive across calls instead of paying a fresh mutual-TLS handshake,
-/// including re-parsing the PEM identity, every single time). Exposed so
-/// `art.rs`'s per-game cover-art loop can build it once outside the loop, instead
-/// of what `fetch_art` used to do (build a fresh one — and a fresh handshake —
-/// per game, which is real, avoidable latency/CPU cost for a library of any size).
+/// Builds mTLS `ureq::Agent` reusable across requests (avoids repeated TLS handshakes).
+/// Exposed for art.rs to build once outside its per-game loop.
 pub fn agent(identity: &(String, String), pin: Option<[u8; 32]>) -> Result<ureq::Agent, LibraryError> {
     use rustls::pki_types::pem::PemObject;
     let bad = |what: &str, e: &dyn std::fmt::Display| LibraryError::Unreachable(format!("{what}: {e}"));
-    // The ring provider, explicitly — the same one punktfunk-core's QUIC endpoints
-    // install (via the `quic` feature), so the process never mixes rustls crypto
-    // providers.
+    // Ring provider (matches punktfunk-core's QUIC for consistent crypto).
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -107,11 +93,8 @@ pub fn agent(identity: &(String, String), pin: Option<[u8; 32]>) -> Result<ureq:
         .with_client_auth_cert(vec![cert], key)
         .map_err(|e| bad("client auth", &e))?;
 
-    // ureq 3.x's own `TlsConfig`/`RustlsConnector` only build a `rustls::ClientConfig`
-    // from a fixed CA-chain/platform-verifier menu — no hook for `cfg`'s custom
-    // fingerprint-pinning `PinVerify` above. So we skip that layer entirely and hand
-    // `cfg` to our own minimal TLS-wrapping `Connector` (`PinnedTlsConnector` below,
-    // modeled on ureq's own `RustlsConnector`), chained onto the stock `TcpConnector`.
+    // WHY: ureq's TlsConfig doesn't hook custom fingerprint pinning. Custom Connector
+    // (PinnedTlsConnector below) wraps cfg for pinning, chained onto TcpConnector.
     let connector = TcpConnector::default().chain(PinnedTlsConnector { config: Arc::new(cfg) });
     let config = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(5)))
@@ -120,10 +103,7 @@ pub fn agent(identity: &(String, String), pin: Option<[u8; 32]>) -> Result<ureq:
     Ok(ureq::Agent::with_parts(config, connector, DefaultResolver::default()))
 }
 
-/// Fetch the host's unified library. Errors are pre-classified for the UI (401/403 →
-/// `NotPaired`, a pin-verifier rejection → `PinMismatch`). Only called from
-/// `load_games_async` — `App` never calls this directly on the UI thread (see that
-/// function's docs on why).
+/// Fetch the host's library (errors pre-classified for UI: 401/403→NotPaired, etc).
 fn fetch_games(
     addr: &str,
     mgmt_port: u16,
@@ -142,11 +122,7 @@ fn fetch_games(
     serde_json::from_str(&body).map_err(|e| LibraryError::Unreachable(format!("bad JSON: {e}")))
 }
 
-/// One `fetch_games` call's result, delivered over `load_games_async`'s channel —
-/// carries `host`/`port`/`mgmt_port` back alongside the result since the receiving
-/// end (`App::drain_games`) needs them to start art loading on success, without
-/// having to keep its own copy in sync with whatever host is selected by the time
-/// the fetch completes.
+/// One `fetch_games` result with `host/port/mgmt_port` (so `drain_games` can start art loading).
 pub struct GamesLoaded {
     pub host: String,
     pub port: u16,
@@ -154,15 +130,8 @@ pub struct GamesLoaded {
     pub result: Result<Vec<GameEntry>, LibraryError>,
 }
 
-/// Spawns one background thread to run `fetch_games` and deliver its result —
-/// `agent(...).get(...).call()` blocks on a real network round-trip (up to the
-/// 5s connect / 10s total timeout `agent` sets), so calling `fetch_games` directly
-/// from the UI thread (the old behavior) froze every input — button presses,
-/// pointer motion, rendering — for as long as the host took to answer or time out.
-/// Switching hosts again before this finishes is safe: `App::select_host` replaces
-/// `games_rx` with a fresh channel, dropping this one's receiver, so this thread's
-/// `tx.send` just fails and it exits — the same discard-on-drop pattern
-/// `art::load_art_async` already relies on.
+/// Spawns background thread to run `fetch_games` (avoids UI freeze from network blocking).
+/// Safe to switch hosts before finish: receiver drop causes thread's send to fail.
 pub fn load_games_async(
     host: String,
     port: u16,

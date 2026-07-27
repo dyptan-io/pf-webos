@@ -1,8 +1,5 @@
-//! Native webOS TV client for punktfunk. See `docs/NOTES.md` for the architecture and
-//! the hard-won platform gotchas. Real body only under `target_os = "linux"` (true
-//! both on a native Linux dev box and the webOS `armv7-unknown-linux-gnueabi` cross
-//! target, which reports the same `target_os`) — this keeps `cargo build` green on
-//! macOS/Windows dev boxes without SDL2 installed.
+//! Native webOS TV client for punktfunk (see `docs/NOTES.md` for architecture).
+//! Platform-gated to `target_os` = "linux" (both webOS and Linux dev boxes).
 #[cfg(target_os = "linux")]
 mod app;
 #[cfg(target_os = "linux")]
@@ -58,17 +55,10 @@ mod real {
     use crate::store;
     use crate::ui::MenuEvent;
 
-    /// What `run_ui_flow` resolved: a `session::connect` already running on its own
-    /// thread (started as soon as the target was confirmed, so it overlaps the
-    /// launch zoom/fade instead of running after it — see `spawn_connect`), plus
-    /// the settings it was started with.
+    /// `ConnectOutcome`: connect thread (started early to overlap animation) + settings.
     type ConnectOutcome = (std::thread::JoinHandle<Result<session::Connected>>, store::Settings);
 
-    /// Starts `session::connect` on its own thread and returns immediately — the
-    /// caller joins it once it's actually needed (after the launch animation, or
-    /// straight away for the dev-override path). Letting connect run alongside the
-    /// launch animation means a fast local handshake often finishes before the
-    /// animation does, so the stream starts the instant it ends instead of after.
+    /// Start `session::connect` on its own thread. Caller joins after animation (or immediately).
     #[allow(clippy::too_many_arguments)]
     fn spawn_connect(
         identity: (String, String),
@@ -83,11 +73,7 @@ mod real {
         std::thread::Builder::new()
             .name("punktfunk-webos-connect".into())
             .spawn(move || {
-                // SDL2/Wayland reports refresh_rate=0 in some launch contexts
-                // (confirmed: the host's virtual-display driver rejected a literal
-                // "0 Hz" mode request with "the parameter is incorrect") — the
-                // settings' own nominal rate (never 0; see `store::Settings::default`)
-                // is what drives the wire value directly.
+                // SDL2/Wayland reports refresh_rate=0; use settings' nominal rate instead
                 let mode = Mode {
                     width: settings.width,
                     height: settings.height,
@@ -109,9 +95,7 @@ mod real {
                     identity,
                     fp,
                     launch,
-                    // The host PARKS an unpinned/TOFU connect until an operator approves it —
-                    // matching clients/session's PENDING_APPROVAL_WAIT convention, not the
-                    // plain 15s handshake budget (too short for a human to notice and click).
+                    // 185s: host parks unpinned/TOFU until approval (15s handhake budget too short)
                     Duration::from_secs(185),
                     display_w,
                     display_h,
@@ -122,26 +106,17 @@ mod real {
             .context("spawn connect thread")
     }
 
-    /// Set by [`handle_term_signal`], read by both event loops below as an extra
-    /// "should we quit" condition alongside SDL's own `Event::Quit`. webOS can ask a
-    /// backgrounded/closing app to exit via SIGTERM before ever reaching SIGKILL —
-    /// without catching that, a stream in progress gets killed with no chance to
-    /// tell the host anything (see `session::Connected::shutdown`'s docs).
+    /// Set by signal handler; read as extra quit condition (webOS uses SIGTERM before SIGKILL).
     static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-    /// Async-signal-safe by construction (a lone atomic store) — real cleanup
-    /// happens later, wherever `QUIT_REQUESTED` is next polled.
+    /// Async-signal-safe handler: just set the flag, cleanup happens at next poll.
     extern "C" fn handle_term_signal(_signum: libc::c_int) {
         QUIT_REQUESTED.store(true, Ordering::Relaxed);
     }
 
-    /// `SIGTERM` (webOS's/systemd's normal "please exit") and `SIGINT` (Ctrl-C, for
-    /// off-device smoke-testing). Best-effort: a failure just leaves the OS default
-    /// (immediate kill) in place.
+    /// Install SIGTERM/SIGINT handlers (best-effort; failure uses OS default).
     fn install_signal_handlers() {
-        // SAFETY: `libc::signal` with a function pointer of the correct
-        // `extern "C" fn(c_int)` signature and no other arguments is exactly its
-        // documented safe-to-call shape.
+        // SAFETY: function pointer matches libc::signal's documented safe shape
         unsafe {
             libc::signal(libc::SIGTERM, handle_term_signal as *const () as libc::sighandler_t);
             libc::signal(libc::SIGINT, handle_term_signal as *const () as libc::sighandler_t);

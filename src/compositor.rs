@@ -37,57 +37,29 @@ pub enum Tile {
     PinMove,
     /// The active modal, full-screen with transparent surroundings.
     Modal,
-    /// Whichever modal's single focused, zoom-animated widget is currently
-    /// cached — a settings/Wake row, a pairing PIN digit or button, or a
-    /// Forget-host confirm button (see `app::ModalFocusKey`). Composited over
-    /// `Modal`'s shell (which draws every widget unfocused) so moving focus,
-    /// or zooming it in, recomposites this instead of re-rasterizing the
-    /// whole modal. Only one modal is ever open at a time, so one tile
-    /// suffices for all of them.
+    /// One modal's focused, zoom-animated widget (row, PIN digit, button, etc).
+    /// Composited over Modal's shell; one tile covers all modals.
     ModalFocusElement,
-    /// An open dropdown's panel + unfocused option list, positioned over the
-    /// row that opened it. Its own tile — rather than being baked into
-    /// `Modal`'s shell — so it composites *after* `ScrollContent`, which would
-    /// otherwise redraw the rows the panel overlaps on top of it.
+    /// Open dropdown panel + option list. Own tile so it composites after `ScrollContent`.
     DropdownOverlay,
-    /// An open dropdown's focused option, as its own small tile — composited
-    /// over `DropdownOverlay` (which draws the dropdown's option list
-    /// unfocused) so moving the dropdown's own focus recomposites this
-    /// instead of re-rasterizing the whole modal.
+    /// Open dropdown's focused option. Composited over `DropdownOverlay`.
     DropdownFocusOption,
     /// The Home status line block (bottom of the grid panel).
     Status,
     /// The "No host selected" hint line.
     NoHost,
-    /// Whichever modal's scroll position indicator is currently baked
-    /// (`ui::render_list_scrollbar_tile`) — keyed by `Screen` since only one
-    /// modal is ever open at a time, so one keyed pair of variants covers
-    /// every scrollable modal (Settings' row list, About's document, ...)
-    /// instead of two new `Tile` variants per modal. See `App::scroll_geometry`.
+    /// Modal scrollbar tile, keyed by Screen (covers all scrollable modals).
     ScrollIndicator(Screen),
-    /// Whichever modal's scrollable content is currently baked, at its
-    /// *unscrolled* position — for Settings, every row at full row-list
-    /// height; for About, a bounded window of the wrapped document (see
-    /// `ui::ContentWindow` — the whole ~12k-line document is far too tall for
-    /// one GPU texture). Scrolling crops/repositions this via
-    /// `DrawCmd::TexCropped` (a GPU op), so it only needs rebuilding when the
-    /// content itself changes (a value/dropdown, or About's window
-    /// recentering), never when the list merely scrolls within it.
+    /// Modal scrollable content at unscrolled position. GPU crops/repositions via
+    /// `TexCropped`; rebuilds only when content changes, not on scroll.
     ScrollContent(Screen),
-    /// One spinner frame's GPU texture, keyed by frame index within the GIF.
-    /// Frames are uploaded at most once (see `Compositor::upload_raw`) and held
-    /// in VRAM for the duration of the UI session; `clear_all` reclaims them
-    /// when a stream starts.
+    /// Spinner frame texture, keyed by frame index. Held in VRAM until stream starts.
     SpinnerFrame(usize),
     /// The in-stream stats overlay panel (`ui::render_stats_overlay_tile`).
     StatsOverlay,
-    /// The in-stream disconnect-confirmation dialog's shell — card, title,
-    /// both buttons unfocused (`ui::render_disconnect_dialog_shell`).
+    /// Disconnect dialog shell (card + title + unfocused buttons).
     DisconnectDialog,
-    /// The disconnect dialog's focused button, as its own small zoom-animated
-    /// tile (`ui::render_confirm_button_tile`) — composited over
-    /// `DisconnectDialog`'s shell, same shell/focus-tile split as every
-    /// pre-stream modal.
+    /// Disconnect dialog focused button. Composited over `DisconnectDialog` shell.
     DisconnectFocusButton,
 }
 
@@ -96,9 +68,7 @@ pub enum DrawCmd {
     /// Copy `tile`'s texture to `dst` (scaled by the GPU if sizes differ),
     /// modulated by `alpha`.
     Tex { tile: Tile, dst: Rect, alpha: u8 },
-    /// Same as `Tex`, but samples only `src` (in the tile's own pixel space) —
-    /// how the Settings row list scrolls: cropping/repositioning a fixed texture
-    /// is a GPU op, so scrolling never needs the tile re-rasterized.
+    /// Copy with source crop — how scrolling works: GPU crops fixed texture.
     TexCropped {
         tile: Tile,
         src: Rect,
@@ -124,9 +94,7 @@ impl Compositor {
         }
     }
 
-    /// Uploads straight-RGBA8 bytes directly into a new static GPU texture for
-    /// `tile`. No-ops if `tile` is already cached — caller only needs to push it
-    /// to `updated` the first time.
+    /// Uploads straight-RGBA8 bytes to a new GPU texture. No-op if already cached.
     pub fn upload_raw(
         &mut self,
         creator: &TextureCreator<WindowContext>,
@@ -149,9 +117,8 @@ impl Compositor {
         Ok(())
     }
 
-    /// Creates/updates `tile`'s texture from a freshly rasterized painter.
-    /// Opaque tiles (`Sidebar`) upload their bytes directly with blending off;
-    /// everything else is un-premultiplied into `staging` and alpha-blended.
+    /// Creates/updates tile's texture from a rasterized painter. Opaque tiles
+    /// upload directly; others un-premultiply and alpha-blend.
     pub fn upload(&mut self, creator: &TextureCreator<WindowContext>, tile: Tile, pm: &Painter) -> Result<()> {
         let (w, h) = (pm.width(), pm.height());
         let recreate = match self.textures.get(&tile) {
@@ -197,11 +164,7 @@ impl Compositor {
         Ok(())
     }
 
-    /// Destroys every cached GPU texture at once.
-    ///
-    /// Call this when the UI is no longer visible (e.g. stream start) so all
-    /// VRAM held by the compositor is returned to the driver in one shot.
-    /// Safe to call with an empty map.
+    /// Destroys all cached GPU textures (call on stream start to free VRAM).
     pub fn clear_all(&mut self) {
         // SAFETY: `unsafe_textures` detaches each `Texture` from its creator's
         // lifetime, making the owner responsible for destruction. We drain the
@@ -212,12 +175,8 @@ impl Compositor {
         }
     }
 
-    /// Drops `tile`'s GPU texture, if it has one.
-    ///
-    /// Needed because card tiles are windowed: a texture for a card scrolled far
-    /// out of view is pure retained VRAM, and with `unsafe_textures` a `Texture`
-    /// is not freed by dropping the map entry — the SDL object must be destroyed.
-    /// Safe to call for a tile that was never uploaded.
+    /// Drops tile's GPU texture. Needed for windowed card tiles to free VRAM
+    /// when scrolled out of view (SDL object must be explicitly destroyed).
     pub fn drop_tile(&mut self, tile: Tile) {
         if let Some(tex) = self.textures.remove(&tile) {
             // SAFETY: see `clear_all`.

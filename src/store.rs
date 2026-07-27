@@ -1,8 +1,4 @@
-//! Persisted client identity, known hosts, and stream settings — JSON files under
-//! the app's own writable directory (`$HOME`, e.g.
-//! `/media/developer/apps/usr/palm/applications/io.dyptan.punktfunk.webos/`). Mirrors
-//! `pf-client-core::trust`'s file-per-concern layout (identity PEMs / known-hosts
-//! JSON / settings JSON) so the shape is familiar, trimmed to what this client uses.
+//! Persisted identity (PEMs), known hosts, and settings (JSON). Layout mirrors `pf-client-core::trust`.
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -17,7 +13,7 @@ fn identity_paths() -> (PathBuf, PathBuf) {
     (dir.join("client-cert.pem"), dir.join("client-key.pem"))
 }
 
-/// Loads the persisted client identity, generating and saving a new one on first run.
+/// Load or generate identity (on first run).
 pub fn load_or_create_identity() -> Result<(String, String)> {
     let (cert_path, key_path) = identity_paths();
     if let (Ok(cert), Ok(key)) = (std::fs::read_to_string(&cert_path), std::fs::read_to_string(&key_path)) {
@@ -34,30 +30,18 @@ pub struct KnownHost {
     pub name: String,
     pub host: String,
     pub port: u16,
-    /// `None` = discovered but never paired.
+    /// None = discovered but never paired.
     pub fingerprint: Option<[u8; 32]>,
-    /// The management API's port (game library fetch) — `#[serde(default)]` so a
-    /// `known-hosts.json` saved before this field existed still loads. `None` falls
-    /// back to `library::DEFAULT_MGMT_PORT`.
+    /// Management API port (game library); defaults to `library::DEFAULT_MGMT_PORT`.
     #[serde(default)]
     pub mgmt_port: Option<u16>,
-    /// Wake-on-LAN MAC(s) (`aa:bb:cc:dd:ee:ff`), learned from this host's mDNS `mac`
-    /// TXT while it was last seen awake (see `discovery::DiscoveredHost::mac` and
-    /// `app::App::drain_discovery`). Empty if never learned — a host in that state
-    /// can't be woken, so `app.rs` falls back to the plain unreachable message.
+    /// Wake-on-LAN MACs learned from mDNS; empty if never advertised.
     #[serde(default)]
     pub mac: Vec<String>,
-    /// Whether an unreachable-at-connect-time host gets a Wake-on-LAN packet sent
-    /// straight away, with no prompt. Per-host rather than global: waking the desktop
-    /// rig on demand is the point, while a laptop that's off is usually off on purpose.
-    /// Off by default (also for a `known-hosts.json` written before this field
-    /// existed): a host that turns out to be unreachable asks first, via the wake
-    /// prompt, and only auto-sends once this has been turned on for it. Lives on the
-    /// host menu's Wake row (⋯ → Wake settings).
+    /// Auto-wake on unreachable (per-host, off by default; lives in Wake settings).
     #[serde(default)]
     pub wol_auto: bool,
-    /// Up to `MAX_PINNED_GAMES` pinned `GameEntry::id`s for this host, in pin order.
-    /// `#[serde(default)]` so an older `known-hosts.json` still loads.
+    /// Pinned game IDs (up to `MAX_PINNED_GAMES`).
     #[serde(default)]
     pub pinned: Vec<String>,
 }
@@ -65,10 +49,7 @@ pub struct KnownHost {
 /// Max games pinned to one host's always-visible grid row at once.
 pub const MAX_PINNED_GAMES: usize = 5;
 
-/// The pin id for the "Desktop" card — not a `GameEntry::id`, but stored in
-/// `KnownHost::pinned` the same way so Desktop can be pinned/unpinned with the
-/// same hold-OK gesture as any game, and counts toward the same
-/// `MAX_PINNED_GAMES` cap. Pinned on a newly added host (see `addhost.rs`).
+/// Pin ID for "Desktop" card (stored in pinned like games; counts toward `MAX_PINNED_GAMES`).
 pub const DESKTOP_PIN_ID: &str = "__desktop__";
 
 impl KnownHost {
@@ -76,8 +57,7 @@ impl KnownHost {
         self.pinned.iter().any(|p| p == id)
     }
 
-    /// Whether toggling `id` would do anything: unpinning always can, pinning
-    /// only under `MAX_PINNED_GAMES`.
+    /// Whether toggling id would do anything (unpin always ok, pin only if under `MAX_PINNED_GAMES`).
     pub fn can_toggle_pin(&self, id: &str) -> bool {
         self.is_pinned(id) || self.pinned.len() < MAX_PINNED_GAMES
     }

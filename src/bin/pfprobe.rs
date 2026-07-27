@@ -1,16 +1,5 @@
-//! Headless network speed probe — the app's "Test connection" measurement as a CLI, so it
-//! can be run on-device over Dev-Mode SSH (no TV UI, no display) while watching kernel
-//! counters from the outside. Mirrors `session::run_speed_probe` exactly: a decode-less
-//! `NativeClient` connect advertising `VIDEO_CAP_CHACHA20` (the counters this measurement
-//! reads increment *after* AEAD decrypt, so the probe must pay the same cipher a real
-//! session does), then one host-driven burst polled to completion.
-//!
-//! Usage:
-//!   pfprobe <host> <port> <cert.pem> <key.pem> <pin-hex-64> [`target_kbps`] [`duration_ms`]
-//!
-//! Prints one `progress:` line per 250 ms poll (live `recv_bytes`) and a final `result:`
-//! line with the host-attested figures. Diagnostics from punktfunk-core (`PUNKTFUNK_PERF=1`
-//! pump-stage splits, ABR/probe decisions) go to stderr via `tracing`.
+//! Headless speed probe CLI (mirrors `session::run_speed_probe`). Run on-device over SSH to test connection.
+//! Usage: pfprobe <host> <port> <cert.pem> <key.pem> <pin-hex-64> [`target_kbps`] [`duration_ms`]
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn main() -> anyhow::Result<()> {
@@ -31,8 +20,7 @@ mod real {
     use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
     use punktfunk_core::quic;
 
-    /// Same non-zero pinned session rate as `session::run_speed_probe`: `bitrate_kbps == 0`
-    /// would arm core's own startup capacity probe against the single shared `ProbeState`.
+    /// Non-zero to avoid triggering core's startup probe (`bitrate_kbps` == 0 would).
     const PROBE_SESSION_BITRATE_KBPS: u32 = 20_000;
     const PROBE_REPORT_GRACE: Duration = Duration::from_secs(12);
 

@@ -1,21 +1,5 @@
-//! On-demand cover-art loading, with a disk cache.
-//!
-//! Art is fetched over the same mTLS-pinned management API as the library itself, decoded
-//! with the pure-Rust `image` crate (no on-device libjpeg/libpng to find), and handed to
-//! the UI as an owned `tiny_skia::Pixmap` — unlike an SDL2 `Texture` (which isn't `Send`,
-//! borrowing a `TextureCreator` tied to the main thread's GL context), a `Pixmap` crosses
-//! a channel as the actual drawable object.
-//!
-//! **This used to fetch and decode the entire library up front, and keep all of it.** On a
-//! 365-title library that is ~365 sequential mTLS round-trips on every launch and host
-//! switch, and — at `MAX_ART_DIMENSION` — on the order of 200 MB of decoded pixmaps held
-//! for the whole session, in a 32-bit process on a TV with under 2 GB usable. The grid can
-//! only ever show a couple of dozen cards at once.
-//!
-//! So: the UI **requests** the covers it is about to draw ([`ArtLoader::request`]) and
-//! drops the ones it has scrolled far away from, and a disk cache makes coming back cheap.
-//! The cache stores the *encoded* bytes exactly as fetched (tens of KB) rather than decoded
-//! pixels (hundreds of KB), so it stays small and a cache hit still costs only a decode.
+//! On-demand cover-art loading with disk cache (not all-at-once, which caused OOM).
+//! Fetches via mTLS, decodes with pure-Rust `image` crate, handed to UI as `Pixmap`.
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -38,21 +22,12 @@ struct ArtRequest {
     path: String,
 }
 
-/// Cap on the longer side of a decoded cover. Source art (Steam CDN capsules etc.) commonly
-/// runs past 1000px, but a card is ~260px wide at 1080p even in the widest layout (see
-/// `ui::grid_card_size`), so anything above this is memory and decode time spent on pixels
-/// the panel cannot show.
+/// Max decoded dimension (panel can't show oversized art anyway).
 const MAX_ART_DIMENSION: u32 = 480;
-
-/// The grid card's fixed portrait aspect (see `ui::grid_card_size`). A card's art is
-/// stretched to exactly fill its rect (`Painter::draw_pixmap_scaled`), so source art at a
-/// different aspect ratio — a lot of it, in the wild (Steam capsules, custom box art) —
-/// would otherwise look visibly squashed or stretched. Center-cropping to this aspect once
-/// at decode time avoids that without ever distorting the image.
+/// Grid card portrait aspect (cropped to avoid distortion).
 const TARGET_ART_ASPECT: f32 = 3.0 / 4.0;
 
-/// Center-crops `img` to `aspect` (width/height), trimming whichever axis is oversized.
-/// A no-op if `img` is already close enough to `aspect`.
+/// Center-crop to aspect ratio (no-op if already close).
 fn crop_to_aspect(img: image::DynamicImage, aspect: f32) -> image::DynamicImage {
     let (w, h) = (img.width(), img.height());
     if w == 0 || h == 0 {
@@ -71,58 +46,47 @@ fn crop_to_aspect(img: image::DynamicImage, aspect: f32) -> image::DynamicImage 
     }
 }
 
-/// Bump when the raw-cache layout or `MAX_ART_DIMENSION` changes, to invalidate stale caches.
-const RAW_CACHE_MAGIC: u32 = 0x50465232; // "PFR2" — bumped for center-cropped art
+/// Cache version magic ("PFR2" — bumped for center-cropped art).
+const RAW_CACHE_MAGIC: u32 = 0x50465232;
 
-/// Root of all cached art, under the app's own writable directory.
 fn cache_root() -> PathBuf {
     let home = std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from);
     home.join("art-cache")
 }
 
-/// A filesystem-safe name for a store-qualified id (`steam:570`, `custom:12`) or a
-/// `host:port` key. Not collision-proof (e.g. `"a:1"` and `"a_1"` sanitize the same).
 fn cache_name(id: &str) -> String {
     id.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
 }
 
-/// One subdirectory per host (keyed by `(host, port)`, same as `store::KnownHost`'s dedup
-/// key) — keeps game-id collisions across hosts from leaking art, and lets a forgotten
-/// host's cache be dropped in one `remove_dir_all`.
 fn cache_dir(host: &str, port: u16) -> PathBuf {
     cache_root().join(cache_name(&format!("{host}_{port}")))
 }
 
-/// Deletes a forgotten host's cached art. Best-effort: a missing or unremovable directory
-/// is not an error the caller needs to react to.
+/// Clear a forgotten host's cached art (best-effort).
 pub fn clear_host_cache(host: &str, port: u16) {
     let _ = std::fs::remove_dir_all(cache_dir(host, port));
 }
 
-/// Decoded/resized/premultiplied pixels, keyed like the encoded cache. A hit here skips
-/// `image::load_from_memory`, `resize`, and `premultiply_rgba` entirely.
 fn raw_cache_path(dir: &std::path::Path, game_id: &str) -> PathBuf {
     dir.join(format!("{}.raw", cache_name(game_id)))
 }
 
-/// Layout: `[magic: u32 LE][width: u32 LE][height: u32 LE][premultiplied RGBA bytes]`.
+/// Write-then-rename (prevents truncated cache files on kill mid-write).
 fn write_raw_cache(path: &std::path::Path, pixmap: &Pixmap) {
     let mut buf = Vec::with_capacity(12 + pixmap.data().len());
     buf.extend_from_slice(&RAW_CACHE_MAGIC.to_le_bytes());
     buf.extend_from_slice(&pixmap.width().to_le_bytes());
     buf.extend_from_slice(&pixmap.height().to_le_bytes());
     buf.extend_from_slice(pixmap.data());
-    // Write-then-rename so a kill mid-write can't leave a truncated file that parses as
-    // garbage forever (same discipline as the encoded cache below).
     let tmp = path.with_extension("raw.tmp");
     if std::fs::write(&tmp, &buf).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
 }
 
-/// Reads back a raw cache entry written by [`write_raw_cache`], if present and well-formed.
+/// Read raw cache, if present and well-formed.
 fn read_raw_cache(path: &std::path::Path) -> Option<Pixmap> {
     let buf = std::fs::read(path).ok()?;
     let magic = u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?);
@@ -136,10 +100,7 @@ fn read_raw_cache(path: &std::path::Path) -> Option<Pixmap> {
     Pixmap::from_vec(pixels, size)
 }
 
-/// Stretches `src` to exactly `(w, h)` on this background thread, before delivery,
-/// so `draw_poster_card` can just blit the result (no per-card-build scaling —
-/// the bilinear resize is real cost on the armv7 softfloat target). `None` only if
-/// `w`/`h` is somehow zero, in which case the caller keeps the unresized art.
+/// Stretch to card size (done here, not in each card build, to save armv7 cost).
 fn resize_pixmap(src: &Pixmap, w: u32, h: u32) -> Option<Pixmap> {
     let mut dst = Pixmap::new(w, h)?;
     let (sw, sh) = (src.width() as f32, src.height() as f32);
@@ -177,10 +138,8 @@ pub struct ArtLoader {
 }
 
 impl ArtLoader {
-    /// `port` is the host's identity port (matches `store::KnownHost::port`); `mgmt_port`
-    /// is what's actually dialed to fetch art. `card_w`/`card_h` is the grid's current
-    /// card size (see `ui::grid_card_size`) — every cover is stretched to exactly this
-    /// before delivery (see `resize_pixmap`).
+    /// Spawn loader. `mgmt_port` is what's dialed (separate from identity `port`).
+    /// Card dimensions determine cover stretch-to size.
     pub fn spawn(
         host: String,
         port: u16,

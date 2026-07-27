@@ -16,13 +16,10 @@
 //! the better mechanism; the facts here are for the decisions that can't be probed
 //! cheaply, and for the log line that makes a bug report from an unknown model useful.
 
-/// What this TV reports about itself. Every field is best-effort: a model that doesn't
-/// expose a given source falls back to a safe default rather than failing.
+/// TV capabilities detected at runtime (best-effort; missing sources fall back safely).
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
-    /// CPU cores usable by this process. Drives how much work can run off the main
-    /// thread before it becomes contention rather than parallelism — a CX has 3, the
-    /// G5 reports 2.
+    /// CPU cores (drives off-main-thread work before contention).
     pub cores: usize,
     /// Major webOS release (5, 6, … 10), when it can be determined.
     pub webos_major: Option<u32>,
@@ -44,20 +41,9 @@ const DEVICE_INFO: &str = "/var/run/nyx/device_info.json";
 /// confirmed on a G5).
 const LX_VIDEODEC_PLUGIN: &str = "/usr/lib/gstreamer-1.0/libgstlxvideodec.so";
 
-/// Whether the platform decoder *declares* AV1 (`video/x-av1` in its `GStreamer` caps).
-///
-/// **Declaring it is not the same as being able to stream it, and on the one device
-/// tested it is not enough.** A G5 whose `libgstlxvideodec.so` advertises `video/x-av1`
-/// cannot actually run an AV1 session: through Starfish the load either times out or
-/// completes and then presents a black screen (and twice took the process down with it),
-/// and NDL's implementation has no AV1 at all. So this answers "does the silicon claim
-/// AV1", which turned out to be a much weaker statement than "can this TV play an AV1
-/// stream" — the caller must additionally require
-/// [`crate::store::dev_override_enable_av1`], and the negotiation is opt-in for that
-/// reason. Kept because it is still a necessary condition and a useful diagnostic.
-///
-/// Fails closed: a missing/unreadable plugin reads as "no AV1". Memoized — the file is
-/// ~400 KB and the answer can't change while the process runs.
+/// Whether platform decoder *declares* AV1 (not the same as ability to stream it).
+/// WHY: G5 declares it but fails in Starfish/NDL. Weak signal; caller must also
+/// require `dev_override_enable_av1`. Still needed as necessary condition + diagnostic.
 pub fn supports_av1() -> bool {
     static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SUPPORTED.get_or_init(|| {
@@ -71,9 +57,7 @@ pub fn supports_av1() -> bool {
     })
 }
 
-/// Pulls `"key": "value"` out of a flat JSON object without a parser — these two files
-/// are flat and machine-generated, and this avoids handing `serde_json` a path that a
-/// hostile-ish filesystem could make large.
+/// Extract JSON field without parser (avoids serde on filesystem source).
 fn json_str_field(text: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
     let rest = text.split_once(&needle)?.1;
@@ -100,11 +84,7 @@ impl DeviceInfo {
         }
     }
 
-    /// Log everything known about the device once at startup.
-    ///
-    /// This exists so a report from a model neither developer owns is actionable: the
-    /// first question about any playback problem is "what is this running on", and
-    /// without this line the log answers it only indirectly.
+    /// Log device details at startup (essential for bug reports on unknown models).
     pub fn log(&self) {
         tracing::info!(
             "device: cores={} webos={} model={}",

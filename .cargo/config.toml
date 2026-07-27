@@ -1,34 +1,9 @@
-# webOS TV cross target (see `task toolchain` in Taskfile.yml for the NDK fetch and
-# scripts/cc-shim.sh for why the linker isn't the NDK's gcc directly).
+# webOS TV cross target (see Taskfile.yml, scripts/cc-shim.sh).
 [target.armv7-unknown-linux-gnueabi]
 linker = "scripts/cc-shim.sh"
-# Rust's built-in `armv7-unknown-linux-gnueabi` target defaults to the `soft-float`
-# LLVM feature — real software floating-point emulation (every f32/f64 op becomes a
-# call into `compiler_builtins`/`__aeabi_f*`, confirmed via `nm` on a release build),
-# not just a soft-float *calling convention*. The vendor's own C toolchain targeting
-# this exact hardware uses `-mfloat-abi=softfp -mfpu=neon-fp16 -mcpu=cortex-a9`
-# (confirmed via `arm-webos-linux-gnueabi-gcc -v`) — softfp, not soft: real VFP3/NEON
-# hardware instructions for computation, base-AAPCS (integer-register) calling
-# convention only at ABI boundaries, matching the sysroot's own libSDL2 etc. Leaving
-# Rust on pure `soft-float` meant every tiny-skia draw call (path fills, blends,
-# blur, transforms — all f32-heavy) paid a software-emulation tax on top of an
-# already-weak CPU, observed as ~300ms per otherwise-trivial render on real hardware.
-# `-soft-float` here only removes that LLVM codegen feature (computation uses real
-# VFP/NEON instructions); it does not change the calling convention, so FFI calls
-# into the sysroot's softfp-ABI libraries stay correct.
-#
-# `target-cpu=cortex-a73`, not the vendor toolchain's `-mcpu=cortex-a9`: that vendor
-# default is a lowest-common-denominator for webOS generations back to genuinely
-# ARMv7 silicon, but this client targets webOS 5.x+ (see README), where every LG SoC
-# (α5/α7/α9 gen 3+, and the MTK-based budget models) is an ARMv8-A core running
-# 32-bit userland. The LG CX's α9-gen3 SoC is a Cortex-A73-class core (verified on
-# device), so we tune for it directly. This is a scheduling/tuning change at the same
-# ARMv8.0-A baseline as the prior `cortex-a53` — NOT an ISA bump — so a binary tuned
-# for the out-of-order A73 still runs on an in-order A53 and vice-versa; Like a53 it unlocks ARMv8's A32
-# instruction set (hardware integer divide — cortex-a9 codegen calls `__aeabi_idiv`
-# instead — and VFPv4 fused multiply-add), and adds A73 instruction scheduling on top.
-# ABI is unchanged (still softfp, as above). If a pre-ARMv8 webOS device ever needs
-# supporting, revert this one value to cortex-a9.
+# Use softfp (real VFP/NEON instructions, not soft-float emulation) to avoid ~300ms/render tax.
+# Tune for cortex-a73 (LG CX's α9-gen3 SoC); binary still runs on cortex-a53.
+# See docs/NOTES.md for detailed rationale on both choices.
 rustflags = ["-C", "target-feature=+neon,+vfp3,-soft-float", "-C", "target-cpu=cortex-a73"]
 
 [env]
@@ -38,6 +13,5 @@ AR_armv7_unknown_linux_gnueabi = { value = ".toolchains/arm-webos-linux-gnueabi_
 PKG_CONFIG_ALLOW_CROSS_armv7_unknown_linux_gnueabi = "1"
 PKG_CONFIG_SYSROOT_DIR_armv7_unknown_linux_gnueabi = { value = ".toolchains/arm-webos-linux-gnueabi_sdk-buildroot/arm-webos-linux-gnueabi/sysroot", relative = true }
 PKG_CONFIG_LIBDIR_armv7_unknown_linux_gnueabi = { value = ".toolchains/arm-webos-linux-gnueabi_sdk-buildroot/arm-webos-linux-gnueabi/sysroot/usr/lib/pkgconfig", relative = true }
-# For the `cmake` crate (audiopus_sys's vendored libopus build, pulled in transitively
-# by punktfunk-core's `quic` feature — see Cargo.toml).
+# For cmake crate (libopus cross-build via punktfunk-core's quic feature).
 CMAKE_TOOLCHAIN_FILE_armv7_unknown_linux_gnueabi = { value = ".toolchains/arm-webos-linux-gnueabi_sdk-buildroot/share/buildroot/toolchainfile.cmake", relative = true }

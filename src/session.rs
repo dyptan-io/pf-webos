@@ -23,22 +23,15 @@ use crate::ndl::{NdlCodec, NdlVideo};
 use crate::starfish::StarfishVideo;
 use crate::store::{CodecPref, VideoBackend};
 
-// ─────────────────────────────────────────────────────────── VideoPlayer ──
-
-/// Unified video-decode backend, selected at connect time via [`VideoBackend`].
-///
-/// The NDL arm is an `Arc` because the audio-offload path shares the handle with a
-/// dedicated audio-drain thread ([`ndl_audio_pump`]): `NdlVideo::drop` unloads NDL
-/// process-globally, so the unload must not happen until *both* threads are done with
-/// it — which is exactly what last-`Arc`-drop gives, with no ordering to get wrong.
+/// Unified video-decode backend. NDL arm is Arc'd because audio-offload shares it with
+/// `ndl_audio_pump`; NDL unloads process-globally, so unload waits for both threads (`Arc::drop`).
 enum VideoPlayer {
     Starfish(StarfishVideo),
     Ndl(Arc<NdlVideo>),
 }
 
 impl VideoPlayer {
-    /// Feed one access unit. `pts_ns` is nanoseconds (`frame.pts_ns` from the host).
-    /// Returns the feed duration for ABR decode-latency reporting.
+    /// Feed access unit; return (result, `feed_duration`) for ABR latency reporting.
     fn play(&self, au: &[u8], pts_ns: u64) -> (anyhow::Result<()>, Duration) {
         let t = Instant::now();
         let result = match self {
@@ -62,8 +55,7 @@ impl VideoPlayer {
         }
     }
 
-    /// Whether the active backend is decoding audio itself (NDL only — the Starfish
-    /// payload sets `needAudio: false`, so that path always uses the software decoder).
+    /// Whether backend decodes audio itself (NDL only; Starfish always uses software decoder).
     fn audio_offloaded(&self) -> bool {
         match self {
             Self::Ndl(ndl) => ndl.audio_offloaded(),
@@ -71,8 +63,7 @@ impl VideoPlayer {
         }
     }
 
-    /// The shared NDL handle when it took the Opus stream — what the dedicated
-    /// audio-drain thread holds. `None` on Starfish or a video-only NDL load.
+    /// Shared NDL handle when audio-offloaded; None on Starfish or video-only NDL.
     fn ndl_audio_handle(&self) -> Option<Arc<NdlVideo>> {
         match self {
             Self::Ndl(ndl) if ndl.audio_offloaded() => Some(ndl.clone()),
@@ -80,9 +71,7 @@ impl VideoPlayer {
         }
     }
 
-    /// NDL's undecoded/unpresented backlog, when the active backend can report it.
-    /// Starfish exposes no equivalent through the wrapper, so it reports `None` — the
-    /// overlay and the log then simply omit the figure rather than showing a fake zero.
+    /// NDL render-buffer backlog; None on Starfish (overlay/log omit the figure).
     fn render_buffer_length(&self) -> Option<i32> {
         match self {
             Self::Ndl(ndl) => ndl.render_buffer_length(),
@@ -101,36 +90,27 @@ impl VideoPlayer {
 pub struct Connected {
     pub client: Arc<NativeClient>,
     pub stop: Arc<AtomicBool>,
-    /// Live pump counters for the stats overlay — see [`StreamStats`].
+    /// Live pump counters for stats overlay; see `StreamStats`.
     pub stats: Arc<StreamStats>,
-    /// Kept alive so [`Connected::shutdown`] can join it and ensure `NativeClient::Drop`
-    /// (which sends the QUIC close frame) runs to completion before process exit.
+    /// Kept alive so `shutdown()` can join and ensure QUIC close frame is sent before exit.
     video_thread: std::thread::JoinHandle<()>,
-    /// The dedicated NDL audio-drain thread ([`ndl_audio_pump`]) — present only when
-    /// `audio_offloaded`. Joined by [`Connected::shutdown`] like the video thread.
+    /// Dedicated NDL audio-drain thread (present only when `audio_offloaded`).
     audio_thread: Option<std::thread::JoinHandle<()>>,
-    /// Set when NDL accepted the Opus config and is decoding audio itself, so the caller
-    /// must NOT also open an SDL2 audio device — see `ndl_audio_config`.
+    /// True when NDL accepted Opus config; prevents opening SDL2 audio device.
     pub audio_offloaded: bool,
 }
 
-/// Live video-pump counters shared with the main thread for the in-stream stats
-/// overlay (`Settings::stats_overlay`): plain relaxed atomics, written per frame
-/// by [`video_pump`], read at the overlay's ~2Hz refresh. Dropped-frame counts
-/// come straight from `NativeClient::frames_dropped()` at read time instead.
+/// Live video-pump counters for stats overlay (read at ~2Hz); relaxed atomics written per frame.
 #[derive(Default)]
 pub struct StreamStats {
-    /// Total frames received from the host so far.
     pub frames: std::sync::atomic::AtomicU64,
-    /// Total access-unit bytes received so far — deltas over time give the overlay's
-    /// measured (as opposed to negotiated) bitrate.
+    /// Bytes received; deltas give measured bitrate.
     pub bytes: std::sync::atomic::AtomicU64,
-    /// Whether the freeze-until-reanchor hold is currently active.
+    /// Freeze-until-reanchor hold active.
     pub holding: AtomicBool,
-    /// The most recent decoder feed duration, in µs.
+    /// Most recent decoder feed duration (µs).
     pub feed_us: std::sync::atomic::AtomicU32,
-    /// NDL's render-buffer backlog at the last heartbeat, or `-1` when the active
-    /// backend can't report one (see `VideoPlayer::render_buffer_length`).
+    /// NDL render-buffer backlog or -1 if unavailable.
     pub render_backlog: std::sync::atomic::AtomicI32,
 }
 
@@ -145,10 +125,7 @@ pub fn codec_name(codec: u8) -> &'static str {
 }
 
 impl Connected {
-    /// Stops and joins the video thread, then drops the `NativeClient` reference.
-    ///
-    /// Call `self.client.disconnect_quit()` before this for a deliberate stop
-    /// (app quit, long-press Back); omit it when the host ended the session.
+    /// Stop and join threads, then drop `NativeClient`. Call `disconnect_quit()` first for graceful shutdown.
     pub fn shutdown(self) {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.video_thread.join();
@@ -159,17 +136,8 @@ impl Connected {
     }
 }
 
-/// Whether to ask NDL to decode the audio stream, given the host-resolved channel count.
-///
-/// **Stereo only, by construction.** `NDL_DIRECTMEDIA_AUDIO_OPUS_INFO_T` carries a channel
-/// count and a sample rate and nothing else — it has no multistream mapping field, so it
-/// cannot describe the 5.1/7.1 layouts `punktfunk_core::audio::layout_for` negotiates
-/// (those are Opus multistream, with a per-layout stream/coupled/mapping triple). Handing
-/// NDL a `channels: 6` it would decode as plain 6-channel Opus would produce noise, not
-/// surround, so anything above stereo stays on the software decoder.
-///
-/// Whether the *device* implements the Opus path at all is a separate question, answered
-/// by probe rather than assumption — see `NdlVideo::load`.
+/// Whether NDL should decode audio (stereo only). NDL struct has no multistream mapping field,
+/// so 5.1/7.1 layouts would produce noise; anything >stereo stays on software decoder.
 fn ndl_audio_config(resolved_channels: u8) -> Option<crate::ndl::NdlAudioConfig> {
     if !crate::store::dev_override_enable_ndl_audio_offload() {
         return None;

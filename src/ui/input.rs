@@ -2,8 +2,7 @@
 //!
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 
-/// A menu event, already debounced from the raw SDL2 input (keyboard arrows — which
-/// the webOS Magic Remote's d-pad mode surfaces as — and gamepad d-pad both map here).
+/// Menu event (debounced from raw SDL2 input: keyboard arrows, gamepad d-pad).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuEvent {
     Up,
@@ -12,18 +11,12 @@ pub enum MenuEvent {
     Right,
     Confirm,
     Back,
-    /// "Forget this host" on the sidebar — deliberately a separate key from
-    /// Back/Confirm so it can't be hit by accident (see `app.rs`).
+    /// "Forget host" (separate from Back/Confirm to prevent accident).
     Secondary,
 }
 
-/// The raw SDL keycode the LG Magic Remote's physical Back button delivers on this TV —
-/// identified via on-device input logging. It is NOT Escape/Backspace/AcBack and has no
-/// named rust-sdl2 `Keycode` variant, so it must be matched by raw value. This is the
-/// only usable hardware Back the remote gives the app: the Home button instead SIGTERMs
-/// the process (webOS closes the app), so it can't act as an in-app "back". See
-/// `docs/NOTES.md`'s note on Back never arriving as a scancode — it arrives as this
-/// keycode via the event API instead.
+/// Magic Remote Back button keycode (not Escape/Backspace/AcBack; identified via logs).
+/// Only usable hardware Back; Home button SIGTERMs the app.
 pub const WEBOS_BACK_KEYCODE: i32 = 2_097_155;
 
 pub fn menu_event_for_key(keycode: sdl2::keyboard::Keycode) -> Option<MenuEvent> {
@@ -34,9 +27,7 @@ pub fn menu_event_for_key(keycode: sdl2::keyboard::Keycode) -> Option<MenuEvent>
         Keycode::Left => MenuEvent::Left,
         Keycode::Right => MenuEvent::Right,
         Keycode::Return | Keycode::Return2 | Keycode::KpEnter => MenuEvent::Confirm,
-        // AcBack: some remotes' dedicated Back button sends the browser-style "AC
-        // Back" key rather than Escape/Backspace — map all three so Back works
-        // regardless of which one this remote actually sends.
+        // Map Backspace/Escape/AcBack so Back works with any remote variant.
         Keycode::Backspace | Keycode::Escape | Keycode::AcBack => MenuEvent::Back,
         Keycode::Delete => MenuEvent::Secondary,
         // The Magic Remote's Back button (see `WEBOS_BACK_KEYCODE`).
@@ -53,26 +44,17 @@ pub fn menu_event_for_button(button: sdl2::controller::Button) -> Option<MenuEve
         Button::DPadLeft => MenuEvent::Left,
         Button::DPadRight => MenuEvent::Right,
         Button::A => MenuEvent::Confirm,
-        // `Back` (SDL's dedicated back/select button) in addition to `B`: on this TV
-        // the Magic Remote surfaces as a game controller ("Smart Remote RCU Input"),
-        // and its physical Back button does *not* arrive as `B` — the temporary input
-        // logging in `main.rs` is what pins down which button it actually is. Mapping
-        // `Back` here is the low-risk best guess (no game relies on Select as a 1.5s
-        // hold, which is all it can trigger in-stream); widen this once the log says.
+        // WHY: Magic Remote's Back doesn't arrive as B; Back is low-risk guess.
         Button::B | Button::Back => MenuEvent::Back,
         Button::Y => MenuEvent::Secondary,
         _ => return None,
     })
 }
 
-/// Left-stick tilt past this fraction of full deflection (of i16's ±32768) counts as
-/// a directional press — well past center-rest noise.
+/// Stick deflection threshold for directional press (well past center noise).
 pub const STICK_MENU_DEADZONE: i16 = 16_000;
 
-/// Edge-detects the left stick's X/Y axes into `MenuEvent`s, per-axis, so a hold
-/// fires once on crossing the deadzone and doesn't repeat until the stick passes back
-/// through center — the same one-shot-per-press behavior a D-pad button already has
-/// (SDL2 doesn't auto-repeat `ControllerButtonDown` while held).
+/// Edge-detect left stick X/Y to `MenuEvents` (one-shot per cross, repeats on re-center).
 #[derive(Default)]
 pub struct StickMenuNav {
     x: Option<MenuEvent>,
@@ -84,7 +66,6 @@ impl StickMenuNav {
         use sdl2::controller::Axis;
         match axis {
             Axis::LeftX => Self::edge(&mut self.x, value, MenuEvent::Left, MenuEvent::Right),
-            // Negative is up (see `gamepad.rs`'s `axis_event` docs for why).
             Axis::LeftY => Self::edge(&mut self.y, value, MenuEvent::Up, MenuEvent::Down),
             _ => None,
         }
@@ -106,14 +87,10 @@ impl StickMenuNav {
     }
 }
 
-/// `SDL_SCANCODE_WEBOS_GREEN` (`webosbrew/SDL-webOS`'s `include/SDL_scancode.h`) — outside
-/// rust-sdl2's `Scancode` enum range, so it never survives the safe event API (see
-/// docs/NOTES.md's note on color buttons needing raw scancode polling).
+/// webOS Green button scancode (outside rust-sdl2's enum; needs raw polling).
 const WEBOS_GREEN_SCANCODE: i32 = 487;
 
-/// Whether the Magic Remote's Green button is held, read straight from SDL's raw
-/// keyboard-state array — mirrors what `KeyboardState::is_scancode_pressed` does
-/// internally, just for a scancode outside its enum. Safe anytime after `sdl2::init()`.
+/// Check Magic Remote Green button via raw SDL keyboard state (safe after `sdl2::init`).
 pub fn webos_green_button_down() -> bool {
     unsafe {
         let mut count = 0;
@@ -122,9 +99,7 @@ pub fn webos_green_button_down() -> bool {
     }
 }
 
-/// The Magic Remote's number buttons (0-9) surface as plain keyboard digit keys —
-/// used for direct PIN entry (type a digit, auto-advance) instead of cycling each
-/// digit with left/right.
+/// Extract digit from Magic Remote number buttons (0-9 direct PIN entry).
 pub fn digit_key_value(keycode: sdl2::keyboard::Keycode) -> Option<u8> {
     use sdl2::keyboard::Keycode;
     Some(match keycode {

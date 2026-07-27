@@ -1,12 +1,3 @@
-//! Per-host Wake-on-LAN settings — the ⋯ on the host menu's "Wake host" row.
-//!
-//! Split out of the former single-file `app.rs`; see `super`'s module docs. Built on
-//! `ui::ListModal` exactly like `hostmenu.rs`, so this module is only the rows, what
-//! Confirm does to them, and where Back goes.
-//!
-//! One toggle today (`KnownHost::wol_auto`). It used to be a global `Settings` field
-//! flipped from inside the wake prompt itself, which made it reachable only by having
-//! a host fail on you, and applied it to every host at once.
 use super::*;
 use sdl2::rect::Rect;
 use std::time::Instant;
@@ -14,16 +5,13 @@ use std::time::Instant;
 use crate::ui::{self, FocusRow, MenuEvent, Painter};
 
 impl App {
-    /// Opens the Wake settings for the host menu's current host. Keeps
-    /// `host_menu_index` set: Back returns to the menu this was opened from, and the
-    /// rows are read straight off that host.
+    /// Open Wake settings for host menu's current host.
     pub(crate) fn open_wake_settings(&mut self) {
         self.wake_settings_focused = 0;
         self.screen = Screen::WakeSettings;
     }
 
-    /// The host this screen is editing — always the host menu's, since that's the only
-    /// way in.
+    /// Host being edited (always from host menu).
     pub(crate) fn wake_settings_host(&self) -> Option<&store::KnownHost> {
         let entry = self.host_menu_index.and_then(|i| self.entries.get(i))?;
         let (host, port) = (entry.host(), entry.port());
@@ -50,8 +38,7 @@ impl App {
         ui::list_modal_card_rect(screen_w, screen_h, fonts, subtitle, 1)
     }
 
-    /// Handles one menu event. Left/Right/Confirm all flip the toggle, matching the
-    /// Settings modal's toggle idiom; Back returns to the host menu.
+    /// Left/Right/Confirm flip toggle; Back returns to host menu.
     pub(crate) fn handle_wake_settings_event(&mut self, ev: MenuEvent) {
         let len = self.wake_settings_rows().len();
         if ui::list_nav(&mut self.wake_settings_focused, len, ev) {
@@ -65,8 +52,7 @@ impl App {
         }
     }
 
-    /// Flips this host's auto-send flag and persists it. A discovered-but-never-saved
-    /// host has no record to write to, so there's nothing to flip.
+    /// Flip auto-send flag and persist (discovered-only hosts have no record).
     fn toggle_wol_auto(&mut self) {
         let Some(entry) = self.host_menu_index.and_then(|i| self.entries.get(i)) else {
             return;

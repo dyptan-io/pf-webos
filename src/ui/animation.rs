@@ -1,28 +1,16 @@
-//! Shared animation clocks and the GPU zoom-pop rect math.
-//!
-//! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 use sdl2::rect::Rect;
 use std::time::{Duration, Instant};
 
-// Shared by every GPU-scale zoom-pop in the app — the grid's card focus-pop
-// (`app.rs`), every pre-stream modal's focused-widget tile, and the in-stream
-// disconnect dialog's (`main.rs`) — so there's exactly one implementation of
-// "ease a clock, then scale a rect around its center" instead of one per caller.
-
-/// How long a focus-pop (zoom-in) animation runs — the grid's card, every
-/// pre-stream modal's focused widget, and the disconnect dialog's button.
+/// Durations for focus-pop and launch-fade animations.
 pub const FOCUS_POP: Duration = Duration::from_millis(140);
-
-/// How long the launch zoom/fade-to-black runs once a grid card is confirmed
-/// — the card keeps zooming for the whole span, not just its start.
 pub const LAUNCH_FADE: Duration = Duration::from_millis(600);
 
-/// Cubic ease-out for the animation fractions below.
+/// Cubic ease-out function.
 pub fn ease(f: f32) -> f32 {
     1.0 - (1.0 - f).powi(3)
 }
 
-/// Eased 0..=1 progress of an animation started at `t`; 1.0 when done/absent.
+/// Eased progress 0..=1 of animation; 1.0 when done/absent.
 pub fn anim_frac(anim: Option<Instant>, dur: Duration) -> f32 {
     match anim {
         Some(t) => ease((t.elapsed().as_secs_f32() / dur.as_secs_f32()).min(1.0)),
@@ -44,10 +32,7 @@ pub fn zoom_rect(base: Rect, frac: f32, growth: f32) -> Rect {
     Rect::new((cx - tw / 2.0) as i32, (cy - th / 2.0) as i32, tw as u32, th as u32)
 }
 
-/// Scales `base` up from `1.0 - shrink` to full size as `frac` runs 0→1 — the
-/// "pop in" counterpart to `zoom_rect`'s "grow past full size" focus pop. A
-/// settled animation returns `base` untouched, so a static frame doesn't drift
-/// through a no-op scale's rounding.
+/// Scale up from (1.0 - shrink) to full size. "Pop in" counterpart to `zoom_rect`.
 pub fn pop_in_rect(base: Rect, frac: f32, shrink: f32) -> Rect {
     if frac >= 1.0 {
         base
@@ -56,10 +41,7 @@ pub fn pop_in_rect(base: Rect, frac: f32, shrink: f32) -> Rect {
     }
 }
 
-/// Translates from `start` toward `end` by `frac` (0.0 = `start`, 1.0 = `end`)
-/// — the "fly to a new grid position" counterpart to `zoom_rect`'s scale-around-
-/// center, used by the pin/unpin move animation. Size follows `end`'s (the two
-/// only ever differ if the window resized mid-animation).
+/// Translate from start to end. Used for pin/unpin move animation.
 pub fn lerp_rect(start: Rect, end: Rect, frac: f32) -> Rect {
     let x = start.x() as f32 + (end.x() - start.x()) as f32 * frac;
     let y = start.y() as f32 + (end.y() - start.y()) as f32 * frac;

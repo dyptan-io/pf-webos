@@ -1,23 +1,13 @@
 //! Shared scroll bookkeeping for modal content lists (uniform-stride rows or
-//! wrapped text lines) — extracted from the Settings modal's original
-//! hand-written offset-clamp/scroll-into-view logic so any modal with
-//! overflowing content (About's document, a future long `ListModal`) can
-//! share the same offset clamping, "scroll into view", and scroll-indicator
-//! fade-in bookkeeping instead of re-deriving it. Knows nothing about
-//! rendering, tile identity, or pixels — callers already have their own pure
-//! `total`/`visible` formulas (a row count vs. a wrapped-line count use
-//! different stride math) and pass them in.
+//! wrapped text lines). Offset clamping, scroll-into-view, and fade logic
+//! extracted so any modal can reuse it. Caller-agnostic to rendering/pixels.
 use std::time::Instant;
 
-/// Offset bookkeeping for one scrollable list of uniform-stride units (rows
-/// or wrapped text lines). `total`/`visible` are passed to each call rather
-/// than stored, since callers already compute them from screen geometry —
-/// storing a second, possibly-stale copy here would just invite the two to
-/// disagree.
+/// Scroll offset bookkeeping. `total`/`visible` passed per-call (not stored)
+/// to avoid stale copies disagreeing with caller's geometry.
 pub struct ScrollWindow {
     pub offset: usize,
-    /// When `offset` last changed — a modal's scrollbar shows briefly after
-    /// this, then fades (see `SCROLL_INDICATOR_HOLD`/`_FADE` in `app::mod`).
+    /// When `offset` last changed (scrollbar shows then fades).
     pub shown_at: Option<Instant>,
 }
 
@@ -29,16 +19,12 @@ impl ScrollWindow {
         }
     }
 
-    /// `offset` is only updated by `scroll_into_view`/`scroll_by`/`page`, so it
-    /// can be stale after a resize (a rotated screen, a font-size change) —
-    /// use this instead of the raw field wherever it feeds a layout formula.
+    /// Clamped offset (use where it feeds layout formulas, not raw field).
     pub fn clamped(&self, total: usize, visible: usize) -> usize {
         self.offset.min(total.saturating_sub(visible))
     }
 
-    /// Moves `offset` just enough to keep `focused` inside the visible
-    /// window (no wraparound — wrapping a scrolled list would silently jump
-    /// the scroll position across the whole thing). Returns whether it moved.
+    /// Scroll to keep `focused` visible (no wraparound). Returns whether moved.
     pub fn scroll_into_view(&mut self, focused: usize, total: usize, visible: usize) -> bool {
         let mut offset = self.clamped(total, visible);
         if focused < offset {

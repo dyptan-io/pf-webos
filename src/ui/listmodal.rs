@@ -1,18 +1,3 @@
-//! The generic list modal: a header (title + optional subtitle) above a vertical list
-//! of focusable rows, and nothing else.
-//!
-//! This is the thing that makes adding a screen cheap. Before it, every modal carried
-//! its own card-geometry function, its own shell renderer, its own `ModalShellKey`
-//! variant and its own focused-widget rendering arm — four scattered edits plus a
-//! matching arm in `prepare_tiles` and `draw_list` for anything new. A screen built on
-//! `ListModal` supplies only two things: a `Vec<FocusRow>` and what Confirm on row `i`
-//! does. Geometry, the unfocused shell, and the focused-row tile are all shared here,
-//! and the row tile is the *same* `render_focus_row_tile` the Settings modal already
-//! used — so the focus-pop animation comes along for free.
-//!
-//! `Screen::HostMenu` is the first consumer; `Screen::Settings` deliberately is not
-//! (its rows carry live dropdown/slider/switch controls and an overlay, which is
-//! exactly the complexity this abstraction leaves out).
 use anyhow::Result;
 use sdl2::rect::Rect;
 
@@ -53,9 +38,7 @@ pub fn list_modal_content_rect(card: Rect, fonts: &Fonts, subtitle: &str, row_co
     )
 }
 
-/// Draws the whole list modal *unfocused* — header plus every row — into `painter`.
-/// The focused row is composited separately from `render_focus_row_tile` (see the
-/// module docs), so moving focus never re-rasterizes this.
+/// Render entire list modal unfocused (header + all rows).
 pub fn render_list_modal(
     painter: &mut Painter,
     text_cache: &mut TextCache,
@@ -81,9 +64,7 @@ pub fn render_list_modal(
     draw_focus_rows(painter, text_cache, fonts, rows, usize::MAX, None, content)
 }
 
-/// Moves `focused` by one `MenuEvent` within a `len`-row list, wrapping. Returns
-/// `true` if it moved (the caller restarts the focus-pop animation on `true`).
-/// Shared so every list-modal screen navigates identically.
+/// Navigate within a list, wrapping. Returns true if focus moved.
 pub fn list_nav(focused: &mut usize, len: usize, ev: MenuEvent) -> bool {
     if len == 0 {
         return false;

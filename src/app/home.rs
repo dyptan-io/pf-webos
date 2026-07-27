@@ -1,7 +1,4 @@
-//! The Home screen: sidebar/grid navigation, host selection, the game library
-//! fetch, grid scrolling, and launching a card.
-//!
-//! Split out of the former single-file `app.rs`; see `super`'s module docs.
+//! Home screen: sidebar/grid navigation, host selection, game library fetch, launching.
 use super::*;
 use crate::store::{self};
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent, TextCache};
@@ -13,10 +10,7 @@ impl App {
         self.entries.len() + 2
     }
 
-    /// The grid's shape at `columns` columns — see `GridLayout`. Cheap, but not
-    /// free (it scans `known_hosts` for the pin list), so a caller mapping many
-    /// indices should build it once rather than go through the `App` helpers
-    /// below.
+    /// Grid shape at `columns` columns; scans for pinned pins, so build once and reuse.
     pub(crate) fn grid_layout(&self, columns: usize) -> GridLayout {
         let desktop_pinned = self.games_loaded
             && self
@@ -67,9 +61,7 @@ impl App {
         }
     }
 
-    /// The inverse of `pin_id_at_grid_idx`: the grid index for pin id `id`
-    /// right now, used to keep focus on whatever was just pinned/unpinned even
-    /// though its index may have just changed under it.
+    /// Inverse of `pin_id_at_grid_idx`: grid index for a pin ID, keeping focus after reorder.
     pub(crate) fn grid_idx_for_pin_id(&self, id: &str, columns: usize) -> Option<usize> {
         self.grid_layout(columns).idx_for_pin_id(&self.games, id)
     }
@@ -211,8 +203,7 @@ impl App {
         None
     }
 
-    /// The pin id of the currently focused grid card (see `pin_id_at_grid_idx`),
-    /// or `None` for the sidebar, or the padding after a partial pinned row.
+    /// Pin ID of focused grid card, or `None` for sidebar/padding.
     pub(crate) fn focused_pin_id(&self, columns: usize) -> Option<&str> {
         match self.home_focus {
             HomeFocus::Grid(idx) => self.pin_id_at_grid_idx(idx, columns),
@@ -220,12 +211,7 @@ impl App {
         }
     }
 
-    /// Toggles the focused card's pinned state, persists, re-sorts pinned games
-    /// to the front, and keeps focus on the same card. Opens the pin-limit
-    /// alert instead of pinning past `store::MAX_PINNED_GAMES`. Starts the
-    /// fly-to-new-position animation (`pin_move_anim`) when the card's own tile
-    /// snapshots successfully — a render failure there just skips the
-    /// animation, not the pin toggle itself.
+    /// Toggles focused card pin state; animates move if snapshot succeeds; opens pin-limit alert on overflow.
     pub(crate) fn toggle_focused_pin(
         &mut self,
         text_cache: &mut TextCache,
@@ -280,12 +266,7 @@ impl App {
         }
     }
 
-    /// Re-sorts `games` so the selected host's pinned games lead (in pin order,
-    /// `pinned_count` entries), the rest keeping their previous order. A pinned id
-    /// the host no longer reports is just dropped. Called on library (re)load and
-    /// on every pin toggle — callers are responsible for `grid_dirty`/
-    /// `grid_reorder_dirty` themselves, since a fresh load and a pin toggle want
-    /// different rebuild behavior (see `grid_reorder_dirty`'s docs).
+    /// Re-sorts games: pinned first (in pin order), rest untouched; drops missing pins.
     pub(crate) fn reorder_games_by_pin(&mut self) {
         let pinned_ids = self
             .selected_host
@@ -437,16 +418,7 @@ impl App {
         }
     }
 
-    /// Makes `(host, port)` the active sidebar selection and kicks off an async
-    /// (re)fetch of its game library via `library::load_games_async` — see
-    /// `drain_games` for where the result lands. Used to call `fetch_games`
-    /// directly, right here, blocking: a real network round-trip (up to the
-    /// 5s connect / 10s total timeout `library::agent` sets) on the same thread
-    /// that pumps SDL events and renders, freezing all input — button presses,
-    /// pointer motion, everything — for as long as the host took to answer or
-    /// time out. `App::new` calls this synchronously-in-spirit-only at startup
-    /// too (restoring the last-selected host), so that froze every launch just
-    /// the same.
+    /// Selects host and kicks off async library fetch; avoids blocking the UI thread (used to freeze input).
     pub(crate) fn select_host(&mut self, host: String, port: u16, mgmt_port: Option<u16>) {
         let _ = store::save_selected_host(&host, port);
         self.selected_host = Some((host.clone(), port));
@@ -486,11 +458,7 @@ impl App {
         ));
     }
 
-    /// Drains a finished `select_host` library fetch, if any — called alongside
-    /// `drain_discovery`/`drain_art`/`tick_wake`. Returns whether anything changed.
-    /// Switching hosts again before a fetch finishes discards its result safely:
-    /// `select_host` already replaced `games_rx` with a fresh channel by the time
-    /// this could run, so there's nothing here to receive from for the stale one.
+    /// Drains `select_host`'s library fetch; switching hosts aborts old fetches safely.
     pub fn drain_games(&mut self) -> bool {
         let Some(rx) = &self.games_rx else { return false };
         let Ok(loaded) = rx.try_recv() else { return false };
@@ -564,14 +532,7 @@ impl App {
             self.home_status = Some(reason);
         }
     }
-    /// Confirms a grid card ("Desktop" or a game — see `grid_card_at`). Kicks off
-    /// a fresh reachability check first rather than handing back a `ConnectTarget`
-    /// directly —
-    /// the grid being populated only proves the host answered once, when its library
-    /// was last fetched, and it could have gone offline since (`session::connect`'s
-    /// failure currently propagates uncaught, taking the whole process down — see
-    /// `main.rs`'s docs). `main.rs`'s tick loop drains the result via
-    /// `drain_launch_check`/`take_ready_launch`. No-ops if a check is already in flight.
+    /// Confirms grid card; runs reachability check first (library-fetch alone may be stale).
     pub(crate) fn confirm_grid_card(&mut self, idx: usize, columns: usize) {
         if self.pending_launch.is_some() {
             return;
