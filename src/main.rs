@@ -1296,7 +1296,7 @@ mod real {
                                 backlog.to_string()
                             };
                             format!(
-                                "Dropped {} · FEC {} · hold {} · backlog {backlog}",
+                                "Drop {} · FEC {} · hold {} · buf {backlog}",
                                 connected.client.frames_dropped(),
                                 connected.client.fec_recovered_shards(),
                                 if holding { "yes" } else { "no" },

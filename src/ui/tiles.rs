@@ -225,9 +225,9 @@ pub fn render_wrapped_text_tile(
 }
 
 /// A worst-case stat line, measured to fix the overlay's width — see
-/// `render_stats_overlay_tile`. The Dropped/FEC/hold/backlog line is the widest of
-/// the bunch once all four counters hit multiple digits.
-pub const STATS_OVERLAY_REF_LINE: &str = "Dropped 9999 · FEC 9999 · hold yes · backlog 999";
+/// `render_stats_overlay_tile`. The Drop/FEC/hold/buf line is the widest of the
+/// bunch once all four counters hit multiple digits.
+pub const STATS_OVERLAY_REF_LINE: &str = "Drop 9999 · FEC 9999 · hold yes · buf 999";
 
 /// The in-stream stats overlay panel: a translucent brand-dark rounded card with
 /// one line of text per stat, plus a small Green-button hint pinned to the
@@ -243,8 +243,8 @@ pub const STATS_OVERLAY_REF_LINE: &str = "Dropped 9999 · FEC 9999 · hold yes �
 /// long line can never overflow the card. `lines[0]` (the mode/codec header) is
 /// the only one that pops; the rest are muted.
 pub fn render_stats_overlay_tile(font: &Font, caption_font: &Font, lines: &[String], hint: &str) -> Result<Painter> {
-    let pad = 18i32;
-    let safety = 12u32; // extra slack past the reference width, so nothing touches the edge
+    let pad = 16i32;
+    let safety = 8u32; // extra slack past the reference width, so nothing touches the edge
     let line_h = font.height() + 6;
     let hint_h = caption_font.height() + 8; // includes a gap above it
     let inner_w = font.size_of(STATS_OVERLAY_REF_LINE).map_or(0, |(w, _)| w) + safety;
