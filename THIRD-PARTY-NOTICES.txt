@@ -1,7 +1,7 @@
 THIRD-PARTY SOFTWARE NOTICES
 ============================================================================
 
-punktfunk-webos (https://github.com/dyptan-io/pf-webos) is licensed under
+punktfunk-webos (https://github.com/dyptan-io/punktfunk-webos) is licensed under
 MIT OR Apache-2.0, matching upstream punktfunk (https://git.unom.io/unom/punktfunk).
 The app links the third-party Rust crates listed below, and bundles or embeds the
 non-Rust components listed first. Each is distributed under its own permissive

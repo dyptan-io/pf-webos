@@ -183,4 +183,4 @@ tasks:
     cmds:
       - rm -rf dist
       - rm -rf .toolchains target
-      - docker volume rm -f pf-webos-toolchains pf-webos-target pf-webos-cargo pf-webos-apt-cache pf-webos-apt-lists pf-webos-tools
+      - docker volume rm -f punktfunk-webos-toolchains punktfunk-webos-target punktfunk-webos-cargo punktfunk-webos-apt-cache punktfunk-webos-apt-lists punktfunk-webos-tools

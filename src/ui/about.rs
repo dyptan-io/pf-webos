@@ -51,7 +51,7 @@ pub fn about_lines() -> Vec<&'static str> {
         "game streaming. Built on the upstream punktfunk project; all credit for",
         "the protocol, FEC/crypto core, and host implementation belongs there.",
         "",
-        "  https://github.com/dyptan-io/pf-webos",
+        "  https://github.com/dyptan-io/punktfunk-webos",
         "  https://git.unom.io/unom/punktfunk",
         "",
         "Licensed under MIT OR Apache-2.0, at your option.",

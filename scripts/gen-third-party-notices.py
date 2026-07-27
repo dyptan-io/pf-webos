@@ -138,7 +138,7 @@ def main():
     w("THIRD-PARTY SOFTWARE NOTICES")
     w("=" * 76)
     w("")
-    w("punktfunk-webos (https://github.com/dyptan-io/pf-webos) is licensed under")
+    w("punktfunk-webos (https://github.com/dyptan-io/punktfunk-webos) is licensed under")
     w("MIT OR Apache-2.0, matching upstream punktfunk (https://git.unom.io/unom/punktfunk).")
     w("The app links the third-party Rust crates listed below, and bundles or embeds the")
     w("non-Rust components listed first. Each is distributed under its own permissive")

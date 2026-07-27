@@ -9,15 +9,15 @@ vars:
   SDL2_BACKPORT_SONAME: libSDL2-2.0.so.0.3000.12
   DOCKER_MOUNTS: >-
     -v {{.ROOT_DIR}}:/workspace
-    -v pf-webos-toolchains:/workspace/.toolchains
-    -v pf-webos-target:/workspace/target
-    -v pf-webos-cargo:/opt/pf-webos-cargo
-    -v pf-webos-apt-cache:/var/cache/apt/archives
-    -v pf-webos-apt-lists:/var/lib/apt/lists
-    -v pf-webos-tools:/opt/pf-webos-tools
+    -v punktfunk-webos-toolchains:/workspace/.toolchains
+    -v punktfunk-webos-target:/workspace/target
+    -v punktfunk-webos-cargo:/opt/punktfunk-webos-cargo
+    -v punktfunk-webos-apt-cache:/var/cache/apt/archives
+    -v punktfunk-webos-apt-lists:/var/lib/apt/lists
+    -v punktfunk-webos-tools:/opt/punktfunk-webos-tools
     -w /workspace
-    -e CARGO_HOME=/opt/pf-webos-cargo
-    -e PATH=/opt/pf-webos-tools/bin:/opt/pf-webos-cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    -e CARGO_HOME=/opt/punktfunk-webos-cargo
+    -e PATH=/opt/punktfunk-webos-tools/bin:/opt/punktfunk-webos-cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 tasks:
   # ---------------------------------------------------------------- toolchain --
@@ -113,7 +113,7 @@ tasks:
         if [ "$PKG_VERSION" = "$APP_VERSION" ]; then
           IPK_FILE="dist/io.dyptan.punktfunk.webos_${PKG_VERSION}_arm.ipk"
           IPK_SHA256="$(sha256sum "$IPK_FILE" | cut -d' ' -f1)"
-          REPO="${GITHUB_REPOSITORY:-dyptan-io/pf-webos}"
+          REPO="${GITHUB_REPOSITORY:-dyptan-io/punktfunk-webos}"
           cat > dist/io.dyptan.punktfunk.webos.manifest.json <<EOF
         {
           "id": "io.dyptan.punktfunk.webos",
@@ -147,7 +147,7 @@ tasks:
           apt-get update -qq &&
           apt-get install -y -qq --no-install-recommends apt-utils cmake curl ca-certificates git pkg-config build-essential xz-utils python3 > /dev/null &&
           if ! command -v task > /dev/null 2>&1; then
-            curl -sL https://taskfile.dev/install.sh | sh -s -- -d -b /opt/pf-webos-tools/bin > /dev/null;
+            curl -sL https://taskfile.dev/install.sh | sh -s -- -d -b /opt/punktfunk-webos-tools/bin > /dev/null;
           fi &&
           task {{.TARGET_TASK}}
         '

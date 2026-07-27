@@ -5,9 +5,9 @@
 <br>
 <br>
 
-[![Build](https://github.com/dyptan-io/pf-webos/actions/workflows/build.yml/badge.svg)](https://github.com/dyptan-io/pf-webos/actions/workflows/build.yml)
-[![Release](https://img.shields.io/github/v/release/dyptan-io/pf-webos?color=6c5bf3&label=release)](https://github.com/dyptan-io/pf-webos/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/dyptan-io/pf-webos/latest/total?color=a79ff8&label=downloads)](https://github.com/dyptan-io/pf-webos/releases/latest)
+[![Build](https://github.com/dyptan-io/punktfunk-webos/actions/workflows/build.yml/badge.svg)](https://github.com/dyptan-io/punktfunk-webos/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/dyptan-io/punktfunk-webos?color=6c5bf3&label=release)](https://github.com/dyptan-io/punktfunk-webos/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/dyptan-io/punktfunk-webos/latest/total?color=a79ff8&label=downloads)](https://github.com/dyptan-io/punktfunk-webos/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-d2c9fb)](#license)
 
 **Native LG webOS TV client for [punktfunk](https://git.unom.io/unom/punktfunk) — low-latency desktop & game streaming.**
@@ -58,10 +58,10 @@ video decode, and webOS packaging.
 
 1. Install [Homebrew Channel](https://www.webosbrew.org/) on the TV.
 2. Homebrew Channel → Configuration → Add repository →
-   `https://raw.githubusercontent.com/dyptan-io/pf-webos/main/repo.json`
+   `https://raw.githubusercontent.com/dyptan-io/punktfunk-webos/main/repo.json`
 3. punktfunk now appears in the Homebrew Channel app list.
 
-Only published [GitHub Releases](https://github.com/dyptan-io/pf-webos/releases) appear this way —
+Only published [GitHub Releases](https://github.com/dyptan-io/punktfunk-webos/releases) appear this way —
 dev/CI builds don't.
 
 **Directly onto a TV** (Developer Mode required): `task deploy TV_HOST=root@<tv-ip>`.

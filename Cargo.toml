@@ -6,7 +6,7 @@ edition = "2021"
 rust-version = "1.82"
 license = "MIT OR Apache-2.0"
 authors = ["Volodymyr Dyptan <volodymyr@dyptan.dev>"]
-repository = "https://github.com/dyptan-io/pf-webos"
+repository = "https://github.com/dyptan-io/punktfunk-webos"
 
 [[bin]]
 name = "punktfunk-webos"
