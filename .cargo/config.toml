@@ -17,16 +17,19 @@ linker = "scripts/cc-shim.sh"
 # VFP/NEON instructions); it does not change the calling convention, so FFI calls
 # into the sysroot's softfp-ABI libraries stay correct.
 #
-# `target-cpu=cortex-a53`, not the vendor toolchain's `-mcpu=cortex-a9`: that vendor
+# `target-cpu=cortex-a73`, not the vendor toolchain's `-mcpu=cortex-a9`: that vendor
 # default is a lowest-common-denominator for webOS generations back to genuinely
 # ARMv7 silicon, but this client targets webOS 5.x+ (see README), where every LG SoC
 # (α5/α7/α9 gen 3+, and the MTK-based budget models) is an ARMv8-A core running
-# 32-bit userland. Tuning for the A53 (the conservative in-order baseline — fine on
-# the bigger A73-class cores too) additionally unlocks ARMv8's A32 instruction set:
-# hardware integer divide (cortex-a9 codegen calls `__aeabi_idiv` instead) and
-# VFPv4 fused multiply-add. ABI is unchanged (still softfp, as above). If a
-# pre-ARMv8 webOS device ever needs supporting, revert this one value to cortex-a9.
-rustflags = ["-C", "target-feature=+neon,+vfp3,-soft-float", "-C", "target-cpu=cortex-a53"]
+# 32-bit userland. The LG CX's α9-gen3 SoC is a Cortex-A73-class core (verified on
+# device), so we tune for it directly. This is a scheduling/tuning change at the same
+# ARMv8.0-A baseline as the prior `cortex-a53` — NOT an ISA bump — so a binary tuned
+# for the out-of-order A73 still runs on an in-order A53 and vice-versa; Like a53 it unlocks ARMv8's A32
+# instruction set (hardware integer divide — cortex-a9 codegen calls `__aeabi_idiv`
+# instead — and VFPv4 fused multiply-add), and adds A73 instruction scheduling on top.
+# ABI is unchanged (still softfp, as above). If a pre-ARMv8 webOS device ever needs
+# supporting, revert this one value to cortex-a9.
+rustflags = ["-C", "target-feature=+neon,+vfp3,-soft-float", "-C", "target-cpu=cortex-a73"]
 
 [env]
 CC_armv7_unknown_linux_gnueabi = { value = "scripts/cc-shim.sh", relative = true }

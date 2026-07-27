@@ -15,7 +15,9 @@ narratives have been pruned; what remains is the load-bearing current state.
   `armv7-unknown-linux-gnueabi` defaults to *software-emulated* FP, not just a soft-float ABI —
   Rust's non-`hf` target spec bakes in LLVM's `soft-float` feature, disabling hardware FP codegen
   even though the platform (softfp, real VFP3/NEON) supports it. Fix in `.cargo/config.toml`:
-  `target-feature=+neon,+vfp3,-soft-float` + `target-cpu=cortex-a9`. `-soft-float` changes *codegen*
+  `target-feature=+neon,+vfp3,-soft-float` + `target-cpu=cortex-a73` (the CX's α9-gen3 is an
+  ARMv8-A Cortex-A73-class core; see `.cargo/config.toml` for why this is a tuning change, not an
+  ISA bump, and why hardware AES is unreachable on this 32-bit target). `-soft-float` changes *codegen*
   only, not the calling convention, so FFI into softfp-ABI sysroot libs stays correct. (The
   "unstable feature" warning it emits is harmless. rustup's prebuilt `std`/`core` still carry the old
   default — closing that needs nightly `-Z build-std`, not yet done; the hot path is our code, not std.)
@@ -457,14 +459,17 @@ string was listed together:
 
 ## Presentation research: the target device is no longer a CX (2026-07-25)
 
-Everything above this line was written against an **LG CX, webOS 5.6, Cortex-A9, 3 cores**.
-The device now under test reports something quite different, and several load-bearing
-assumptions in these notes do not carry over:
+Everything above this line was written against an **LG CX, webOS 5.6**. The CX's CPU was
+originally recorded here as "Cortex-A9, ARMv7-A"; that was **stale/wrong** — its α9-gen3 SoC is
+an ARMv8-A **Cortex-A73-class** core running a 32-bit userland (confirmed on device; the earlier
+A9 note contradicted `.cargo/config.toml`'s own reasoning). The 32-bit-userland consequences below
+(software AES ⇒ ChaCha20) still stand regardless of the exact core. The device now under test is a
+different model, and several load-bearing assumptions do not carry over:
 
 | | CX (these notes) | G5 (`OLED65G58LW`, measured 2026-07-25) |
 |---|---|---|
 | webOS | 5.6 | **10.3.1** (Rockhopper, kernel 5.4.268) |
-| CPU | Cortex-A9, ARMv7-A | **ARMv8-A `aarch64` kernel**, `Features: aes pmull sha1 sha2 crc32 asimddp` |
+| CPU | Cortex-A73-class, ARMv8-A (32-bit userland) | **ARMv8-A `aarch64` kernel**, `Features: aes pmull sha1 sha2 crc32 asimddp` |
 | Cores | 3 | **2** (`/sys/devices/system/cpu/online` = `0-1`), max 1.4 GHz |
 | Userland | 32-bit | 32-bit (`webos_imagename: lib32-starfish-global-secured`) |
 | RAM | — | 2.5 GB (1.9 GB visible) |
