@@ -357,7 +357,7 @@ mod real {
                 return Ok(None);
             }
             dirty |= app.drain_discovery();
-            dirty |= app.drain_art();
+            dirty |= app.drain_art(display_mode.w as u32);
             dirty |= app.drain_games();
             dirty |= app.drain_pairing();
             dirty |= app.drain_speed_test();
@@ -435,7 +435,13 @@ mod real {
                 // press/release notion, so this intercepts the raw SDL event: a
                 // Confirm-mapped KeyDown/ControllerButtonDown on a pinnable card
                 // starts the hold and is swallowed rather than dispatched immediately.
-                if matches!(app.screen, Screen::Home) && app.focused_game_id().is_some() {
+                if matches!(app.screen, Screen::Home)
+                    && app
+                        .focused_game_id(crate::ui::grid_columns(
+                            (display_mode.w as u32).saturating_sub(crate::ui::SIDEBAR_W),
+                        ))
+                        .is_some()
+                {
                     // Also matches OS auto-repeat KeyDowns while held, so a repeat
                     // can't fall through to the dispatch below and launch mid-hold.
                     let confirm_down = matches!(

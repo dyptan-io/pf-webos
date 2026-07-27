@@ -217,9 +217,10 @@ pub enum HomeFocus {
     /// continues to the grid, Left returns to the row. This replaced a hold-OK gesture:
     /// the actions existed but nothing on screen advertised them.
     SidebarMenu(usize),
-    /// Index into the grid: `0` is "Desktop", `1..` are `games` — pinned games
-    /// (see `App::pinned_count`) sort to the front of `games` but are otherwise
-    /// plain grid cards, scrolling with everything else.
+    /// Index into the grid, not a plain offset into `games` — pinned games (see
+    /// `App::pinned_count`) sort to the front and occupy whole rows on their own,
+    /// so the index skips over any empty padding after a partial pinned row
+    /// before the rest of `games` resumes (see `App::game_at_grid_idx`).
     Grid(usize),
 }
 
@@ -796,17 +797,18 @@ impl App {
     /// Drains any cover art that's finished decoding since the last tick — called
     /// alongside `drain_discovery`. Returns whether any new art actually arrived
     /// (see `drain_discovery`'s docs on why).
-    pub fn drain_art(&mut self) -> bool {
+    pub fn drain_art(&mut self, screen_w: u32) -> bool {
         let Some(loader) = &self.art_loader else { return false };
         let loaded = loader.drain();
         if loaded.is_empty() {
             return false;
         }
+        let columns = ui::grid_columns(screen_w.saturating_sub(ui::SIDEBAR_W));
         for item in loaded {
             // Layout is unchanged by art arriving — queue a repaint of just that
             // card's tile (see `grid_cards_dirty`) rather than a full layer rebuild.
             if let Some(i) = self.games.iter().position(|g| g.id == item.game_id) {
-                self.grid_cards_dirty.push(i + self.card_offset());
+                self.grid_cards_dirty.push(self.grid_idx_for_game_pos(i, columns));
             }
             self.art.insert(item.game_id, item.pixmap);
         }
@@ -1085,16 +1087,21 @@ impl App {
                 } else {
                     let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
                     let columns = ui::grid_columns(available_w);
-                    // Clicked empty space (`?`'s early `None`) — nothing to focus or confirm.
+                    // Clicked empty space (`?`'s early `None`) — nothing to focus or
+                    // confirm. Same for a hit that lands in the padding after a
+                    // partial pinned row — it looks empty for the same reason.
                     let idx = ui::hit_test_grid_card(
                         x,
                         y,
                         columns,
-                        self.grid_len(),
+                        self.grid_len(columns),
                         ui::SIDEBAR_W as i32,
                         available_w,
                         self.grid_scroll,
                     )?;
+                    if !self.is_grid_card(idx, columns) {
+                        return None;
+                    }
                     self.home_focus = HomeFocus::Grid(idx);
                 }
                 self.handle_home_event(MenuEvent::Confirm, screen_w, screen_h)
@@ -1179,12 +1186,15 @@ impl App {
     }
 
     /// The title of grid card `idx` (0 = the fixed "Desktop" card, when shown — see
-    /// `card_offset`) and its cover art, if fetched.
-    pub(crate) fn grid_card_content(&self, idx: usize) -> (&str, Option<&Pixmap>) {
+    /// `card_offset`) and its cover art, if fetched. Callers must only pass an
+    /// `idx` that `is_grid_card` (tile building already filters padding gaps out).
+    pub(crate) fn grid_card_content(&self, idx: usize, columns: usize) -> (&str, Option<&Pixmap>) {
         if self.games_loaded && idx == 0 {
             ("Desktop", None)
         } else {
-            let game = &self.games[idx - self.card_offset()];
+            let game = self
+                .game_at_grid_idx(idx, columns)
+                .expect("idx filtered to a real card before building");
             (game.title.as_str(), self.art.get(&game.id))
         }
     }
@@ -1278,7 +1288,7 @@ impl App {
         // full rate forever.
         self.tiles_pending = false;
         if self.selected_host.is_some() {
-            let count = self.grid_len();
+            let count = self.grid_len(columns);
             if self.grid_dirty || self.card_tiles.len() != count {
                 // Every existing texture is stale (different library, or a different
                 // layout) — drop them rather than leaving them to be overwritten one by
@@ -1312,6 +1322,24 @@ impl App {
             let keep_lo = first_visible_row - CARD_KEEP_ROWS;
             let keep_hi = first_visible_row + visible_rows + CARD_KEEP_ROWS;
 
+            // Maps a grid index to its game (`None` for "Desktop" or the padding
+            // after a partial pinned row — see `App::game_at_grid_idx`), inlined as
+            // plain field access rather than that method so this closure captures
+            // only `self.games`, not all of `self` — it runs alongside `&mut
+            // self.art_loader` below, which a method call's whole-`self` borrow
+            // would conflict with.
+            let card_offset = self.card_offset();
+            let pinned_count = self.pinned_count;
+            let unpinned_start = self.unpinned_start(columns);
+            let game_for_idx = |idx: usize| -> Option<&GameEntry> {
+                if idx < card_offset + pinned_count {
+                    idx.checked_sub(card_offset).and_then(|p| self.games.get(p))
+                } else {
+                    idx.checked_sub(unpinned_start)
+                        .and_then(|p| self.games.get(pinned_count + p))
+                }
+            };
+
             // Evict first, so a long scroll frees textures in the same frame it needs new
             // ones rather than a frame later.
             for idx in 0..count {
@@ -1319,7 +1347,7 @@ impl App {
                 if (row < keep_lo || row > keep_hi) && self.card_tiles[idx].is_some() {
                     self.card_tiles[idx] = None;
                     self.evicted_tiles.push(Tile::Card(idx));
-                    if let Some(game) = self.games.get(idx.wrapping_sub(self.card_offset())) {
+                    if let Some(game) = game_for_idx(idx) {
                         // Drop the decoded cover too — it is several times the size of the
                         // tile it feeds. Re-requested from the disk cache on scroll back.
                         self.art.remove(&game.id);
@@ -1331,11 +1359,10 @@ impl App {
             }
 
             // Ready once nothing more can arrive: cover already in `self.art`, or the game
-            // never had one to fetch (no `self.art` entry either way). `idx == 0` (Desktop,
-            // when shown) has no `games` entry and is always ready.
-            let card_offset = self.card_offset();
+            // never had one to fetch (no `self.art` entry either way). "Desktop" and the
+            // padding after a partial pinned row have no `games` entry and are always ready.
             let art_ready = |idx: usize| {
-                self.games.get(idx.wrapping_sub(card_offset)).is_none_or(|game| {
+                game_for_idx(idx).is_none_or(|game| {
                     self.art.contains_key(&game.id) || (game.art.portrait.is_none() && game.art.header.is_none())
                 })
             };
@@ -1348,11 +1375,14 @@ impl App {
                 if row < build_lo || row > build_hi {
                     continue;
                 }
+                // Nothing to build or fetch art for in the padding after a partial
+                // pinned row.
+                if !self.is_grid_card(idx, columns) {
+                    continue;
+                }
                 // Ask for this card's cover as it enters the window, not for the whole
                 // library at once (see `art::ArtLoader`).
-                if let (Some(loader), Some(game)) =
-                    (&mut self.art_loader, self.games.get(idx.wrapping_sub(card_offset)))
-                {
+                if let (Some(loader), Some(game)) = (&mut self.art_loader, game_for_idx(idx)) {
                     loader.request(game);
                 }
                 if self.card_tiles[idx].is_some() {
@@ -1369,7 +1399,7 @@ impl App {
                     break;
                 }
                 let tile = {
-                    let (title, art) = self.grid_card_content(idx);
+                    let (title, art) = self.grid_card_content(idx, columns);
                     ui::render_card_tile(text_cache, fonts, card_w, card_h, title, art)?
                 };
                 self.card_tiles[idx] = Some(tile);
@@ -1901,7 +1931,7 @@ impl App {
                 alpha: 0xff,
             });
         } else {
-            let count = self.grid_len();
+            let count = self.grid_len(columns);
             let focused = match self.home_focus {
                 HomeFocus::Grid(i) if i < count => Some(i),
                 HomeFocus::Grid(_) | HomeFocus::Sidebar(_) | HomeFocus::SidebarMenu(_) => None,
@@ -1910,6 +1940,9 @@ impl App {
             for idx in 0..count {
                 if Some(idx) == focused {
                     continue; // drawn last, on top of its neighbors
+                }
+                if !self.is_grid_card(idx, columns) {
+                    continue; // padding after a partial pinned row — nothing to draw
                 }
                 let r = self.scrolled_card_rect(idx, columns, grid_x, available_w);
                 if r.y() + r.height() as i32 + pad < 0 || r.y() - pad > screen_h as i32 {
@@ -1968,11 +2001,8 @@ impl App {
                 });
                 // The pin-state badge — only on the focused card, and only for a
                 // real game (not the "Desktop" card, which can't be pinned).
-                if !(self.games_loaded && idx == 0) {
-                    let is_pinned = self
-                        .games
-                        .get(idx - self.card_offset())
-                        .is_some_and(|game| self.selected_known_host().is_some_and(|h| h.is_pinned(&game.id)));
+                if let Some(game) = self.game_at_grid_idx(idx, columns) {
+                    let is_pinned = self.selected_known_host().is_some_and(|h| h.is_pinned(&game.id));
                     let badge = ui::PIN_BADGE_SIZE;
                     let badge_base = Rect::new(
                         r.x() + r.width() as i32 - badge as i32 - PIN_BADGE_MARGIN,
