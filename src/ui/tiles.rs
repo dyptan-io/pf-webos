@@ -243,8 +243,8 @@ pub const STATS_OVERLAY_REF_LINE: &str = "Drop 9999 · FEC 9999 · hold yes · b
 /// long line can never overflow the card. `lines[0]` (the mode/codec header) is
 /// the only one that pops; the rest are muted.
 pub fn render_stats_overlay_tile(font: &Font, caption_font: &Font, lines: &[String], hint: &str) -> Result<Painter> {
-    let pad = 16i32;
-    let safety = 8u32; // extra slack past the reference width, so nothing touches the edge
+    let pad = 10i32;
+    let safety = 2u32; // extra slack past the reference width, so nothing touches the edge
     let line_h = font.height() + 6;
     let hint_h = caption_font.height() + 8; // includes a gap above it
     let inner_w = font.size_of(STATS_OVERLAY_REF_LINE).map_or(0, |(w, _)| w) + safety;
