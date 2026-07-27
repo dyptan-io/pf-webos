@@ -226,10 +226,8 @@ pub fn render_wrapped_text_tile(
 
 /// A worst-case stat line, measured to fix the overlay's width — see
 /// `render_stats_overlay_tile`. The Drop/FEC/hold/buf line is the widest of the
-/// bunch at 3 digits per counter — the practical ceiling for a stream anyone is
-/// still watching; past that, `render_stats_overlay_tile`'s ellipsize fallback
-/// truncates rather than widening the panel.
-pub const STATS_OVERLAY_REF_LINE: &str = "Drop 999 · FEC 999 · hold y · buf 999";
+/// bunch once all four counters hit multiple digits.
+pub const STATS_OVERLAY_REF_LINE: &str = "Drop 99  FEC 99  hold yes  buf 99";
 
 /// The in-stream stats overlay panel: a translucent brand-dark rounded card with
 /// one line of text per stat, plus a small Green-button hint pinned to the
@@ -245,8 +243,8 @@ pub const STATS_OVERLAY_REF_LINE: &str = "Drop 999 · FEC 999 · hold y · buf 9
 /// long line can never overflow the card. `lines[0]` (the mode/codec header) is
 /// the only one that pops; the rest are muted.
 pub fn render_stats_overlay_tile(font: &Font, caption_font: &Font, lines: &[String], hint: &str) -> Result<Painter> {
-    let pad = 14i32;
-    let safety = 8u32; // extra slack past the reference width, so nothing touches the edge
+    let pad = 18i32;
+    let safety = 16u32; // extra slack past the reference width, so nothing touches the edge
     let line_h = font.height() + 6;
     let hint_h = caption_font.height() + 8; // includes a gap above it
     let inner_w = font.size_of(STATS_OVERLAY_REF_LINE).map_or(0, |(w, _)| w) + safety;
@@ -261,7 +259,9 @@ pub fn render_stats_overlay_tile(font: &Font, caption_font: &Font, lines: &[Stri
         draw_text(&mut p, &mut tc, font, &clipped, pad, pad + i as i32 * line_h, color)?;
     }
     let hint_y = pad + lines.len() as i32 * line_h + (hint_h - caption_font.height());
-    draw_text(&mut p, &mut tc, caption_font, hint, pad, hint_y, MUTED)?;
+    let hint_w = caption_font.size_of(hint).map_or(0, |(w, _)| w) as i32;
+    let hint_x = pad + (w as i32 - 2 * pad - hint_w) / 2;
+    draw_text(&mut p, &mut tc, caption_font, hint, hint_x, hint_y, MUTED)?;
     Ok(p)
 }
 
