@@ -27,14 +27,14 @@ jobs:
         uses: actions/cache@v5
         with:
           path: target-clippy
-          key: armv7-unknown-linux-gnueabi-clippy-${{ hashFiles('Cargo.lock') }}
+          key: ${{ github.repository }}-armv7-unknown-linux-gnueabi-clippy-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            armv7-unknown-linux-gnueabi-clippy-
+            ${{ github.repository }}-armv7-unknown-linux-gnueabi-clippy-
 
       - name: Cache cargo registry/git/target
         uses: Swatinem/rust-cache@v2
         with:
-          key: armv7-unknown-linux-gnueabi
+          key: ${{ github.repository }}-armv7-unknown-linux-gnueabi
 
       - name: Cache webOS toolchain + ares-package
         uses: actions/cache@v5
