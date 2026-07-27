@@ -11,13 +11,13 @@ const PIN_LIMIT_BUTTON_W: u32 = 200;
 const PIN_LIMIT_BUTTON_H: u32 = 72;
 
 impl App {
-    /// Shown when a hold-to-pin can't add another game — `store::MAX_PINNED_GAMES`
-    /// is already pinned for this host.
+    /// Shown when a hold-to-pin can't add another item ("Desktop" or a game) —
+    /// `store::MAX_PINNED_GAMES` are already pinned for this host.
     pub(crate) const PIN_LIMIT_MESSAGE: &'static str =
-        "You can only pin up to 5 games. Remove some games before pinning this one.";
+        "You can only pin up to 5 items. Unpin something before pinning this one.";
 
     /// Enters `Screen::PinLimit` — called from `App::toggle_focused_pin` when
-    /// pinning a 6th game would exceed `store::MAX_PINNED_GAMES`.
+    /// pinning a 6th item would exceed `store::MAX_PINNED_GAMES`.
     pub(crate) fn open_pin_limit(&mut self) {
         self.screen = Screen::PinLimit;
     }

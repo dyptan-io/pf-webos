@@ -113,6 +113,9 @@ pub(crate) const CARD_GROWTH: f32 = 0.028;
 pub(crate) const LAUNCH_GROWTH: f32 = 3.5;
 /// Inset from the focused card's top-right corner for the pin-state badge.
 const PIN_BADGE_MARGIN: i32 = 10;
+/// How long a pin/unpin toggle's fly-to-new-position animation runs — see
+/// `App::pin_move_anim`.
+pub(crate) const PIN_MOVE_ANIM: Duration = Duration::from_millis(380);
 /// How long a modal's fade/slide-in runs.
 pub(crate) const MODAL_FADE: Duration = Duration::from_millis(170);
 /// How long a scroll indicator (Settings' row list, About's document, ...) stays
@@ -217,11 +220,85 @@ pub enum HomeFocus {
     /// continues to the grid, Left returns to the row. This replaced a hold-OK gesture:
     /// the actions existed but nothing on screen advertised them.
     SidebarMenu(usize),
-    /// Index into the grid, not a plain offset into `games` — pinned games (see
-    /// `App::pinned_count`) sort to the front and occupy whole rows on their own,
-    /// so the index skips over any empty padding after a partial pinned row
-    /// before the rest of `games` resumes (see `App::game_at_grid_idx`).
+    /// Index into the grid, not a plain offset into `games` — the pinned front
+    /// block (pinned games, plus "Desktop" if it's pinned too) occupies whole
+    /// rows on its own, so the index skips over any empty padding after a
+    /// partial pinned row before the "rest" section resumes (see
+    /// `App::grid_card_at`).
     Grid(usize),
+}
+
+/// What's shown at a grid index — either the fixed "Desktop" card or a game.
+/// Both are pinnable (see `store::DESKTOP_PIN_ID`); see `App::grid_card_at`.
+pub(crate) enum GridCard<'a> {
+    Desktop,
+    Game(&'a GameEntry),
+}
+
+/// The Home grid's shape at one column count: the pinned front block leads
+/// (pinned games, preceded by "Desktop" when it's pinned too), then the "rest"
+/// (unpinned "Desktop", then unpinned games). The front block owns whole rows,
+/// so a partial last row leaves empty padding — indices in it map to no card at
+/// all — and the rest resumes at `unpinned_start`. Built by `App::grid_layout`;
+/// takes `games` per call so callers can hold it across a `&mut self` borrow of
+/// an unrelated field.
+#[derive(Clone, Copy)]
+pub(crate) struct GridLayout {
+    pinned_count: usize,
+    pub(crate) desktop_pinned: bool,
+    desktop_in_rest: bool,
+    front_count: usize,
+    pub(crate) pinned_rows: usize,
+    pub(crate) unpinned_start: usize,
+}
+
+impl GridLayout {
+    pub(crate) fn len(&self, games: usize) -> usize {
+        self.unpinned_start + usize::from(self.desktop_in_rest) + games.saturating_sub(self.pinned_count)
+    }
+
+    pub(crate) fn card_at<'a>(&self, games: &'a [GameEntry], idx: usize) -> Option<GridCard<'a>> {
+        if idx < self.front_count {
+            if self.desktop_pinned {
+                return if idx == 0 {
+                    Some(GridCard::Desktop)
+                } else {
+                    games.get(idx - 1).map(GridCard::Game)
+                };
+            }
+            return games.get(idx).map(GridCard::Game);
+        }
+        let rest_pos = idx.checked_sub(self.unpinned_start)?;
+        if self.desktop_in_rest {
+            return if rest_pos == 0 {
+                Some(GridCard::Desktop)
+            } else {
+                games.get(self.pinned_count + rest_pos - 1).map(GridCard::Game)
+            };
+        }
+        games.get(self.pinned_count + rest_pos).map(GridCard::Game)
+    }
+
+    /// `card_at`, keeping only real games — `None` for "Desktop" as well as for
+    /// padding, since neither has cover art or a `games` entry.
+    pub(crate) fn game_at<'a>(&self, games: &'a [GameEntry], idx: usize) -> Option<&'a GameEntry> {
+        match self.card_at(games, idx)? {
+            GridCard::Game(g) => Some(g),
+            GridCard::Desktop => None,
+        }
+    }
+
+    pub(crate) fn idx_for_pin_id(&self, games: &[GameEntry], id: &str) -> Option<usize> {
+        if id == store::DESKTOP_PIN_ID {
+            return Some(if self.desktop_pinned { 0 } else { self.unpinned_start });
+        }
+        let pos = games.iter().position(|g| g.id == id)?;
+        Some(if pos < self.pinned_count {
+            usize::from(self.desktop_pinned) + pos
+        } else {
+            self.unpinned_start + usize::from(self.desktop_in_rest) + (pos - self.pinned_count)
+        })
+    }
 }
 
 /// What the user picked to stream to, once they confirm a grid card.
@@ -492,8 +569,13 @@ pub struct App {
     /// Per-card tiles (shadow baked in, transparent padding), index-aligned
     /// with the grid. `None` = not yet rasterized (or invalidated).
     pub(crate) card_tiles: Vec<Option<Painter>>,
-    /// All card tiles stale (games list / host changed).
+    /// All card tiles stale (games list / host changed) — a fresh library load,
+    /// so `prepare_tiles` also re-arms the loading spinner (`grid_reveal_ready`).
     pub(crate) grid_dirty: bool,
+    /// All card tiles stale from a pin toggle's reorder — rebuilt like
+    /// `grid_dirty`, but without re-arming the spinner: the grid is already on
+    /// screen, just re-sorted, so re-pinning must not flash a reload over it.
+    pub(crate) grid_reorder_dirty: bool,
     /// Card tiles still waiting to be rasterized inside the prefetch window. Keeps the
     /// main loop ticking until the window is filled — without it the redraw-on-change
     /// loop would go idle mid-build and leave blank cards on screen.
@@ -506,9 +588,16 @@ pub struct App {
     pub(crate) evicted_tiles: Vec<Tile>,
     /// The shared focus-ring glow tile (one per card size).
     pub(crate) ring_tile: Option<Painter>,
-    /// The shared pin-state badge tiles — `[unpinned, pinned]`, built once (they
-    /// don't depend on card size), composited over whichever card is focused.
-    pub(crate) pin_badge_tiles: Option<[Painter; 2]>,
+    /// The shared pinned badge tile — built once (it doesn't depend on card
+    /// size), composited over the focused card when that card is pinned.
+    pub(crate) pin_badge_tile: Option<Painter>,
+    /// A pin/unpin toggle's moved card, snapshotted at `toggle_focused_pin` time
+    /// (only its position changes) — cleared once `PIN_MOVE_ANIM` elapses.
+    pub(crate) pin_move_tile: Option<Painter>,
+    /// The in-flight pin-move animation: start time, and the moved card's
+    /// start/end rects in *unscrolled* grid space — `grid_scroll` is subtracted
+    /// at draw time, so scrolling mid-flight doesn't detach it from the grid.
+    pub(crate) pin_move_anim: Option<(Instant, Rect, Rect)>,
     /// The focused sidebar row's tile, keyed by row index.
     pub(crate) focused_row_tile: Option<((usize, bool), Painter)>,
     /// The active modal rasterized full-screen (transparent surroundings);
@@ -675,11 +764,14 @@ impl App {
             sidebar_dirty: true,
             card_tiles: Vec::new(),
             grid_dirty: true,
+            grid_reorder_dirty: false,
             tiles_pending: false,
             grid_cards_dirty: Vec::new(),
             evicted_tiles: Vec::new(),
             ring_tile: None,
-            pin_badge_tiles: None,
+            pin_badge_tile: None,
+            pin_move_tile: None,
+            pin_move_anim: None,
             focused_row_tile: None,
             modal_tile: None,
             modal_shell_key: None,
@@ -807,8 +899,8 @@ impl App {
         for item in loaded {
             // Layout is unchanged by art arriving — queue a repaint of just that
             // card's tile (see `grid_cards_dirty`) rather than a full layer rebuild.
-            if let Some(i) = self.games.iter().position(|g| g.id == item.game_id) {
-                self.grid_cards_dirty.push(self.grid_idx_for_game_pos(i, columns));
+            if let Some(idx) = self.grid_idx_for_pin_id(&item.game_id, columns) {
+                self.grid_cards_dirty.push(idx);
             }
             self.art.insert(item.game_id, item.pixmap);
         }
@@ -925,6 +1017,13 @@ impl App {
         if let Some(t) = self.scroll.shown_at {
             if t.elapsed() >= SCROLL_INDICATOR_LIFETIME {
                 self.scroll.shown_at = None;
+            }
+            animating = true;
+        }
+        if let Some((t, _, _)) = self.pin_move_anim {
+            if t.elapsed() >= PIN_MOVE_ANIM {
+                self.pin_move_anim = None;
+                self.pin_move_tile = None;
             }
             animating = true;
         }
@@ -1087,9 +1186,8 @@ impl App {
                 } else {
                     let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
                     let columns = ui::grid_columns(available_w);
-                    // Clicked empty space (`?`'s early `None`) — nothing to focus or
-                    // confirm. Same for a hit that lands in the padding after a
-                    // partial pinned row — it looks empty for the same reason.
+                    // Clicked empty space — either between cards (`?`'s early
+                    // `None`) or the padding after a partial pinned row.
                     let idx = ui::hit_test_grid_card(
                         x,
                         y,
@@ -1170,14 +1268,6 @@ impl App {
     }
     // --------------------------------------------------------------- render --
 
-    /// `1` when the fixed "Desktop" card occupies grid index `0` — only once
-    /// `games_loaded`, i.e. the host has actually answered a library fetch — `0`
-    /// otherwise, so index `0` is the first game directly. Subtract this from a
-    /// grid index before indexing into `games`.
-    pub(crate) fn card_offset(&self) -> usize {
-        usize::from(self.games_loaded)
-    }
-
     /// The `KnownHost` record backing `selected_host`, if any — shared by every
     /// pin-related lookup (the focused card's badge, `toggle_focused_pin`).
     pub(crate) fn selected_known_host(&self) -> Option<&KnownHost> {
@@ -1185,17 +1275,19 @@ impl App {
         self.known_hosts.iter().find(|h| h.host == *host && h.port == *port)
     }
 
-    /// The title of grid card `idx` (0 = the fixed "Desktop" card, when shown — see
-    /// `card_offset`) and its cover art, if fetched. Callers must only pass an
-    /// `idx` that `is_grid_card` (tile building already filters padding gaps out).
+    pub(crate) fn selected_known_host_mut(&mut self) -> Option<&mut KnownHost> {
+        let (host, port) = self.selected_host.clone()?;
+        self.known_hosts.iter_mut().find(|h| h.host == host && h.port == port)
+    }
+
+    /// The title of grid card `idx` (see `grid_card_at`) and its cover art, if
+    /// fetched. Callers must only pass an `idx` that `is_grid_card` (tile
+    /// building already filters padding gaps out).
     pub(crate) fn grid_card_content(&self, idx: usize, columns: usize) -> (&str, Option<&Pixmap>) {
-        if self.games_loaded && idx == 0 {
-            ("Desktop", None)
-        } else {
-            let game = self
-                .game_at_grid_idx(idx, columns)
-                .expect("idx filtered to a real card before building");
-            (game.title.as_str(), self.art.get(&game.id))
+        match self.grid_card_at(idx, columns) {
+            Some(GridCard::Desktop) => ("Desktop", None),
+            Some(GridCard::Game(game)) => (game.title.as_str(), self.art.get(&game.id)),
+            None => unreachable!("idx filtered to a real card before building"),
         }
     }
 
@@ -1289,21 +1381,27 @@ impl App {
         self.tiles_pending = false;
         if self.selected_host.is_some() {
             let count = self.grid_len(columns);
-            if self.grid_dirty || self.card_tiles.len() != count {
-                // Every existing texture is stale (different library, or a different
-                // layout) — drop them rather than leaving them to be overwritten one by
+            // Captured before it's cleared below: a fresh library load is the only
+            // rebuild that also re-arms the spinner.
+            let full_reset = self.grid_dirty;
+            if full_reset || self.grid_reorder_dirty || self.card_tiles.len() != count {
+                // Every existing texture is stale (different games, different grid
+                // shape) — drop them rather than leaving them to be overwritten one by
                 // one, which would strand the tail of a longer previous library.
                 for idx in 0..self.card_tiles.len() {
                     self.evicted_tiles.push(Tile::Card(idx));
                 }
                 self.card_tiles = std::iter::repeat_with(|| None).take(count).collect();
                 self.grid_dirty = false;
+                self.grid_reorder_dirty = false;
                 self.grid_cards_dirty.clear();
-                // Only a full reset re-arms the spinner — ordinary scrolling into the
-                // prefetch window must not hide the grid again.
-                self.grid_reveal_ready = false;
-                self.spinner_since = None;
-                self.spinner_frame = None;
+                if full_reset {
+                    // Scrolling, a resize, or re-pinning a card must not hide the
+                    // already-visible grid behind the spinner again.
+                    self.grid_reveal_ready = false;
+                    self.spinner_since = None;
+                    self.spinner_frame = None;
+                }
             } else {
                 for idx in std::mem::take(&mut self.grid_cards_dirty) {
                     if idx < count {
@@ -1322,23 +1420,10 @@ impl App {
             let keep_lo = first_visible_row - CARD_KEEP_ROWS;
             let keep_hi = first_visible_row + visible_rows + CARD_KEEP_ROWS;
 
-            // Maps a grid index to its game (`None` for "Desktop" or the padding
-            // after a partial pinned row — see `App::game_at_grid_idx`), inlined as
-            // plain field access rather than that method so this closure captures
-            // only `self.games`, not all of `self` — it runs alongside `&mut
-            // self.art_loader` below, which a method call's whole-`self` borrow
-            // would conflict with.
-            let card_offset = self.card_offset();
-            let pinned_count = self.pinned_count;
-            let unpinned_start = self.unpinned_start(columns);
-            let game_for_idx = |idx: usize| -> Option<&GameEntry> {
-                if idx < card_offset + pinned_count {
-                    idx.checked_sub(card_offset).and_then(|p| self.games.get(p))
-                } else {
-                    idx.checked_sub(unpinned_start)
-                        .and_then(|p| self.games.get(pinned_count + p))
-                }
-            };
+            // Held by value, not re-derived per index — and, unlike the `App`
+            // helpers, it maps indices without borrowing all of `self`, so the art
+            // lookups below can sit next to `&mut self.art_loader`.
+            let layout = self.grid_layout(columns);
 
             // Evict first, so a long scroll frees textures in the same frame it needs new
             // ones rather than a frame later.
@@ -1347,7 +1432,7 @@ impl App {
                 if (row < keep_lo || row > keep_hi) && self.card_tiles[idx].is_some() {
                     self.card_tiles[idx] = None;
                     self.evicted_tiles.push(Tile::Card(idx));
-                    if let Some(game) = game_for_idx(idx) {
+                    if let Some(game) = layout.game_at(&self.games, idx) {
                         // Drop the decoded cover too — it is several times the size of the
                         // tile it feeds. Re-requested from the disk cache on scroll back.
                         self.art.remove(&game.id);
@@ -1362,7 +1447,7 @@ impl App {
             // never had one to fetch (no `self.art` entry either way). "Desktop" and the
             // padding after a partial pinned row have no `games` entry and are always ready.
             let art_ready = |idx: usize| {
-                game_for_idx(idx).is_none_or(|game| {
+                layout.game_at(&self.games, idx).is_none_or(|game| {
                     self.art.contains_key(&game.id) || (game.art.portrait.is_none() && game.art.header.is_none())
                 })
             };
@@ -1377,12 +1462,12 @@ impl App {
                 }
                 // Nothing to build or fetch art for in the padding after a partial
                 // pinned row.
-                if !self.is_grid_card(idx, columns) {
+                if layout.card_at(&self.games, idx).is_none() {
                     continue;
                 }
                 // Ask for this card's cover as it enters the window, not for the whole
                 // library at once (see `art::ArtLoader`).
-                if let (Some(loader), Some(game)) = (&mut self.art_loader, game_for_idx(idx)) {
+                if let (Some(loader), Some(game)) = (&mut self.art_loader, layout.game_at(&self.games, idx)) {
                     loader.request(game);
                 }
                 if self.card_tiles[idx].is_some() {
@@ -1407,12 +1492,11 @@ impl App {
             }
             self.tiles_pending = pending;
 
-            // The pin-state badge tiles — built once, composited over the focused
+            // The pinned badge tile — built once, composited over the focused
             // card in `draw_list` rather than baked into individual card tiles.
-            if self.pin_badge_tiles.is_none() {
-                self.pin_badge_tiles = Some([ui::render_pin_badge_tile(false), ui::render_pin_badge_tile(true)]);
-                updated.push(Tile::PinBadge(false));
-                updated.push(Tile::PinBadge(true));
+            if self.pin_badge_tile.is_none() {
+                self.pin_badge_tile = Some(ui::render_pin_badge_tile(text_cache, fonts.icon)?);
+                updated.push(Tile::PinBadge);
             }
 
             // Rechecks the whole window rather than trusting `!pending`, since a card
@@ -1519,9 +1603,8 @@ impl App {
             }),
             // `EditHost` joins `AddHost` in having no shell key: its typed-digit
             // display has no separate focus tile to protect, so it just redraws on
-            // any `content_dirty` tick. `PinLimit` has nothing that changes at all
-            // once open (a fixed message + one always-focused button), so the same
-            // "just redraw on `content_dirty`" fallback is fine for it too.
+            // any `content_dirty` tick — same for `PinLimit`, which is a fixed
+            // message plus one always-focused button.
             Screen::Home | Screen::AddHost | Screen::EditHost | Screen::PinLimit => None,
         };
         let modal_stale = if modal_shell_key.is_some() {
@@ -1873,10 +1956,8 @@ impl App {
             Tile::FocusRow => self.focused_row_tile.as_ref().map(|(_, p)| p),
             Tile::Card(i) => self.card_tiles.get(i).and_then(|t| t.as_ref()),
             Tile::Ring => self.ring_tile.as_ref(),
-            Tile::PinBadge(pinned) => self
-                .pin_badge_tiles
-                .as_ref()
-                .map(|[unpinned, pinned_tile]| if pinned { pinned_tile } else { unpinned }),
+            Tile::PinBadge => self.pin_badge_tile.as_ref(),
+            Tile::PinMove => self.pin_move_tile.as_ref(),
             Tile::Modal => self.modal_tile.as_ref(),
             Tile::ModalFocusElement => self.modal_focus_tile.as_ref().map(|(_, p)| p),
             Tile::DropdownOverlay => self.dropdown_overlay_tile.as_ref().map(|(_, p)| p),
@@ -1937,11 +2018,12 @@ impl App {
                 HomeFocus::Grid(_) | HomeFocus::Sidebar(_) | HomeFocus::SidebarMenu(_) => None,
             };
             let pad = ui::CARD_TILE_PAD;
+            let layout = self.grid_layout(columns);
             for idx in 0..count {
                 if Some(idx) == focused {
                     continue; // drawn last, on top of its neighbors
                 }
-                if !self.is_grid_card(idx, columns) {
+                if layout.card_at(&self.games, idx).is_none() {
                     continue; // padding after a partial pinned row — nothing to draw
                 }
                 let r = self.scrolled_card_rect(idx, columns, grid_x, available_w);
@@ -1999,10 +2081,14 @@ impl App {
                     dst: ui::zoom_rect(ring_base, f, CARD_GROWTH),
                     alpha: (255.0 * f) as u8,
                 });
-                // The pin-state badge — only on the focused card, and only for a
-                // real game (not the "Desktop" card, which can't be pinned).
-                if let Some(game) = self.game_at_grid_idx(idx, columns) {
-                    let is_pinned = self.selected_known_host().is_some_and(|h| h.is_pinned(&game.id));
+                // The pinned badge — only on a focused card that's actually
+                // pinned, be it a game or "Desktop" (see `store::DESKTOP_PIN_ID`).
+                let pin_id = match layout.card_at(&self.games, idx) {
+                    Some(GridCard::Desktop) => Some(store::DESKTOP_PIN_ID),
+                    Some(GridCard::Game(g)) => Some(g.id.as_str()),
+                    None => None,
+                };
+                if pin_id.is_some_and(|id| self.selected_known_host().is_some_and(|h| h.is_pinned(id))) {
                     let badge = ui::PIN_BADGE_SIZE;
                     let badge_base = Rect::new(
                         r.x() + r.width() as i32 - badge as i32 - PIN_BADGE_MARGIN,
@@ -2011,11 +2097,28 @@ impl App {
                         badge,
                     );
                     cmds.push(DrawCmd::Tex {
-                        tile: Tile::PinBadge(is_pinned),
+                        tile: Tile::PinBadge,
                         dst: ui::zoom_rect(badge_base, f, CARD_GROWTH),
                         alpha: 0xff,
                     });
                 }
+            }
+            // The toggled card's snapshot flies from its old grid position to its
+            // new one, over everything drawn above — see `pin_move_anim`.
+            if let Some((t, start, end)) = self.pin_move_anim {
+                let f = ui::anim_frac(Some(t), PIN_MOVE_ANIM);
+                let scrolled = |r: Rect| Rect::new(r.x(), r.y() - self.grid_scroll, r.width(), r.height());
+                let base = ui::lerp_rect(scrolled(start), scrolled(end), f);
+                cmds.push(DrawCmd::Tex {
+                    tile: Tile::PinMove,
+                    dst: Rect::new(
+                        base.x() - pad,
+                        base.y() - pad,
+                        base.width() + 2 * pad as u32,
+                        base.height() + 2 * pad as u32,
+                    ),
+                    alpha: 0xff,
+                });
             }
         }
         if self.selected_host.is_some() && self.home_status.is_some() {

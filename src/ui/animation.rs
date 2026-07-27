@@ -43,3 +43,13 @@ pub fn zoom_rect(base: Rect, frac: f32, growth: f32) -> Rect {
     let th = base.height() as f32 * scale;
     Rect::new((cx - tw / 2.0) as i32, (cy - th / 2.0) as i32, tw as u32, th as u32)
 }
+
+/// Translates from `start` toward `end` by `frac` (0.0 = `start`, 1.0 = `end`)
+/// — the "fly to a new grid position" counterpart to `zoom_rect`'s scale-around-
+/// center, used by the pin/unpin move animation. Size follows `end`'s (the two
+/// only ever differ if the window resized mid-animation).
+pub fn lerp_rect(start: Rect, end: Rect, frac: f32) -> Rect {
+    let x = start.x() as f32 + (end.x() - start.x()) as f32 * frac;
+    let y = start.y() as f32 + (end.y() - start.y()) as f32 * frac;
+    Rect::new(x as i32, y as i32, end.width(), end.height())
+}

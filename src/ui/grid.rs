@@ -8,6 +8,12 @@ pub const GRID_GAP: i32 = 24;
 pub const GRID_TOP_Y: i32 = 160;
 pub const CARD_MIN_W: u32 = 220;
 
+/// Extra vertical gap, on top of the normal `GRID_GAP`, inserted once between
+/// the pinned front block and the "rest" section below it — so pinned cards
+/// read as a visually separate group. `App::pinned_separator_rect` draws its
+/// thin divider centered in this gap.
+pub const PINNED_SECTION_GAP: i32 = 32;
+
 /// `clamp(2, available_w / (min_card_w + gap), 5)` — moonlight-tv's own formula.
 pub fn grid_columns(available_w: u32) -> usize {
     let cols = (available_w / (CARD_MIN_W + GRID_GAP as u32)).max(1);

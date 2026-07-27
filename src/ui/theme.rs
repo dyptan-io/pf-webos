@@ -55,3 +55,5 @@ pub const ICON_EDIT: &str = "\u{E3C9}";
 pub const ICON_INFO: &str = "\u{E88E}";
 /// The host row's "more actions" affordance — see `sidebar_menu_button_rect`.
 pub const ICON_MORE: &str = "\u{E5D3}";
+/// The Home grid's pin/unpin badge — see `render_pin_badge_tile`.
+pub const ICON_PIN: &str = "\u{F10D}";

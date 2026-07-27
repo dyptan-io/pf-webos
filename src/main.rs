@@ -206,6 +206,16 @@ mod real {
     /// of launching it — see `run_ui_flow`'s interception.
     const PIN_HOLD: Duration = Duration::from_millis(500);
 
+    /// An in-flight hold-to-pin gesture: OK is down on a pinnable Home card. The
+    /// toggle fires the moment `PIN_HOLD` elapses (so the pin visibly lands under
+    /// the still-held button), and `fired` then makes the release a no-op instead
+    /// of the launch a quick tap would have dispatched.
+    struct PinHold {
+        since: Instant,
+        focus: HomeFocus,
+        fired: bool,
+    }
+
     /// webOS ships a real on-screen keyboard, and the SDL fork this app links wires it
     /// up (`SDL_waylandwebos_osk.c` in `webosbrew/SDL-webOS`, driving `zwp_text_input_v3`)
     /// — but only for an app that actually asks for text input. Nothing here ever called
@@ -326,9 +336,8 @@ mod real {
         // press dispatches Back exactly once no matter how SDL reports (or
         // misreports) repeats for it.
         let mut menu_back_down = false;
-        // Hold-to-pin on Home (see `PIN_HOLD`): `Some((pressed_at, focus_at_press))`
-        // while OK is held on a pinnable card; tap vs. hold is decided on release.
-        let mut pin_held: Option<(Instant, HomeFocus)> = None;
+        // Hold-to-pin on Home (see `PIN_HOLD`), while OK is held on a pinnable card.
+        let mut pin_held: Option<PinHold> = None;
         let mut stick_nav = crate::ui::StickMenuNav::default();
         // Owned handle (it just clones the video subsystem's refcount), so taking it
         // here doesn't hold a borrow on `canvas` for the rest of the loop.
@@ -365,6 +374,16 @@ mod real {
             dirty |= app.drain_reachability();
             dirty |= app.tick_wake();
             dirty |= app.drain_launch_check();
+            // Hold-to-pin fires here rather than on release, so the pin lands the
+            // instant `PIN_HOLD` elapses and the user can see it before letting go.
+            if let Some(hold) = pin_held.as_mut().filter(|h| !h.fired && h.since.elapsed() >= PIN_HOLD) {
+                hold.fired = true;
+                let still_there = matches!(app.screen, Screen::Home) && hold.focus == app.home_focus;
+                if still_there {
+                    app.toggle_focused_pin(&mut text_cache, fonts, display_mode.w as u32, display_mode.h as u32);
+                }
+                dirty = true;
+            }
             // Reachability check passed — start connecting now, in parallel with the
             // launch zoom/fade, so a fast handshake finishes before the animation
             // does rather than only starting once it's done.
@@ -429,15 +448,15 @@ mod real {
                     }
                     continue;
                 }
-                // Hold-to-pin: OK on a focused Home game card pins/unpins past
-                // `PIN_HOLD`, or launches on a quick tap — resolved entirely on
-                // release so the two outcomes can't both fire. `MenuEvent` has no
-                // press/release notion, so this intercepts the raw SDL event: a
-                // Confirm-mapped KeyDown/ControllerButtonDown on a pinnable card
-                // starts the hold and is swallowed rather than dispatched immediately.
+                // Hold-to-pin: OK on a focused Home card ("Desktop" or a game — both
+                // pinnable) pins/unpins once `PIN_HOLD` elapses, or launches on a quick
+                // tap. `MenuEvent` has no press/release notion, so this intercepts the
+                // raw SDL event: a Confirm-mapped KeyDown/ControllerButtonDown on a
+                // pinnable card starts the hold and is swallowed rather than dispatched
+                // immediately — the launch can only ever come from the release.
                 if matches!(app.screen, Screen::Home)
                     && app
-                        .focused_game_id(crate::ui::grid_columns(
+                        .focused_pin_id(crate::ui::grid_columns(
                             (display_mode.w as u32).saturating_sub(crate::ui::SIDEBAR_W),
                         ))
                         .is_some()
@@ -454,9 +473,11 @@ mod real {
                             if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Confirm)
                     );
                     if confirm_down {
-                        if pin_held.is_none() {
-                            pin_held = Some((Instant::now(), app.home_focus));
-                        }
+                        pin_held.get_or_insert(PinHold {
+                            since: Instant::now(),
+                            focus: app.home_focus,
+                            fired: false,
+                        });
                         continue;
                     }
                 }
@@ -470,21 +491,18 @@ mod real {
                         if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Confirm)
                 );
                 if ends_hold {
-                    if let Some((since, focus)) = pin_held.take() {
+                    if let Some(hold) = pin_held.take() {
                         dirty = true;
-                        if !matches!(app.screen, Screen::Home) || focus != app.home_focus {
-                            // Screen or focus changed mid-hold — act on neither.
-                        } else if since.elapsed() < PIN_HOLD {
-                            // A quick tap: the press never dispatched, so do it now.
-                            if app
+                        // A quick tap: the press never dispatched, so do it now. A hold
+                        // that already toggled, or one whose screen/focus moved out from
+                        // under it, resolves to nothing.
+                        let tapped = !hold.fired && matches!(app.screen, Screen::Home) && hold.focus == app.home_focus;
+                        if tapped
+                            && app
                                 .handle_home_event(MenuEvent::Confirm, display_mode.w as u32, display_mode.h as u32)
                                 .is_some()
-                            {
-                                break 'ui;
-                            }
-                        } else {
-                            // Held past the threshold: toggle the pin, never launch.
-                            app.toggle_focused_pin(display_mode.w as u32, display_mode.h as u32);
+                        {
+                            break 'ui;
                         }
                         continue; // this press was ours (tap or hold) — swallow the release
                     }

@@ -133,20 +133,22 @@ pub fn render_focus_ring_tile(w: u32, h: u32) -> Painter {
     p
 }
 
-/// Diameter of the pin-state badge composited over the focused grid/pinned
+/// Diameter of the pinned badge composited over the focused grid/pinned
 /// card's top-right corner (see `Tile::PinBadge`).
 pub const PIN_BADGE_SIZE: u32 = 28;
 
-/// The pin-state badge: a dark backing disc (for contrast over bright cover
-/// art) with a smaller dot on top — white when pinned, muted grey when not.
-/// One shared tile per state, like `render_focus_ring_tile`.
-pub fn render_pin_badge_tile(pinned: bool) -> Painter {
+/// The pinned badge: a dark backing disc (for contrast over bright cover art)
+/// with a muted `ICON_PIN` glyph on top. Only ever drawn on a card that *is*
+/// pinned, so there's a single shared tile, like `render_focus_ring_tile`.
+pub fn render_pin_badge_tile(text_cache: &mut TextCache, icon_font: &Font) -> Result<Painter> {
     let d = PIN_BADGE_SIZE;
     let mut p = Painter::new(d, d);
     let c = d as f32 / 2.0;
     p.fill_circle(c, c, c, Color::RGBA(0x00, 0x00, 0x00, 0x70));
-    p.fill_circle(c, c, c * 0.42, if pinned { WHITE } else { MUTED });
-    p
+    let icon = (d as f32 * 0.6) as u32;
+    let icon_rect = Rect::new(((d - icon) / 2) as i32, ((d - icon) / 2) as i32, icon, icon);
+    draw_icon(&mut p, text_cache, icon_font, icon_rect, ICON_PIN, MUTED)?;
+    Ok(p)
 }
 
 /// Transparent padding around a focused-row tile, generous enough for a

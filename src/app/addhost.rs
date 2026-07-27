@@ -49,7 +49,9 @@ impl App {
                 fingerprint: None,
                 mgmt_port: None,
                 mac: Vec::new(),
-                pinned: Vec::new(),
+                // Only reaches a genuinely new host — `upsert_known_host` keeps an
+                // existing record's pins.
+                pinned: vec![store::DESKTOP_PIN_ID.to_string()],
             },
         );
         let _ = store::save_known_hosts(&self.known_hosts);
