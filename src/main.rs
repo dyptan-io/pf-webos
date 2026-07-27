@@ -856,12 +856,14 @@ mod real {
         let font_label = crate::ui::load_font(&ttf, display_mode.h as u32, 22, crate::ui::FontWeight::Medium)?;
         let font_value = crate::ui::load_font(&ttf, display_mode.h as u32, 20, crate::ui::FontWeight::Regular)?;
         let font_title = crate::ui::load_font(&ttf, display_mode.h as u32, 40, crate::ui::FontWeight::SemiBold)?;
+        let font_caption = crate::ui::load_font(&ttf, display_mode.h as u32, 14, crate::ui::FontWeight::Regular)?;
         let icon_font = crate::ui::load_icon_font(&ttf)?;
         let fonts = crate::ui::Fonts {
             label: &font_label,
             value: &font_value,
             title: &font_title,
             icon: &icon_font,
+            caption: &font_caption,
         };
 
         // Owned here, at the top of the menu/stream cycle, rather than re-declared in
@@ -1274,7 +1276,6 @@ mod real {
                     let feed_ms = connected.stats.feed_us.load(Ordering::Relaxed) as f32 / 1000.0;
                     let holding = connected.stats.holding.load(Ordering::Relaxed);
                     let lines = vec![
-                        "Green: hide this overlay".to_string(),
                         format!(
                             "{}x{}@{} {}{}",
                             mode.width,
@@ -1307,7 +1308,12 @@ mod real {
                             connected.client.resolved_bitrate_kbps / 1000,
                         ),
                     ];
-                    match crate::ui::render_stats_overlay_tile(fonts.value, &lines) {
+                    match crate::ui::render_stats_overlay_tile(
+                        fonts.value,
+                        fonts.caption,
+                        &lines,
+                        "Press green button to hide this overlay",
+                    ) {
                         Ok(tile) => {
                             let (tw, th) = (tile.width(), tile.height());
                             compositor.upload(&texture_creator, Tile::StatsOverlay, &tile)?;

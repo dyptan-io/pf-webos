@@ -27,15 +27,17 @@ pub enum FontWeight {
     SemiBold,
 }
 
-/// The app's four UI fonts, bundled so the many functions needing several of
-/// them take one `&Fonts` instead of threading each separately. Borrow-only —
-/// the fonts are owned in `main.rs`'s `run_inner` for the whole menu/stream
-/// cycle (see `load_font`), so this never needs storing anywhere.
+/// The app's UI fonts, bundled so the many functions needing several of them
+/// take one `&Fonts` instead of threading each separately. Borrow-only — the
+/// fonts are owned in `main.rs`'s `run_inner` for the whole menu/stream cycle
+/// (see `load_font`), so this never needs storing anywhere.
 pub struct Fonts<'a, 'ttf> {
     pub label: &'a Font<'ttf, 'static>,
     pub value: &'a Font<'ttf, 'static>,
     pub title: &'a Font<'ttf, 'static>,
     pub icon: &'a Font<'ttf, 'static>,
+    /// Smallest weight — currently just the stats overlay's Green-button hint.
+    pub caption: &'a Font<'ttf, 'static>,
 }
 
 /// Loads a bundled Geist weight at a size proportional to the display height

@@ -230,32 +230,36 @@ pub fn render_wrapped_text_tile(
 pub const STATS_OVERLAY_REF_LINE: &str = "Dropped 9999 · FEC 9999 · hold yes · backlog 999";
 
 /// The in-stream stats overlay panel: a translucent brand-dark rounded card with
-/// one line of text per stat. Rebuilt at the overlay's ~2Hz refresh with a
-/// THROWAWAY `TextCache` — the numeric lines change every refresh, so a
-/// persistent cache would only accumulate dead entries for the whole stream's
-/// duration.
+/// one line of text per stat, plus a small Green-button hint pinned to the
+/// bottom in a dimmer, smaller caption font. Rebuilt at the overlay's ~2Hz
+/// refresh with a THROWAWAY `TextCache` — the numeric lines change every
+/// refresh, so a persistent cache would only accumulate dead entries for the
+/// whole stream's duration.
 ///
 /// Width is FIXED — measured from `STATS_OVERLAY_REF_LINE` plus a safety margin,
 /// not from the live content — so the right-anchored panel keeps a constant left
 /// edge instead of jittering horizontally as the numbers change digit count.
 /// Lines are ellipsized to the inner width as a further safety, so an unexpectedly
-/// long line can never overflow the card. Line 0 is the Green-button hint, line 1
-/// the mode/codec header (the only one that pops); everything else is muted.
-pub fn render_stats_overlay_tile(font: &Font, lines: &[String]) -> Result<Painter> {
-    let pad = 24i32;
-    let safety = 32u32; // extra slack past the reference width, so nothing touches the edge
+/// long line can never overflow the card. `lines[0]` (the mode/codec header) is
+/// the only one that pops; the rest are muted.
+pub fn render_stats_overlay_tile(font: &Font, caption_font: &Font, lines: &[String], hint: &str) -> Result<Painter> {
+    let pad = 18i32;
+    let safety = 12u32; // extra slack past the reference width, so nothing touches the edge
     let line_h = font.height() + 6;
+    let hint_h = caption_font.height() + 8; // includes a gap above it
     let inner_w = font.size_of(STATS_OVERLAY_REF_LINE).map_or(0, |(w, _)| w) + safety;
     let w = inner_w + 2 * pad as u32;
-    let h = (lines.len() as i32 * line_h + 2 * pad) as u32;
+    let h = (lines.len() as i32 * line_h + hint_h + 2 * pad) as u32;
     let mut p = Painter::new(w.max(1), h.max(1));
     let mut tc = TextCache::new();
     p.fill_rounded_rect(Rect::new(0, 0, w, h), 14, Color::RGBA(0x14, 0x10, 0x1f, 0x90));
     for (i, line) in lines.iter().enumerate() {
-        let color = if i == 1 { WHITE } else { MUTED };
+        let color = if i == 0 { WHITE } else { MUTED };
         let clipped = ellipsize(font, line, inner_w);
         draw_text(&mut p, &mut tc, font, &clipped, pad, pad + i as i32 * line_h, color)?;
     }
+    let hint_y = pad + lines.len() as i32 * line_h + (hint_h - caption_font.height());
+    draw_text(&mut p, &mut tc, caption_font, hint, pad, hint_y, MUTED)?;
     Ok(p)
 }
 
