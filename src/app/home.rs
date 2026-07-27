@@ -81,14 +81,15 @@ impl App {
     }
 
     pub(crate) fn sidebar_index_for_selected(&self) -> usize {
-        match &self.selected_host {
-            Some((h, p)) => self
-                .entries
-                .iter()
-                .position(|e| e.host() == h && e.port() == *p)
-                .unwrap_or(0),
-            None => 0,
-        }
+        self.sidebar_index_of_selected_host().unwrap_or(0)
+    }
+
+    /// Like `sidebar_index_for_selected`, but `None` both when nothing is selected
+    /// and when the selected host has since dropped out of `entries` — a caller
+    /// highlighting the active row must not fall back to row 0 in that case.
+    pub(crate) fn sidebar_index_of_selected_host(&self) -> Option<usize> {
+        let (h, p) = self.selected_host.as_ref()?;
+        self.entries.iter().position(|e| e.host() == h && e.port() == *p)
     }
     /// The sidebar focus for row `index`, staying on the ⋯ column when `prefer_menu`
     /// and that row actually has one (only host rows do).

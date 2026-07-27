@@ -122,6 +122,9 @@ pub struct Connected {
 pub struct StreamStats {
     /// Total frames received from the host so far.
     pub frames: std::sync::atomic::AtomicU64,
+    /// Total access-unit bytes received so far — deltas over time give the overlay's
+    /// measured (as opposed to negotiated) bitrate.
+    pub bytes: std::sync::atomic::AtomicU64,
     /// Whether the freeze-until-reanchor hold is currently active.
     pub holding: AtomicBool,
     /// The most recent decoder feed duration, in µs.
@@ -897,6 +900,7 @@ fn video_pump(
             Ok(frame) => {
                 frames_received += 1;
                 stats.frames.store(frames_received, Ordering::Relaxed);
+                stats.bytes.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
                 if last_heartbeat.elapsed() >= Duration::from_secs(2) {
                     last_heartbeat = Instant::now();
                     let backlog = player.render_buffer_length();
@@ -911,7 +915,7 @@ fn video_pump(
                     // exactly the situation it exists for, a freeze reported off a
                     // plain sideloaded run with no telemetry listener. Half a line per
                     // second is affordable; a second round trip to reproduce is not.
-                    tracing::info!(
+                    tracing::debug!(
                         "video: {frames_received} frames, holding={holding}, dropped={}, backlog={}",
                         client.frames_dropped(),
                         backlog.map_or_else(|| "n/a".to_string(), |b| b.to_string()),

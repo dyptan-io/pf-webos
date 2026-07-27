@@ -187,6 +187,7 @@ pub fn render_focused_row_tile(
             entry.name(),
             entry.is_paired(),
             true,
+            false,
             menu_focused,
             online,
         )?;
@@ -223,9 +224,10 @@ pub fn render_wrapped_text_tile(
     Ok(p)
 }
 
-/// A worst-case stat line (max resolution + longest codec/HDR tag), measured to
-/// fix the overlay's width — see `render_stats_overlay_tile`.
-pub const STATS_OVERLAY_REF_LINE: &str = "3840x2160@120 HEVC HDR";
+/// A worst-case stat line, measured to fix the overlay's width — see
+/// `render_stats_overlay_tile`. The Dropped/FEC/hold/backlog line is the widest of
+/// the bunch once all four counters hit multiple digits.
+pub const STATS_OVERLAY_REF_LINE: &str = "Dropped 9999 · FEC 9999 · hold yes · backlog 999";
 
 /// The in-stream stats overlay panel: a translucent brand-dark rounded card with
 /// one line of text per stat. Rebuilt at the overlay's ~2Hz refresh with a
@@ -237,20 +239,20 @@ pub const STATS_OVERLAY_REF_LINE: &str = "3840x2160@120 HEVC HDR";
 /// not from the live content — so the right-anchored panel keeps a constant left
 /// edge instead of jittering horizontally as the numbers change digit count.
 /// Lines are ellipsized to the inner width as a further safety, so an unexpectedly
-/// long line can never overflow the card.
+/// long line can never overflow the card. Line 0 is the Green-button hint, line 1
+/// the mode/codec header (the only one that pops); everything else is muted.
 pub fn render_stats_overlay_tile(font: &Font, lines: &[String]) -> Result<Painter> {
-    let pad = 18i32;
-    let safety = 16u32; // extra slack past the reference width, so nothing touches the edge
+    let pad = 24i32;
+    let safety = 32u32; // extra slack past the reference width, so nothing touches the edge
     let line_h = font.height() + 6;
     let inner_w = font.size_of(STATS_OVERLAY_REF_LINE).map_or(0, |(w, _)| w) + safety;
     let w = inner_w + 2 * pad as u32;
     let h = (lines.len() as i32 * line_h + 2 * pad) as u32;
     let mut p = Painter::new(w.max(1), h.max(1));
     let mut tc = TextCache::new();
-    p.fill_rounded_rect(Rect::new(0, 0, w, h), 14, Color::RGBA(0x14, 0x10, 0x1f, 0xd2));
+    p.fill_rounded_rect(Rect::new(0, 0, w, h), 14, Color::RGBA(0x14, 0x10, 0x1f, 0x90));
     for (i, line) in lines.iter().enumerate() {
-        // First line (mode/codec header) pops; the measurements below are muted.
-        let color = if i == 0 { WHITE } else { MUTED };
+        let color = if i == 1 { WHITE } else { MUTED };
         let clipped = ellipsize(font, line, inner_w);
         draw_text(&mut p, &mut tc, font, &clipped, pad, pad + i as i32 * line_h, color)?;
     }

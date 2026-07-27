@@ -72,6 +72,18 @@ pub fn hit_test_sidebar_row(x: i32, y: i32, row_count: usize, screen_h: u32) -> 
     (0..settings_index).find(|&i| sidebar_row_rect(i).contains_point((x, y)))
 }
 
+/// Draw a selectable row with optional selection highlighting. When focused, shows
+/// the full card with shadow and zoom. When selected (but not focused), shows a
+/// subtle background. When neither, shows no background.
+fn draw_selectable_with_selection(painter: &mut Painter, rect: Rect, focused: bool, selected: bool) -> Rect {
+    let r = draw_selectable(painter, rect, focused);
+    if !focused && selected {
+        let selected_bg = Color::RGBA(0x2b, 0x21, 0x48, 0x40);
+        painter.fill_rounded_rect(r, CARD_RADIUS, selected_bg);
+    }
+    r
+}
+
 /// One entry in the sidebar's host list — either a fully known/paired host or a
 /// freshly discovered (not yet paired) one.
 #[derive(Clone)]
@@ -124,13 +136,16 @@ impl HostEntry {
 /// `settings_row_rect`) rather than following on from the host list — it stays
 /// put regardless of how many hosts are known, instead of drifting down the
 /// screen as the list grows. `focused_index` is `Some` only when the sidebar
-/// itself has focus (see `app.rs`'s `HomeFocus`).
+/// itself has focus (see `app.rs`'s `HomeFocus`). `selected_index` highlights
+/// the currently-selected host row to indicate it's the active/connected host.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_sidebar(
     painter: &mut Painter,
     text_cache: &mut TextCache,
     fonts: &Fonts,
     entries: &[HostEntry],
     focused_index: Option<usize>,
+    selected_index: Option<usize>,
     // `online` is index-aligned with `entries`; `None` = not probed yet (see `app::reach`).
     online: &[Option<bool>],
     screen_h: u32,
@@ -158,6 +173,7 @@ pub fn draw_sidebar(
             entry.name(),
             entry.is_paired(),
             focused_index == Some(i),
+            selected_index == Some(i),
             false,
             online.get(i).copied().flatten(),
         )?;
@@ -196,9 +212,10 @@ pub fn draw_sidebar(
 /// "Settings" utility rows alike): a left-aligned icon and a label, both
 /// colored by focus, plus the [`draw_selectable`] card that only appears
 /// (zoomed in, see [`inflate`]) once focused — an unfocused row has no
-/// background at all. Host rows and utility rows used to each carry their own
-/// near-identical copy of this (differing only by accident of drift, in icon
-/// size/padding, not by design).
+/// background at all. `selected` adds a subtle background when not focused.
+/// Host rows and utility rows used to each carry their own near-identical copy
+/// of this (differing only by accident of drift, in icon size/padding, not by
+/// design).
 #[allow(clippy::too_many_arguments)]
 pub fn draw_sidebar_row(
     painter: &mut Painter,
@@ -208,9 +225,10 @@ pub fn draw_sidebar_row(
     glyph: &str,
     label: &str,
     focused: bool,
+    selected: bool,
     reserve_right: u32,
 ) -> Result<()> {
-    let drawn = draw_selectable(painter, rect, focused);
+    let drawn = draw_selectable_with_selection(painter, rect, focused, selected);
     let icon_size = 30u32;
     let icon_pad = 20;
     let icon_rect = Rect::new(
@@ -245,6 +263,7 @@ pub fn draw_sidebar_row(
 /// advertise that per-host actions are there at all. (It replaced a hold-OK gesture,
 /// which worked but nothing on screen ever said so.) `menu_focused` highlights the
 /// button itself — the row can be focused with the button not, and vice versa.
+/// `selected` adds a subtle background to indicate the currently-active host.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_host_row(
     painter: &mut Painter,
@@ -254,6 +273,7 @@ pub fn draw_host_row(
     name: &str,
     paired: bool,
     focused: bool,
+    selected: bool,
     menu_focused: bool,
     online: Option<bool>,
 ) -> Result<()> {
@@ -266,6 +286,7 @@ pub fn draw_host_row(
         glyph,
         name,
         focused,
+        selected,
         SIDEBAR_MENU_BTN + 10,
     )?;
     // Badged onto the icon's corner rather than given its own column: it needs no layout
@@ -324,5 +345,5 @@ pub fn draw_utility_row(
         ICON_SETTINGS
     };
     let label = label.trim_start_matches('+').trim();
-    draw_sidebar_row(painter, text_cache, fonts, rect, glyph, label, focused, 0)
+    draw_sidebar_row(painter, text_cache, fonts, rect, glyph, label, focused, false, 0)
 }

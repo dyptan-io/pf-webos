@@ -106,6 +106,22 @@ impl StickMenuNav {
     }
 }
 
+/// `SDL_SCANCODE_WEBOS_GREEN` (`webosbrew/SDL-webOS`'s `include/SDL_scancode.h`) — outside
+/// rust-sdl2's `Scancode` enum range, so it never survives the safe event API (see
+/// docs/NOTES.md's note on color buttons needing raw scancode polling).
+const WEBOS_GREEN_SCANCODE: i32 = 487;
+
+/// Whether the Magic Remote's Green button is held, read straight from SDL's raw
+/// keyboard-state array — mirrors what `KeyboardState::is_scancode_pressed` does
+/// internally, just for a scancode outside its enum. Safe anytime after `sdl2::init()`.
+pub fn webos_green_button_down() -> bool {
+    unsafe {
+        let mut count = 0;
+        let state = sdl2::sys::SDL_GetKeyboardState(&mut count);
+        !state.is_null() && WEBOS_GREEN_SCANCODE < count && *state.offset(WEBOS_GREEN_SCANCODE as isize) != 0
+    }
+}
+
 /// The Magic Remote's number buttons (0-9) surface as plain keyboard digit keys —
 /// used for direct PIN entry (type a digit, auto-advance) instead of cycling each
 /// digit with left/right.

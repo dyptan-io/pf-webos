@@ -1435,12 +1435,14 @@ impl App {
                 Some(l) => l,
                 None => Painter::new(ui::SIDEBAR_W, screen_h),
             };
+            let selected = self.sidebar_index_of_selected_host();
             ui::draw_sidebar(
                 &mut layer,
                 text_cache,
                 fonts,
                 &self.entries,
                 None,
+                selected,
                 &self.reachability_list(),
                 screen_h,
             )?;
