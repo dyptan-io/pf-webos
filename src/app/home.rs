@@ -324,6 +324,13 @@ impl App {
         Rect::new(r.x(), r.y() + extra, r.width(), r.height())
     }
 
+    /// Eased 0..=1 progress of grid index `idx`'s zoom-in (see
+    /// `CardTile::pop_since`) — 1.0, full size, for anything not animating.
+    pub(crate) fn card_pop_frac(&self, idx: usize) -> f32 {
+        let card = self.card_tiles.get(idx).and_then(|t| t.as_ref());
+        ui::anim_frac(card.and_then(|c| c.pop_since), CARD_POP)
+    }
+
     /// `unscrolled_card_rect`, translated by the current scroll offset — every
     /// draw-list card position starts from this.
     pub(crate) fn scrolled_card_rect(&self, idx: usize, columns: usize, grid_x: i32, available_w: u32) -> Rect {
@@ -442,7 +449,12 @@ impl App {
     pub(crate) fn select_host(&mut self, host: String, port: u16, mgmt_port: Option<u16>) {
         let _ = store::save_selected_host(&host, port);
         self.selected_host = Some((host.clone(), port));
-        self.home_status = Some("Loading library…".into());
+        let name = self
+            .known_hosts
+            .iter()
+            .find(|h| h.host == host && h.port == port)
+            .map_or_else(|| host.clone(), |h| h.name.clone());
+        self.home_status = Some(format!("Loading library from {name}…"));
         self.games = Vec::new();
         self.pinned_count = 0;
         self.games_loaded = false;
@@ -570,21 +582,22 @@ impl App {
             return;
         };
         let Some(fingerprint) = known.fingerprint else { return };
-        let launch = match self.grid_card_at(idx, columns) {
-            Some(GridCard::Desktop) => None,
-            Some(GridCard::Game(game)) => Some(game.id.clone()),
+        let (launch, title) = match self.grid_card_at(idx, columns) {
+            Some(GridCard::Desktop) => (None, "Desktop".to_string()),
+            Some(GridCard::Game(game)) => (Some(game.id.clone()), game.title.clone()),
             None => return,
         };
         let mgmt_port = known.mgmt_port.unwrap_or(crate::library::DEFAULT_MGMT_PORT);
         let identity = (self.identity.0.clone(), self.identity.1.clone());
         tracing::debug!("launch: checking {host}:{port} is still reachable before connecting…");
-        self.home_status = Some("Checking connection…".into());
+        self.home_status = Some(format!("Checking the host is still reachable before starting {title}…"));
         let rx = crate::library::load_games_async(host.clone(), port, mgmt_port, identity, Some(fingerprint));
         self.pending_launch = Some(PendingLaunch {
             host,
             port,
             fingerprint,
             launch,
+            title,
             rx,
             idx,
         });
@@ -606,6 +619,7 @@ impl App {
             port,
             fingerprint,
             launch,
+            title,
             idx,
             ..
         } = self.pending_launch.take().expect("just matched Some above");
@@ -616,7 +630,9 @@ impl App {
                     .as_ref()
                     .is_some_and(|(h, p)| *h == host && *p == port)
                 {
-                    self.home_status = None;
+                    // Stays up through the launch zoom and the connect that follows it —
+                    // `run_inner` puts its own UI on screen from there.
+                    self.home_status = Some(format!("Starting {title}…"));
                     self.launch_anim_idx = Some(idx);
                     self.launch_ready = Some(ConnectTarget {
                         host,

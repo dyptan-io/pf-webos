@@ -44,6 +44,18 @@ pub fn zoom_rect(base: Rect, frac: f32, growth: f32) -> Rect {
     Rect::new((cx - tw / 2.0) as i32, (cy - th / 2.0) as i32, tw as u32, th as u32)
 }
 
+/// Scales `base` up from `1.0 - shrink` to full size as `frac` runs 0→1 — the
+/// "pop in" counterpart to `zoom_rect`'s "grow past full size" focus pop. A
+/// settled animation returns `base` untouched, so a static frame doesn't drift
+/// through a no-op scale's rounding.
+pub fn pop_in_rect(base: Rect, frac: f32, shrink: f32) -> Rect {
+    if frac >= 1.0 {
+        base
+    } else {
+        zoom_rect(base, 1.0 - frac, -shrink)
+    }
+}
+
 /// Translates from `start` toward `end` by `frac` (0.0 = `start`, 1.0 = `end`)
 /// — the "fly to a new grid position" counterpart to `zoom_rect`'s scale-around-
 /// center, used by the pin/unpin move animation. Size follows `end`'s (the two

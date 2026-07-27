@@ -26,6 +26,7 @@ mod reach;
 mod settings;
 mod speedtest;
 mod wake;
+mod wakesettings;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Screen {
@@ -54,6 +55,10 @@ pub enum Screen {
     /// Per-host network speed test (`HostMenu` -> "Test network speed"), measuring over
     /// the real data plane. See `app::speedtest`.
     SpeedTest,
+    /// Per-host Wake-on-LAN settings (`HostMenu` -> the ⋯ on "Wake host"), currently
+    /// just the auto-send toggle. Which host is `App::host_menu_index`, same as the
+    /// menu it opens from. See `app::wakesettings`.
+    WakeSettings,
     /// "You can only pin 5 games" — a single-OK-button alert, reached from Home
     /// when `App::toggle_focused_pin` hits `store::MAX_PINNED_GAMES`. See `app::pinlimit`.
     PinLimit,
@@ -116,6 +121,11 @@ const PIN_BADGE_MARGIN: i32 = 10;
 /// How long a pin/unpin toggle's fly-to-new-position animation runs — see
 /// `App::pin_move_anim`.
 pub(crate) const PIN_MOVE_ANIM: Duration = Duration::from_millis(380);
+/// How long a card's zoom-in runs when it first appears — see
+/// `CardTile::pop_since`.
+pub(crate) const CARD_POP: Duration = Duration::from_millis(300);
+/// How far below full size a card starts that zoom-in — see `ui::pop_in_rect`.
+pub(crate) const CARD_POP_SHRINK: f32 = 0.14;
 /// How long a modal's fade/slide-in runs.
 pub(crate) const MODAL_FADE: Duration = Duration::from_millis(170);
 /// How long a scroll indicator (Settings' row list, About's document, ...) stays
@@ -161,13 +171,11 @@ pub(crate) const PAIRING_SUBTITLE: &str = "Two ways to pair with this host — e
 /// confirmation.
 pub(crate) const SIMPLE_MODAL_WIDTH_FRAC: f32 = 0.40;
 
-/// How often the magic packet is re-sent while a wake is in flight — see
-/// `App::tick_wake`.
-pub(crate) const WAKE_RESEND_INTERVAL: Duration = Duration::from_secs(15);
-
-/// How long a *silent* auto-send (`Settings::wol_auto_send`) waits before giving up on
-/// staying quiet and surfacing the wake prompt anyway — see `App::tick_wake`.
-pub(crate) const WAKE_ESCALATE_AFTER: Duration = Duration::from_secs(60);
+/// How often the magic packet is re-sent while a wake is in flight, and — the same
+/// moment, for a silent auto-send — how long it stays silent before showing the wake
+/// prompt: a minute of retrying without the host coming back is the point at which the
+/// user should be looking at it rather than at an unexplained grid. See `App::tick_wake`.
+pub(crate) const WAKE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How often `App::tick_wake` actively re-checks reachability, independent of the WOL
 /// timers above and of whether a MAC is even on record.
@@ -178,7 +186,12 @@ pub(crate) const WAKE_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 /// distinguished by `silent`. Entered from `App::start_wake` whenever a known/paired
 /// host's library fetch fails as genuinely unreachable, replacing the old plain grid
 /// error message in every case — even with no MAC on record, where `render_wake` just
-/// hides the send/auto-send controls instead.
+/// hides the send controls instead.
+///
+/// Whether the packet goes out silently is `KnownHost::wol_auto`, edited per host from
+/// the host menu's Wake row (⋯ → `Screen::WakeSettings`). It used to be a global
+/// `Settings` flag toggled *inside this prompt*, which meant the only way to reach the
+/// setting was to have a host fail on you first.
 pub struct WakeState {
     pub(crate) host: String,
     pub(crate) port: u16,
@@ -188,20 +201,24 @@ pub struct WakeState {
     /// without sending — so declining the prompt looks exactly like it did before this
     /// flow existed.
     pub(crate) reason: String,
-    /// Focus on the modal: `0` = the "Always send automatically" toggle row,
-    /// `1` = the "Wake" button, `2` = the "Cancel" button (see `render_wake`'s
-    /// shell/buttons split, mirroring `Screen::ForgetHost`'s).
+    /// Focus on the modal: `0` = the "Wake host" button, `1` = "Cancel" (see
+    /// `render_wake`, mirroring `Screen::ForgetHost`'s shell/buttons split).
     pub(crate) focused: usize,
     /// Whether a packet has gone out for the current wait window.
     pub(crate) sent: bool,
-    /// When the current wait window started (its first send) — drives the 60s
-    /// escalation.
+    /// How many magic packets have actually gone out for this wait (the initial send
+    /// plus `tick_wake`'s resends) — only shown, in `wake_home_status`, so a silent
+    /// wait visibly progresses instead of sitting on one unchanging line.
+    pub(crate) attempts: u32,
+    /// When the current wait window started (its first send).
     pub(crate) since: Option<Instant>,
+    /// When the last magic packet went out — drives both the resend and, for a silent
+    /// wait, the moment the prompt appears (one `WAKE_RETRY_INTERVAL`, same clock).
     pub(crate) last_attempt: Option<Instant>,
-    /// `true` while this wait is running quietly because `wol_auto_send` fired it with
-    /// no prompt shown — `App::tick_wake` flips it (and shows the prompt) once
-    /// `WAKE_ESCALATE_AFTER` passes with the host still unreachable, so the user gets a
-    /// chance to turn auto-send back off instead of it failing forever in silence.
+    /// `true` while this wait is running quietly because `KnownHost::wol_auto` fired it
+    /// with no prompt shown. `App::tick_wake` flips it (and shows the prompt) once
+    /// `WAKE_RETRY_INTERVAL` has passed since the last packet with the host still
+    /// unreachable — once shown, it stays shown-or-dismissed rather than re-popping.
     pub(crate) silent: bool,
     /// When the last active reachability probe went out — see `App::tick_wake`.
     pub(crate) last_probe: Option<Instant>,
@@ -233,6 +250,17 @@ pub enum HomeFocus {
 pub(crate) enum GridCard<'a> {
     Desktop,
     Game(&'a GameEntry),
+}
+
+/// One rasterized grid card, with the clock for its zoom-in.
+pub(crate) struct CardTile {
+    pub(crate) tile: Painter,
+    /// When this card started zooming up to full size. Cards land a few per tick
+    /// as their art arrives (`CARD_BUILD_BUDGET`), so each runs its own clock and
+    /// a filling grid ripples in. `None` behind the loading spinner — nothing
+    /// built there is visible yet, so `prepare_tiles` stamps them all together
+    /// when `grid_reveal_ready` flips.
+    pub(crate) pop_since: Option<Instant>,
 }
 
 /// The Home grid's shape at one column count: the pinned front block leads
@@ -319,6 +347,10 @@ pub(crate) struct PendingLaunch {
     pub(crate) port: u16,
     pub(crate) fingerprint: [u8; 32],
     pub(crate) launch: Option<String>,
+    /// The card's display title ("Desktop" or the game's), for the status bar —
+    /// resolving it here keeps `drain_launch_check` off the grid geometry it would
+    /// otherwise need (a column count) just to name the thing it's starting.
+    pub(crate) title: String,
     pub(crate) rx: std::sync::mpsc::Receiver<crate::library::GamesLoaded>,
     /// The confirmed card, so `launch_anim` zooms the right one even if focus
     /// has since moved elsewhere on the grid.
@@ -354,7 +386,6 @@ pub(crate) enum ModalShellKey {
         name: String,
         mac_empty: bool,
         sent: bool,
-        auto_send: bool,
         hover_close: bool,
     },
     Pairing {
@@ -381,6 +412,13 @@ pub(crate) enum ModalShellKey {
     /// tile, cropped/positioned by the GPU same as Settings' row list. So this shell
     /// is invalidated only by the same thing every other shell already excludes
     /// focus/scroll for: nothing screen-specific here at all.
+    /// One toggle whose state is the only thing on the card that can change (the
+    /// title names the host, which can't change while this is open).
+    WakeSettings {
+        title: String,
+        auto: bool,
+        hover_close: bool,
+    },
     About {
         hover_close: bool,
     },
@@ -402,6 +440,8 @@ pub(crate) enum ModalShellKey {
 #[derive(PartialEq)]
 pub(crate) enum ModalFocusKey {
     SettingsRow(usize, Settings),
+    /// `Screen::WakeSettings`' auto-send switch, carrying its state so flipping it
+    /// re-bakes the tile.
     WakeToggle(bool),
     WakeButton(usize),
     PairingDigit(usize, u8),
@@ -413,8 +453,10 @@ pub(crate) enum ModalFocusKey {
     SpeedTestButton(usize, String),
     /// Any `ListModal`-based screen's focused row. Carries the row's label as well as
     /// its index so a row list that changes shape under a fixed index (e.g. "Wake
-    /// host" appearing once a MAC is learned) still invalidates the tile.
-    MenuRow(usize, String),
+    /// host" appearing once a MAC is learned) still invalidates the tile, plus whether
+    /// focus is on the row's ⋯ button rather than its body (the tile draws that
+    /// highlight, so it isn't a mere focus move — see `FocusRow::menu`).
+    MenuRow(usize, String, bool),
 }
 
 /// What invalidates whichever modal's `Tile::ScrollContent(Screen)` is currently
@@ -512,6 +554,14 @@ pub struct App {
     /// Forget confirmation's two-button focus — the two screens can be open in
     /// sequence and must not share a cursor.
     pub menu_focused: usize,
+    /// Whether focus is on the ⋯ button of the host menu's focused row rather than on
+    /// the row body — the list-modal counterpart of `HomeFocus::SidebarMenu`. Only the
+    /// "Wake host" row has one (see `host_menu_actions`).
+    pub host_menu_dots: bool,
+    /// Focused row of `Screen::WakeSettings`. Its own cursor rather than `menu_focused`:
+    /// that screen sits *over* the host menu and Back returns there, so the menu's
+    /// cursor has to survive the round trip.
+    pub wake_settings_focused: usize,
     /// The sidebar row `Screen::EditHost` is editing, `None` otherwise.
     pub edit_host_index: Option<usize>,
     /// The in-flight/finished speed test, `None` when that screen isn't open.
@@ -568,7 +618,7 @@ pub struct App {
     pub(crate) sidebar_dirty: bool,
     /// Per-card tiles (shadow baked in, transparent padding), index-aligned
     /// with the grid. `None` = not yet rasterized (or invalidated).
-    pub(crate) card_tiles: Vec<Option<Painter>>,
+    pub(crate) card_tiles: Vec<Option<CardTile>>,
     /// All card tiles stale (games list / host changed) — a fresh library load,
     /// so `prepare_tiles` also re-arms the loading spinner (`grid_reveal_ready`).
     pub(crate) grid_dirty: bool,
@@ -739,6 +789,8 @@ impl App {
             host_menu_index: None,
             host_menu_focused: 1,
             menu_focused: 0,
+            host_menu_dots: false,
+            wake_settings_focused: 0,
             edit_host_index: None,
             speed_test: None,
             speed_test_rx: None,
@@ -881,9 +933,15 @@ impl App {
     /// (`tick_wake`'s reachability probe succeeding). `source` is just for the log line.
     pub(crate) fn wake_succeeded(&mut self, host: String, port: u16, mgmt_port: Option<u16>, source: &str) {
         tracing::info!("wake succeeded: {host}:{port} back ({source})");
-        self.wake = None;
+        let name = self.wake.take().map(|w| w.name);
         self.screen = Screen::Home;
         self.select_host(host, port, mgmt_port);
+        // Overrides `select_host`'s plain "Loading library…": after a wait that may
+        // have run for minutes with no modal up, the bar's job is to report that the
+        // host came back, not just that a fetch started.
+        if let Some(name) = name {
+            self.home_status = Some(format!("{name} is back online — loading its library…"));
+        }
     }
 
     /// Drains any cover art that's finished decoding since the last tick — called
@@ -942,6 +1000,10 @@ impl App {
             }
             Screen::HostMenu => {
                 self.handle_host_menu_event(MenuEvent::Back);
+                None
+            }
+            Screen::WakeSettings => {
+                self.handle_wake_settings_event(MenuEvent::Back);
                 None
             }
             Screen::SpeedTest => {
@@ -1025,6 +1087,15 @@ impl App {
                 self.pin_move_anim = None;
                 self.pin_move_tile = None;
             }
+            animating = true;
+        }
+        // A scan, not one clock: every card zooms on its own (`CardTile::pop_since`).
+        if self
+            .card_tiles
+            .iter()
+            .flatten()
+            .any(|c| c.pop_since.is_some_and(|t| t.elapsed() < CARD_POP))
+        {
             animating = true;
         }
         animating
@@ -1121,6 +1192,11 @@ impl App {
                 let subtitle = self.host_menu_subtitle();
                 let rows = self.host_menu_actions().len();
                 let card = Self::host_menu_card_rect(screen_w, screen_h, fonts, &subtitle, rows);
+                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
+            }
+            Screen::WakeSettings => {
+                let subtitle = self.wake_settings_subtitle();
+                let card = Self::wake_settings_card_rect(screen_w, screen_h, fonts, &subtitle);
                 self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
             }
             Screen::EditHost => {
@@ -1249,7 +1325,21 @@ impl App {
                 let content = ui::list_modal_content_rect(card, fonts, &subtitle, rows);
                 let i = (0..rows).find(|&i| ui::focus_row_rect(content, i).contains_point((x, y)))?;
                 self.menu_focused = i;
+                // A click that landed on the row's ⋯ opens that instead of the row's own
+                // action — same split as a sidebar host row's button.
+                let row = ui::focus_row_rect(content, i);
+                self.host_menu_dots =
+                    self.host_menu_row_has_dots() && ui::sidebar_menu_button_rect(row).contains_point((x, y));
                 self.handle_host_menu_event(MenuEvent::Confirm);
+                None
+            }
+            Screen::WakeSettings => {
+                let subtitle = self.wake_settings_subtitle();
+                let card = Self::wake_settings_card_rect(screen_w, screen_h, fonts, &subtitle);
+                let content = ui::list_modal_content_rect(card, fonts, &subtitle, 1);
+                if ui::focus_row_rect(content, 0).contains_point((x, y)) {
+                    self.handle_wake_settings_event(MenuEvent::Confirm);
+                }
                 None
             }
             Screen::SpeedTest => {
@@ -1487,7 +1577,10 @@ impl App {
                     let (title, art) = self.grid_card_content(idx, columns);
                     ui::render_card_tile(text_cache, fonts, card_w, card_h, title, art)?
                 };
-                self.card_tiles[idx] = Some(tile);
+                self.card_tiles[idx] = Some(CardTile {
+                    tile,
+                    pop_since: self.grid_reveal_ready.then(Instant::now),
+                });
                 updated.push(Tile::Card(idx));
             }
             self.tiles_pending = pending;
@@ -1514,6 +1607,12 @@ impl App {
                 if self.grid_reveal_ready {
                     self.spinner_since = None;
                     self.spinner_frame = None;
+                    // Everything built behind the spinner becomes visible in this
+                    // one frame, so it all zooms in off a single clock.
+                    let now = Instant::now();
+                    for card in self.card_tiles.iter_mut().flatten() {
+                        card.pop_since.get_or_insert(now);
+                    }
                 } else {
                     let (frame_idx, _) = ui::spinner_frame_at(since.elapsed().as_secs_f32());
                     if self.spinner_frame != Some(frame_idx) {
@@ -1570,7 +1669,6 @@ impl App {
                 name: w.name.clone(),
                 mac_empty: w.mac.is_empty(),
                 sent: w.sent,
-                auto_send: self.settings.wol_auto_send,
                 hover_close: self.hover_close,
             }),
             Screen::Pairing => Some(ModalShellKey::Pairing {
@@ -1590,6 +1688,11 @@ impl App {
                 name: self.host_menu_title(),
                 subtitle: self.host_menu_subtitle(),
                 rows: self.host_menu_actions().len(),
+                hover_close: self.hover_close,
+            }),
+            Screen::WakeSettings => Some(ModalShellKey::WakeSettings {
+                title: self.wake_settings_title(),
+                auto: self.wake_settings_host().is_some_and(|h| h.wol_auto),
                 hover_close: self.hover_close,
             }),
             Screen::About => Some(ModalShellKey::About {
@@ -1637,6 +1740,9 @@ impl App {
                 Screen::HostMenu => {
                     self.render_host_menu(&mut p, text_cache, fonts, screen_w, screen_h)?;
                 }
+                Screen::WakeSettings => {
+                    self.render_wake_settings(&mut p, text_cache, fonts, screen_w, screen_h)?;
+                }
                 Screen::EditHost => self.render_edit_host(&mut p, text_cache, fonts, screen_w, screen_h)?,
                 Screen::About => self.render_about(&mut p, text_cache, fonts, screen_w, screen_h)?,
                 Screen::SpeedTest => self.render_speed_test(&mut p, text_cache, fonts, screen_w, screen_h)?,
@@ -1651,13 +1757,11 @@ impl App {
         // see `handle_wake_event`'s matching guard).
         let focus_key = match self.screen {
             Screen::Settings => Some(ModalFocusKey::SettingsRow(self.settings_focused, self.settings)),
-            Screen::Wake => self.wake.as_ref().filter(|w| !w.mac.is_empty()).map(|w| {
-                if w.focused == 0 {
-                    ModalFocusKey::WakeToggle(self.settings.wol_auto_send)
-                } else {
-                    ModalFocusKey::WakeButton(w.focused)
-                }
-            }),
+            Screen::Wake => self
+                .wake
+                .as_ref()
+                .filter(|w| !w.mac.is_empty())
+                .map(|w| ModalFocusKey::WakeButton(w.focused)),
             Screen::Pairing => Some(match self.pairing_focus {
                 PairingFocus::Pin => {
                     ModalFocusKey::PairingDigit(self.pin_digit_index, self.pin_digits[self.pin_digit_index])
@@ -1668,7 +1772,10 @@ impl App {
             Screen::HostMenu => self
                 .host_menu_actions()
                 .get(self.menu_focused)
-                .map(|(_, row)| ModalFocusKey::MenuRow(self.menu_focused, row.label.clone())),
+                .map(|(_, row)| ModalFocusKey::MenuRow(self.menu_focused, row.label.clone(), self.host_menu_dots)),
+            Screen::WakeSettings => Some(ModalFocusKey::WakeToggle(
+                self.wake_settings_host().is_some_and(|h| h.wol_auto),
+            )),
             // Only once there are buttons to focus — while measuring there is nothing
             // on the card but text.
             Screen::SpeedTest => matches!(
@@ -1715,30 +1822,15 @@ impl App {
                             .as_ref()
                             .expect("focus_key only Some for a Wake with a focusable widget");
                         let card = Self::wake_card_rect(screen_w, screen_h, wake, fonts);
-                        if wake.focused == 0 {
-                            let rows = ui::wake_rows(self.settings.wol_auto_send);
-                            let content_w = Self::wake_toggle_rect(card, wake, fonts).width();
-                            ui::render_focus_row_tile(
-                                text_cache,
-                                fonts,
-                                &rows,
-                                content_w,
-                                0,
-                                false,
-                                self.toggle_frac(self.settings.wol_auto_send),
-                            )?
-                        } else {
-                            let toggle = Self::wake_toggle_rect(card, wake, fonts);
-                            let rect = ui::confirm_button_rect(Self::wake_buttons_rect(toggle), wake.focused - 1);
-                            let buttons = Self::wake_buttons();
-                            ui::render_confirm_button_tile(
-                                text_cache,
-                                fonts,
-                                &buttons[wake.focused - 1],
-                                rect.width(),
-                                rect.height(),
-                            )?
-                        }
+                        let rect = ui::confirm_button_rect(Self::wake_buttons_rect(card, wake, fonts), wake.focused);
+                        let buttons = Self::wake_buttons();
+                        ui::render_confirm_button_tile(
+                            text_cache,
+                            fonts,
+                            &buttons[wake.focused],
+                            rect.width(),
+                            rect.height(),
+                        )?
                     }
                     Screen::Pairing => match self.pairing_focus {
                         PairingFocus::Pin => ui::render_pairing_digit_tile(
@@ -1772,7 +1864,11 @@ impl App {
                     }
                     Screen::HostMenu => {
                         let subtitle = self.host_menu_subtitle();
-                        let rows = self.host_menu_rows();
+                        let mut rows = self.host_menu_rows();
+                        // The only place a row's ⋯ is drawn lit — see `host_menu_actions`.
+                        if let Some(row) = rows.get_mut(self.menu_focused) {
+                            row.menu = row.menu.map(|_| self.host_menu_dots);
+                        }
                         let card = Self::host_menu_card_rect(screen_w, screen_h, fonts, &subtitle, rows.len());
                         let content = ui::list_modal_content_rect(card, fonts, &subtitle, rows.len());
                         ui::render_focus_row_tile(
@@ -1783,6 +1879,22 @@ impl App {
                             self.menu_focused,
                             false,
                             0.0,
+                        )?
+                    }
+                    Screen::WakeSettings => {
+                        let subtitle = self.wake_settings_subtitle();
+                        let rows = self.wake_settings_rows();
+                        let card = Self::wake_settings_card_rect(screen_w, screen_h, fonts, &subtitle);
+                        let content = ui::list_modal_content_rect(card, fonts, &subtitle, rows.len());
+                        let on = self.wake_settings_host().is_some_and(|h| h.wol_auto);
+                        ui::render_focus_row_tile(
+                            text_cache,
+                            fonts,
+                            &rows,
+                            content.width(),
+                            self.wake_settings_focused,
+                            false,
+                            self.toggle_frac(on),
                         )?
                     }
                     Screen::SpeedTest => {
@@ -1954,7 +2066,7 @@ impl App {
         match tile {
             Tile::Sidebar => self.sidebar_layer.as_ref(),
             Tile::FocusRow => self.focused_row_tile.as_ref().map(|(_, p)| p),
-            Tile::Card(i) => self.card_tiles.get(i).and_then(|t| t.as_ref()),
+            Tile::Card(i) => self.card_tiles.get(i).and_then(|t| t.as_ref()).map(|c| &c.tile),
             Tile::Ring => self.ring_tile.as_ref(),
             Tile::PinBadge => self.pin_badge_tile.as_ref(),
             Tile::PinMove => self.pin_move_tile.as_ref(),
@@ -2030,15 +2142,18 @@ impl App {
                 if r.y() + r.height() as i32 + pad < 0 || r.y() - pad > screen_h as i32 {
                     continue; // culled — fully off-screen at this scroll offset
                 }
+                // A card that just landed is still zooming up to full size.
+                let pop = self.card_pop_frac(idx);
+                let base = Rect::new(
+                    r.x() - pad,
+                    r.y() - pad,
+                    r.width() + 2 * pad as u32,
+                    r.height() + 2 * pad as u32,
+                );
                 cmds.push(DrawCmd::Tex {
                     tile: Tile::Card(idx),
-                    dst: Rect::new(
-                        r.x() - pad,
-                        r.y() - pad,
-                        r.width() + 2 * pad as u32,
-                        r.height() + 2 * pad as u32,
-                    ),
-                    alpha: 0xff,
+                    dst: ui::pop_in_rect(base, pop, CARD_POP_SHRINK),
+                    alpha: (255.0 * pop) as u8,
                 });
             }
             // The divider between pinned games and the rest — scrolled with
@@ -2064,10 +2179,15 @@ impl App {
                     r.width() + 2 * pad as u32,
                     r.height() + 2 * pad as u32,
                 );
+                // The focused card zooms in on first appearance like any other,
+                // composed with its focus pop — both scale around the card's own
+                // center, so they can't fight over position.
+                let pop = self.card_pop_frac(idx);
+                let popped = |base: Rect| ui::pop_in_rect(base, pop, CARD_POP_SHRINK);
                 cmds.push(DrawCmd::Tex {
                     tile: Tile::Card(idx),
-                    dst: ui::zoom_rect(card_base, f, CARD_GROWTH),
-                    alpha: 0xff,
+                    dst: popped(ui::zoom_rect(card_base, f, CARD_GROWTH)),
+                    alpha: (255.0 * pop) as u8,
                 });
                 let rp = ui::FOCUS_RING_PAD;
                 let ring_base = Rect::new(
@@ -2078,8 +2198,8 @@ impl App {
                 );
                 cmds.push(DrawCmd::Tex {
                     tile: Tile::Ring,
-                    dst: ui::zoom_rect(ring_base, f, CARD_GROWTH),
-                    alpha: (255.0 * f) as u8,
+                    dst: popped(ui::zoom_rect(ring_base, f, CARD_GROWTH)),
+                    alpha: (255.0 * f * pop) as u8,
                 });
                 // The pinned badge — only on a focused card that's actually
                 // pinned, be it a game or "Desktop" (see `store::DESKTOP_PIN_ID`).
@@ -2096,10 +2216,12 @@ impl App {
                         badge,
                         badge,
                     );
+                    // Corner-anchored, so it only fades — scaling it around its
+                    // own center would drift it off the shrunken card.
                     cmds.push(DrawCmd::Tex {
                         tile: Tile::PinBadge,
                         dst: ui::zoom_rect(badge_base, f, CARD_GROWTH),
-                        alpha: 0xff,
+                        alpha: (255.0 * pop) as u8,
                     });
                 }
             }
@@ -2247,12 +2369,7 @@ impl App {
                 }
                 Screen::Wake => self.wake.as_ref().filter(|w| !w.mac.is_empty()).map(|w| {
                     let card = Self::wake_card_rect(screen_w, screen_h, w, fonts);
-                    let toggle = Self::wake_toggle_rect(card, w, fonts);
-                    if w.focused == 0 {
-                        ui::focus_row_rect(toggle, 0)
-                    } else {
-                        ui::confirm_button_rect(Self::wake_buttons_rect(toggle), w.focused - 1)
-                    }
+                    ui::confirm_button_rect(Self::wake_buttons_rect(card, w, fonts), w.focused)
                 }),
                 Screen::Pairing => {
                     let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
@@ -2280,6 +2397,12 @@ impl App {
                     let card = Self::host_menu_card_rect(screen_w, screen_h, fonts, &subtitle, rows);
                     let content = ui::list_modal_content_rect(card, fonts, &subtitle, rows);
                     Some(ui::focus_row_rect(content, self.menu_focused))
+                }
+                Screen::WakeSettings => {
+                    let subtitle = self.wake_settings_subtitle();
+                    let card = Self::wake_settings_card_rect(screen_w, screen_h, fonts, &subtitle);
+                    let content = ui::list_modal_content_rect(card, fonts, &subtitle, 1);
+                    Some(ui::focus_row_rect(content, self.wake_settings_focused))
                 }
                 Screen::SpeedTest => matches!(
                     self.speed_test,

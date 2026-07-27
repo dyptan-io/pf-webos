@@ -91,6 +91,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             kind: RowKind::Dropdown,
             fraction: 0.0,
             danger: false,
+            menu: None,
         },
         FocusRow {
             icon: ICON_SCHEDULE,
@@ -99,6 +100,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             kind: RowKind::Dropdown,
             fraction: 0.0,
             danger: false,
+            menu: None,
         },
         FocusRow {
             icon: ICON_SIGNAL,
@@ -111,6 +113,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             kind: RowKind::Slider,
             fraction: bitrate_frac,
             danger: false,
+            menu: None,
         },
         FocusRow {
             icon: ICON_SUN,
@@ -123,6 +126,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             kind: RowKind::Toggle,
             fraction: 0.0,
             danger: false,
+            menu: None,
         },
         FocusRow {
             icon: ICON_TV,
@@ -134,6 +138,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             kind: RowKind::Dropdown,
             fraction: 0.0,
             danger: false,
+            menu: None,
         },
         FocusRow {
             icon: ICON_MONITOR,
@@ -149,6 +154,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             kind: RowKind::Dropdown,
             fraction: 0.0,
             danger: false,
+            menu: None,
         },
         FocusRow {
             icon: ICON_SUN,
@@ -161,6 +167,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             kind: RowKind::Toggle,
             fraction: 0.0,
             danger: false,
+            menu: None,
         },
         FocusRow {
             icon: ICON_SIGNAL,
@@ -169,6 +176,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             kind: RowKind::Dropdown,
             fraction: 0.0,
             danger: false,
+            menu: None,
         },
         // The build version rides along as this row's value, so it's visible without
         // opening the screen — matching where the other clients surface it.
@@ -176,21 +184,19 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
     ]
 }
 
-/// The Wake modal's one row — the "Always send automatically" toggle (see
-/// `app::WakeState`) — as a single-element `FocusRow` list, so it draws and
-/// zoom-animates through the exact same `draw_focus_rows`/
-/// `render_focus_row_tile` machinery as the settings modal. The actual
-/// "Wake"/"Cancel" actions are a `draw_confirm_buttons` row below this one
-/// (see `app.rs`'s `render_wake`), not rows here — mirroring the
-/// Forget-host confirmation's shell/buttons split.
-pub fn wake_rows(auto_send: bool) -> Vec<FocusRow> {
+/// The per-host Wake settings modal's rows (`Screen::WakeSettings`, opened from the
+/// ⋯ on the host menu's Wake row) — just the auto-send toggle today. A `FocusRow`
+/// list so it draws and zoom-animates through the exact same `draw_focus_rows`/
+/// `render_focus_row_tile` machinery as every other list modal.
+pub fn wake_settings_rows(auto_send: bool) -> Vec<FocusRow> {
     vec![FocusRow {
-        icon: ICON_SETTINGS,
+        icon: ICON_POWER,
         label: "Wake automatically".into(),
         value: if auto_send { "On".into() } else { "Off".into() },
         kind: RowKind::Toggle,
         fraction: 0.0,
         danger: false,
+        menu: None,
     }]
 }
 

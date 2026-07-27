@@ -31,7 +31,15 @@ impl App {
     pub(crate) fn open_host_menu(&mut self, idx: usize) {
         self.host_menu_index = Some(idx);
         self.menu_focused = 0;
+        self.host_menu_dots = false;
         self.screen = Screen::HostMenu;
+    }
+
+    /// Whether the focused row has a ⋯ button to move onto (only "Wake host" does).
+    pub(crate) fn host_menu_row_has_dots(&self) -> bool {
+        self.host_menu_actions()
+            .get(self.menu_focused)
+            .is_some_and(|(a, _)| *a == HostAction::Wake)
     }
 
     /// The menu's rows, paired with what each one does. Conditional on the host's
@@ -60,7 +68,16 @@ impl App {
             ),
         ];
         if !entry.mac().is_empty() {
-            rows.push((HostAction::Wake, FocusRow::action(ui::ICON_POWER, "Wake host")));
+            // The one row with a ⋯: Confirm wakes now, the button holds the per-host
+            // wake settings (`Screen::WakeSettings`). Same affordance and the same
+            // Right-to-reach-it gesture as a sidebar host row's. Always built
+            // *un*focused — whether the button is lit is `host_menu_dots`, applied by
+            // the focused-row tile alone (see `App::modal_focus_tile`), so the shell
+            // underneath can't bake in a highlight that outlives it.
+            rows.push((
+                HostAction::Wake,
+                FocusRow::action(ui::ICON_POWER, "Wake host").with_menu(false),
+            ));
         }
         if saved {
             rows.push((HostAction::Edit, FocusRow::action(ui::ICON_EDIT, "Edit address…")));
@@ -113,10 +130,24 @@ impl App {
     pub(crate) fn handle_host_menu_event(&mut self, ev: MenuEvent) {
         let len = self.host_menu_actions().len();
         if ui::list_nav(&mut self.menu_focused, len, ev) {
+            // Vertical movement always lands on the row body — a ⋯ belongs to the row
+            // it's on, so leaving that row leaves the button too.
+            self.host_menu_dots = false;
             self.modal_focus_anim = Some(Instant::now());
             return;
         }
         match ev {
+            // Right/Left move onto and off the focused row's ⋯, mirroring the sidebar's
+            // `HomeFocus::SidebarMenu`; on a row without one they do nothing.
+            MenuEvent::Right if !self.host_menu_dots && self.host_menu_row_has_dots() => {
+                self.host_menu_dots = true;
+                self.modal_focus_anim = Some(Instant::now());
+            }
+            MenuEvent::Left if self.host_menu_dots => {
+                self.host_menu_dots = false;
+                self.modal_focus_anim = Some(Instant::now());
+            }
+            MenuEvent::Confirm if self.host_menu_dots => self.open_wake_settings(),
             MenuEvent::Confirm => self.confirm_host_menu_row(),
             MenuEvent::Back => {
                 self.host_menu_index = None;

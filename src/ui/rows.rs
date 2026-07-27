@@ -37,6 +37,12 @@ pub struct FocusRow {
     /// Destructive action (Forget host) — drawn in `ERROR_RED` rather than the
     /// normal muted/white pair, so it reads as dangerous before it's confirmed.
     pub danger: bool,
+    /// `Some` gives this row its own ⋯ actions button, drawn and focused exactly like
+    /// a sidebar host row's (`draw_sidebar_menu_button`) — the bool is whether the
+    /// *button* has focus rather than the row body. A row with one has a second thing
+    /// Confirm can mean, reached with Right, so the row's own action stays a single
+    /// press. `None` (the default) draws no button at all.
+    pub menu: Option<bool>,
 }
 
 impl FocusRow {
@@ -49,6 +55,7 @@ impl FocusRow {
             kind: RowKind::Action,
             fraction: 0.0,
             danger: false,
+            menu: None,
         }
     }
 
@@ -63,6 +70,13 @@ impl FocusRow {
     /// Marks this row destructive (see [`FocusRow::danger`]).
     pub fn danger(mut self) -> Self {
         self.danger = true;
+        self
+    }
+
+    /// Gives this row a ⋯ actions button (see [`FocusRow::menu`]); `focused` is
+    /// whether the button, rather than the row body, currently has focus.
+    pub fn with_menu(mut self, focused: bool) -> Self {
+        self.menu = Some(focused);
         self
     }
 }
@@ -270,18 +284,23 @@ pub fn draw_focus_row(
         // is a muted right-aligned hint (an address, a state), never interactive.
         RowKind::Action => {
             if !row.value.is_empty() {
+                // A ⋯ button occupies the same right edge, so the hint stops short of it.
+                let menu_w = row.menu.map_or(0, |_| SIDEBAR_MENU_BTN as i32 + 10);
                 let value_w = fonts.value.size_of(&row.value).map_or(0, |(w, _)| w);
                 draw_text(
                     painter,
                     text_cache,
                     fonts.value,
                     &row.value,
-                    row_rect.x() + row_rect.width() as i32 - control_pad - value_w as i32,
+                    row_rect.x() + row_rect.width() as i32 - control_pad - menu_w - value_w as i32,
                     row_rect.y() + (row_rect.height() as i32 - fonts.value.height()) / 2,
                     MUTED,
                 )?;
             }
         }
+    }
+    if let Some(menu_focused) = row.menu {
+        draw_sidebar_menu_button(painter, text_cache, fonts, row_rect, focused, menu_focused)?;
     }
     Ok(())
 }

@@ -53,8 +53,9 @@ this client lacks.
 
 - **Pre-stream UI** (`app/` + `ui/`): `app/` owns the screen state machine (`Screen::Home` —
   sidebar of known hosts + game grid — with `Pairing`/`Settings`/`AddHost`/`EditHost`/`Wake`/
-  `HostMenu`/`ForgetHost`/`About` as modals over it — `HostMenu` opens from the ⋯ button on each
-  sidebar host row), one module per screen (`app/mod.rs` keeps
+  `HostMenu`/`WakeSettings`/`ForgetHost`/`About` as modals over it — `HostMenu` opens from the ⋯
+  button on each sidebar host row, and `WakeSettings` from the ⋯ on its own "Wake host" row),
+  one module per screen (`app/mod.rs` keeps
   the `App` struct, the shared drains, and the tile orchestration; its fields are `pub(crate)` so
   the screen modules can reach them). `ui/` owns drawing primitives and key-to-`MenuEvent`
   mapping, split along the same seams (`painter`/`text`/`rows`/`sidebar`/`grid`/`listmodal`/…) and

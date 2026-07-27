@@ -74,6 +74,7 @@ impl App {
                 fingerprint: old.fingerprint,
                 mgmt_port: old.mgmt_port,
                 mac: old.mac.clone(),
+                wol_auto: old.wol_auto,
                 pinned: old.pinned.clone(),
             },
         );

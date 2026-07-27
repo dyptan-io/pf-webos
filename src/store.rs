@@ -47,6 +47,15 @@ pub struct KnownHost {
     /// can't be woken, so `app.rs` falls back to the plain unreachable message.
     #[serde(default)]
     pub mac: Vec<String>,
+    /// Whether an unreachable-at-connect-time host gets a Wake-on-LAN packet sent
+    /// straight away, with no prompt. Per-host rather than global: waking the desktop
+    /// rig on demand is the point, while a laptop that's off is usually off on purpose.
+    /// Off by default (also for a `known-hosts.json` written before this field
+    /// existed): a host that turns out to be unreachable asks first, via the wake
+    /// prompt, and only auto-sends once this has been turned on for it. Lives on the
+    /// host menu's Wake row (⋯ → Wake settings).
+    #[serde(default)]
+    pub wol_auto: bool,
     /// Up to `MAX_PINNED_GAMES` pinned `GameEntry::id`s for this host, in pin order.
     /// `#[serde(default)]` so an older `known-hosts.json` still loads.
     #[serde(default)]
@@ -126,6 +135,8 @@ pub fn upsert_known_host(hosts: &mut Vec<KnownHost>, mut new: KnownHost) {
             new.mac.clone_from(&existing.mac);
         }
         new.pinned.clone_from(&existing.pinned);
+        // Per-host preference, not something a re-pair/re-add should reset.
+        new.wol_auto = existing.wol_auto;
         *existing = new;
     } else {
         hosts.push(new);
@@ -203,14 +214,6 @@ pub struct Settings {
     /// slider — see `ui::BITRATE_MIN_KBPS`/`BITRATE_MAX_KBPS`.
     pub bitrate_kbps: u32,
     pub hdr_enabled: bool,
-    /// Whether a Wake-on-LAN magic packet is sent automatically (no prompt) when a
-    /// known host turns out to be unreachable. Off by default — a first-time
-    /// unreachable host always asks. There's deliberately no settings-screen row for
-    /// this: it's toggled from the wake prompt itself (`app::App::handle_wake_event`),
-    /// which is also the only place that re-surfaces if turning it on doesn't
-    /// actually get the host back within a minute (see `app.rs`'s `tick_wake` docs).
-    #[serde(default)]
-    pub wol_auto_send: bool,
     /// Which hardware decode pipeline to use. Defaults to `Ndl` (stable baseline);
     /// switch to `Starfish` to test `pauseAtDecodeTime` + smooth-pacing above 1080p.
     /// Persisted across restarts; takes effect on the next stream.
@@ -250,7 +253,6 @@ impl Default for Settings {
             // own client-side AIMD controller does — see `ui::BITRATE_AUTOMATIC`.
             bitrate_kbps: 0,
             hdr_enabled: true,
-            wol_auto_send: false,
             stats_overlay: false,
             video_backend: VideoBackend::Ndl,
             codec: CodecPref::Auto,

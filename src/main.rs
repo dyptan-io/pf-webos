@@ -203,7 +203,7 @@ mod real {
     const GUIDE_HOLD: Duration = Duration::from_secs(2);
 
     /// How long OK must be held on a focused Home game card to pin/unpin it instead
-    /// of launching it — see `run_ui_flow`'s interception.
+    /// of launching it — see `pin_hold_gate`.
     const PIN_HOLD: Duration = Duration::from_millis(500);
 
     /// An in-flight hold-to-pin gesture: OK is down on a pinnable Home card. The
@@ -246,6 +246,271 @@ mod real {
             *held = true;
             ev
         }
+    }
+
+    /// The UI loop's input state that outlives a single event: the Back debounce,
+    /// an in-flight hold-to-pin, and analogue-stick nav.
+    #[derive(Default)]
+    struct UiInput {
+        /// Whether a Back-mapped key/button is currently held, per the
+        /// keyboard/gamepad event stream — edge-detected so a single physical press
+        /// dispatches Back exactly once no matter how SDL reports (or misreports)
+        /// repeats for it.
+        menu_back_down: bool,
+        /// Hold-to-pin on Home (see `PIN_HOLD`), while OK is held on a pinnable card.
+        pin_held: Option<PinHold>,
+        stick_nav: crate::ui::StickMenuNav,
+    }
+
+    /// What the UI loop should do with the event `handle_ui_event` just consumed.
+    enum EventAction {
+        /// Handled — carry on with the next event.
+        Next,
+        /// A launch is under way; leave the UI flow.
+        Launch,
+    }
+
+    /// Hold-to-pin arbitration (see `PIN_HOLD`). `MenuEvent` has no press/release
+    /// notion, so the gesture works off raw SDL events: OK down on a pinnable Home
+    /// card starts the hold and is swallowed, and the launch can only ever come
+    /// from the release. `Some` means the event was the gesture's and goes no
+    /// further.
+    fn pin_hold_gate(
+        app: &mut App,
+        event: &sdl2::event::Event,
+        input: &mut UiInput,
+        display_mode: sdl2::video::DisplayMode,
+        dirty: &mut bool,
+    ) -> Option<EventAction> {
+        use sdl2::event::Event;
+        // No `repeat: false` filter, deliberately — OS auto-repeats while OK is held
+        // have to be caught here too, not dispatched as fresh presses.
+        let confirm_down = matches!(
+            *event,
+            Event::KeyDown { keycode: Some(k), .. }
+                if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Confirm)
+        ) || matches!(
+            *event,
+            Event::ControllerButtonDown { button, .. }
+                if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Confirm)
+        );
+        if confirm_down {
+            // OK stays the gesture's until released, whatever the toggle put on
+            // screen: a hold that hit the pin limit opens the `PinLimit` alert
+            // *under the still-held button*, and the next auto-repeat KeyDown would
+            // otherwise dispatch Confirm to it and dismiss it instantly.
+            if input.pin_held.is_some() {
+                return Some(EventAction::Next);
+            }
+            let columns = crate::ui::grid_columns((display_mode.w as u32).saturating_sub(crate::ui::SIDEBAR_W));
+            if matches!(app.screen, Screen::Home) && app.focused_pin_id(columns).is_some() {
+                input.pin_held = Some(PinHold {
+                    since: Instant::now(),
+                    focus: app.home_focus,
+                    fired: false,
+                });
+                return Some(EventAction::Next);
+            }
+            return None;
+        }
+        let ends_hold = matches!(
+            *event,
+            Event::KeyUp { keycode: Some(k), .. }
+                if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Confirm)
+        ) || matches!(
+            *event,
+            Event::ControllerButtonUp { button, .. }
+                if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Confirm)
+        );
+        // This press was ours (tap or hold) — swallow the release.
+        let hold = ends_hold.then(|| input.pin_held.take()).flatten()?;
+        *dirty = true;
+        // A quick tap: the press never dispatched, so do it now. A hold that already
+        // toggled, or one whose screen/focus moved out from under it, resolves to
+        // nothing.
+        let tapped = !hold.fired && matches!(app.screen, Screen::Home) && hold.focus == app.home_focus;
+        let launched = tapped
+            && app
+                .handle_home_event(MenuEvent::Confirm, display_mode.w as u32, display_mode.h as u32)
+                .is_some();
+        Some(if launched {
+            EventAction::Launch
+        } else {
+            EventAction::Next
+        })
+    }
+
+    /// Routes a resolved `MenuEvent` to whichever screen is up — one of the
+    /// dispatch sites a new screen has to be added to.
+    fn dispatch_menu_event(
+        app: &mut App,
+        menu_ev: MenuEvent,
+        display_mode: sdl2::video::DisplayMode,
+        fonts: &crate::ui::Fonts,
+    ) -> EventAction {
+        let (w, h) = (display_mode.w as u32, display_mode.h as u32);
+        match app.screen {
+            // Back on Home is a no-op (root screen — `App::back` decides); routed
+            // through `back` anyway so the policy lives in one place. A grid-card
+            // Confirm goes the same async route as a mouse click and never resolves
+            // to a target directly here.
+            Screen::Home => {
+                let launched = match menu_ev {
+                    MenuEvent::Back => app.back().is_some(),
+                    _ => app.handle_home_event(menu_ev, w, h).is_some(),
+                };
+                if launched {
+                    return EventAction::Launch;
+                }
+            }
+            Screen::Pairing => app.handle_pairing_event(menu_ev),
+            Screen::Settings => app.handle_settings_event(menu_ev, h),
+            Screen::AddHost => app.handle_add_host_event(menu_ev),
+            Screen::Wake => app.handle_wake_event(menu_ev),
+            Screen::ForgetHost => app.handle_forget_host_event(menu_ev),
+            Screen::HostMenu => app.handle_host_menu_event(menu_ev),
+            Screen::WakeSettings => app.handle_wake_settings_event(menu_ev),
+            Screen::SpeedTest => app.handle_speed_test_event(menu_ev),
+            Screen::EditHost => app.handle_edit_host_event(menu_ev),
+            Screen::About => app.handle_about_event(menu_ev, w, h, fonts),
+            Screen::PinLimit => app.handle_pin_limit_event(menu_ev),
+        }
+        EventAction::Next
+    }
+
+    /// One SDL event from the pre-stream UI's pump, routed into `app`. `dirty` is
+    /// set whenever the event can have changed what's on screen. Device-level
+    /// events (quit, controller hotplug) are the caller's and never arrive here.
+    fn handle_ui_event(
+        app: &mut App,
+        event: sdl2::event::Event,
+        input: &mut UiInput,
+        display_mode: sdl2::video::DisplayMode,
+        fonts: &crate::ui::Fonts,
+        dirty: &mut bool,
+    ) -> EventAction {
+        use sdl2::event::Event;
+        let (w, h) = (display_mode.w as u32, display_mode.h as u32);
+        // The Magic Remote's pointer mode surfaces as a plain SDL2 MouseMotion
+        // event fired continuously while the remote is moving — unlike every other
+        // event handled below, redraw only if the motion actually changed the
+        // focused/hovered element, not on every no-op tick.
+        if let Event::MouseMotion { x, y, .. } = event {
+            *dirty |= app.handle_mouse_motion(x, y, w, h, fonts);
+            return EventAction::Next;
+        }
+        // The Magic Remote's scroll wheel — scrolls the game grid on Home (wheel
+        // y > 0 = "scroll up" = content moves down). Like motion above, only
+        // redraws when the offset actually moved (a wheel tick at either clamp
+        // edge is a no-op).
+        if let Event::MouseWheel { y: wheel_y, .. } = event {
+            match app.screen {
+                Screen::About => {
+                    /// Licence-wall px per wheel detent — a few lines at a time.
+                    const ABOUT_WHEEL_STEP: i32 = 90;
+                    *dirty |= app.scroll_about_by(-wheel_y * ABOUT_WHEEL_STEP, w, h, fonts);
+                }
+                Screen::Home => {
+                    /// Grid px scrolled per wheel detent — about a third of a card
+                    /// row, so a few ticks walk one row.
+                    const WHEEL_STEP: i32 = 120;
+                    *dirty |= app.scroll_grid_by(-wheel_y * WHEEL_STEP, w, h);
+                }
+                _ => {}
+            }
+            return EventAction::Next;
+        }
+        if let Some(action) = pin_hold_gate(app, &event, input, display_mode, dirty) {
+            return action;
+        }
+        // Any other event might change what's on screen (focus/hover, a typed
+        // digit, a screen transition) — simplest to mark dirty for all of them
+        // rather than re-litigate that per event kind.
+        *dirty = true;
+        match event {
+            // The Magic Remote's pointer delivers OK as a plain mouse click.
+            // Dispatch it on press: there is no hold gesture to disambiguate any
+            // more (per-host actions have their own ⋯ button — see
+            // `ui::sidebar_menu_button_rect`), so nothing needs to wait for the
+            // release.
+            Event::MouseButtonDown {
+                mouse_btn: sdl2::mouse::MouseButton::Left,
+                x,
+                y,
+                ..
+            } => {
+                // A grid-card click resolves via `confirm_grid_card`'s async check,
+                // same as a remote Confirm — never a target directly here.
+                return if app.handle_mouse_click(x, y, w, h, fonts).is_some() {
+                    EventAction::Launch
+                } else {
+                    EventAction::Next
+                };
+            }
+            // Direct digit entry via the remote's number buttons — PIN entry on the
+            // pairing screen, IP entry on the add/edit-host screens.
+            Event::KeyDown { keycode: Some(k), .. }
+                if matches!(app.screen, Screen::Pairing | Screen::AddHost | Screen::EditHost) =>
+            {
+                if let Some(digit) = crate::ui::digit_key_value(k) {
+                    match app.screen {
+                        Screen::Pairing => app.enter_pin_digit(digit),
+                        Screen::AddHost | Screen::EditHost => app.enter_add_host_digit(digit),
+                        _ => unreachable!(),
+                    }
+                    return EventAction::Next;
+                }
+            }
+            // Text committed by webOS's on-screen keyboard (see `SOFTWARE_KEYBOARD`
+            // in this module): the OSK delivers whole strings via SDL_TEXTINPUT, not
+            // synthetic key events, so it has to be consumed separately from the
+            // number-pad path above. Each character is fed through the same entry
+            // state machine, so typing "192.168.1.5" on the keyboard and tapping it
+            // out on the remote produce identical results.
+            Event::TextInput { ref text, .. } => {
+                match app.screen {
+                    Screen::Pairing => {
+                        for d in text.chars().filter_map(|c| c.to_digit(10)) {
+                            app.enter_pin_digit(d as u8);
+                        }
+                    }
+                    Screen::AddHost | Screen::EditHost => {
+                        for c in text.chars() {
+                            app.enter_host_address_char(c);
+                        }
+                    }
+                    _ => {}
+                }
+                return EventAction::Next;
+            }
+            _ => {}
+        }
+        let menu_ev = match event {
+            Event::KeyDown { keycode: Some(k), .. } => {
+                edge_trigger_back(crate::ui::menu_event_for_key(k), &mut input.menu_back_down)
+            }
+            Event::KeyUp { keycode: Some(k), .. } => {
+                if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) {
+                    input.menu_back_down = false;
+                }
+                None
+            }
+            Event::ControllerButtonDown { button, .. } => {
+                edge_trigger_back(crate::ui::menu_event_for_button(button), &mut input.menu_back_down)
+            }
+            Event::ControllerButtonUp { button, .. } => {
+                if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back) {
+                    input.menu_back_down = false;
+                }
+                None
+            }
+            Event::ControllerAxisMotion { axis, value, .. } => input.stick_nav.axis_event(axis, value),
+            _ => None,
+        };
+        let Some(menu_ev) = menu_ev else {
+            return EventAction::Next;
+        };
+        dispatch_menu_event(app, menu_ev, display_mode, fonts)
     }
 
     enum StreamOutcome {
@@ -331,14 +596,7 @@ mod real {
         // already-rasterized+premultiplied `Pixmap` instead of re-rasterizing
         // freetype glyphs on every ~60fps tick.
         let mut text_cache = crate::ui::TextCache::new();
-        // Whether a Back-mapped key/button is currently held, per the
-        // keyboard/gamepad event stream — edge-detected so a single physical
-        // press dispatches Back exactly once no matter how SDL reports (or
-        // misreports) repeats for it.
-        let mut menu_back_down = false;
-        // Hold-to-pin on Home (see `PIN_HOLD`), while OK is held on a pinnable card.
-        let mut pin_held: Option<PinHold> = None;
-        let mut stick_nav = crate::ui::StickMenuNav::default();
+        let mut input = UiInput::default();
         // Owned handle (it just clones the video subsystem's refcount), so taking it
         // here doesn't hold a borrow on `canvas` for the rest of the loop.
         let text_input = canvas.window().subsystem().text_input();
@@ -347,13 +605,12 @@ mod real {
             text_input.has_screen_keyboard_support()
         );
         let mut text_input_active = false;
-        // Redraw-on-change: this screen has no time-based animation at all (no
-        // spinner/blink/marquee), so every pixel that can change only ever changes
-        // as a reaction to one of: an SDL event or a Discovery/art/library
-        // background result — anything else is a no-op tick. Without this,
-        // `app.render(...)` (and the `canvas.present()` vsync swap inside it) ran
-        // unconditionally every 16ms forever, even sitting on an untouched menu.
-        // Starts `true` so the first frame always draws.
+        // Redraw-on-change: outside a running animation (which the tick below asks
+        // `App` about separately), pixels only ever change in reaction to an SDL
+        // event or a discovery/art/library background result — anything else is a
+        // no-op tick. Without this, `app.render(...)` (and the `canvas.present()`
+        // vsync swap inside it) ran unconditionally every 16ms forever, even sitting
+        // on an untouched menu. Starts `true` so the first frame always draws.
         let mut dirty = true;
         // Set once the reachability check passes — `spawn_connect` is already
         // running by then, so this just carries its handle out of the loop for
@@ -376,7 +633,11 @@ mod real {
             dirty |= app.drain_launch_check();
             // Hold-to-pin fires here rather than on release, so the pin lands the
             // instant `PIN_HOLD` elapses and the user can see it before letting go.
-            if let Some(hold) = pin_held.as_mut().filter(|h| !h.fired && h.since.elapsed() >= PIN_HOLD) {
+            if let Some(hold) = input
+                .pin_held
+                .as_mut()
+                .filter(|h| !h.fired && h.since.elapsed() >= PIN_HOLD)
+            {
                 hold.fired = true;
                 let still_there = matches!(app.screen, Screen::Home) && hold.focus == app.home_focus;
                 if still_there {
@@ -410,186 +671,12 @@ mod real {
             }
             for event in events.poll_iter() {
                 use sdl2::event::Event;
-                if let Event::Quit { .. } = event {
-                    tracing::info!("quit during UI");
-                    return Ok(None);
-                }
-                // The Magic Remote's pointer mode surfaces as a plain SDL2
-                // MouseMotion event fired continuously while the remote is
-                // moving — unlike every other event handled below, redraw only
-                // if the motion actually changed the focused/hovered element,
-                // not on every no-op tick.
-                if let Event::MouseMotion { x, y, .. } = event {
-                    dirty |= app.handle_mouse_motion(x, y, display_mode.w as u32, display_mode.h as u32, fonts);
-                    continue;
-                }
-                // The Magic Remote's scroll wheel — scrolls the game grid on Home
-                // (wheel y > 0 = "scroll up" = content moves down). Like motion
-                // above, only redraws when the offset actually moved (a wheel tick
-                // at either clamp edge is a no-op).
-                if let Event::MouseWheel { y: wheel_y, .. } = event {
-                    if matches!(app.screen, Screen::About) {
-                        /// Licence-wall px per wheel detent — a few lines at a time.
-                        const ABOUT_WHEEL_STEP: i32 = 90;
-                        dirty |= app.scroll_about_by(
-                            -wheel_y * ABOUT_WHEEL_STEP,
-                            display_mode.w as u32,
-                            display_mode.h as u32,
-                            fonts,
-                        );
-                        continue;
-                    }
-                    if matches!(app.screen, Screen::Home) {
-                        /// Grid px scrolled per wheel detent — about a third of a
-                        /// card row, so a few ticks walk one row.
-                        const WHEEL_STEP: i32 = 120;
-                        dirty |=
-                            app.scroll_grid_by(-wheel_y * WHEEL_STEP, display_mode.w as u32, display_mode.h as u32);
-                    }
-                    continue;
-                }
-                // Hold-to-pin: OK on a focused Home card ("Desktop" or a game — both
-                // pinnable) pins/unpins once `PIN_HOLD` elapses, or launches on a quick
-                // tap. `MenuEvent` has no press/release notion, so this intercepts the
-                // raw SDL event: a Confirm-mapped KeyDown/ControllerButtonDown on a
-                // pinnable card starts the hold and is swallowed rather than dispatched
-                // immediately — the launch can only ever come from the release.
-                if matches!(app.screen, Screen::Home)
-                    && app
-                        .focused_pin_id(crate::ui::grid_columns(
-                            (display_mode.w as u32).saturating_sub(crate::ui::SIDEBAR_W),
-                        ))
-                        .is_some()
-                {
-                    // Also matches OS auto-repeat KeyDowns while held, so a repeat
-                    // can't fall through to the dispatch below and launch mid-hold.
-                    let confirm_down = matches!(
-                        event,
-                        Event::KeyDown { keycode: Some(k), .. }
-                            if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Confirm)
-                    ) || matches!(
-                        event,
-                        Event::ControllerButtonDown { button, .. }
-                            if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Confirm)
-                    );
-                    if confirm_down {
-                        pin_held.get_or_insert(PinHold {
-                            since: Instant::now(),
-                            focus: app.home_focus,
-                            fired: false,
-                        });
-                        continue;
-                    }
-                }
-                let ends_hold = matches!(
-                    event,
-                    Event::KeyUp { keycode: Some(k), .. }
-                        if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Confirm)
-                ) || matches!(
-                    event,
-                    Event::ControllerButtonUp { button, .. }
-                        if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Confirm)
-                );
-                if ends_hold {
-                    if let Some(hold) = pin_held.take() {
-                        dirty = true;
-                        // A quick tap: the press never dispatched, so do it now. A hold
-                        // that already toggled, or one whose screen/focus moved out from
-                        // under it, resolves to nothing.
-                        let tapped = !hold.fired && matches!(app.screen, Screen::Home) && hold.focus == app.home_focus;
-                        if tapped
-                            && app
-                                .handle_home_event(MenuEvent::Confirm, display_mode.w as u32, display_mode.h as u32)
-                                .is_some()
-                        {
-                            break 'ui;
-                        }
-                        continue; // this press was ours (tap or hold) — swallow the release
-                    }
-                }
-                // Any other event might change what's on screen (focus/hover, a typed
-                // digit, a screen transition) — simplest to mark dirty for all of
-                // them rather than re-litigate that per event kind.
-                dirty = true;
+                // Device-level events, handled before anything screen-specific:
+                // shutdown and controller hotplug.
                 match event {
-                    // The Magic Remote's pointer delivers OK as a plain mouse click.
-                    // Dispatch it on press: there is no hold gesture to disambiguate
-                    // any more (per-host actions have their own ⋯ button — see
-                    // `ui::sidebar_menu_button_rect`), so nothing needs to wait for
-                    // the release.
-                    Event::MouseButtonDown {
-                        mouse_btn: sdl2::mouse::MouseButton::Left,
-                        x,
-                        y,
-                        ..
-                    } => {
-                        // A grid-card click resolves via `confirm_grid_card`'s async check
-                        // above, same as a remote Confirm — never a target directly here.
-                        if app
-                            .handle_mouse_click(x, y, display_mode.w as u32, display_mode.h as u32, fonts)
-                            .is_some()
-                        {
-                            break 'ui;
-                        }
-                        continue;
-                    }
-                    // Direct digit entry via the remote's number buttons — PIN entry
-                    // on the pairing screen, IP entry on the add/edit-host screens.
-                    Event::KeyDown { keycode: Some(k), .. }
-                        if matches!(app.screen, Screen::Pairing | Screen::AddHost | Screen::EditHost) =>
-                    {
-                        if let Some(digit) = crate::ui::digit_key_value(k) {
-                            match app.screen {
-                                Screen::Pairing => app.enter_pin_digit(digit),
-                                Screen::AddHost | Screen::EditHost => app.enter_add_host_digit(digit),
-                                _ => unreachable!(),
-                            }
-                            continue;
-                        }
-                    }
-                    // Text committed by webOS's on-screen keyboard (see
-                    // `SOFTWARE_KEYBOARD` in this module): the OSK delivers whole
-                    // strings via SDL_TEXTINPUT, not synthetic key events, so it has
-                    // to be consumed separately from the number-pad path above. Each
-                    // character is fed through the same entry state machine, so typing
-                    // "192.168.1.5" on the keyboard and tapping it out on the remote
-                    // produce identical results.
-                    Event::TextInput { ref text, .. } => {
-                        match app.screen {
-                            Screen::Pairing => {
-                                for d in text.chars().filter_map(|c| c.to_digit(10)) {
-                                    app.enter_pin_digit(d as u8);
-                                }
-                            }
-                            Screen::AddHost | Screen::EditHost => {
-                                for c in text.chars() {
-                                    app.enter_host_address_char(c);
-                                }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    _ => {}
-                }
-                let menu_ev = match event {
-                    Event::KeyDown { keycode: Some(k), .. } => {
-                        edge_trigger_back(crate::ui::menu_event_for_key(k), &mut menu_back_down)
-                    }
-                    Event::KeyUp { keycode: Some(k), .. } => {
-                        if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) {
-                            menu_back_down = false;
-                        }
-                        None
-                    }
-                    Event::ControllerButtonDown { button, .. } => {
-                        edge_trigger_back(crate::ui::menu_event_for_button(button), &mut menu_back_down)
-                    }
-                    Event::ControllerButtonUp { button, .. } => {
-                        if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back) {
-                            menu_back_down = false;
-                        }
-                        None
+                    Event::Quit { .. } => {
+                        tracing::info!("quit during UI");
+                        return Ok(None);
                     }
                     Event::ControllerDeviceAdded { which, .. } if controller.is_none() => {
                         match game_controller.open(which) {
@@ -599,45 +686,17 @@ mod real {
                             }
                             Err(e) => tracing::warn!("controller open failed: {e}"),
                         }
-                        None
+                        continue;
                     }
                     Event::ControllerDeviceRemoved { .. } => {
                         *controller = None;
-                        None
+                        continue;
                     }
-                    Event::ControllerAxisMotion { axis, value, .. } => stick_nav.axis_event(axis, value),
-                    _ => None,
-                };
-                let Some(menu_ev) = menu_ev else { continue };
-                match app.screen {
-                    // Back on Home is a no-op (root screen — `App::back` decides);
-                    // routed through `back` anyway so the policy lives in one place.
-                    Screen::Home => {
-                        if menu_ev == MenuEvent::Back {
-                            if app.back().is_some() {
-                                break 'ui;
-                            }
-                        // Same async path as the mouse click above — a grid-card
-                        // Confirm never resolves to a target directly here.
-                        } else if app
-                            .handle_home_event(menu_ev, display_mode.w as u32, display_mode.h as u32)
-                            .is_some()
-                        {
-                            break 'ui;
-                        }
-                    }
-                    Screen::Pairing => app.handle_pairing_event(menu_ev),
-                    Screen::Settings => app.handle_settings_event(menu_ev, display_mode.h as u32),
-                    Screen::AddHost => app.handle_add_host_event(menu_ev),
-                    Screen::Wake => app.handle_wake_event(menu_ev),
-                    Screen::ForgetHost => app.handle_forget_host_event(menu_ev),
-                    Screen::HostMenu => app.handle_host_menu_event(menu_ev),
-                    Screen::SpeedTest => app.handle_speed_test_event(menu_ev),
-                    Screen::EditHost => app.handle_edit_host_event(menu_ev),
-                    Screen::About => {
-                        app.handle_about_event(menu_ev, display_mode.w as u32, display_mode.h as u32, fonts)
-                    }
-                    Screen::PinLimit => app.handle_pin_limit_event(menu_ev),
+                    _ => {}
+                }
+                match handle_ui_event(&mut app, event, &mut input, display_mode, fonts, &mut dirty) {
+                    EventAction::Next => {}
+                    EventAction::Launch => break 'ui,
                 }
             }
             // Track whether the panel is actually up, not merely whether text input was
@@ -673,10 +732,11 @@ mod real {
                     text_input.is_screen_keyboard_shown(canvas.window())
                 );
             }
-            // Three reasons to render another frame:
+            // Four reasons to render another frame:
             // 1. `dirty`         — an event or drain changed state (tiles need re-rasterizing).
-            // 2. `tiles_pending` — card window still filling in a few tiles at a time.
-            // 3. `!grid_reveal_ready` — spinner is animating (one frame per ~33 ms tick).
+            // 2. `tick_animations` — a scroll/pop/fade clock is still running.
+            // 3. `tiles_pending` — card window still filling in a few tiles at a time.
+            // 4. `!grid_reveal_ready` — spinner is animating (one frame per ~33 ms tick).
             // The 16ms sleep when none of these holds keeps the SoC idle between frames.
             let animating = app.tick_animations() || app.tiles_pending || !app.grid_reveal_ready;
             if !dirty && !animating {
