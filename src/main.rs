@@ -798,15 +798,20 @@ mod real {
         // button (which webOS otherwise treats as its own Home shortcut, backgrounding
         // the app into the launcher — see `keyboard.rs`'s LGui/RGui mapping and
         // `gamepad.rs`'s BTN_GUIDE mapping, which need these to actually reach the app
-        // instead). Must be set before window creation.
+        // instead). Must be set before window creation — confirmed on-device these
+        // hints only latch at creation time, so there's no way to scope them to just
+        // the stream: the tradeoff is the remote's own physical Home button no longer
+        // opens webOS's launcher either, in the menu or mid-stream (accepted — the
+        // priority is that no keyboard/gamepad input can ever reach the TV OS, only
+        // the Magic Remote can).
         sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
         sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_HOME", "true");
         sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_META", "true");
         sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_GUIDE", "true");
-        // The Home-equivalent hints above stop the key itself from backgrounding the
-        // app, but webOS's card-switcher ribbon overlay is gated separately — without
-        // this it can still pop the launcher UI on top even though the app stays
-        // foregrounded (confirmed pairing in aurora-tv's app.c).
+        // The hints above stop the key itself from backgrounding the app, but webOS's
+        // card-switcher ribbon overlay is gated separately — without this it can still
+        // pop the launcher UI on top even though the app stays foregrounded (confirmed
+        // pairing in aurora-tv's app.c).
         sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_RIBBON", "false");
         // Linear texture filtering (SDL defaults to nearest) — the focus pop
         // scales card textures slightly, which shimmers without it.
@@ -1064,24 +1069,15 @@ mod real {
                                 _ => {}
                             }
                         }
-                        // Real game input (Backspace/Escape/etc. included) — forward
-                        // only, never open the dialog. `resolve_scancode` covers webOS
-                        // 26, which reports a connected HID keyboard's Escape with
-                        // `scancode: None` (webOS 5 always fills it in); recovering the
-                        // scancode from the keycode keeps it routed here instead of
-                        // falling through to the Magic Remote Back arm below.
-                        Event::KeyDown { scancode, keycode, .. }
-                            if keyboard::resolve_scancode(scancode, keycode).is_some() =>
-                        {
-                            if let Some(ev) =
-                                keyboard::key_event(keyboard::resolve_scancode(scancode, keycode).unwrap(), true)
-                            {
+                        // Scancode keys are real game input (Backspace/Escape/etc.
+                        // included) — forward only, never open the dialog.
+                        Event::KeyDown { scancode: Some(sc), .. } => {
+                            if let Some(ev) = keyboard::key_event(sc, true) {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
                         }
-                        // Magic Remote Back (0x200003): a vendor keycode with no
-                        // physical key position, so `resolve_scancode` above never
-                        // resolves it — open the disconnect dialog.
+                        // Magic Remote Back (0x200003): no scancode, never
+                        // forwarded to the host — open the disconnect dialog.
                         Event::KeyDown {
                             keycode: Some(k),
                             scancode: None,
@@ -1093,12 +1089,8 @@ mod real {
                             disconnect_focus_dirty = true;
                             disconnect_focus_anim = Some(Instant::now());
                         }
-                        Event::KeyUp { scancode, keycode, .. }
-                            if keyboard::resolve_scancode(scancode, keycode).is_some() =>
-                        {
-                            if let Some(ev) =
-                                keyboard::key_event(keyboard::resolve_scancode(scancode, keycode).unwrap(), false)
-                            {
+                        Event::KeyUp { scancode: Some(sc), .. } => {
+                            if let Some(ev) = keyboard::key_event(sc, false) {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
                         }

@@ -6,7 +6,7 @@
 //! connected to the TV are handled the same way via SDL2 scancodes (physical key
 //! positions) so the host receives QWERTY-positional VKs regardless of layout.
 use punktfunk_core::input::{InputEvent, InputKind};
-use sdl2::keyboard::{Keycode, Scancode};
+use sdl2::keyboard::Scancode;
 
 /// SDL2 scancode → Windows VK code (`vk_to_evdev` on the host side).
 /// `None` for keys not in that table.
@@ -136,17 +136,6 @@ fn vk_code(sc: Scancode) -> Option<u32> {
 
         _ => return None,
     })
-}
-
-/// Recovers a scancode from an SDL event that reported only a keycode — seen on
-/// webOS 26 for a connected HID keyboard's Escape key, where webOS 5 always fills
-/// in `scancode`. `Scancode::from_keycode` reverses the current layout mapping, so
-/// a real key (Escape, Backspace, ...) still resolves; the Magic Remote's vendor
-/// `WEBOS_BACK_KEYCODE` has no physical key position and never does, which is what
-/// lets the streaming loop tell "real key, keycode-only" apart from "the remote's
-/// Back button" without depending on which webOS version fills in `scancode`.
-pub fn resolve_scancode(scancode: Option<Scancode>, keycode: Option<Keycode>) -> Option<Scancode> {
-    scancode.or_else(|| keycode.and_then(Scancode::from_keycode))
 }
 
 pub fn key_event(scancode: Scancode, pressed: bool) -> Option<InputEvent> {
