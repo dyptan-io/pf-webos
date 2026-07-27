@@ -1299,7 +1299,7 @@ mod real {
                                 "Drop {} · FEC {} · hold {} · buf {backlog}",
                                 connected.client.frames_dropped(),
                                 connected.client.fec_recovered_shards(),
-                                if holding { "yes" } else { "no" },
+                                if holding { "y" } else { "n" },
                             )
                         },
                         format!(
