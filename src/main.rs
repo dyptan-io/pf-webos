@@ -172,6 +172,19 @@ mod real {
         LOG_OVERLAY_STATE.store(next as u8, Ordering::Relaxed);
     }
 
+    /// Diagnostics' "Show logs" toggle, for remotes without a Yellow button. Unlike
+    /// `cycle_log_overlay`'s 3-state cycle this only ever lands on Off/Live; the
+    /// preference itself is persisted separately, in `Settings::show_logs`.
+    pub(crate) fn set_log_overlay_enabled(enabled: bool) {
+        crate::logger::set_ring_capture(enabled);
+        let next = if enabled {
+            LogOverlayState::Live
+        } else {
+            LogOverlayState::Off
+        };
+        LOG_OVERLAY_STATE.store(next as u8, Ordering::Relaxed);
+    }
+
     /// Current lines to render; None if Off.
     fn log_overlay_lines() -> Option<Vec<String>> {
         match log_overlay_state() {
@@ -466,6 +479,7 @@ mod real {
             Screen::About => app.handle_about_event(menu_ev, w, h, fonts),
             Screen::PinLimit => app.handle_pin_limit_event(menu_ev),
             Screen::Diagnostics => app.handle_diagnostics_event(menu_ev),
+            Screen::SendLogs => app.handle_send_logs_event(menu_ev),
         }
         EventAction::Next
     }
@@ -732,6 +746,7 @@ mod real {
             dirty |= app.drain_games();
             dirty |= app.drain_pairing();
             dirty |= app.drain_speed_test();
+            dirty |= app.drain_send_logs();
             app.tick_reachability();
             dirty |= app.drain_reachability();
             dirty |= app.tick_wake();

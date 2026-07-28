@@ -52,7 +52,12 @@ pub const SETTINGS_ROW_COUNT: usize = 10;
 /// 0 so its dropdown's `(Screen, row)` tile key stays stable.
 pub const DIAG_ROW_LOG_LEVEL: usize = 0;
 pub const DIAG_ROW_STATS_OVERLAY: usize = 1;
-pub const DIAGNOSTICS_ROW_COUNT: usize = 2;
+/// Menu-driven mirror of the Yellow-button log overlay — for remotes without one.
+pub const DIAG_ROW_SHOW_LOGS: usize = 2;
+/// Uploads the current session's log file to the developer (see `app::sendlogs`).
+/// An action row, not a setting — Confirm opens a warning/confirmation modal first.
+pub const DIAG_ROW_SEND_LOGS: usize = 3;
+pub const DIAGNOSTICS_ROW_COUNT: usize = 4;
 
 pub const COLOR_RANGE_OPTIONS: [ColorRangeOverride; 3] = [
     ColorRangeOverride::Auto,
@@ -259,8 +264,8 @@ pub fn log_level_dropdown_current_index(level: LogLevelOverride) -> usize {
     LOG_LEVEL_OPTIONS.iter().position(|&o| o == level).unwrap_or(0)
 }
 
-/// Diagnostics modal rows: log level (dropdown) + stats overlay (toggle).
-/// Order must match `DIAG_ROW_*`.
+/// Diagnostics modal rows: log level (dropdown), stats overlay (toggle), and
+/// show logs (toggle). Order must match `DIAG_ROW_*`.
 pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
     vec![
         FocusRow {
@@ -285,6 +290,16 @@ pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
             danger: false,
             menu: None,
         },
+        FocusRow {
+            icon: ICON_VISIBILITY,
+            label: "Show logs".into(),
+            value: if settings.show_logs { "On".into() } else { "Off".into() },
+            kind: RowKind::Toggle,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+        },
+        FocusRow::action(ICON_SEND, "Send logs to developer"),
     ]
 }
 

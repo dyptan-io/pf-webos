@@ -252,6 +252,11 @@ pub struct Settings {
     /// the persisted value for that run — see `load_settings`.
     #[serde(default)]
     pub log_level_override: LogLevelOverride,
+    /// Diagnostics' "Show logs" toggle, applied at startup (`App::new`). Distinct
+    /// from the Yellow-button overlay cycle (`main.rs`'s `LOG_OVERLAY_STATE`),
+    /// which stays ephemeral and never writes here.
+    #[serde(default)]
+    pub show_logs: bool,
 }
 
 fn default_audio_channels() -> u8 {
@@ -276,6 +281,7 @@ impl Default for Settings {
             audio_channels: default_audio_channels(),
             color_range_override: ColorRangeOverride::Auto,
             log_level_override: LogLevelOverride::Info,
+            show_logs: false,
         }
     }
 }

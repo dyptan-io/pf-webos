@@ -1,7 +1,7 @@
 //! Routes `tracing` to TCP (dev machine) or log file. Destination from argv[1] at
 //! runtime (webOS SAM passes launch `params` as JSON argv), not compile-time.
 use std::collections::VecDeque;
-use std::io::{Seek, Write};
+use std::io::Write;
 use std::net::TcpStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -62,17 +62,26 @@ pub fn launch_level_override() -> Option<LogLevelOverride> {
 }
 
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+/// Rotated files kept alongside the active log (`base.log.1`..`.3`). Bounds disk
+/// use at ~`(MAX_LOG_ROTATIONS + 1) * MAX_LOG_BYTES` while preserving history the
+/// old wipe-in-place discarded — which is what left uploaded logs stale.
+const MAX_LOG_ROTATIONS: usize = 3;
 
 /// Log destination (file or TCP). Non-blocking dispatch prevents blocking video pump.
 enum Sink {
-    File { file: std::fs::File, written: u64 },
+    File {
+        file: std::fs::File,
+        written: u64,
+        /// Active log path, so a full file can be rotated (renamed) and reopened.
+        path: std::path::PathBuf,
+    },
     Tcp(TcpStream),
 }
 
 impl Write for Sink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
-            Self::File { file, written } => {
+            Self::File { file, written, .. } => {
                 let n = file.write(buf)?;
                 *written += n as u64;
                 Ok(n)
@@ -82,14 +91,17 @@ impl Write for Sink {
     }
 
     /// `tracing_appender`'s worker thread flushes after each drained batch, not per
-    /// line — so the wrap check runs once per batch instead of once per write.
+    /// line — so the size/rotation check runs once per batch instead of per write.
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
-            Self::File { file, written } => {
+            Self::File { file, written, path } => {
                 file.flush()?;
                 if *written >= MAX_LOG_BYTES {
-                    file.set_len(0)?;
-                    file.seek(std::io::SeekFrom::Start(0))?;
+                    // Rotate rather than truncate: the just-filled file becomes `.1`
+                    // (the newest complete log), and writing continues in a fresh
+                    // active file. Send picks whichever is newest (`latest_log_file`).
+                    rotate_logs(path);
+                    *file = open_fresh(path)?;
                     *written = 0;
                 }
                 Ok(())
@@ -99,17 +111,43 @@ impl Write for Sink {
     }
 }
 
-/// Truncated on every launch, then wiped and restarted mid-run if it hits
-/// `MAX_LOG_BYTES` — bounds disk usage regardless of session length.
-fn open_file(app_dir: &Path) -> Result<Sink> {
-    let path = app_dir.join(format!("punktfunk-webos-{VERSION}.log"));
-    let file = std::fs::OpenOptions::new()
+/// `base.log` → `base.log.<n>`.
+fn numbered_log(base: &Path, n: usize) -> std::path::PathBuf {
+    let mut s = base.as_os_str().to_owned();
+    s.push(format!(".{n}"));
+    std::path::PathBuf::from(s)
+}
+
+/// Shift the ring down one: drop the oldest (`.MAX`), rename `.k`→`.k+1`, then
+/// `base`→`.1`. Best-effort — a failed rename just means one lost rotation, never a
+/// lost active log. Called on size overflow and once at launch.
+fn rotate_logs(base: &Path) {
+    let _ = std::fs::remove_file(numbered_log(base, MAX_LOG_ROTATIONS));
+    for n in (1..MAX_LOG_ROTATIONS).rev() {
+        let _ = std::fs::rename(numbered_log(base, n), numbered_log(base, n + 1));
+    }
+    let _ = std::fs::rename(base, numbered_log(base, 1));
+}
+
+/// Create (truncating) a fresh active log at `path`.
+fn open_fresh(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(&path)
-        .with_context(|| format!("open log file {}", path.display()))?;
-    Ok(Sink::File { file, written: 0 })
+        .open(path)
+}
+
+/// A fresh active log each launch; the previous session's file is rotated to `.1`
+/// first, so relaunching to reproduce a bug no longer discards the prior run.
+/// Rotates again mid-run whenever the active file hits `MAX_LOG_BYTES`.
+fn open_file(app_dir: &Path) -> Result<Sink> {
+    let path = log_file_path(app_dir);
+    if path.metadata().is_ok_and(|m| m.len() > 0) {
+        rotate_logs(&path);
+    }
+    let file = open_fresh(&path).with_context(|| format!("open log file {}", path.display()))?;
+    Ok(Sink::File { file, written: 0, path })
 }
 
 /// Open TCP or file sink; fall back to file if unreachable (dev convenience, not critical).
@@ -120,6 +158,26 @@ fn open_sink(app_dir: &Path) -> Result<Sink> {
         }
     }
     open_file(app_dir)
+}
+
+/// Absolute path of the active log file (`open_file`'s target).
+pub fn log_file_path(app_dir: &Path) -> std::path::PathBuf {
+    app_dir.join(format!("punktfunk-webos-{VERSION}.log"))
+}
+
+/// The newest log file to upload — the active file, or the most recently modified
+/// rotation if there's no active file (e.g. a TCP-telemetry session wrote none).
+/// `None` if nothing has been logged to disk at all.
+pub fn latest_log_file(app_dir: &Path) -> Option<std::path::PathBuf> {
+    let base = log_file_path(app_dir);
+    (0..=MAX_LOG_ROTATIONS)
+        .map(|n| if n == 0 { base.clone() } else { numbered_log(&base, n) })
+        .filter_map(|p| {
+            let meta = p.metadata().ok()?;
+            (meta.len() > 0).then(|| (p, meta.modified().ok()))
+        })
+        .max_by_key(|(_, mtime)| *mtime)
+        .map(|(p, _)| p)
 }
 
 /// Startup filter level, mapped from persisted/launch-override settings.

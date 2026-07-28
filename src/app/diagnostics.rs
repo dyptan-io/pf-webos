@@ -26,11 +26,12 @@ impl App {
         ui::list_modal_card_rect(screen_w, screen_h, fonts, subtitle, ui::DIAGNOSTICS_ROW_COUNT)
     }
 
-    /// Two rows (`ui::DIAG_ROW_*`): Log level (Left/Right cycles, Confirm opens the
+    /// Three rows (`ui::DIAG_ROW_*`): Log level (Left/Right cycles, Confirm opens the
     /// same dropdown picker every `Settings` dropdown uses — its row `0` is
     /// disambiguated from `Settings`' row 0 by `self.screen`, see
-    /// `dropdown_overlay_tile`'s docs) and Stats overlay (Left/Right/Confirm all
-    /// toggle). Back saves and returns to Settings — this is reached from there.
+    /// `dropdown_overlay_tile`'s docs), Stats overlay, and Show logs (both
+    /// Left/Right/Confirm toggle). Back saves and returns to Settings — this is
+    /// reached from there.
     pub(crate) fn handle_diagnostics_event(&mut self, ev: MenuEvent) {
         if let Some(dd) = self.dropdown.as_mut() {
             let len = ui::LOG_LEVEL_OPTIONS.len();
@@ -69,6 +70,18 @@ impl App {
                 let from = self.settings.stats_overlay;
                 self.settings.stats_overlay = !from;
                 self.switch_anim = Some((Instant::now(), from));
+            }
+            (ui::DIAG_ROW_SHOW_LOGS, MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
+                let from = self.settings.show_logs;
+                self.settings.show_logs = !from;
+                crate::real::set_log_overlay_enabled(!from);
+                self.switch_anim = Some((Instant::now(), from));
+            }
+            (ui::DIAG_ROW_SEND_LOGS, MenuEvent::Confirm) => {
+                // Persist any pending diagnostics changes before leaving the screen —
+                // the confirmation modal's buttons return to Home, not back here.
+                self.settings_writer.save(self.settings);
+                self.open_send_logs();
             }
             (_, MenuEvent::Back) => {
                 self.settings_writer.save(self.settings);

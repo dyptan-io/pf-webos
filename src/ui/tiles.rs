@@ -264,12 +264,23 @@ fn log_line_color(line: &str) -> Color {
     }
 }
 
+/// Left indent for a wrapped log line's 2nd+ row, so it reads as a continuation.
+const LOG_OVERLAY_WRAP_INDENT: i32 = 20;
+
 /// Full-width log-tail at screen bottom (all screens, unlike stats overlay).
+/// Long lines word-wrap instead of clipping.
 pub fn render_log_overlay_tile(font: &Font, screen_w: u32, lines: &[String]) -> Result<Painter> {
     let pad = 14i32;
     let line_h = font.height() + 4;
     let inner_w = screen_w.saturating_sub(2 * pad as u32);
-    let h = (lines.len().max(1) as i32 * line_h + 2 * pad).max(1) as u32;
+    // Narrowed by the indent so continuation rows fit too; first row just has slack.
+    let wrap_w = inner_w.saturating_sub(LOG_OVERLAY_WRAP_INDENT as u32).max(1);
+    let wrapped: Vec<(Vec<String>, Color)> = lines
+        .iter()
+        .map(|line| (wrap_text(font, line, wrap_w), log_line_color(line)))
+        .collect();
+    let total_rows: usize = wrapped.iter().map(|(rows, _)| rows.len().max(1)).sum();
+    let h = (total_rows.max(1) as i32 * line_h + 2 * pad).max(1) as u32;
     let mut p = Painter::new(screen_w.max(1), h);
     let mut tc = TextCache::new();
     p.fill_rounded_rect(
@@ -277,17 +288,18 @@ pub fn render_log_overlay_tile(font: &Font, screen_w: u32, lines: &[String]) -> 
         14,
         Color::RGBA(0x14, 0x10, 0x1f, 0x90),
     );
-    for (i, line) in lines.iter().enumerate() {
-        let clipped = ellipsize(font, line, inner_w);
-        draw_text(
-            &mut p,
-            &mut tc,
-            font,
-            &clipped,
-            pad,
-            pad + i as i32 * line_h,
-            log_line_color(line),
-        )?;
+    let mut row = 0i32;
+    for (wrapped_rows, color) in &wrapped {
+        // Empty line wraps to zero rows — still reserve one so later lines don't creep up.
+        if wrapped_rows.is_empty() {
+            row += 1;
+            continue;
+        }
+        for (i, text) in wrapped_rows.iter().enumerate() {
+            let x = if i == 0 { pad } else { pad + LOG_OVERLAY_WRAP_INDENT };
+            draw_text(&mut p, &mut tc, font, text, x, pad + row * line_h, *color)?;
+            row += 1;
+        }
     }
     Ok(p)
 }

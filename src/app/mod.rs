@@ -21,6 +21,7 @@ mod hostmenu;
 mod pairing;
 mod pinlimit;
 mod reach;
+mod sendlogs;
 mod settings;
 mod speedtest;
 mod wake;
@@ -42,6 +43,8 @@ pub enum Screen {
     PinLimit,
     /// Log level debug aid (see `app/diagnostics.rs`).
     Diagnostics,
+    /// "Send logs to developer" confirmation (see `app/sendlogs.rs`).
+    SendLogs,
 }
 
 /// Pairing modal's focused input: PIN row or "Request access" button.
@@ -284,6 +287,11 @@ pub(crate) enum ModalShellKey {
     Diagnostics {
         log_level: store::LogLevelOverride,
         stats_overlay: bool,
+        show_logs: bool,
+        hover_close: bool,
+    },
+    /// Fixed warning copy + two buttons; only the close (X) hover varies.
+    SendLogs {
         hover_close: bool,
     },
 }
@@ -302,8 +310,10 @@ pub(crate) enum ModalFocusKey {
     SpeedTestButton(usize, String),
     /// Carries label+menu flag for row list shape changes and ⋯ state.
     MenuRow(usize, String, bool),
-    /// (focused row, log level, stats-overlay on) — any change invalidates the tile.
-    DiagnosticsRow(usize, store::LogLevelOverride, bool),
+    /// (focused row, log level, stats-overlay on, show-logs on) — any change invalidates the tile.
+    DiagnosticsRow(usize, store::LogLevelOverride, bool, bool),
+    /// Which `Screen::SendLogs` button is focused (0 = Cancel, 1 = Send).
+    SendLogsButton(usize),
 }
 
 /// Scrollable modal content keys. Paired with Screen for staleness checks.
@@ -380,6 +390,13 @@ pub struct App {
     /// Focused row of `Screen::Diagnostics`; kept as its own cursor
     /// (like `wake_settings_focused`) to survive nested menu traversal.
     pub diagnostics_focused: usize,
+    /// Which `Screen::SendLogs` button has focus: `0` = "Cancel", `1` = "Send".
+    /// Defaults to Cancel (see `open_send_logs`) — sending logs off-device is a
+    /// privacy-relevant action, so it shouldn't be one accidental OK press away.
+    pub send_logs_focused: usize,
+    /// Delivers the background log upload's result; `None` when no upload is in
+    /// flight. Drained each tick by `drain_send_logs`.
+    pub(crate) send_logs_rx: Option<std::sync::mpsc::Receiver<sendlogs::SendLogsMsg>>,
     /// The sidebar row `Screen::EditHost` is editing, `None` otherwise.
     pub edit_host_index: Option<usize>,
     /// The in-flight/finished speed test, `None` when that screen isn't open.
@@ -606,6 +623,8 @@ impl App {
             host_menu_dots: false,
             wake_settings_focused: 0,
             diagnostics_focused: 0,
+            send_logs_focused: 0,
+            send_logs_rx: None,
             edit_host_index: None,
             speed_test: None,
             speed_test_rx: None,
@@ -677,6 +696,10 @@ impl App {
         // render-thread hitch). `spinner_frames`'s `OnceLock` makes this a pure warm-up:
         // harmless if the spinner is drawn before this thread finishes, redundant work
         // (never a race) if it finishes first.
+        // Applies the persisted "Show logs" preference to the otherwise-ephemeral overlay.
+        if app.settings.show_logs {
+            crate::real::set_log_overlay_enabled(true);
+        }
         std::thread::spawn(ui::spinner_frames);
         std::thread::spawn(crate::device::supports_av1);
         app
@@ -838,6 +861,10 @@ impl App {
             }
             Screen::Diagnostics => {
                 self.handle_diagnostics_event(MenuEvent::Back);
+                None
+            }
+            Screen::SendLogs => {
+                self.handle_send_logs_event(MenuEvent::Back);
                 None
             }
         }
@@ -1028,6 +1055,10 @@ impl App {
                 let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
                 self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
             }
+            Screen::SendLogs => {
+                let card = Self::send_logs_card_rect(screen_w, screen_h, fonts);
+                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
+            }
         }
     }
 
@@ -1106,7 +1137,8 @@ impl App {
                         let row_y = content.y() + i as i32 * (ui::SETTINGS_ROW_H as i32 + ui::SETTINGS_ROW_GAP);
                         Rect::new(content.x(), row_y, content.width(), ui::SETTINGS_ROW_H).contains_point((x, y))
                     })?;
-                    self.settings_focused = self.scroll.clamped(ui::settings_row_count(&self.settings), visible) + local;
+                    self.settings_focused =
+                        self.scroll.clamped(ui::settings_row_count(&self.settings), visible) + local;
                 }
                 self.handle_settings_event(MenuEvent::Confirm, screen_h);
                 None
@@ -1176,6 +1208,12 @@ impl App {
                         break;
                     }
                 }
+                None
+            }
+            // A click confirms whichever of Cancel/Send currently has focus —
+            // same click-confirms-the-focused-button shape as ForgetHost.
+            Screen::SendLogs => {
+                self.handle_send_logs_event(MenuEvent::Confirm);
                 None
             }
             // Nothing clickable but the close button (handled above).
@@ -1475,18 +1513,6 @@ impl App {
                 self.outline_tile = Some(ui::render_card_outline_tile(card_w, card_h));
                 updated.push(Tile::CardOutline);
             }
-            match &self.home_status {
-                Some(s) => {
-                    let stale = !matches!(&self.status_tile, Some((t, _)) if t == s);
-                    if stale {
-                        let max_w = available_w.saturating_sub(2 * ui::GRID_PAD as u32);
-                        let tile = ui::render_wrapped_text_tile(text_cache, fonts.label, s, max_w, ui::MUTED, 6)?;
-                        self.status_tile = Some((s.clone(), tile));
-                        updated.push(Tile::Status);
-                    }
-                }
-                None => self.status_tile = None,
-            }
         } else {
             self.grid_reveal_ready = true;
             self.spinner_since = None;
@@ -1499,6 +1525,22 @@ impl App {
                 )?);
                 updated.push(Tile::NoHost);
             }
+        }
+
+        // Status line block — built whenever `home_status` is set, independent of
+        // whether a host is selected (the "Send logs" result shows here too).
+        match &self.home_status {
+            Some(s) => {
+                let stale = !matches!(&self.status_tile, Some((t, _)) if t == s);
+                if stale {
+                    let avail = screen_w.saturating_sub(ui::SIDEBAR_W);
+                    let max_w = avail.saturating_sub(2 * ui::GRID_PAD as u32);
+                    let tile = ui::render_wrapped_text_tile(text_cache, fonts.label, s, max_w, ui::MUTED, 6)?;
+                    self.status_tile = Some((s.clone(), tile));
+                    updated.push(Tile::Status);
+                }
+            }
+            None => self.status_tile = None,
         }
 
         let modal_open = !matches!(self.screen, Screen::Home);
@@ -1554,6 +1596,10 @@ impl App {
             Screen::Diagnostics => Some(ModalShellKey::Diagnostics {
                 log_level: self.settings.log_level_override,
                 stats_overlay: self.settings.stats_overlay,
+                show_logs: self.settings.show_logs,
+                hover_close: self.hover_close,
+            }),
+            Screen::SendLogs => Some(ModalShellKey::SendLogs {
                 hover_close: self.hover_close,
             }),
             // `EditHost` joins `AddHost` in having no shell key: its typed-digit
@@ -1602,6 +1648,9 @@ impl App {
                 Screen::Diagnostics => {
                     self.render_diagnostics(&mut p, text_cache, fonts, screen_w, screen_h)?;
                 }
+                Screen::SendLogs => {
+                    self.render_send_logs(&mut p, text_cache, fonts, screen_w, screen_h)?;
+                }
             }
             self.modal_tile = Some(p);
             updated.push(Tile::Modal);
@@ -1648,7 +1697,9 @@ impl App {
                 self.diagnostics_focused,
                 self.settings.log_level_override,
                 self.settings.stats_overlay,
+                self.settings.show_logs,
             )),
+            Screen::SendLogs => Some(ModalFocusKey::SendLogsButton(self.send_logs_focused)),
             // Neither has a single focused widget: the address form is one always-active
             // field, About is a scrolling document, and `PinLimit`'s one button is
             // always drawn focused directly in `render_pin_limit`.
@@ -1784,6 +1835,7 @@ impl App {
                             .dropdown
                             .as_ref()
                             .is_some_and(|dd| dd.row == self.diagnostics_focused);
+                        let target_on = rows.get(self.diagnostics_focused).is_some_and(|r| r.value == "On");
                         ui::render_focus_row_tile(
                             text_cache,
                             fonts,
@@ -1791,7 +1843,20 @@ impl App {
                             content.width(),
                             self.diagnostics_focused,
                             dropdown_open,
-                            self.toggle_frac(self.settings.stats_overlay),
+                            self.toggle_frac(target_on),
+                        )?
+                    }
+                    Screen::SendLogs => {
+                        let card = Self::send_logs_card_rect(screen_w, screen_h, fonts);
+                        let content = Self::send_logs_content_rect(card, fonts);
+                        let rect = ui::confirm_button_rect(content, self.send_logs_focused);
+                        let buttons = Self::send_logs_buttons();
+                        ui::render_confirm_button_tile(
+                            text_cache,
+                            fonts,
+                            &buttons[self.send_logs_focused],
+                            rect.width(),
+                            rect.height(),
                         )?
                     }
                     Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About | Screen::PinLimit => {
@@ -2154,7 +2219,7 @@ impl App {
                 }
             }
         }
-        if self.selected_host.is_some() && self.home_status.is_some() {
+        if self.home_status.is_some() {
             if let Some((_, p)) = &self.status_tile {
                 let line_h = fonts.label.height() + 6;
                 let box_h = 2 * line_h as u32 + 2 * STATUS_BG_PAD as u32;
@@ -2337,6 +2402,11 @@ impl App {
                     let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
                     let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT);
                     Some(ui::focus_row_rect(content, self.diagnostics_focused))
+                }
+                Screen::SendLogs => {
+                    let card = Self::send_logs_card_rect(screen_w, screen_h, fonts);
+                    let content = Self::send_logs_content_rect(card, fonts);
+                    Some(ui::confirm_button_rect(content, self.send_logs_focused))
                 }
                 Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About | Screen::PinLimit => None,
             };
