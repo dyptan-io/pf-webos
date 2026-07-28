@@ -60,6 +60,30 @@ pub const COLOR_RANGE_OPTIONS: [ColorRangeOverride; 3] = [
     ColorRangeOverride::Limited,
 ];
 
+/// Only Starfish honours the VUI full-range flag; NDL has no equivalent field,
+/// so the row is hidden there rather than shown disabled.
+pub fn color_range_row_shown(settings: &Settings) -> bool {
+    settings.video_backend == VideoBackend::Starfish
+}
+
+/// Live row count (vs. `SETTINGS_ROW_COUNT`, the maximum).
+pub fn settings_row_count(settings: &Settings) -> usize {
+    if color_range_row_shown(settings) {
+        SETTINGS_ROW_COUNT
+    } else {
+        SETTINGS_ROW_COUNT - 1
+    }
+}
+
+/// On-screen row position -> logical `ROW_*` index, shifted past Color range when hidden.
+pub fn settings_logical_row(settings: &Settings, display: usize) -> usize {
+    if !color_range_row_shown(settings) && display >= ROW_COLOR_RANGE {
+        display + 1
+    } else {
+        display
+    }
+}
+
 pub fn color_range_label(o: ColorRangeOverride) -> &'static str {
     match o {
         ColorRangeOverride::Auto => "Automatic",
@@ -101,7 +125,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
     } else {
         (settings.bitrate_kbps.saturating_sub(BITRATE_MIN_KBPS)) as f32 / (BITRATE_MAX_KBPS - BITRATE_MIN_KBPS) as f32
     };
-    vec![
+    let mut rows = vec![
         FocusRow {
             icon: ICON_MONITOR,
             label: "Resolution".into(),
@@ -147,7 +171,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             menu: None,
         },
         FocusRow {
-            icon: ICON_TV,
+            icon: ICON_MEMORY,
             label: "Video backend".into(),
             value: match settings.video_backend {
                 VideoBackend::Ndl => "NDL".into(),
@@ -159,7 +183,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             menu: None,
         },
         FocusRow {
-            icon: ICON_MONITOR,
+            icon: ICON_MOVIE,
             label: "Codec".into(),
             // A persisted choice that is no longer offered (AV1 after Starfish proved it
             // won't load this run) says so, rather than displaying a codec the session
@@ -184,7 +208,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             menu: None,
         },
         FocusRow {
-            icon: ICON_SUN,
+            icon: ICON_PALETTE,
             label: "Color range".into(),
             value: color_range_label(settings.color_range_override).into(),
             kind: RowKind::Dropdown,
@@ -197,7 +221,12 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
         // opening the screen — matching where the other clients surface it. Last row:
         // every other punktfunk client puts version + licences at the very bottom.
         FocusRow::action_with_value(ICON_INFO, "About & licenses", format!("v{VERSION}")),
-    ]
+    ];
+    // Mirrors `settings_logical_row`: drop rather than disable when hidden.
+    if !color_range_row_shown(settings) {
+        rows.remove(ROW_COLOR_RANGE);
+    }
+    rows
 }
 
 pub const LOG_LEVEL_OPTIONS: [LogLevelOverride; 4] = [
@@ -235,7 +264,7 @@ pub fn log_level_dropdown_current_index(level: LogLevelOverride) -> usize {
 pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
     vec![
         FocusRow {
-            icon: ICON_MONITOR,
+            icon: ICON_BUG,
             label: "Log level".into(),
             value: log_level_label(settings.log_level_override).into(),
             kind: RowKind::Dropdown,
@@ -244,7 +273,7 @@ pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
             menu: None,
         },
         FocusRow {
-            icon: ICON_SUN,
+            icon: ICON_CHART,
             label: "Stats overlay".into(),
             value: if settings.stats_overlay {
                 "On".into()

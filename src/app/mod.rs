@@ -973,7 +973,7 @@ impl App {
                 false
             }
             Screen::Settings => {
-                let (card, _content) = Self::settings_layout(screen_w, screen_h);
+                let (card, _content) = self.settings_layout(screen_w, screen_h);
                 self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
             }
             // Pairing/AddHost/Wake/ForgetHost are plain single-card modals with
@@ -1105,15 +1105,15 @@ impl App {
                 // whatever option `dd.focused` (moved by keyboard/remote only, same
                 // as everywhere else) already points at; unaffected by this change.
                 if self.dropdown.is_none() {
-                    let (_, content) = Self::settings_layout(screen_w, screen_h);
-                    let visible = Self::settings_visible_rows(screen_h);
+                    let (_, content) = self.settings_layout(screen_w, screen_h);
+                    let visible = self.settings_visible_rows(screen_h);
                     // `local` is relative to the visible window; `?` bails if the click
                     // hit empty space within the card — nothing to focus or confirm.
                     let local = (0..visible).find(|&i| {
                         let row_y = content.y() + i as i32 * (ui::SETTINGS_ROW_H as i32 + ui::SETTINGS_ROW_GAP);
                         Rect::new(content.x(), row_y, content.width(), ui::SETTINGS_ROW_H).contains_point((x, y))
                     })?;
-                    self.settings_focused = self.scroll.clamped(ui::SETTINGS_ROW_COUNT, visible) + local;
+                    self.settings_focused = self.scroll.clamped(ui::settings_row_count(&self.settings), visible) + local;
                 }
                 self.handle_settings_event(MenuEvent::Confirm, screen_h);
                 None
@@ -1659,7 +1659,7 @@ impl App {
             if stale {
                 let tile = match self.screen {
                     Screen::Settings => {
-                        let (_, content) = Self::settings_layout(screen_w, screen_h);
+                        let (_, content) = self.settings_layout(screen_w, screen_h);
                         let rows = ui::settings_rows(&self.settings);
                         let dropdown_open = self.dropdown.as_ref().is_some_and(|dd| dd.row == self.settings_focused);
                         let target_on = rows.get(self.settings_focused).is_some_and(|r| r.value == "On");
@@ -1811,8 +1811,9 @@ impl App {
                     (ui::log_level_dropdown_options(), content.width())
                 }
                 _ => {
-                    let (_, content) = Self::settings_layout(screen_w, screen_h);
-                    (ui::dropdown_options(&self.settings, dd.row), content.width())
+                    let (_, content) = self.settings_layout(screen_w, screen_h);
+                    let logical = ui::settings_logical_row(&self.settings, dd.row);
+                    (ui::dropdown_options(&self.settings, logical), content.width())
                 }
             };
 
@@ -1879,7 +1880,7 @@ impl App {
                         // Settings' whole row list always fits one tile — no windowing.
                         self.content_window = ui::ContentWindow {
                             start: 0,
-                            len: ui::SETTINGS_ROW_COUNT,
+                            len: ui::settings_row_count(&self.settings),
                         };
                         updated.push(Tile::ScrollContent(Screen::Settings));
                     }
@@ -1937,9 +1938,9 @@ impl App {
     ) -> Option<(usize, usize, Rect, Rect)> {
         match screen {
             Screen::Settings => {
-                let (card, content) = Self::settings_layout(screen_w, screen_h);
-                let visible = Self::settings_visible_rows(screen_h);
-                Some((ui::SETTINGS_ROW_COUNT, visible, card, content))
+                let (card, content) = self.settings_layout(screen_w, screen_h);
+                let visible = self.settings_visible_rows(screen_h);
+                Some((ui::settings_row_count(&self.settings), visible, card, content))
             }
             Screen::About => {
                 let card = ui::about_card_rect(screen_w, screen_h);
@@ -2264,7 +2265,7 @@ impl App {
                     let overlay_rect = Self::dropdown_overlay_rect(content, row_in_view);
                     let options_len = match screen {
                         Screen::Diagnostics => ui::LOG_LEVEL_OPTIONS.len(),
-                        _ => ui::dropdown_options(&self.settings, row).len(),
+                        _ => ui::dropdown_options(&self.settings, ui::settings_logical_row(&self.settings, row)).len(),
                     };
                     cmds.push(DrawCmd::Tex {
                         tile: Tile::DropdownOverlay,
