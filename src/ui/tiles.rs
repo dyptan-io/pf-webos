@@ -116,15 +116,28 @@ pub fn spinner_frame_at(phase: f32) -> (usize, &'static SpinnerFrame) {
     }
 }
 
-/// Transparent padding around the focus-ring tile (the ring's outer glow pass
-/// sits 6px out + stroke width).
-pub const FOCUS_RING_PAD: i32 = 12;
+/// Transparent padding around the focus-ring tile — must clear
+/// `FOCUS_GLOW_BLUR`'s blur radius or the glow clips against the canvas edge.
+pub const FOCUS_RING_PAD: i32 = 20;
 
 /// Focus-ring glow as shared tile (all cards same size). GPU scales + fades.
 pub fn render_focus_ring_tile(w: u32, h: u32) -> Painter {
     let pad = FOCUS_RING_PAD;
     let mut p = Painter::new(w + 2 * pad as u32, h + 2 * pad as u32);
     draw_focus_ring(&mut p, Rect::new(pad, pad, w, h), CARD_RADIUS);
+    p
+}
+
+/// Transparent padding around the card-outline tile — just enough for the
+/// stroke's own width/AA, not a blur radius like `FOCUS_RING_PAD`.
+pub const CARD_OUTLINE_PAD: i32 = 4;
+
+/// The focused card's crisp edge outline as a shared tile (all cards same
+/// size), composited on top of the card art — see `draw_card_outline`.
+pub fn render_card_outline_tile(w: u32, h: u32) -> Painter {
+    let pad = CARD_OUTLINE_PAD;
+    let mut p = Painter::new(w + 2 * pad as u32, h + 2 * pad as u32);
+    draw_card_outline(&mut p, Rect::new(pad, pad, w, h));
     p
 }
 

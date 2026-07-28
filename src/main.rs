@@ -728,7 +728,7 @@ mod real {
             }
             yellow_held = yellow_down;
             dirty |= app.drain_discovery();
-            dirty |= app.drain_art(display_mode.w as u32);
+            dirty |= app.drain_art();
             dirty |= app.drain_games();
             dirty |= app.drain_pairing();
             dirty |= app.drain_speed_test();
@@ -745,7 +745,7 @@ mod real {
                 hold.fired = true;
                 let still_there = matches!(app.screen, Screen::Home) && hold.focus == app.home_focus;
                 if still_there {
-                    app.toggle_focused_pin(&mut text_cache, fonts, display_mode.w as u32, display_mode.h as u32);
+                    app.toggle_focused_pin(display_mode.w as u32, display_mode.h as u32);
                 }
                 dirty = true;
             }
@@ -851,14 +851,14 @@ mod real {
                 compositor.drop_tile(tile);
             }
             for tile in updated {
-                match tile {
-                    Tile::SpinnerFrame(idx) => {
+                match &tile {
+                    &Tile::SpinnerFrame(idx) => {
                         if let Some(frame) = crate::ui::spinner_frame(idx) {
                             compositor.upload_raw(texture_creator, tile, frame.width, frame.height, &frame.pixels)?;
                         }
                     }
                     _ => {
-                        if let Some(pm) = app.tile_pixmap(tile) {
+                        if let Some(pm) = app.tile_pixmap(&tile) {
                             compositor.upload(texture_creator, tile, pm)?;
                         }
                     }

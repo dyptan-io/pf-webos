@@ -17,24 +17,26 @@ use sdl2::video::{Window, WindowContext};
 use crate::app::Screen;
 use crate::ui::Painter;
 
-/// Identity of one cached tile/texture. `Card` is keyed by grid index.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// Identity of one cached tile/texture. `Card` is keyed by pin id (a
+/// `GameEntry::id`, or `store::DESKTOP_PIN_ID`) rather than grid index, so a
+/// pin/unpin reorder — which only shuffles positions, not which games exist —
+/// never needs to re-upload a card's texture.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Tile {
     /// The focus-free sidebar strip (opaque, screen-height).
     Sidebar,
     /// The currently focused sidebar row (transparent padding + shadow).
     FocusRow,
-    /// One grid card, shadow included (transparent padding).
-    Card(usize),
+    /// One grid card, shadow included (transparent padding), keyed by pin id.
+    Card(String),
     /// The shared focus-ring glow (all cards are the same size).
     Ring,
+    /// The focused card's crisp edge outline, composited on top of the card
+    /// art (unlike `Ring`, which sits behind it). Shared, like `Ring`.
+    CardOutline,
     /// The pinned badge composited over the focused grid card's top-right
     /// corner, only when that card is pinned. Shared by every card, like `Ring`.
     PinBadge,
-    /// A pin/unpin toggle's moved card, snapshotted once and flown from its old
-    /// grid position to its new one — see `App::pin_move_anim`. Only one such
-    /// animation ever runs at a time, so there's no per-card key like `Card`.
-    PinMove,
     /// The active modal, full-screen with transparent surroundings.
     Modal,
     /// One modal's focused, zoom-animated widget (row, PIN digit, button, etc).
@@ -135,7 +137,7 @@ impl Compositor {
             let tex = creator
                 .create_texture_static(PixelFormatEnum::RGBA32, w, h)
                 .map_err(|e| anyhow::anyhow!("create texture {tile:?} {w}x{h}: {e}"))?;
-            self.textures.insert(tile, tex);
+            self.textures.insert(tile.clone(), tex);
         }
         let tex = self.textures.get_mut(&tile).expect("just inserted");
         let pitch = w as usize * 4;

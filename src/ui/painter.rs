@@ -4,7 +4,7 @@ use sdl2::rect::Rect;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use tiny_skia::{
-    Color as SkColor, FillRule, FilterQuality, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform,
+    Color as SkColor, FillRule, FilterQuality, IntSize, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform,
 };
 
 pub fn sk_color(c: Color) -> SkColor {
@@ -69,6 +69,22 @@ thread_local! {
     /// without `unsafe`/atomics since every `Painter` is built on the single
     /// SDL/render thread.
     static SHADOW_CACHE: RefCell<HashMap<ShadowKey, Pixmap>> = RefCell::new(HashMap::new());
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GlowKey {
+    w: u32,
+    h: u32,
+    radius: i32,
+    blur_bits: u32,
+    color: u32,
+}
+
+thread_local! {
+    /// Same cached-shape technique as `SHADOW_CACHE`, for the focused-card glow
+    /// (`fill_glow`) — one blurred colored shape shared by every card of the same
+    /// size, since focus only ever moves, it never changes card dimensions.
+    static GLOW_CACHE: RefCell<HashMap<GlowKey, Pixmap>> = RefCell::new(HashMap::new());
 }
 
 impl Painter {
@@ -192,6 +208,43 @@ impl Painter {
         });
     }
 
+    /// A soft colored glow centered on a rounded-rect shape — same cached-shape,
+    /// box-blurred technique as `fill_shadow`, just tinted and un-offset (a glow
+    /// surrounds its shape evenly; a shadow falls to one side).
+    pub fn fill_glow(&mut self, rect: Rect, radius: i32, color: Color, blur: f32) {
+        if rect.width() == 0 || rect.height() == 0 {
+            return;
+        }
+        let pad = blur.ceil().max(0.0) as i32 + 1;
+        let key = GlowKey {
+            w: rect.width(),
+            h: rect.height(),
+            radius,
+            blur_bits: blur.to_bits(),
+            color: u32::from_be_bytes([color.r, color.g, color.b, color.a]),
+        };
+        GLOW_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let shape = match cache.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let Some(shape) = render_glow_shape(rect.width(), rect.height(), radius, pad, blur, color) else {
+                        return;
+                    };
+                    e.insert(shape)
+                }
+            };
+            self.pixmap.draw_pixmap(
+                rect.x() - pad,
+                rect.y() - pad,
+                shape.as_ref(),
+                &PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
+        });
+    }
+
     /// Blurs the pixmap content already drawn within `rect`, in place (clamped to bounds).
     pub fn blur_rect(&mut self, rect: Rect, radius: usize) {
         if radius == 0 {
@@ -293,6 +346,37 @@ pub fn render_shadow_shape(w: u32, h: u32, radius: i32, pad: i32, blur: f32, opa
     }
 
     Some(shape)
+}
+
+/// Rasterizes a `(w, h)` rounded-rect shape filled with `color` and box-blurs it
+/// on all four channels (unlike `render_shadow_shape`, a colored glow can't
+/// reduce to a single alpha channel) — see `Painter::fill_glow`'s cache, keyed
+/// on everything that determines these pixels.
+pub fn render_glow_shape(w: u32, h: u32, radius: i32, pad: i32, blur: f32, color: Color) -> Option<Pixmap> {
+    let (pw, ph) = (w as i32 + 2 * pad, h as i32 + 2 * pad);
+    if pw <= 0 || ph <= 0 {
+        return None;
+    }
+    let mut shape = Pixmap::new(pw as u32, ph as u32)?;
+    let path = rounded_rect_path(pad as f32, pad as f32, w as f32, h as f32, radius as f32)?;
+    shape.fill_path(
+        &path,
+        &solid_paint(color),
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+
+    let (pwu, phu) = (pw as usize, ph as usize);
+    let mut data = shape.data().to_vec();
+    let mut scratch = vec![0u8; pwu * phu];
+    let radius_px = (blur / 2.0).round().max(1.0) as usize;
+    for _ in 0..3 {
+        for channel in 0..4 {
+            box_blur_channel(&mut data, &mut scratch, pwu, phu, channel, radius_px);
+        }
+    }
+    Pixmap::from_vec(data, IntSize::from_wh(pw as u32, ph as u32)?)
 }
 
 /// Separable box blur (horizontal pass into `tmp`, then vertical back into

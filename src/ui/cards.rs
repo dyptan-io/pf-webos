@@ -29,19 +29,30 @@ pub fn draw_card_shadow(painter: &mut Painter, rect: Rect, radius: i32) {
     painter.fill_shadow(rect, radius, 3.0, 5.0, SHADOW_BLUR, 0x60);
 }
 
-/// Focus ring: outline offset outward (moonlight-tv style). Used only for game grid selection.
+/// How far the focused-card glow's blur extends past the card edge — the
+/// pad `render_focus_ring_tile`'s canvas must leave for it not to clip.
+pub const FOCUS_GLOW_BLUR: f32 = 16.0;
+
+/// Soft glow behind a focused card — a blurred halo in the accent color,
+/// replacing the old hard double-outline ring for a more pleasant look. Same
+/// cached-shape technique as a drop shadow (`Painter::fill_glow`), so it costs
+/// one shared texture, reused by every card, not a per-frame re-blur. Rounded
+/// noticeably less than the card itself (`radius`) — a smaller pre-blur radius
+/// leaves more straight edge for the blur to soften, which reads as hugging
+/// the card's actual corners rather than blooming into a big round blob.
 pub fn draw_focus_ring(painter: &mut Painter, rect: Rect, radius: i32) {
-    let passes = [(3, 0xff), (6, 0x60)];
-    for (offset, alpha) in passes {
-        let ring = Rect::new(
-            rect.x() - offset,
-            rect.y() - offset,
-            rect.width() + 2 * offset as u32,
-            rect.height() + 2 * offset as u32,
-        );
-        let color = Color::RGBA(ACCENT_BRIGHT.r, ACCENT_BRIGHT.g, ACCENT_BRIGHT.b, alpha);
-        painter.stroke_rounded_rect(ring, radius + offset, color, 2.0);
-    }
+    painter.fill_glow(rect, radius / 2, ACCENT_BRIGHT, FOCUS_GLOW_BLUR);
+}
+
+/// A crisp thin outline right at the card's own edge — composited on top of
+/// the card art (unlike the soft glow behind it), so the transition from
+/// glow to art reads as a clean rectangle rather than a smudge. Square, not
+/// `CARD_RADIUS`-rounded: the art itself is a plain blit with square corners
+/// (see `draw_poster_card`), so a rounded outline would float visibly outside
+/// the actual art edge whenever a cover is loaded.
+pub fn draw_card_outline(painter: &mut Painter, rect: Rect) {
+    let color = Color::RGBA(ACCENT_BRIGHT.r, ACCENT_BRIGHT.g, ACCENT_BRIGHT.b, 0xd0);
+    painter.stroke_rounded_rect(rect, 0, color, 1.5);
 }
 
 /// Draw text-entry card (PIN/IP boxes); always visible, zoom when focused.

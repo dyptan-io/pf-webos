@@ -1,7 +1,7 @@
 //! Home screen: sidebar/grid navigation, host selection, game library fetch, launching.
 use super::*;
 use crate::store::{self};
-use crate::ui::{self, AddHostState, HostEntry, MenuEvent, TextCache};
+use crate::ui::{self, AddHostState, HostEntry, MenuEvent};
 use std::time::Instant;
 
 impl App {
@@ -51,14 +51,9 @@ impl App {
         self.grid_layout(columns).card_at(&self.games, idx)
     }
 
-    /// The pin id for whatever's at grid index `idx` — a `GameEntry::id`, or
-    /// `store::DESKTOP_PIN_ID` for "Desktop" — `None` for the padding after a
-    /// partial pinned row, or out of range.
+    /// The pin id for whatever's at grid index `idx` — see `GridLayout::pin_id_at`.
     pub(crate) fn pin_id_at_grid_idx(&self, idx: usize, columns: usize) -> Option<&str> {
-        match self.grid_card_at(idx, columns)? {
-            GridCard::Desktop => Some(store::DESKTOP_PIN_ID),
-            GridCard::Game(g) => Some(g.id.as_str()),
-        }
+        self.grid_layout(columns).pin_id_at(&self.games, idx)
     }
 
     /// Inverse of `pin_id_at_grid_idx`: grid index for a pin ID, keeping focus after reorder.
@@ -211,14 +206,9 @@ impl App {
         }
     }
 
-    /// Toggles focused card pin state; animates move if snapshot succeeds; opens pin-limit alert on overflow.
-    pub(crate) fn toggle_focused_pin(
-        &mut self,
-        text_cache: &mut TextCache,
-        fonts: &ui::Fonts,
-        screen_w: u32,
-        screen_h: u32,
-    ) {
+    /// Toggles focused card pin state and reorders the grid; opens pin-limit
+    /// alert on overflow.
+    pub(crate) fn toggle_focused_pin(&mut self, screen_w: u32, screen_h: u32) {
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
         let columns = ui::grid_columns(available_w);
         let HomeFocus::Grid(old_idx) = self.home_focus else {
@@ -235,14 +225,7 @@ impl App {
             self.open_pin_limit();
             return;
         }
-
-        // Snapshot the moved card's own look and grid position *before* the
-        // toggle below — both read pin state live from `known_hosts`, so
-        // toggling first would capture a Desktop card already in its new spot.
-        let (card_w, card_h) = self.card_size;
-        let (title, art) = self.grid_card_content(old_idx, columns);
-        let old_rect = self.unscrolled_card_rect(old_idx, columns, ui::SIDEBAR_W as i32, available_w);
-        let snapshot = ui::render_card_tile(text_cache, fonts, card_w, card_h, title, art).ok();
+        let was_pinned = known.is_pinned(&id);
 
         let Some(known) = self.selected_known_host_mut() else {
             return;
@@ -251,17 +234,34 @@ impl App {
         let _ = store::save_known_hosts(&self.known_hosts);
 
         self.reorder_games_by_pin();
-        // Rebuild the moved tiles quietly — unlike `drain_games`' fresh library
-        // load, this isn't a reason to hide the grid behind the spinner again
-        // (see `grid_reorder_dirty`'s docs).
-        self.grid_reorder_dirty = true;
         if let Some(new_idx) = self.grid_idx_for_pin_id(&id, columns) {
             self.home_focus = HomeFocus::Grid(new_idx);
             self.ensure_grid_visible(new_idx, columns, screen_w, screen_h);
-            if let Some(tile) = snapshot {
-                let new_rect = self.unscrolled_card_rect(new_idx, columns, ui::SIDEBAR_W as i32, available_w);
-                self.pin_move_tile = Some(tile);
-                self.pin_move_anim = Some((Instant::now(), old_rect, new_rect));
+        }
+        self.replay_reorder_pop(&id, was_pinned, columns);
+    }
+
+    /// Reorder's appear animation — the same "every card pops in together" look
+    /// as a fresh library reveal (see `grid_reveal_ready`), scoped to what
+    /// actually needs it: the newly pinned card alone (top row — an already-
+    /// pinned card that just changed order doesn't replay), plus every card in
+    /// the unpinned "rest" section, which reshuffles regardless of direction.
+    /// Card tiles themselves need no rebuilding either way — they're keyed by
+    /// pin id (see `card_tiles`), which reordering never changes.
+    fn replay_reorder_pop(&mut self, id: &str, was_pinned: bool, columns: usize) {
+        let now = Instant::now();
+        let layout = self.grid_layout(columns);
+        let rest_ids: Vec<String> = (layout.unpinned_start..layout.len(self.games.len()))
+            .filter_map(|idx| layout.pin_id_at(&self.games, idx).map(str::to_string))
+            .collect();
+        if !was_pinned {
+            if let Some(card) = self.card_tiles.get_mut(id) {
+                card.pop_since = Some(now);
+            }
+        }
+        for pin_id in rest_ids {
+            if let Some(card) = self.card_tiles.get_mut(&pin_id) {
+                card.pop_since = Some(now);
             }
         }
     }
@@ -313,19 +313,17 @@ impl App {
     }
 
     /// `grid_card_rect`, translated by `extra_row_gap` — everything except the
-    /// current scroll offset. Used for the pin-move animation's start/end rects,
-    /// which apply scroll themselves at draw time (see `App::pin_move_anim`).
+    /// current scroll offset; `scrolled_card_rect` applies that on top.
     pub(crate) fn unscrolled_card_rect(&self, idx: usize, columns: usize, grid_x: i32, available_w: u32) -> Rect {
         let r = ui::grid_card_rect(idx, columns, grid_x, available_w);
         let extra = self.extra_row_gap(idx, columns);
         Rect::new(r.x(), r.y() + extra, r.width(), r.height())
     }
 
-    /// Eased 0..=1 progress of grid index `idx`'s zoom-in (see
-    /// `CardTile::pop_since`) — 1.0, full size, for anything not animating.
-    pub(crate) fn card_pop_frac(&self, idx: usize) -> f32 {
-        let card = self.card_tiles.get(idx).and_then(|t| t.as_ref());
-        ui::anim_frac(card.and_then(|c| c.pop_since), CARD_POP)
+    /// Eased 0..=1 progress of pin id `id`'s zoom-in (see `CardTile::pop_since`)
+    /// — 1.0, full size, for anything not animating.
+    pub(crate) fn card_pop_frac(&self, id: &str) -> f32 {
+        ui::anim_frac(self.card_tiles.get(id).and_then(|c| c.pop_since), CARD_POP)
     }
 
     /// `unscrolled_card_rect`, translated by the current scroll offset — every

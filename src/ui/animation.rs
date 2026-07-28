@@ -40,10 +40,3 @@ pub fn pop_in_rect(base: Rect, frac: f32, shrink: f32) -> Rect {
         zoom_rect(base, 1.0 - frac, -shrink)
     }
 }
-
-/// Translate from start to end. Used for pin/unpin move animation.
-pub fn lerp_rect(start: Rect, end: Rect, frac: f32) -> Rect {
-    let x = start.x() as f32 + (end.x() - start.x()) as f32 * frac;
-    let y = start.y() as f32 + (end.y() - start.y()) as f32 * frac;
-    Rect::new(x as i32, y as i32, end.width(), end.height())
-}
