@@ -42,4 +42,4 @@ Set `TV_HOST` in `.env` (copy `.env.example`). Run with `task -s` to skip echo. 
 
 ## Code comments
 
-**Write only when necessary**: Do not write comments that repeat what the code obviously does. Write concise comments that explain WHY (non-obvious invariants, platform workarounds, subtle constraints).
+**Write only when necessary**: Do not write comments that repeat what the code obviously does. Write concise comments that explain WHY (non-obvious invariants, platform workarounds, subtle constraints) only when necessary.

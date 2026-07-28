@@ -322,6 +322,10 @@ pub struct App {
     pub settings_focused: usize,
     /// Scroll state for overflowing modal content.
     pub(crate) scroll: ui::ScrollWindow,
+    /// Settings' scroll position, stashed while About borrows `scroll` for its
+    /// own document — restored on return so the focus highlight doesn't end up
+    /// outside the visible rows.
+    pub(crate) settings_scroll: ui::ScrollWindow,
     /// Window slice of baked About document.
     pub(crate) content_window: ui::ContentWindow,
     pub dropdown: Option<DropdownState>,
@@ -570,6 +574,7 @@ impl App {
             settings_writer: store::SettingsWriter::spawn(),
             settings_focused: 0,
             scroll: ui::ScrollWindow::new(),
+            settings_scroll: ui::ScrollWindow::new(),
             content_window: ui::ContentWindow::new(),
             dropdown: None,
             host_menu_index: None,
@@ -805,6 +810,7 @@ impl App {
             // The screen size/fonts are irrelevant for a Back, so a zero probe is fine.
             Screen::About => {
                 self.screen = Screen::Settings;
+                self.scroll = self.settings_scroll;
                 None
             }
             Screen::PinLimit => {
@@ -1205,12 +1211,15 @@ impl App {
 
         // Every screen transition triggers close-fade for the left screen and
         // open-fade for the entered screen, centralized here rather than at each
-        // dispatch site.
+        // dispatch site. Close-fade only on returning to Home: a direct
+        // modal-to-modal jump (Settings <-> About) shares `modal_tile`, which
+        // this same block rebuilds for the entered screen below — a close-fade
+        // there would replay a tile that already holds the new screen's content.
         let screen_changed = self.screen != self.last_screen;
         if screen_changed {
             let left = self.last_screen;
             self.last_screen = self.screen;
-            if !matches!(left, Screen::Home) {
+            if !matches!(left, Screen::Home) && matches!(self.screen, Screen::Home) {
                 self.modal_fade.close(left);
             }
             if !matches!(self.screen, Screen::Home) {

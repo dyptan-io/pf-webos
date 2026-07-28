@@ -9,6 +9,8 @@ impl App {
         if self.about_lines.is_empty() {
             self.about_lines = ui::about_lines();
         }
+        // `scroll` is shared with Settings' row list — stash it (see `settings_scroll`).
+        self.settings_scroll = self.scroll;
         self.scroll = ui::ScrollWindow::new();
         self.content_window = ui::ContentWindow::new();
         self.screen = Screen::About;
@@ -33,7 +35,10 @@ impl App {
                 self.scroll.page(page_step, true, total, visible);
             }
             // Return to Settings (not Home) to preserve settings context
-            MenuEvent::Back | MenuEvent::Confirm => self.screen = Screen::Settings,
+            MenuEvent::Back | MenuEvent::Confirm => {
+                self.screen = Screen::Settings;
+                self.scroll = self.settings_scroll;
+            }
             MenuEvent::Secondary => {}
         }
     }

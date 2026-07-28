@@ -5,6 +5,7 @@ use std::time::Instant;
 
 /// Scroll offset bookkeeping. `total`/`visible` passed per-call (not stored)
 /// to avoid stale copies disagreeing with caller's geometry.
+#[derive(Clone, Copy)]
 pub struct ScrollWindow {
     pub offset: usize,
     /// When `offset` last changed (scrollbar shows then fades).

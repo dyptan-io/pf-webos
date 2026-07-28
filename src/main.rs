@@ -1028,9 +1028,7 @@ mod real {
             // Gamepad path to the disconnect dialog (see `GUIDE_HOLD`): `Some(t)` =
             // Guide pressed at `t` and still held; cleared on release or once it fires.
             let mut guide_held_since: Option<Instant> = None;
-            // Set when "Disconnect" is confirmed — the actual `break` waits for
-            // `disconnect`'s close-fade to finish first (see the render block below),
-            // same as any other dismiss, instead of cutting the dialog off mid-animation.
+            // Delayed outcome: waits for close-fade to finish.
             let mut pending_outcome: Option<StreamOutcome> = None;
             let outcome = 'running: loop {
                 if QUIT_REQUESTED.load(Ordering::Relaxed) {
@@ -1042,8 +1040,6 @@ mod real {
                     use sdl2::event::Event;
                     match event {
                         Event::Quit { .. } => {
-                            // As deliberate a stop as long-press-Back below — tear the
-                            // virtual display down now instead of lingering for a reconnect.
                             connected.client.disconnect_quit();
                             break 'running StreamOutcome::Quit;
                         }
