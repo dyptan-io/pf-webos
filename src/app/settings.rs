@@ -15,8 +15,10 @@ impl App {
         // closed (by picking an option or backing out) — it's a modal overlay on
         // top of the settings row list.
         if let Some(dd) = self.dropdown.as_mut() {
+            // `dd.row` is the display position; setting lookups need the logical row.
             let row = dd.row;
-            let len = ui::dropdown_options(&self.settings, row).len().max(1);
+            let logical = ui::settings_logical_row(&self.settings, row);
+            let len = ui::dropdown_options(&self.settings, logical).len().max(1);
             match ev {
                 MenuEvent::Up => dd.focused = if dd.focused == 0 { len - 1 } else { dd.focused - 1 },
                 MenuEvent::Down => dd.focused = (dd.focused + 1) % len,
@@ -25,7 +27,7 @@ impl App {
                     // Not persisted here — `MenuEvent::Back` below (leaving the
                     // whole Settings screen) saves once for every change made
                     // during this visit, not per-row.
-                    ui::apply_dropdown_choice(&mut self.settings, row, choice);
+                    ui::apply_dropdown_choice(&mut self.settings, logical, choice);
                     self.dropdown_fade.close((row, dd.focused));
                     self.dropdown = None;
                 }
@@ -37,7 +39,7 @@ impl App {
             }
             return;
         }
-        let total = ui::SETTINGS_ROW_COUNT;
+        let total = ui::settings_row_count(&self.settings);
         match ev {
             // No wraparound here (unlike most other row lists) — wrapping a scrolled
             // list would silently jump the scroll position across the whole card.
@@ -57,7 +59,7 @@ impl App {
             }
             MenuEvent::Left => self.apply_setting_adjust(self.settings_focused, false),
             MenuEvent::Right => self.apply_setting_adjust(self.settings_focused, true),
-            MenuEvent::Confirm => match self.settings_focused {
+            MenuEvent::Confirm => match ui::settings_logical_row(&self.settings, self.settings_focused) {
                 // Not a setting — a link out to the About screen (see `ui::ROW_ABOUT`).
                 // Settings are saved on the way out so the visit's changes aren't lost
                 // behind the navigation.
@@ -69,20 +71,22 @@ impl App {
                     self.settings_writer.save(self.settings);
                     self.open_diagnostics();
                 }
-                ui::ROW_RESOLUTION
+                logical @ (ui::ROW_RESOLUTION
                 | ui::ROW_FRAMERATE
                 | ui::ROW_VIDEO_BACKEND
                 | ui::ROW_CODEC
                 | ui::ROW_AUDIO
-                | ui::ROW_COLOR_RANGE => {
-                    let focused = ui::dropdown_current_index(&self.settings, self.settings_focused);
+                | ui::ROW_COLOR_RANGE) => {
+                    let focused = ui::dropdown_current_index(&self.settings, logical);
+                    // `row` is the display position (what the overlay is drawn against);
+                    // the logical row is recovered on lookup via `settings_logical_row`.
                     self.dropdown = Some(DropdownState {
                         row: self.settings_focused,
                         focused,
                     });
                     self.dropdown_fade.reopen();
                 }
-                row => self.apply_setting_adjust(row, true),
+                _ => self.apply_setting_adjust(self.settings_focused, true),
             },
             // Leaving Settings (Back key or the modal's close-X, both funnel
             // through `App::back`) — save once for whatever changed during
@@ -99,7 +103,9 @@ impl App {
     }
 
     /// Adjusts row in memory; persisted on `Back` (not per-keystroke). Starts `switch_anim` for toggle slides.
-    pub(crate) fn apply_setting_adjust(&mut self, row: usize, forward: bool) {
+    /// `display_row` is the on-screen position; resolved to a logical `ROW_*` first.
+    pub(crate) fn apply_setting_adjust(&mut self, display_row: usize, forward: bool) {
+        let row = ui::settings_logical_row(&self.settings, display_row);
         let toggled_from = match row {
             ui::ROW_HDR => Some(self.settings.hdr_enabled),
             _ => None,
@@ -110,24 +116,25 @@ impl App {
             }
         }
     }
-    /// Settings rows visible on screen (1080p card scrolls if needed).
-    pub(crate) fn settings_visible_rows(screen_h: u32) -> usize {
+    /// Settings rows visible on screen (1080p card scrolls if needed). Capped at
+    /// the live row count so a hidden row (Color range on NDL) leaves no empty slot.
+    pub(crate) fn settings_visible_rows(&self, screen_h: u32) -> usize {
         let stride = ui::SETTINGS_ROW_H + ui::SETTINGS_ROW_GAP as u32;
         // 200 header/footer padding (mirrors `settings_layout`) + 160 edge margin.
         let available = screen_h.saturating_sub(200 + 160);
-        ((available / stride) as usize).clamp(1, ui::SETTINGS_ROW_COUNT)
+        ((available / stride) as usize).clamp(1, ui::settings_row_count(&self.settings))
     }
 
     /// Scrolls `settings_focused` into view; updates scroll indicator.
     pub(crate) fn scroll_settings_into_view(&mut self, screen_h: u32) {
-        let visible = Self::settings_visible_rows(screen_h);
+        let visible = self.settings_visible_rows(screen_h);
         self.scroll
-            .scroll_into_view(self.settings_focused, ui::SETTINGS_ROW_COUNT, visible);
+            .scroll_into_view(self.settings_focused, ui::settings_row_count(&self.settings), visible);
     }
 
     /// Settings card and content rects (shared by render and hit-test).
-    pub(crate) fn settings_layout(screen_w: u32, screen_h: u32) -> (Rect, Rect) {
-        let visible = Self::settings_visible_rows(screen_h);
+    pub(crate) fn settings_layout(&self, screen_w: u32, screen_h: u32) -> (Rect, Rect) {
+        let visible = self.settings_visible_rows(screen_h);
         let content_h = visible as u32 * (ui::SETTINGS_ROW_H + ui::SETTINGS_ROW_GAP as u32);
         // Room for the title/divider above and the high-bitrate caution below.
         let card_h = content_h + 200;
@@ -149,7 +156,7 @@ impl App {
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
-        let (card, content) = Self::settings_layout(screen_w, screen_h);
+        let (card, content) = self.settings_layout(screen_w, screen_h);
         self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
         ui::draw_text(
             painter,
