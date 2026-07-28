@@ -192,6 +192,47 @@ impl Painter {
         });
     }
 
+    /// Blurs the pixmap content already drawn within `rect`, in place (clamped to bounds).
+    pub fn blur_rect(&mut self, rect: Rect, radius: usize) {
+        if radius == 0 {
+            return;
+        }
+        let (pw, ph) = (self.pixmap.width() as i32, self.pixmap.height() as i32);
+        let x0 = rect.x().max(0);
+        let y0 = rect.y().max(0);
+        let x1 = (rect.x() + rect.width() as i32).min(pw);
+        let y1 = (rect.y() + rect.height() as i32).min(ph);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
+        let row_bytes = w * 4;
+        let src_stride = pw as usize * 4;
+        let data = self.pixmap.data_mut();
+
+        let mut region = vec![0u8; row_bytes * h];
+        for y in 0..h {
+            let src = (y0 as usize + y) * src_stride + x0 as usize * 4;
+            region[y * row_bytes..(y + 1) * row_bytes].copy_from_slice(&data[src..src + row_bytes]);
+        }
+
+        let mut scratch = vec![0u8; w * h];
+        for channel in 0..4 {
+            box_blur_channel(&mut region, &mut scratch, w, h, channel, radius);
+        }
+
+        for y in 0..h {
+            let dst = (y0 as usize + y) * src_stride + x0 as usize * 4;
+            data[dst..dst + row_bytes].copy_from_slice(&region[y * row_bytes..(y + 1) * row_bytes]);
+        }
+    }
+
+    /// Frosted-glass panel: blurs whatever's under `rect`, then tints it.
+    pub fn fill_frosted_rect(&mut self, rect: Rect, radius: i32, tint: Color, blur_radius: usize) {
+        self.blur_rect(rect, blur_radius);
+        self.fill_rounded_rect(rect, radius, tint);
+    }
+
     pub fn draw_pixmap(&mut self, x: i32, y: i32, src: &Pixmap) {
         self.pixmap
             .draw_pixmap(x, y, src.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
@@ -267,6 +308,29 @@ pub fn box_blur(pixels: &mut [u8], w: usize, h: usize, radius: usize) {
     }
     for x in 0..w {
         blur_1d(h, radius, |y| tmp[y * w + x], |y, v| pixels[y * w + x] = v);
+    }
+}
+
+/// `box_blur`, but for one channel of a packed RGBA buffer, with a caller-supplied scratch buffer.
+pub fn box_blur_channel(region: &mut [u8], scratch: &mut [u8], w: usize, h: usize, channel: usize, radius: usize) {
+    if radius == 0 {
+        return;
+    }
+    for y in 0..h {
+        blur_1d(
+            w,
+            radius,
+            |x| region[(y * w + x) * 4 + channel],
+            |x, v| scratch[y * w + x] = v,
+        );
+    }
+    for x in 0..w {
+        blur_1d(
+            h,
+            radius,
+            |y| scratch[y * w + x],
+            |y, v| region[(y * w + x) * 4 + channel] = v,
+        );
     }
 }
 

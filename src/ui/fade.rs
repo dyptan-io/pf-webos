@@ -29,16 +29,12 @@ impl<T: Copy + PartialEq> ModalFade<T> {
         }
     }
 
-    /// Starts (or restarts) the open fade. Leaves an in-flight close alone — call
-    /// `cancel_closing` too if this open should pre-empt it (see its docs).
+    /// Starts (or restarts) the open fade. Leaves an in-flight close alone.
     pub fn open(&mut self) {
         self.open_since = Some(Instant::now());
     }
 
-    /// `open`, but unconditionally cancels any in-flight close — for callers with a
-    /// single overlay instance, where a fresh open always means the same thing as
-    /// whatever was closing (the disconnect dialog; `App` uses `cancel_closing`
-    /// instead, since a different `Screen` closing behind a new one must keep fading).
+    /// `open`, but cancels any in-flight close (for single-overlay callers).
     pub fn reopen(&mut self) {
         self.open();
         self.closing = None;
@@ -49,18 +45,14 @@ impl<T: Copy + PartialEq> ModalFade<T> {
         self.closing = Some((Instant::now(), payload));
     }
 
-    /// Cancels an in-flight close only if it's fading out `payload` — call from an
-    /// open site so reopening the very thing that was still closing doesn't leave a
-    /// stale close-fade fighting the new open (see `ModalFade`'s docs on `T`).
+    /// Cancels an in-flight close only if it's fading out `payload`.
     pub fn cancel_closing(&mut self, payload: T) {
         if self.closing.is_some_and(|(_, p)| p == payload) {
             self.closing = None;
         }
     }
 
-    /// `(alpha 0..1, payload)` while a close is in flight — `None` once it's run its
-    /// course (or none was started), meaning the caller should fall back to whatever
-    /// live state it actually has.
+    /// Returns `(alpha, payload)` while a close is in flight; `None` otherwise.
     pub fn closing_frame(&self, dur: Duration) -> Option<(f32, T)> {
         let (t, payload) = self.closing.filter(|(t, _)| t.elapsed() < dur)?;
         Some((1.0 - anim_frac(Some(t), dur), payload))
@@ -71,9 +63,7 @@ impl<T: Copy + PartialEq> ModalFade<T> {
         anim_frac(self.open_since, dur)
     }
 
-    /// Advances the clock; reports whether either fade is still in flight. The tick an
-    /// animation expires on still reports `true`, so its final (fully open/closed)
-    /// frame gets drawn once before this goes quiet.
+    /// Advances the clock; returns whether either fade is still in flight.
     pub fn tick(&mut self, dur: Duration) -> bool {
         let mut animating = false;
         if let Some(t) = self.open_since {

@@ -144,13 +144,8 @@ pub fn draw_poster_card(
         }
     }
 
-    let strip = Rect::new(
-        r.x() + 2,
-        r.y() + r.height() as i32 - strip_h,
-        r.width().saturating_sub(4),
-        strip_h.max(0) as u32,
-    );
-    painter.fill_rect(strip, Color::RGBA(0x00, 0x00, 0x00, 0x70));
+    let strip = Rect::new(r.x(), r.y() + r.height() as i32 - strip_h, r.width(), strip_h.max(0) as u32);
+    painter.fill_frosted_rect(strip, 0, Color::RGBA(0x00, 0x00, 0x00, 0x68), 6);
     let label = ellipsize(fonts.value, title, strip.width().saturating_sub(16));
     draw_text(
         painter,

@@ -62,12 +62,11 @@ const SPINNER_MAX_WAIT: Duration = Duration::from_millis(900);
 pub(crate) const CARD_GROWTH: f32 = 0.028;
 pub(crate) const LAUNCH_GROWTH: f32 = 3.5;
 const PIN_BADGE_MARGIN: i32 = 10;
-pub(crate) const PIN_MOVE_ANIM: Duration = Duration::from_millis(380);
+pub(crate) const PIN_MOVE_ANIM: Duration = Duration::from_millis(300);
 pub(crate) const CARD_POP: Duration = Duration::from_millis(300);
 pub(crate) const CARD_POP_SHRINK: f32 = 0.14;
 pub(crate) const MODAL_FADE: Duration = Duration::from_millis(200);
-/// Subtler than `CARD_POP_SHRINK` (the modal covers most of the screen) — enough scale
-/// to read as motion where the front-loaded fade alone (`ease`) barely does.
+/// Scale during open — subtle, since fade dominates for full-screen modal.
 pub(crate) const MODAL_POP_SHRINK: f32 = 0.05;
 pub(crate) const SCROLL_INDICATOR_HOLD: Duration = Duration::from_millis(700);
 pub(crate) const SCROLL_INDICATOR_FADE: Duration = Duration::from_millis(350);
@@ -652,11 +651,7 @@ impl App {
         // harmless if the spinner is drawn before this thread finishes, redundant work
         // (never a race) if it finishes first.
         std::thread::spawn(ui::spinner_frames);
-        // Same warm-up shape: `supports_av1`'s `OnceLock` byte-scans the platform decoder
-        // plugin on first call, which otherwise lands inline in the first Settings open.
-        std::thread::spawn(|| {
-            crate::device::supports_av1();
-        });
+        std::thread::spawn(crate::device::supports_av1);
         app
     }
 
@@ -763,8 +758,7 @@ impl App {
     /// through here so the policy lives in one place) and a modal's close (X)
     /// button click (`handle_mouse_click`'s `hover_close` branch below).
     pub fn back(&mut self) -> Option<ConnectTarget> {
-        let from = self.screen;
-        let result = match self.screen {
+        match self.screen {
             // Home has nothing to "back out" of (it's the root screen) — Back is a
             // no-op. (It used to be a shortcut straight to Settings, but that made
             // Back in Settings feel broken: close Settings, press Back again, and
@@ -817,14 +811,7 @@ impl App {
                 self.handle_pin_limit_event(MenuEvent::Back);
                 None
             }
-        };
-        // Any modal-to-something Back (including a sub-nav like WakeSettings ->
-        // HostMenu or About -> Settings, not just landing on Home) fades the modal
-        // just left the same way. `from` is never `Home` here — `back` is a no-op there.
-        if self.screen != from {
-            self.modal_fade.close(from);
         }
-        result
     }
     /// Advances every live animation one tick — the eased scroll, the focus pop,
     /// the modal fade — and reports whether anything is still moving (the main
@@ -1216,18 +1203,20 @@ impl App {
         let (card_w, card_h) = ui::grid_card_size(available_w, columns);
         self.card_size = (card_w, card_h);
 
-        // Screen transitions are detected centrally here (rather than at every
-        // `self.screen = ...` site): opening a modal starts its fade-in and
-        // forces its first rasterize.
+        // Every screen transition triggers close-fade for the left screen and
+        // open-fade for the entered screen, centralized here rather than at each
+        // dispatch site.
         let screen_changed = self.screen != self.last_screen;
         if screen_changed {
+            let left = self.last_screen;
             self.last_screen = self.screen;
+            if !matches!(left, Screen::Home) {
+                self.modal_fade.close(left);
+            }
             if !matches!(self.screen, Screen::Home) {
                 self.modal_fade.open();
                 // Reopening the same screen before its close-fade finished — the new
-                // open wins. A close-fade for a *different* screen (e.g. WakeSettings
-                // closing while HostMenu opens behind it) is left alone: `draw_list`
-                // prioritizes it until it expires, then this open is already done.
+                // open wins. A close-fade for a *different* screen is left alone.
                 self.modal_fade.cancel_closing(self.screen);
             }
         }
@@ -2121,10 +2110,6 @@ impl App {
             });
             let dy = ((1.0 - m) * 26.0) as i32;
             let modal_base = Rect::new(0, dy, screen_w, screen_h);
-            // Open also grows in (same pop-in technique as grid cards) — the fade
-            // alone is barely visible since `ease` is front-loaded. Close stays a
-            // plain fade/slide, no scale — already-visible content shrinking away
-            // reads fine without it.
             let modal_dst = if closing_frame.is_some() {
                 modal_base
             } else {

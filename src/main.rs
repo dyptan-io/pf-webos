@@ -192,6 +192,65 @@ mod real {
         fired: bool,
     }
 
+    /// In-stream disconnect dialog — same open/close fade as pre-stream modals.
+    struct DisconnectDialog {
+        focus: Option<usize>,
+        fade: crate::ui::ModalFade<usize>,
+        /// Re-render only on open; focused button is its own tile.
+        shell_dirty: bool,
+        focus_dirty: bool,
+        focus_anim: Option<Instant>,
+        tc: crate::ui::TextCache,
+    }
+
+    impl DisconnectDialog {
+        fn new() -> Self {
+            Self {
+                focus: None,
+                fade: crate::ui::ModalFade::new(),
+                shell_dirty: false,
+                focus_dirty: false,
+                focus_anim: None,
+                tc: crate::ui::TextCache::new(),
+            }
+        }
+
+        fn is_open(&self) -> bool {
+            self.focus.is_some()
+        }
+
+        /// Opens (or reopens) with `focus` focused — the Back key or a Guide hold.
+        fn open(&mut self, focus: usize) {
+            self.focus = Some(focus);
+            self.fade.reopen();
+            self.shell_dirty = true;
+            self.focus_dirty = true;
+            self.focus_anim = Some(Instant::now());
+        }
+
+        /// Moves focus between the two buttons (Left/Right while open).
+        fn set_focus(&mut self, focus: usize) {
+            self.focus = Some(focus);
+            self.focus_dirty = true;
+            self.focus_anim = Some(Instant::now());
+        }
+
+        /// Starts close-fade with the focused button.
+        fn dismiss(&mut self) {
+            if let Some(focus) = self.focus.take() {
+                self.fade.close(focus);
+            }
+        }
+
+        /// Returns `(focus, alpha, is_closing)` to draw, or `None` if nothing to show.
+        fn frame(&self, dur: Duration) -> Option<(usize, f32, bool)> {
+            if let Some((alpha, focus)) = self.fade.closing_frame(dur) {
+                return Some((focus, alpha, true));
+            }
+            self.focus.map(|focus| (focus, self.fade.open_alpha(dur), false))
+        }
+    }
+
     /// webOS ships a real on-screen keyboard, and the SDL fork this app links wires it
     /// up (`SDL_waylandwebos_osk.c` in `webosbrew/SDL-webOS`, driving `zwp_text_input_v3`)
     /// — but only for an app that actually asks for text input. Nothing here ever called
@@ -325,9 +384,6 @@ mod real {
         fonts: &crate::ui::Fonts,
     ) -> EventAction {
         let (w, h) = (display_mode.w as u32, display_mode.h as u32);
-        // Every screen's Back funnels through `App::back` (not just Home's), so its
-        // close-fade capture (`modal_closing`) sees every dismissal, not just a
-        // close-button click. `back` dispatches to the same per-screen handler below.
         if menu_ev == MenuEvent::Back {
             return if app.back().is_some() {
                 EventAction::Launch
@@ -967,24 +1023,15 @@ mod real {
             let mut overlay_prev_frames: u64 = 0;
             let mut overlay_prev_bytes: u64 = 0;
             let mut overlay_prev_at = Instant::now();
-            // None = dialog not shown; Some(0) = shown, "Disconnect" focused;
-            // Some(1) = shown, "Cancel" focused (default on open — safer).
-            let mut disconnect_dialog: Option<usize> = None;
-            // Same open/close fade every pre-stream modal uses (`ui::ModalFade`) —
-            // payload is the focused button, so a dismiss keeps rendering the right
-            // one while it fades out after `disconnect_dialog` has gone back to `None`.
-            let mut disconnect_fade: crate::ui::ModalFade<usize> = crate::ui::ModalFade::new();
-            // The shell (card/title/both buttons unfocused) only needs
-            // re-rendering when the dialog opens; the focused button is its
-            // own small tile (same shell/focus-tile split as every pre-stream
-            // modal) so toggling focus never re-rasterizes the shell.
-            let mut disconnect_shell_dirty = false;
-            let mut disconnect_focus_dirty = false;
-            let mut disconnect_focus_anim: Option<Instant> = None;
-            let mut disconnect_tc = crate::ui::TextCache::new();
+            // 0 = "Disconnect" focused, 1 = "Cancel" (default on open — safer).
+            let mut disconnect = DisconnectDialog::new();
             // Gamepad path to the disconnect dialog (see `GUIDE_HOLD`): `Some(t)` =
             // Guide pressed at `t` and still held; cleared on release or once it fires.
             let mut guide_held_since: Option<Instant> = None;
+            // Set when "Disconnect" is confirmed — the actual `break` waits for
+            // `disconnect`'s close-fade to finish first (see the render block below),
+            // same as any other dismiss, instead of cutting the dialog off mid-animation.
+            let mut pending_outcome: Option<StreamOutcome> = None;
             let outcome = 'running: loop {
                 if QUIT_REQUESTED.load(Ordering::Relaxed) {
                     tracing::warn!("SIGTERM/SIGINT received — disconnecting before exit");
@@ -1015,8 +1062,8 @@ mod real {
                         // Dialog open: navigate it only, don't forward input to the
                         // host. Non-repeat keys/fresh controller presses only, so the
                         // held Back that opened it doesn't also dismiss it.
-                        _ if disconnect_dialog.is_some() => {
-                            let focus = disconnect_dialog.expect("guarded by is_some above");
+                        _ if disconnect.is_open() => {
+                            let focus = disconnect.focus.expect("guarded by is_open above");
                             let nav = match &event {
                                 Event::KeyDown {
                                     keycode: Some(k),
@@ -1028,22 +1075,16 @@ mod real {
                             };
                             match nav {
                                 Some(MenuEvent::Left) | Some(MenuEvent::Right) => {
-                                    disconnect_dialog = Some(1 - focus);
-                                    disconnect_focus_dirty = true;
-                                    disconnect_focus_anim = Some(Instant::now());
+                                    disconnect.set_focus(1 - focus);
                                 }
                                 Some(MenuEvent::Confirm) if focus == 0 => {
                                     tracing::info!("back — disconnecting to menu");
                                     connected.client.disconnect_quit();
-                                    break 'running StreamOutcome::ReturnToMenu;
+                                    disconnect.dismiss();
+                                    pending_outcome = Some(StreamOutcome::ReturnToMenu);
                                 }
                                 Some(MenuEvent::Confirm) | Some(MenuEvent::Back) => {
-                                    disconnect_fade.close(focus);
-                                    disconnect_dialog = None;
-                                    // The double-buffer wipe (same as a stats-overlay
-                                    // toggle-off) happens once the close-fade actually
-                                    // finishes — see the render block below — not here,
-                                    // or it would erase the dialog before it fades out.
+                                    disconnect.dismiss();
                                     overlay_last = None;
                                 }
                                 _ => {}
@@ -1064,11 +1105,7 @@ mod real {
                             repeat: false,
                             ..
                         } if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) => {
-                            disconnect_dialog = Some(1);
-                            disconnect_fade.reopen();
-                            disconnect_shell_dirty = true;
-                            disconnect_focus_dirty = true;
-                            disconnect_focus_anim = Some(Instant::now());
+                            disconnect.open(1);
                         }
                         Event::KeyUp { scancode: Some(sc), .. } => {
                             if let Some(ev) = keyboard::key_event(sc, false) {
@@ -1128,15 +1165,11 @@ mod real {
                 }
                 // Guide held long enough (and the dialog isn't already up) —
                 // open it, then disarm so it fires once per hold.
-                if disconnect_dialog.is_none() {
+                if !disconnect.is_open() {
                     if let Some(since) = guide_held_since {
                         if since.elapsed() >= GUIDE_HOLD {
                             guide_held_since = None;
-                            disconnect_dialog = Some(1);
-                            disconnect_fade.reopen();
-                            disconnect_shell_dirty = true;
-                            disconnect_focus_dirty = true;
-                            disconnect_focus_anim = Some(Instant::now());
+                            disconnect.open(1);
                         }
                     }
                 }
@@ -1144,7 +1177,7 @@ mod real {
                 // (not via the event queue — see `ui::webos_green_button_down`'s docs
                 // on why the safe SDL2 event API can't see this key at all). Skipped
                 // while the disconnect dialog owns input, same as scancode forwarding.
-                let green_down = disconnect_dialog.is_none() && crate::ui::webos_green_button_down();
+                let green_down = !disconnect.is_open() && crate::ui::webos_green_button_down();
                 if green_down && !green_held {
                     stats_enabled = !stats_enabled;
                     if stats_enabled {
@@ -1161,32 +1194,25 @@ mod real {
                     }
                 }
                 green_held = green_down;
-                // Render the disconnect dialog when open or still closing — same
-                // open/close fade as every pre-stream modal (`ui::ModalFade`,
-                // `MODAL_FADE`/`MODAL_POP_SHRINK`). The card floats over the live
-                // video (transparent surroundings); the shell re-rasterizes only
-                // when the dialog opens, the focused button only on focus change —
-                // but scrim + tiles recomposite every tick (double buffered — a
-                // single present would leave the other buffer stale), so the
-                // fade/pop/zoom all play smoothly.
-                let dialog_frame = match disconnect_fade.closing_frame(MODAL_FADE) {
-                    Some((alpha, focus)) => Some((focus, alpha, true)),
-                    None => disconnect_dialog.map(|focus| (focus, disconnect_fade.open_alpha(MODAL_FADE), false)),
-                };
+                // Captured once: reused below to skip the stats overlay for exactly the
+                // ticks the dialog block itself owns the canvas — that's wider than
+                // `is_open()`, since a dismissed dialog still draws (fading out) for a
+                // few more ticks after `focus` has already gone back to `None`.
+                let dialog_frame = disconnect.frame(MODAL_FADE);
                 if let Some((focus, m, closing)) = dialog_frame {
                     let full = sdl2::rect::Rect::new(0, 0, display_mode.w as u32, display_mode.h as u32);
-                    if disconnect_shell_dirty {
-                        disconnect_shell_dirty = false;
+                    if disconnect.shell_dirty {
+                        disconnect.shell_dirty = false;
                         let shell = crate::ui::render_disconnect_dialog_shell(full.width(), full.height(), &fonts)?;
                         compositor.upload(&texture_creator, Tile::DisconnectDialog, &shell)?;
                     }
                     let (_, content) = crate::ui::disconnect_dialog_layout(full.width(), full.height(), fonts.label);
                     let btn_rect = crate::ui::confirm_button_rect(content, focus);
-                    if disconnect_focus_dirty {
-                        disconnect_focus_dirty = false;
+                    if disconnect.focus_dirty {
+                        disconnect.focus_dirty = false;
                         let buttons = crate::ui::disconnect_dialog_buttons();
                         let tile = crate::ui::render_confirm_button_tile(
-                            &mut disconnect_tc,
+                            &mut disconnect.tc,
                             &fonts,
                             &buttons[focus],
                             btn_rect.width(),
@@ -1206,7 +1232,7 @@ mod real {
                         btn_rect.width() + 2 * pad as u32,
                         btn_rect.height() + 2 * pad as u32,
                     );
-                    let f = crate::ui::anim_frac(disconnect_focus_anim, crate::ui::FOCUS_POP);
+                    let f = crate::ui::anim_frac(disconnect.focus_anim, crate::ui::FOCUS_POP);
                     // Open grows in like every other modal; close stays a plain fade,
                     // no scale — see `app.rs`'s `draw_list` for why.
                     let shell_dst = if closing {
@@ -1237,12 +1263,16 @@ mod real {
                         ],
                     )?;
                     canvas.present();
-                } else if disconnect_fade.tick(MODAL_FADE) {
-                    // Fade just finished this tick (and no dialog is open) — one-time
-                    // wipe so the last frame doesn't stick over the video, same as a
-                    // stats-overlay toggle-off. `tick` already advanced the clock above
-                    // via `closing_frame`/`open_alpha`; this only catches the instant it
-                    // goes quiet.
+                } else if disconnect.fade.tick(MODAL_FADE) {
+                    // The close-fade (Cancel/Back, or a confirmed Disconnect) just
+                    // finished this tick. A confirmed Disconnect breaks out of the
+                    // loop now — the fade already played, and the pre-stream UI takes
+                    // the canvas over next, so there's nothing to wipe for that case.
+                    if let Some(outcome) = pending_outcome.take() {
+                        break 'running outcome;
+                    }
+                    // Otherwise (Cancel/Back): wipe the last frame so it doesn't stick
+                    // over the video, same as a stats-overlay toggle-off.
                     canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
                     canvas.clear();
                     canvas.present();
@@ -1254,10 +1284,10 @@ mod real {
                 if let Some(player) = &mut audio_player {
                     session::pump_audio_once(&connected.client, player);
                 }
-                // Skipped while the dialog is open — its own redraw above already
-                // owns the canvas this tick.
+                // Skipped whenever the dialog block drew this tick (open or still
+                // fading out) — its own redraw above already owns the canvas.
                 if stats_enabled
-                    && disconnect_dialog.is_none()
+                    && dialog_frame.is_none()
                     && overlay_last.is_none_or(|t| t.elapsed() >= Duration::from_millis(500))
                 {
                     overlay_last = Some(Instant::now());
