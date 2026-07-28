@@ -9,6 +9,8 @@ impl App {
     /// bottom of Settings (`ui::ROW_DIAGNOSTICS`), not a hidden/remote-button menu.
     pub(crate) fn open_diagnostics(&mut self) {
         self.diagnostics_focused = 0;
+        // Stash scroll so Back can restore it; Diagnostics doesn't use it.
+        self.settings_scroll = self.scroll;
         self.screen = Screen::Diagnostics;
     }
 
