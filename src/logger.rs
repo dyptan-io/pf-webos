@@ -202,6 +202,20 @@ impl<S> Filter<S> for RingBufferFilter {
         RING_CAPTURE_ACTIVE.load(Ordering::Relaxed)
             && level_ordinal(*metadata.level()) <= RING_LEVEL.load(Ordering::Relaxed)
     }
+
+    /// Keep the hint bounded to the current ring/file level (`set_level_override`).
+    /// An unbounded filter lowers tracing's global static max-level, forcing
+    /// extra per-event callsite checks (down to `trace!`) instead of cached `never`.
+    /// `handle.modify` in `set_level_override` refreshes interest when this changes.
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(match RING_LEVEL.load(Ordering::Relaxed) {
+            1 => LevelFilter::ERROR,
+            2 => LevelFilter::WARN,
+            3 => LevelFilter::INFO,
+            4 => LevelFilter::DEBUG,
+            _ => LevelFilter::TRACE,
+        })
+    }
 }
 
 /// In-memory ring for log-tail overlay (independent of file/TCP sink).
