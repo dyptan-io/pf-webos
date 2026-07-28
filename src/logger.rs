@@ -1,6 +1,6 @@
 //! Routes `tracing` to TCP (dev machine) or log file. Destination from argv[1] at
 //! runtime (webOS SAM passes launch `params` as JSON argv), not compile-time.
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -45,29 +45,46 @@ fn telemetry_level() -> tracing::Level {
         .unwrap_or(tracing::Level::DEBUG)
 }
 
+const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+
 /// Log destination (file or TCP). Non-blocking dispatch prevents blocking video pump.
 enum Sink {
-    File(std::fs::File),
+    File { file: std::fs::File, written: u64 },
     Tcp(TcpStream),
 }
 
 impl Write for Sink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
-            Self::File(f) => f.write(buf),
+            Self::File { file, written } => {
+                let n = file.write(buf)?;
+                *written += n as u64;
+                Ok(n)
+            }
             Self::Tcp(s) => s.write(buf),
         }
     }
 
+    /// `tracing_appender`'s worker thread flushes after each drained batch, not per
+    /// line — so the wrap check runs once per batch instead of once per write.
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
-            Self::File(f) => f.flush(),
+            Self::File { file, written } => {
+                file.flush()?;
+                if *written >= MAX_LOG_BYTES {
+                    file.set_len(0)?;
+                    file.seek(std::io::SeekFrom::Start(0))?;
+                    *written = 0;
+                }
+                Ok(())
+            }
             Self::Tcp(s) => s.flush(),
         }
     }
 }
 
-/// Truncate log file per run (was unbounded). Info-only to bound disk usage without telemetry.
+/// Truncated on every launch, then wiped and restarted mid-run if it hits
+/// `MAX_LOG_BYTES` — bounds disk usage regardless of session length.
 fn open_file(app_dir: &Path) -> Result<Sink> {
     let path = app_dir.join(format!("punktfunk-webos-{VERSION}.log"));
     let file = std::fs::OpenOptions::new()
@@ -76,7 +93,7 @@ fn open_file(app_dir: &Path) -> Result<Sink> {
         .truncate(true)
         .open(&path)
         .with_context(|| format!("open log file {}", path.display()))?;
-    Ok(Sink::File(file))
+    Ok(Sink::File { file, written: 0 })
 }
 
 /// Open TCP or file sink; fall back to file if unreachable (dev convenience, not critical).
