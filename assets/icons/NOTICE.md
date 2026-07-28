@@ -25,13 +25,19 @@ the full font is ~357 KB covering 2000+ icons; this subset is ~2.0 KB:
 | `ICON_INFO`                       | `info`                | `U+E88E`  |
 | `ICON_MORE`                       | `more_horiz`          | `U+E5D3`  |
 | `ICON_PIN`                        | `push_pin`            | `U+F10D`  |
+| `ICON_WRENCH`                     | `build`               | `U+E869`  |
+| `ICON_BUG`                        | `bug_report`          | `U+E868`  |
+| `ICON_CHART`                      | `show_chart`          | `U+E6E1`  |
+| `ICON_PALETTE`                    | `palette`             | `U+E40A`  |
+| `ICON_MEMORY`                     | `memory`              | `U+E322`  |
+| `ICON_MOVIE`                      | `movie`               | `U+E02C`  |
 
 To regenerate after adding/changing an icon, re-run against a fresh copy of the upstream
 font with the updated codepoint list:
 
 ```
 pyftsubset MaterialIcons-Regular.ttf \
-  --unicodes=U+E333,U+E897,U+E145,U+E5CD,U+E8B8,U+E8B5,U+E202,U+E430,U+E5C5,U+EF5B,U+E8AC,U+E872,U+E3C9,U+E88E,U+E5D3,U+F10D \
+  --unicodes=U+E333,U+E897,U+E145,U+E5CD,U+E8B8,U+E8B5,U+E202,U+E430,U+E5C5,U+EF5B,U+E8AC,U+E872,U+E3C9,U+E88E,U+E5D3,U+F10D,U+E869,U+E868,U+E6E1,U+E40A,U+E322,U+E02C \
   --output-file=MaterialIcons-subset.ttf \
   --no-hinting --desubroutinize --name-IDs="" --notdef-glyph --notdef-outline
 ```
