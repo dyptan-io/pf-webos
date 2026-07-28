@@ -33,3 +33,4 @@ pub const ICON_EDIT: &str = "\u{E3C9}";
 pub const ICON_INFO: &str = "\u{E88E}";
 pub const ICON_MORE: &str = "\u{E5D3}";
 pub const ICON_PIN: &str = "\u{F10D}";
+pub const ICON_WRENCH: &str = "\u{E869}";

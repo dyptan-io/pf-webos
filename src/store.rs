@@ -182,6 +182,31 @@ pub enum CodecPref {
     Av1,
 }
 
+/// Override for the VUI `video_full_range_flag` sent to the decoder — see
+/// `session::connect`'s colour-info splice. `Auto` forwards the host's own
+/// `ColorInfo.full_range` unchanged; `Full`/`Limited` force it, to test whether the
+/// panel's own default (rather than what the stream signals) is what's washing out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorRangeOverride {
+    #[default]
+    Auto,
+    Full,
+    Limited,
+}
+
+/// Override for the on-device log verbosity, settable live from the Diagnostics
+/// screen — see `logger::set_level_override`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevelOverride {
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
 /// Stream settings: resolution/framerate/bitrate/HDR/video-backend.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
@@ -215,6 +240,20 @@ pub struct Settings {
     /// pinned at stereo. `#[serde(default …)]` so an existing settings.json loads as 2.
     #[serde(default = "default_audio_channels")]
     pub audio_channels: u8,
+    /// Forces the VUI range flag sent to the decoder regardless of what the host
+    /// signals — see [`ColorRangeOverride`]. Debug aid for the washed-out-colour
+    /// investigation; takes effect on the next connect.
+    #[serde(default)]
+    pub color_range_override: ColorRangeOverride,
+    /// Forces on-device log verbosity — see [`LogLevelOverride`]. Applied live via
+    /// `logger::set_level_override` as soon as it's changed in Diagnostics.
+    /// Deliberately session-only, not persisted: `#[serde(skip)]` means a saved
+    /// `settings.json` never carries a stale verbosity choice into a later,
+    /// non-telemetry launch — every fresh start is `Info` unless
+    /// `logger::launch_level_override` (`TELEMETRY_LEVEL`) says otherwise, applied
+    /// in `load_settings` after deserializing (see there).
+    #[serde(skip)]
+    pub log_level_override: LogLevelOverride,
 }
 
 fn default_audio_channels() -> u8 {
@@ -237,6 +276,8 @@ impl Default for Settings {
             video_backend: VideoBackend::Ndl,
             codec: CodecPref::Auto,
             audio_channels: default_audio_channels(),
+            color_range_override: ColorRangeOverride::Auto,
+            log_level_override: LogLevelOverride::Info,
         }
     }
 }
@@ -246,10 +287,18 @@ fn settings_path() -> PathBuf {
 }
 
 pub fn load_settings() -> Settings {
-    std::fs::read_to_string(settings_path())
+    let mut settings: Settings = std::fs::read_to_string(settings_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // `task deploy TELEMETRY=...` dev convenience: TELEMETRY_LEVEL picks the level
+    // this launch starts at (and what Diagnostics displays), overriding whatever
+    // was last persisted — see `logger::launch_level_override`. Absent, the
+    // persisted/default value (Info) stands.
+    if let Some(level) = crate::logger::launch_level_override() {
+        settings.log_level_override = level;
+    }
+    settings
 }
 
 pub fn save_settings(settings: &Settings) -> Result<()> {

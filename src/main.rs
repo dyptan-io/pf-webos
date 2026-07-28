@@ -39,7 +39,8 @@ mod wol;
 
 #[cfg(target_os = "linux")]
 mod real {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    use std::sync::{Mutex, OnceLock, PoisonError};
     use std::time::{Duration, Instant};
 
     use anyhow::{Context, Result};
@@ -101,6 +102,7 @@ mod real {
                     display_h,
                     settings.video_backend,
                     settings.codec,
+                    settings.color_range_override,
                 )
             })
             .context("spawn connect thread")
@@ -123,6 +125,64 @@ mod real {
         }
     }
 
+    /// Yellow-button log overlay state (process-lifetime, all screens).
+    /// Explicit discriminants: `cycle_log_overlay` stores `next as u8` and
+    /// `log_overlay_state` decodes it — the two must agree.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum LogOverlayState {
+        Off = 0,
+        /// Live tail — updates every refresh.
+        Live = 1,
+        /// Frozen snapshot for stable reading.
+        Frozen = 2,
+    }
+
+    static LOG_OVERLAY_STATE: AtomicU8 = AtomicU8::new(0);
+    static FROZEN_LOG_LINES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+    fn frozen_log_lines() -> &'static Mutex<Vec<String>> {
+        FROZEN_LOG_LINES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    fn log_overlay_state() -> LogOverlayState {
+        match LOG_OVERLAY_STATE.load(Ordering::Relaxed) {
+            1 => LogOverlayState::Live,
+            2 => LogOverlayState::Frozen,
+            _ => LogOverlayState::Off,
+        }
+    }
+
+    /// Yellow button cycle Off → Live → Frozen → Off; capture on/off at boundaries.
+    fn cycle_log_overlay() {
+        let next = match log_overlay_state() {
+            LogOverlayState::Off => {
+                crate::logger::set_ring_capture(true);
+                LogOverlayState::Live
+            }
+            LogOverlayState::Live => {
+                let mut snap = frozen_log_lines().lock().unwrap_or_else(PoisonError::into_inner);
+                *snap = crate::logger::recent_lines(crate::ui::LOG_OVERLAY_LINES);
+                LogOverlayState::Frozen
+            }
+            LogOverlayState::Frozen => {
+                crate::logger::set_ring_capture(false);
+                LogOverlayState::Off
+            }
+        };
+        LOG_OVERLAY_STATE.store(next as u8, Ordering::Relaxed);
+    }
+
+    /// Current lines to render; None if Off.
+    fn log_overlay_lines() -> Option<Vec<String>> {
+        match log_overlay_state() {
+            LogOverlayState::Off => None,
+            LogOverlayState::Live => Some(crate::logger::recent_lines(crate::ui::LOG_OVERLAY_LINES)),
+            LogOverlayState::Frozen => {
+                Some(frozen_log_lines().lock().unwrap_or_else(PoisonError::into_inner).clone())
+            }
+        }
+    }
+
     pub fn run() -> Result<()> {
         install_signal_handlers();
         // Streams to a dev machine when `task deploy TELEMETRY=...` passed a
@@ -134,13 +194,7 @@ mod real {
         // video-pump thread) on a slow disk or a dev machine not draining its
         // telemetry listener fast enough.
         let app_dir = store::app_dir();
-        let (writer, _guard) = crate::logger::init(&app_dir).context("init logger")?;
-        tracing_subscriber::fmt()
-            .with_writer(writer)
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(crate::logger::resolved_level())
-            .init();
+        let _guard = crate::logger::init_subscriber(&app_dir).context("init logger")?;
         tracing::info!("punktfunk-webos starting");
         // Logged before anything else can fail: a report from a model neither developer
         // owns is only actionable if the log says what it was running on.
@@ -408,6 +462,7 @@ mod real {
             Screen::EditHost => app.handle_edit_host_event(menu_ev),
             Screen::About => app.handle_about_event(menu_ev, w, h, fonts),
             Screen::PinLimit => app.handle_pin_limit_event(menu_ev),
+            Screen::Diagnostics => app.handle_diagnostics_event(menu_ev),
         }
         EventAction::Next
     }
@@ -650,12 +705,25 @@ mod real {
         // running by then, so this just carries its handle out of the loop for
         // `run_inner` to join once the launch animation finishes.
         let mut connect_handle: Option<ConnectOutcome> = None;
+        // Yellow button log overlay works here too (see streaming loop).
+        let mut yellow_held = false;
+        let mut log_overlay_last: Option<Instant> = None;
+        // Cache last overlay tile size for idle frames (no re-render if size stable).
+        let mut log_overlay_dims: Option<(u32, u32)> = None;
         'ui: loop {
             let tick_start = Instant::now();
             if QUIT_REQUESTED.load(Ordering::Relaxed) {
                 tracing::warn!("SIGTERM/SIGINT received during UI");
                 return Ok(None);
             }
+            // Raw scancode poll (not SDL2 event); edge-detected like streaming loop.
+            let yellow_down = crate::ui::webos_yellow_button_down();
+            if yellow_down && !yellow_held {
+                cycle_log_overlay();
+                dirty = true; // force an immediate redraw with the new state
+                log_overlay_last = None;
+            }
+            yellow_held = yellow_down;
             dirty |= app.drain_discovery();
             dirty |= app.drain_art(display_mode.w as u32);
             dirty |= app.drain_games();
@@ -665,8 +733,7 @@ mod real {
             dirty |= app.drain_reachability();
             dirty |= app.tick_wake();
             dirty |= app.drain_launch_check();
-            // Hold-to-pin fires here rather than on release, so the pin lands the
-            // instant `PIN_HOLD` elapses and the user can see it before letting go.
+            // Fire on hold elapsed, not release, so user sees it before letting go.
             if let Some(hold) = input
                 .pin_held
                 .as_mut()
@@ -679,9 +746,7 @@ mod real {
                 }
                 dirty = true;
             }
-            // Reachability check passed — start connecting now, in parallel with the
-            // launch zoom/fade, so a fast handshake finishes before the animation
-            // does rather than only starting once it's done.
+            // Start connect in parallel with launch anim (fast handshake finishes first).
             if app.launch_ready.is_some() && connect_handle.is_none() {
                 app.launch_anim = Some(Instant::now());
                 dirty = true;
@@ -733,20 +798,14 @@ mod real {
                     EventAction::Launch => break 'ui,
                 }
             }
-            // Track whether the panel is actually up, not merely whether text input was
-            // requested: webOS lets the user dismiss the keyboard while the field stays
-            // focused, and the address card drops back down when that happens. A change
-            // is `dirty`, since it moves the card.
+            // Track actual keyboard state (user can dismiss while field focused; moves card).
             let keyboard_shown = text_input.is_screen_keyboard_shown(canvas.window());
             if keyboard_shown != app.keyboard_shown {
                 app.keyboard_shown = keyboard_shown;
                 dirty = true;
                 tracing::info!("on-screen keyboard shown: {keyboard_shown}");
             }
-            // Ask for (or dismiss) the webOS on-screen keyboard as the screen changes —
-            // see `text_input_screen`. Edge-triggered: `SDL_StartTextInput` is not
-            // idempotent-free on this backend (it re-shows the panel), so calling it
-            // every tick would fight the user dismissing it.
+            // Toggle text input (edge-triggered; SDL doesn't tolerate repeated calls).
             let wants_text = text_input_screen(app.screen);
             if wants_text != text_input_active {
                 text_input_active = wants_text;
@@ -756,24 +815,19 @@ mod real {
                 } else {
                     text_input.stop();
                 }
-                // Both values, deliberately: `HasScreenKeyboardSupport` and
-                // `IsScreenKeyboardShown` are separate SDL video-driver callbacks, and a
-                // driver can implement the first without the second — in which case SDL
-                // returns false unconditionally and the address card would never lift.
-                // Logging the pair makes that distinguishable on-device in one run.
+                // Log both; separate SDL callbacks — some drivers implement only one.
                 tracing::info!(
                     "text input requested: {wants_text} (keyboard shown: {})",
                     text_input.is_screen_keyboard_shown(canvas.window())
                 );
             }
-            // Four reasons to render another frame:
-            // 1. `dirty`         — an event or drain changed state (tiles need re-rasterizing).
-            // 2. `tick_animations` — a scroll/pop/fade clock is still running.
-            // 3. `tiles_pending` — card window still filling in a few tiles at a time.
-            // 4. `!grid_reveal_ready` — spinner is animating (one frame per ~33 ms tick).
-            // The 16ms sleep when none of these holds keeps the SoC idle between frames.
+            // Five reasons to render: dirty, animations running, tiles pending,
+            // spinner animating, or log overlay due for refresh (~2Hz).
+            // 16ms sleep when none holds keeps SoC idle.
             let animating = app.tick_animations() || app.tiles_pending || !app.grid_reveal_ready;
-            if !dirty && !animating {
+            let log_overlay_due = log_overlay_state() != LogOverlayState::Off
+                && log_overlay_last.is_none_or(|t| t.elapsed() >= Duration::from_millis(500));
+            if !dirty && !animating && !log_overlay_due {
                 let elapsed = tick_start.elapsed();
                 if elapsed < TICK_BUDGET {
                     std::thread::sleep(TICK_BUDGET - elapsed);
@@ -789,9 +843,7 @@ mod real {
                 display_mode.h as u32,
                 content_dirty,
             )?;
-            // Release textures for cards scrolled out of the keep window before uploading
-            // new ones, so a long scroll frees memory in the same frame it claims more
-            // rather than peaking at both.
+            // Free old textures before uploading new (reduce peak memory during scroll).
             for tile in std::mem::take(&mut app.evicted_tiles) {
                 compositor.drop_tile(tile);
             }
@@ -809,7 +861,36 @@ mod real {
                     }
                 }
             }
-            let cmds = app.draw_list(display_mode.w as u32, display_mode.h as u32, fonts);
+            let mut cmds = app.draw_list(display_mode.w as u32, display_mode.h as u32, fonts);
+            // Appended into the same single draw list/present as the rest of the
+            // screen — this loop has no separate overlay pass (see the streaming
+            // loop's `Tile::LogOverlay` handling for why that one differs).
+            //
+            // Text is only re-rendered/re-uploaded when `log_overlay_due` (~2Hz) —
+            // otherwise every animation tick (scroll, focus pop, hover) while the
+            // overlay is on would re-rasterize and re-upload it on every single
+            // frame instead of twice a second, which is what made the menu feel
+            // laggy with the overlay enabled (the streaming loop already gated
+            // this correctly; this one didn't).
+            if let Some(lines) = log_overlay_lines() {
+                if log_overlay_due {
+                    log_overlay_last = Some(Instant::now());
+                    match crate::ui::render_log_overlay_tile(fonts.caption, display_mode.w as u32, &lines) {
+                        Ok(tile) => {
+                            log_overlay_dims = Some((tile.width(), tile.height()));
+                            compositor.upload(texture_creator, Tile::LogOverlay, &tile)?;
+                        }
+                        Err(e) => tracing::warn!("log overlay render failed: {e:#}"),
+                    }
+                }
+                if let Some((tw, th)) = log_overlay_dims {
+                    cmds.push(DrawCmd::Tex {
+                        tile: Tile::LogOverlay,
+                        dst: sdl2::rect::Rect::new(0, display_mode.h - th as i32, tw, th),
+                        alpha: 0xff,
+                    });
+                }
+            }
             canvas.set_blend_mode(sdl2::render::BlendMode::None);
             canvas.set_draw_color(crate::ui::BG);
             canvas.clear();
@@ -1019,6 +1100,7 @@ mod real {
             // of this stream only, without writing back to `settings`.
             let mut stats_enabled = settings.stats_overlay;
             let mut green_held = false;
+            let mut yellow_held = false;
             let mut overlay_last: Option<Instant> = None;
             let mut overlay_prev_frames: u64 = 0;
             let mut overlay_prev_bytes: u64 = 0;
@@ -1190,6 +1272,25 @@ mod real {
                     }
                 }
                 green_held = green_down;
+                // Yellow button: log-tail overlay Off -> Live -> Frozen -> Off, same
+                // edge-detect technique as Green above (raw scancode poll — see
+                // `ui::webos_yellow_button_down`'s docs). Works on every screen, not
+                // just while streaming — see the matching handling in `run_ui_flow`.
+                let yellow_down = !disconnect.is_open() && crate::ui::webos_yellow_button_down();
+                if yellow_down && !yellow_held {
+                    cycle_log_overlay();
+                    overlay_last = None; // force an immediate redraw with the new state
+                    if log_overlay_state() == LogOverlayState::Off && !stats_enabled {
+                        // Same "nothing else clears this canvas" wipe as Green's
+                        // toggle-off above — otherwise the last overlay frame sticks.
+                        canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
+                        canvas.clear();
+                        canvas.present();
+                        canvas.clear();
+                        canvas.present();
+                    }
+                }
+                yellow_held = yellow_down;
                 // Captured once: reused below to skip the stats overlay for exactly the
                 // ticks the dialog block itself owns the canvas — that's wider than
                 // `is_open()`, since a dismissed dialog still draws (fading out) for a
@@ -1244,7 +1345,12 @@ mod real {
                         &[
                             DrawCmd::Fill {
                                 rect: full,
-                                color: sdl2::pixels::Color::RGBA(0, 0, 0, (f32::from(crate::ui::MODAL_SCRIM.a) * m) as u8),
+                                color: sdl2::pixels::Color::RGBA(
+                                    0,
+                                    0,
+                                    0,
+                                    (f32::from(crate::ui::MODAL_SCRIM.a) * m) as u8,
+                                ),
                             },
                             DrawCmd::Tex {
                                 tile: Tile::DisconnectDialog,
@@ -1281,80 +1387,101 @@ mod real {
                     session::pump_audio_once(&connected.client, player);
                 }
                 // Skipped whenever the dialog block drew this tick (open or still
-                // fading out) — its own redraw above already owns the canvas.
-                if stats_enabled
+                // fading out) — its own redraw above already owns the canvas. Stats
+                // and the log overlay share one clear/execute/present: each does its
+                // own `canvas.clear()` otherwise, which would erase whichever tile the
+                // other just drew.
+                let log_lines = log_overlay_lines();
+                if (stats_enabled || log_lines.is_some())
                     && dialog_frame.is_none()
                     && overlay_last.is_none_or(|t| t.elapsed() >= Duration::from_millis(500))
                 {
                     overlay_last = Some(Instant::now());
-                    let frames = connected.stats.frames.load(Ordering::Relaxed);
-                    let bytes = connected.stats.bytes.load(Ordering::Relaxed);
-                    let dt = overlay_prev_at.elapsed().as_secs_f32().max(0.001);
-                    let fps = (frames.saturating_sub(overlay_prev_frames)) as f32 / dt;
-                    // Measured (received bytes/dt), vs. `resolved_bitrate_kbps` (negotiated).
-                    let actual_kbps = (bytes.saturating_sub(overlay_prev_bytes)) as f32 * 8.0 / 1000.0 / dt;
-                    overlay_prev_frames = frames;
-                    overlay_prev_bytes = bytes;
-                    overlay_prev_at = Instant::now();
-                    let mode = connected.client.mode();
-                    let feed_ms = connected.stats.feed_us.load(Ordering::Relaxed) as f32 / 1000.0;
-                    let holding = connected.stats.holding.load(Ordering::Relaxed);
-                    let lines = vec![
-                        format!(
-                            "{}x{}@{} {}{}",
-                            mode.width,
-                            mode.height,
-                            mode.refresh_hz,
-                            session::codec_name(connected.client.codec),
-                            if connected.client.color.is_hdr() { " HDR" } else { "" },
-                        ),
-                        format!("Video {fps:.1} fps · {frames} frames"),
-                        {
-                            // `backlog` is NDL's own undecoded/unpresented depth: rising
-                            // means the decoder is behind, flat-near-zero while the
-                            // picture stutters means the problem is upstream of it.
-                            let backlog = connected.stats.render_backlog.load(Ordering::Relaxed);
-                            let backlog = if backlog < 0 {
-                                "n/a".to_string()
-                            } else {
-                                backlog.to_string()
-                            };
+                    let mut cmds: Vec<DrawCmd> = Vec::new();
+                    if stats_enabled {
+                        let frames = connected.stats.frames.load(Ordering::Relaxed);
+                        let bytes = connected.stats.bytes.load(Ordering::Relaxed);
+                        let dt = overlay_prev_at.elapsed().as_secs_f32().max(0.001);
+                        let fps = (frames.saturating_sub(overlay_prev_frames)) as f32 / dt;
+                        // Measured (received bytes/dt), vs. `resolved_bitrate_kbps` (negotiated).
+                        let actual_kbps = (bytes.saturating_sub(overlay_prev_bytes)) as f32 * 8.0 / 1000.0 / dt;
+                        overlay_prev_frames = frames;
+                        overlay_prev_bytes = bytes;
+                        overlay_prev_at = Instant::now();
+                        let mode = connected.client.mode();
+                        let feed_ms = connected.stats.feed_us.load(Ordering::Relaxed) as f32 / 1000.0;
+                        let holding = connected.stats.holding.load(Ordering::Relaxed);
+                        let lines = vec![
                             format!(
-                                "Drop {} · FEC {} · hold {} · buf {backlog}",
-                                connected.client.frames_dropped(),
-                                connected.client.fec_recovered_shards(),
-                                if holding { "yes" } else { "no" },
-                            )
-                        },
-                        format!(
-                            "Feed {feed_ms:.1} ms · {:.0}/{} Mbps",
-                            actual_kbps / 1000.0,
-                            connected.client.resolved_bitrate_kbps / 1000,
-                        ),
-                    ];
-                    match crate::ui::render_stats_overlay_tile(
-                        fonts.value,
-                        fonts.caption,
-                        &lines,
-                        "Press green button to hide this overlay",
-                    ) {
-                        Ok(tile) => {
-                            let (tw, th) = (tile.width(), tile.height());
-                            compositor.upload(&texture_creator, Tile::StatsOverlay, &tile)?;
-                            canvas.set_blend_mode(sdl2::render::BlendMode::None);
-                            canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
-                            canvas.clear();
-                            compositor.execute(
-                                &mut canvas,
-                                &[DrawCmd::Tex {
+                                "{}x{}@{} {}{}",
+                                mode.width,
+                                mode.height,
+                                mode.refresh_hz,
+                                session::codec_name(connected.client.codec),
+                                if connected.client.color.is_hdr() { " HDR" } else { "" },
+                            ),
+                            format!("Video {fps:.1} fps · {frames} frames"),
+                            {
+                                // `backlog` is NDL's own undecoded/unpresented depth: rising
+                                // means the decoder is behind, flat-near-zero while the
+                                // picture stutters means the problem is upstream of it.
+                                let backlog = connected.stats.render_backlog.load(Ordering::Relaxed);
+                                let backlog = if backlog < 0 {
+                                    "n/a".to_string()
+                                } else {
+                                    backlog.to_string()
+                                };
+                                format!(
+                                    "Drop {} · FEC {} · hold {} · buf {backlog}",
+                                    connected.client.frames_dropped(),
+                                    connected.client.fec_recovered_shards(),
+                                    if holding { "yes" } else { "no" },
+                                )
+                            },
+                            format!(
+                                "Feed {feed_ms:.1} ms · {:.0}/{} Mbps",
+                                actual_kbps / 1000.0,
+                                connected.client.resolved_bitrate_kbps / 1000,
+                            ),
+                        ];
+                        match crate::ui::render_stats_overlay_tile(
+                            fonts.value,
+                            fonts.caption,
+                            &lines,
+                            "Press green button to hide this overlay",
+                        ) {
+                            Ok(tile) => {
+                                let (tw, th) = (tile.width(), tile.height());
+                                compositor.upload(&texture_creator, Tile::StatsOverlay, &tile)?;
+                                cmds.push(DrawCmd::Tex {
                                     tile: Tile::StatsOverlay,
                                     dst: sdl2::rect::Rect::new(display_mode.w - tw as i32 - 24, 24, tw, th),
                                     alpha: 0xff,
-                                }],
-                            )?;
-                            canvas.present();
+                                });
+                            }
+                            Err(e) => tracing::warn!("stats overlay render failed: {e:#}"),
                         }
-                        Err(e) => tracing::warn!("stats overlay render failed: {e:#}"),
+                    }
+                    if let Some(lines) = log_lines {
+                        match crate::ui::render_log_overlay_tile(fonts.caption, display_mode.w as u32, &lines) {
+                            Ok(tile) => {
+                                let (tw, th) = (tile.width(), tile.height());
+                                compositor.upload(&texture_creator, Tile::LogOverlay, &tile)?;
+                                cmds.push(DrawCmd::Tex {
+                                    tile: Tile::LogOverlay,
+                                    dst: sdl2::rect::Rect::new(0, display_mode.h - th as i32, tw, th),
+                                    alpha: 0xff,
+                                });
+                            }
+                            Err(e) => tracing::warn!("log overlay render failed: {e:#}"),
+                        }
+                    }
+                    if !cmds.is_empty() {
+                        canvas.set_blend_mode(sdl2::render::BlendMode::None);
+                        canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
+                        canvas.clear();
+                        compositor.execute(&mut canvas, &cmds)?;
+                        canvas.present();
                     }
                 }
                 if connected.client.is_session_ended() {

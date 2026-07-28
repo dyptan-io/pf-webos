@@ -238,6 +238,39 @@ pub fn render_stats_overlay_tile(font: &Font, caption_font: &Font, lines: &[Stri
     Ok(p)
 }
 
+/// Number of lines shown in the log-tail overlay.
+pub const LOG_OVERLAY_LINES: usize = 12;
+
+/// Color for log line by level prefix; errors/warnings highlighted to stand out.
+fn log_line_color(line: &str) -> Color {
+    match line.split_whitespace().next() {
+        Some("ERROR") => ERROR_RED,
+        Some("WARN") => WARNING,
+        Some("INFO") => WHITE,
+        _ => MUTED,
+    }
+}
+
+/// Full-width log-tail at screen bottom (all screens, unlike stats overlay).
+pub fn render_log_overlay_tile(font: &Font, screen_w: u32, lines: &[String]) -> Result<Painter> {
+    let pad = 14i32;
+    let line_h = font.height() + 4;
+    let inner_w = screen_w.saturating_sub(2 * pad as u32);
+    let h = (lines.len().max(1) as i32 * line_h + 2 * pad).max(1) as u32;
+    let mut p = Painter::new(screen_w.max(1), h);
+    let mut tc = TextCache::new();
+    p.fill_rounded_rect(
+        Rect::new(0, 0, screen_w.max(1), h),
+        14,
+        Color::RGBA(0x14, 0x10, 0x1f, 0x90),
+    );
+    for (i, line) in lines.iter().enumerate() {
+        let clipped = ellipsize(font, line, inner_w);
+        draw_text(&mut p, &mut tc, font, &clipped, pad, pad + i as i32 * line_h, log_line_color(line))?;
+    }
+    Ok(p)
+}
+
 /// Stop/Cancel button pair for shell and focused-button tile.
 pub fn disconnect_dialog_buttons() -> [ConfirmButton<'static>; 2] {
     [

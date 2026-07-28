@@ -13,6 +13,7 @@ use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};
 
 mod about;
 mod addhost;
+mod diagnostics;
 mod edithost;
 mod forget;
 mod home;
@@ -39,6 +40,8 @@ pub enum Screen {
     SpeedTest,
     WakeSettings,
     PinLimit,
+    /// Log level debug aid (see `app/diagnostics.rs`).
+    Diagnostics,
 }
 
 /// Pairing modal's focused input: PIN row or "Request access" button.
@@ -283,6 +286,7 @@ pub(crate) enum ModalFocusKey {
     SpeedTestButton(usize, String),
     /// Carries label+menu flag for row list shape changes and ⋯ state.
     MenuRow(usize, String, bool),
+    LogLevel(store::LogLevelOverride),
 }
 
 /// Scrollable modal content keys. Paired with Screen for staleness checks.
@@ -356,6 +360,9 @@ pub struct App {
     /// that screen sits *over* the host menu and Back returns there, so the menu's
     /// cursor has to survive the round trip.
     pub wake_settings_focused: usize,
+    /// Focused row of `Screen::Diagnostics`; kept as its own cursor
+    /// (like `wake_settings_focused`) to survive nested menu traversal.
+    pub diagnostics_focused: usize,
     /// The sidebar row `Screen::EditHost` is editing, `None` otherwise.
     pub edit_host_index: Option<usize>,
     /// The in-flight/finished speed test, `None` when that screen isn't open.
@@ -459,15 +466,12 @@ pub struct App {
     /// The single focused, zoom-animated widget of whichever modal is open —
     /// see `ModalFocusKey`'s docs on why one tile/key suffices for all of them.
     pub(crate) modal_focus_tile: Option<(ModalFocusKey, Painter)>,
-    /// The open dropdown's panel + unfocused option list, keyed by its row (the
-    /// options list depends only on which row opened it). Composited *after*
-    /// `scroll_content_tile` — see `Tile::DropdownOverlay`'s docs.
-    pub(crate) dropdown_overlay_tile: Option<(usize, Painter)>,
-    /// The open dropdown's focused option, as its own small tile — keyed by
-    /// (dropdown row, focused option index). Composited over `dropdown_overlay_tile`
-    /// (which draws the overlay's option list unfocused); moving the
-    /// dropdown's own focus rebuilds only this.
-    pub(crate) dropdown_focus_tile: Option<((usize, usize), Painter)>,
+    /// Dropdown overlay panel, keyed by (Screen, row) to disambiguate
+    /// row 0 across Settings vs Diagnostics. Composited after `ScrollContent`.
+    pub(crate) dropdown_overlay_tile: Option<((Screen, usize), Painter)>,
+    /// Dropdown's focused option tile, keyed by (Screen, row, focused index).
+    /// Composited over `DropdownOverlay`; focus movement rebuilds only this.
+    pub(crate) dropdown_focus_tile: Option<((Screen, usize, usize), Painter)>,
     /// Whichever scrollable modal's indicator is baked, keyed by `(total units,
     /// visible units, scroll offset)` — rebuilt only when those change; the
     /// fade is a per-frame alpha, not baked into the tile. One slot for all of
@@ -589,6 +593,7 @@ impl App {
             menu_focused: 0,
             host_menu_dots: false,
             wake_settings_focused: 0,
+            diagnostics_focused: 0,
             edit_host_index: None,
             speed_test: None,
             speed_test_rx: None,
@@ -824,6 +829,10 @@ impl App {
                 self.handle_pin_limit_event(MenuEvent::Back);
                 None
             }
+            Screen::Diagnostics => {
+                self.handle_diagnostics_event(MenuEvent::Back);
+                None
+            }
         }
     }
     /// Advances every live animation one tick — the eased scroll, the focus pop,
@@ -1015,6 +1024,11 @@ impl App {
                 let card = Self::pin_limit_card_rect(screen_w, screen_h, fonts);
                 self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
             }
+            Screen::Diagnostics => {
+                let subtitle = self.diagnostics_subtitle();
+                let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
+                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
+            }
         }
     }
 
@@ -1150,6 +1164,15 @@ impl App {
             // same as the one OK button would — there's nothing else on this card.
             Screen::PinLimit => {
                 self.handle_pin_limit_event(MenuEvent::Confirm);
+                None
+            }
+            Screen::Diagnostics => {
+                let subtitle = self.diagnostics_subtitle();
+                let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
+                let content = ui::list_modal_content_rect(card, fonts, &subtitle, 1);
+                if ui::focus_row_rect(content, 0).contains_point((x, y)) {
+                    self.handle_diagnostics_event(MenuEvent::Confirm);
+                }
                 None
             }
             // Nothing clickable but the close button (handled above).
@@ -1519,7 +1542,7 @@ impl App {
             // display has no separate focus tile to protect, so it just redraws on
             // any `content_dirty` tick — same for `PinLimit`, which is a fixed
             // message plus one always-focused button.
-            Screen::Home | Screen::AddHost | Screen::EditHost | Screen::PinLimit => None,
+            Screen::Home | Screen::AddHost | Screen::EditHost | Screen::PinLimit | Screen::Diagnostics => None,
         };
         let modal_stale = if modal_shell_key.is_some() {
             self.modal_tile.is_none() || self.modal_shell_key != modal_shell_key
@@ -1558,6 +1581,9 @@ impl App {
                 Screen::About => self.render_about(&mut p, text_cache, fonts, screen_w, screen_h)?,
                 Screen::SpeedTest => self.render_speed_test(&mut p, text_cache, fonts, screen_w, screen_h)?,
                 Screen::PinLimit => self.render_pin_limit(&mut p, text_cache, fonts, screen_w, screen_h)?,
+                Screen::Diagnostics => {
+                    self.render_diagnostics(&mut p, text_cache, fonts, screen_w, screen_h)?;
+                }
             }
             self.modal_tile = Some(p);
             updated.push(Tile::Modal);
@@ -1600,6 +1626,7 @@ impl App {
                 };
                 ModalFocusKey::SpeedTestButton(self.speed_test_focused, Self::speed_test_apply_label(recommended))
             }),
+            Screen::Diagnostics => Some(ModalFocusKey::LogLevel(self.settings.log_level_override)),
             // Neither has a single focused widget: the address form is one always-active
             // field, About is a scrolling document, and `PinLimit`'s one button is
             // always drawn focused directly in `render_pin_limit`.
@@ -1726,6 +1753,21 @@ impl App {
                             rect.height(),
                         )?
                     }
+                    Screen::Diagnostics => {
+                        let subtitle = self.diagnostics_subtitle();
+                        let rows = self.diagnostics_rows();
+                        let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
+                        let content = ui::list_modal_content_rect(card, fonts, &subtitle, rows.len());
+                        ui::render_focus_row_tile(
+                            text_cache,
+                            fonts,
+                            &rows,
+                            content.width(),
+                            self.diagnostics_focused,
+                            false,
+                            0.0,
+                        )?
+                    }
                     Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About | Screen::PinLimit => {
                         unreachable!("focus_key checked above")
                     }
@@ -1738,24 +1780,35 @@ impl App {
         }
 
         if let Some(dd) = &self.dropdown {
-            let (_, content) = Self::settings_layout(screen_w, screen_h);
-            let options = ui::dropdown_options(&self.settings, dd.row);
+            let (options, content_w) = match self.screen {
+                Screen::Diagnostics => {
+                    let subtitle = self.diagnostics_subtitle();
+                    let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
+                    let content = ui::list_modal_content_rect(card, fonts, &subtitle, 1);
+                    (ui::log_level_dropdown_options(), content.width())
+                }
+                _ => {
+                    let (_, content) = Self::settings_layout(screen_w, screen_h);
+                    (ui::dropdown_options(&self.settings, dd.row), content.width())
+                }
+            };
 
-            let overlay_stale = !matches!(&self.dropdown_overlay_tile, Some((k, _)) if *k == dd.row);
+            let overlay_key = (self.screen, dd.row);
+            let overlay_stale = !matches!(&self.dropdown_overlay_tile, Some((k, _)) if *k == overlay_key);
             if overlay_stale {
                 let overlay_h = options.len() as u32 * ui::DROPDOWN_OPTION_H;
-                let mut p = Painter::new(content.width(), overlay_h.max(1));
-                let rect = Rect::new(0, 0, content.width(), overlay_h);
+                let mut p = Painter::new(content_w, overlay_h.max(1));
+                let rect = Rect::new(0, 0, content_w, overlay_h);
                 ui::draw_dropdown_overlay(&mut p, text_cache, fonts.value, &options, usize::MAX, rect)?;
-                self.dropdown_overlay_tile = Some((dd.row, p));
+                self.dropdown_overlay_tile = Some((overlay_key, p));
                 updated.push(Tile::DropdownOverlay);
             }
 
-            let key = (dd.row, dd.focused);
+            let key = (self.screen, dd.row, dd.focused);
             let stale = !matches!(&self.dropdown_focus_tile, Some((k, _)) if *k == key);
             if stale {
                 let option = options.get(dd.focused).map_or("", String::as_str);
-                let tile = ui::render_dropdown_option_tile(text_cache, fonts.value, option, content.width())?;
+                let tile = ui::render_dropdown_option_tile(text_cache, fonts.value, option, content_w)?;
                 self.dropdown_focus_tile = Some((key, tile));
                 updated.push(Tile::DropdownFocusOption);
             }
@@ -1913,7 +1966,11 @@ impl App {
             // `main.rs`), never rasterized as a `Painter`; the rest are stream-side only
             // (uploaded directly by `run_inner`'s overlay refresh) — never one of App's
             // menu tiles.
-            Tile::SpinnerFrame(_) | Tile::StatsOverlay | Tile::DisconnectDialog | Tile::DisconnectFocusButton => None,
+            Tile::SpinnerFrame(_)
+            | Tile::StatsOverlay
+            | Tile::LogOverlay
+            | Tile::DisconnectDialog
+            | Tile::DisconnectFocusButton => None,
         }
     }
 
@@ -2140,17 +2197,12 @@ impl App {
                 dst: modal_dst,
                 alpha: (255.0 * m) as u8,
             });
-            // Whichever modal's content overflows (Settings' rows, About's document),
-            // computed once and reused by every block below instead of each
-            // re-deriving it — see `scroll_geometry`'s docs.
+            // Scrollable content geometry (Settings rows or About document), computed
+            // once and reused. Scrolling crops the full baked tile, never re-rasterizes.
             let scroll_geom = self.scroll_geometry_for(screen, screen_w, screen_h, fonts);
-            // Its content: cropped/repositioned straight off its own full (unscrolled)
-            // tile — a GPU op, so scrolling never re-rasterizes anything (see
-            // `Tile::ScrollContent`'s docs). About's tile only ever holds a bounded
-            // window of the document, not the whole thing — `window_start` is where
-            // that window begins, so the crop offset is relative to it, not to 0.
             if let Some((total, visible, _, content)) = scroll_geom {
                 let scroll = self.scroll.clamped(total, visible);
+                // About uses a bounded window; for other screens, window_start is 0.
                 let window_start = match screen {
                     Screen::About => self.content_window.start,
                     _ => 0,
@@ -2168,42 +2220,45 @@ impl App {
                     alpha: (255.0 * m) as u8,
                 });
             }
-            // The open dropdown's panel + unfocused option list — Settings-only (no
-            // other modal has one) — its own tile so it composites *after*
-            // `Tile::ScrollContent` (which would otherwise redraw the rows the overlay
-            // extends over, on top of it).
-            if matches!(screen, Screen::Settings) {
-                if let Some((total, visible, _, content)) = scroll_geom {
-                    let scroll = self.scroll.clamped(total, visible);
-                    if let Some((row, _, dd_alpha)) = self.dropdown_draw_state() {
-                        let overlay_rect = Self::dropdown_overlay_rect(content, row - scroll);
-                        let options_len = ui::dropdown_options(&self.settings, row).len();
-                        cmds.push(DrawCmd::Tex {
-                            tile: Tile::DropdownOverlay,
-                            dst: Rect::new(
-                                overlay_rect.x(),
-                                overlay_rect.y() + dy,
-                                overlay_rect.width(),
-                                options_len as u32 * ui::DROPDOWN_OPTION_H,
-                            ),
-                            alpha: (255.0 * m * dd_alpha) as u8,
-                        });
+            // Dropdown overlay (Settings or Diagnostics).
+            if let Some((row, _, dd_alpha)) = self.dropdown_draw_state() {
+                // Diagnostics isn't scrollable, so compute its content rect directly.
+                let content_and_row_in_view = match screen {
+                    Screen::Settings => scroll_geom.map(|(total, visible, _, content)| {
+                        (content, row.saturating_sub(self.scroll.clamped(total, visible)))
+                    }),
+                    Screen::Diagnostics => {
+                        let subtitle = self.diagnostics_subtitle();
+                        let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
+                        Some((ui::list_modal_content_rect(card, fonts, &subtitle, 1), row))
                     }
+                    _ => None,
+                };
+                if let Some((content, row_in_view)) = content_and_row_in_view {
+                    let overlay_rect = Self::dropdown_overlay_rect(content, row_in_view);
+                    let options_len = match screen {
+                        Screen::Diagnostics => ui::LOG_LEVEL_OPTIONS.len(),
+                        _ => ui::dropdown_options(&self.settings, row).len(),
+                    };
+                    cmds.push(DrawCmd::Tex {
+                        tile: Tile::DropdownOverlay,
+                        dst: Rect::new(
+                            overlay_rect.x(),
+                            overlay_rect.y() + dy,
+                            overlay_rect.width(),
+                            options_len as u32 * ui::DROPDOWN_OPTION_H,
+                        ),
+                        alpha: (255.0 * m * dd_alpha) as u8,
+                    });
                 }
             }
-            // Whichever modal is open, its one focused widget — a settings/Wake
-            // row, a pairing digit/button, or a Forget-host button (see
-            // `ModalFocusKey`'s docs) — composites on top of the shell (which
-            // draws every widget unfocused) at its actual on-screen position,
-            // so moving focus needs no modal re-rasterize at all. Same
-            // fade/slide as the shell so it stays glued to it during the
-            // modal-open animation.
+            // Focused widget of the active modal (setting row, button, etc.);
+            // composites on shell at its on-screen position (no re-rasterize on move).
             let focus_rect = match screen {
                 Screen::Settings => {
                     let (total, visible, _, content) = scroll_geom.expect("screen is Screen::Settings");
                     let scroll = self.scroll.clamped(total, visible);
-                    // `content`'s rows are the scrolled-to-visible window — translate
-                    // the focused row's global index back to a local one.
+                    // Translate focused row's global index to local (within visible window).
                     Some(ui::focus_row_rect(content, self.settings_focused - scroll))
                 }
                 Screen::Wake => self.wake.as_ref().filter(|w| !w.mac.is_empty()).map(|w| {
@@ -2251,6 +2306,12 @@ impl App {
                     let card = self.speed_test_card_rect(screen_w, screen_h, fonts);
                     ui::confirm_button_rect(self.speed_test_buttons_rect(card, fonts), self.speed_test_focused)
                 }),
+                Screen::Diagnostics => {
+                    let subtitle = self.diagnostics_subtitle();
+                    let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
+                    let content = ui::list_modal_content_rect(card, fonts, &subtitle, 1);
+                    Some(ui::focus_row_rect(content, self.diagnostics_focused))
+                }
                 Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About | Screen::PinLimit => None,
             };
             if let Some(rect) = focus_rect {
@@ -2276,24 +2337,32 @@ impl App {
             // The open dropdown's focused option — same idea, composited on
             // top of the shell's unfocused option list at its actual
             // position, so navigating dropdown options needs no modal
-            // re-rasterize either. Settings-only.
-            if matches!(screen, Screen::Settings) {
-                if let Some((total, visible, _, content)) = scroll_geom {
-                    let scroll = self.scroll.clamped(total, visible);
-                    if let Some((row, focused, dd_alpha)) = self.dropdown_draw_state() {
-                        let overlay_rect = Self::dropdown_overlay_rect(content, row - scroll);
-                        let option_rect = ui::dropdown_option_rect(overlay_rect, focused);
-                        cmds.push(DrawCmd::Tex {
-                            tile: Tile::DropdownFocusOption,
-                            dst: Rect::new(
-                                option_rect.x(),
-                                option_rect.y() + dy,
-                                option_rect.width(),
-                                option_rect.height(),
-                            ),
-                            alpha: (255.0 * m * dd_alpha) as u8,
-                        });
+            // re-rasterize either. `Settings` or `Diagnostics`.
+            if let Some((row, focused, dd_alpha)) = self.dropdown_draw_state() {
+                let content_and_row_in_view = match screen {
+                    Screen::Settings => scroll_geom.map(|(total, visible, _, content)| {
+                        (content, row.saturating_sub(self.scroll.clamped(total, visible)))
+                    }),
+                    Screen::Diagnostics => {
+                        let subtitle = self.diagnostics_subtitle();
+                        let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
+                        Some((ui::list_modal_content_rect(card, fonts, &subtitle, 1), row))
                     }
+                    _ => None,
+                };
+                if let Some((content, row_in_view)) = content_and_row_in_view {
+                    let overlay_rect = Self::dropdown_overlay_rect(content, row_in_view);
+                    let option_rect = ui::dropdown_option_rect(overlay_rect, focused);
+                    cmds.push(DrawCmd::Tex {
+                        tile: Tile::DropdownFocusOption,
+                        dst: Rect::new(
+                            option_rect.x(),
+                            option_rect.y() + dy,
+                            option_rect.width(),
+                            option_rect.height(),
+                        ),
+                        alpha: (255.0 * m * dd_alpha) as u8,
+                    });
                 }
             }
             // Whichever modal is scrollable, its indicator — full opacity for

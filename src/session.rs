@@ -21,7 +21,22 @@ use punktfunk_core::quic;
 
 use crate::ndl::{NdlCodec, NdlVideo};
 use crate::starfish::StarfishVideo;
-use crate::store::{CodecPref, VideoBackend};
+use crate::store::{CodecPref, ColorRangeOverride, VideoBackend};
+
+impl ColorRangeOverride {
+    /// Force the VUI `full_range` flag per the user override before it's handed to
+    /// the decoder; `Auto` leaves the host-signalled value untouched. Applied on
+    /// both the NDL and Starfish paths (via `VideoPlayer::set_color_info`), though
+    /// NDL's native HDR-info struct has no range field so it's a no-op there — see
+    /// `ndl.rs`/`starfish.rs` `set_color_info`.
+    fn apply(self, color: &mut quic::ColorInfo) {
+        match self {
+            Self::Full => color.full_range = 1,
+            Self::Limited => color.full_range = 0,
+            Self::Auto => {}
+        }
+    }
+}
 
 /// Unified video-decode backend. NDL arm is Arc'd because audio-offload shares it with
 /// `ndl_audio_pump`; NDL unloads process-globally, so unload waits for both threads (`Arc::drop`).
@@ -212,6 +227,7 @@ pub fn connect(
     display_h: i32,
     video_backend: VideoBackend,
     codec_pref: CodecPref,
+    color_range_override: ColorRangeOverride,
 ) -> Result<Connected> {
     // VIDEO_CAP_CHACHA20: unconditional — armv7 has no hardware AES, so ChaCha20 is
     // faster. A ≥0.17.2 host picks it up; older hosts ignore the unknown bit.
@@ -395,15 +411,17 @@ pub fn connect(
     // this purpose; HDR streams additionally carry mastering metadata.
     let is_hdr = client.color.is_hdr();
     let initial_meta = is_hdr.then(cx_display_hdr);
-    if let Err(e) = player.set_color_info(initial_meta.as_ref(), client.color) {
+    let mut color = client.color;
+    color_range_override.apply(&mut color);
+    if let Err(e) = player.set_color_info(initial_meta.as_ref(), color) {
         tracing::warn!("{} colour metadata failed: {e:#}", player.backend_name());
     }
     tracing::debug!(
         "colour metadata sent: hdr={is_hdr} transfer={} primaries={} matrix={} full_range={}",
-        client.color.transfer,
-        client.color.primaries,
-        client.color.matrix,
-        client.color.full_range,
+        color.transfer,
+        color.primaries,
+        color.matrix,
+        color.full_range,
     );
 
     let audio_offloaded = player.audio_offloaded();
@@ -425,7 +443,16 @@ pub fn connect(
     let video_stats = stats.clone();
     let video_thread = std::thread::Builder::new()
         .name("punktfunk-webos-video".into())
-        .spawn(move || video_pump(video_client, player, video_stop, video_stats, is_hdr))
+        .spawn(move || {
+            video_pump(
+                video_client,
+                player,
+                video_stop,
+                video_stats,
+                is_hdr,
+                color_range_override,
+            )
+        })
         .context("spawn video thread")?;
     let audio_thread = match ndl_audio {
         Some(ndl) => {
@@ -810,6 +837,7 @@ fn video_pump(
     stop: Arc<AtomicBool>,
     stats: Arc<StreamStats>,
     is_hdr: bool,
+    color_range_override: ColorRangeOverride,
 ) {
     client.register_hot_thread();
     // Summarized at info, not left as per-tid debug lines: whether these renices work at
@@ -995,7 +1023,9 @@ fn video_pump(
 
         if is_hdr {
             if let Ok(meta) = client.next_hdr_meta(Duration::ZERO) {
-                if let Err(e) = player.set_color_info(Some(&meta), client.color) {
+                let mut color = client.color;
+                color_range_override.apply(&mut color);
+                if let Err(e) = player.set_color_info(Some(&meta), color) {
                     tracing::warn!("{} set_color_info: {e:#}", player.backend_name());
                 }
             }

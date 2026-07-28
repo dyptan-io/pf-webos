@@ -65,7 +65,16 @@ impl App {
                     self.settings_writer.save(self.settings);
                     self.open_about();
                 }
-                ui::ROW_RESOLUTION | ui::ROW_FRAMERATE | ui::ROW_VIDEO_BACKEND | ui::ROW_CODEC | ui::ROW_AUDIO => {
+                ui::ROW_DIAGNOSTICS => {
+                    self.settings_writer.save(self.settings);
+                    self.open_diagnostics();
+                }
+                ui::ROW_RESOLUTION
+                | ui::ROW_FRAMERATE
+                | ui::ROW_VIDEO_BACKEND
+                | ui::ROW_CODEC
+                | ui::ROW_AUDIO
+                | ui::ROW_COLOR_RANGE => {
                     let focused = ui::dropdown_current_index(&self.settings, self.settings_focused);
                     self.dropdown = Some(DropdownState {
                         row: self.settings_focused,

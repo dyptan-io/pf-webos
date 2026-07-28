@@ -57,6 +57,9 @@ pub enum Tile {
     SpinnerFrame(usize),
     /// The in-stream stats overlay panel (`ui::render_stats_overlay_tile`).
     StatsOverlay,
+    /// The log-tail overlay (`ui::render_log_overlay_tile`) — Yellow-button debug
+    /// aid, shown on every screen (menu UI and stream), not just while streaming.
+    LogOverlay,
     /// Disconnect dialog shell (card + title + unfocused buttons).
     DisconnectDialog,
     /// Disconnect dialog focused button. Composited over `DisconnectDialog` shell.
