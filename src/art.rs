@@ -18,8 +18,9 @@ pub struct ArtLoaded {
 /// A cover the UI wants soon.
 struct ArtRequest {
     game_id: String,
-    /// Host-relative art path (`/api/v1/library/art/...`).
-    path: String,
+    /// Candidate art paths (host-relative or external URL), tried in order — a
+    /// host-reported path can 404 even when another variant works fine.
+    paths: Vec<String>,
 }
 
 /// Max decoded dimension (panel can't show oversized art anyway).
@@ -181,13 +182,19 @@ impl ArtLoader {
         // Remember the id either way: a game with no art at all must not be re-queued
         // every frame forever.
         self.requested.insert(game.id.clone());
-        let Some(path) = game.art.portrait.as_deref().or(game.art.header.as_deref()) else {
+        // Preference order: portrait (right aspect), then header, then hero.
+        let paths: Vec<String> = [game.art.portrait.as_deref(), game.art.header.as_deref(), game.art.hero.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::to_string)
+            .collect();
+        if paths.is_empty() {
             return;
-        };
+        }
         // A closed channel means the worker is gone; the card keeps its placeholder.
         let _ = self.tx.send(ArtRequest {
             game_id: game.id.clone(),
-            path: path.to_string(),
+            paths,
         });
     }
 
@@ -245,13 +252,26 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
             Ok(b) if !b.is_empty() => b,
             _ => {
                 if agent.is_none() {
-                    let Ok(a) = crate::library::agent(identity, fingerprint) else {
-                        continue;
-                    };
-                    agent = Some(a);
+                    match crate::library::agent(identity, fingerprint) {
+                        Ok(a) => agent = Some(a),
+                        Err(e) => {
+                            tracing::warn!("art: {} building mTLS agent failed: {e}", req.game_id);
+                            continue;
+                        }
+                    }
                 }
                 let Some(a) = agent.as_ref() else { continue };
-                let Ok(fetched) = crate::library::fetch_art(a, host, mgmt_port, &req.path) else {
+                let mut fetched = None;
+                for path in &req.paths {
+                    match crate::library::fetch_art(a, host, mgmt_port, path) {
+                        Ok(b) => {
+                            fetched = Some(b);
+                            break;
+                        }
+                        Err(e) => tracing::warn!("art: {} fetch {} failed: {e}", req.game_id, path),
+                    }
+                }
+                let Some(fetched) = fetched else {
                     continue;
                 };
                 // Write-then-rename, never truncate-in-place: a kill mid-write would
@@ -265,11 +285,15 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
             }
         };
 
-        let Ok(decoded) = image::load_from_memory(&bytes) else {
-            // Drop a cache entry that won't decode — otherwise it poisons this card for
-            // the life of the install.
-            let _ = std::fs::remove_file(&cached);
-            continue;
+        let decoded = match image::load_from_memory(&bytes) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("art: {} decode failed ({} bytes): {e}", req.game_id, bytes.len());
+                // Drop a cache entry that won't decode — otherwise it poisons this card for
+                // the life of the install.
+                let _ = std::fs::remove_file(&cached);
+                continue;
+            }
         };
         let decoded = crop_to_aspect(decoded, TARGET_ART_ASPECT);
         let longer_side = decoded.width().max(decoded.height());
@@ -285,11 +309,13 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
         let rgba = decoded.to_rgba8();
         let (width, height) = rgba.dimensions();
         let Some(size) = IntSize::from_wh(width, height) else {
+            tracing::warn!("art: {} decoded to zero size ({width}x{height})", req.game_id);
             continue;
         };
         let mut buf = rgba.into_raw();
         premultiply_rgba(&mut buf);
         let Some(pixmap) = Pixmap::from_vec(buf, size) else {
+            tracing::warn!("art: {} Pixmap::from_vec failed ({width}x{height})", req.game_id);
             continue;
         };
         write_raw_cache(&raw_cached, &pixmap);

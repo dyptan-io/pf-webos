@@ -266,23 +266,38 @@ impl App {
         }
     }
 
-    /// Re-sorts games: pinned first (in pin order), rest untouched; drops missing pins.
+    /// Re-sorts games: pinned first (in pin order), rest untouched. Also prunes
+    /// `known_hosts`' persisted pins for games the host no longer lists — otherwise
+    /// a removed game keeps counting toward `MAX_PINNED_GAMES` forever.
     pub(crate) fn reorder_games_by_pin(&mut self) {
-        let pinned_ids = self
+        let Some(known_idx) = self
             .selected_host
             .as_ref()
-            .and_then(|(h, p)| self.known_hosts.iter().find(|k| k.host == *h && k.port == *p))
-            .map(|k| k.pinned.clone())
-            .unwrap_or_default();
+            .and_then(|(h, p)| self.known_hosts.iter().position(|k| k.host == *h && k.port == *p))
+        else {
+            self.pinned_count = 0;
+            return;
+        };
+        let pinned_ids = self.known_hosts[known_idx].pinned.clone();
         let mut pinned = Vec::new();
+        let mut still_pinned = Vec::new();
         for id in &pinned_ids {
-            if let Some(pos) = self.games.iter().position(|g| &g.id == id) {
+            // Desktop isn't in `self.games`, so it's never "missing".
+            if id == store::DESKTOP_PIN_ID {
+                still_pinned.push(id.clone());
+            } else if let Some(pos) = self.games.iter().position(|g| &g.id == id) {
                 pinned.push(self.games.remove(pos));
+                still_pinned.push(id.clone());
             }
         }
         self.pinned_count = pinned.len();
         pinned.append(&mut self.games);
         self.games = pinned;
+
+        if still_pinned.len() != pinned_ids.len() {
+            self.known_hosts[known_idx].pinned = still_pinned;
+            let _ = store::save_known_hosts(&self.known_hosts);
+        }
     }
 
     /// Extra vertical offset for grid index `idx`'s row — `ui::PINNED_SECTION_GAP`

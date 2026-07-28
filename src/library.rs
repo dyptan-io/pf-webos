@@ -156,17 +156,35 @@ pub fn load_games_async(
 }
 
 /// Fetches one piece of cover art's raw bytes (JPEG/PNG, undecoded) from a
-/// host-relative `art_path` (one of `GameEntry::art`'s fields) — same mTLS pinning
-/// as `fetch_games`, but takes an already-built `agent` so a caller fetching many
-/// art paths in a row (see `art.rs`) reuses one connection instead of a fresh mTLS
-/// handshake per call. Decoding happens in `art.rs`, off this module's REST concern.
+/// host-relative `art_path` (one of `GameEntry::art`'s fields), reusing an
+/// already-built `agent` (see `fetch_games`) to avoid a fresh mTLS handshake per
+/// cover. Decoding happens in `art.rs`, off this module's REST concern.
 pub fn fetch_art(agent: &ureq::Agent, addr: &str, mgmt_port: u16, art_path: &str) -> Result<Vec<u8>, LibraryError> {
+    // Some hosts hand back a full external URL (e.g. a SteamGridDB CDN link) instead
+    // of a host-relative path — that can't go through the pinned agent (wrong CA,
+    // and prefixing it with base_url would double up the authority).
+    if art_path.starts_with("http://") || art_path.starts_with("https://") {
+        return fetch_external_art(art_path);
+    }
     let url = format!("{}{art_path}", base_url(addr, mgmt_port));
     match agent.get(url.as_str()).call() {
         Ok(mut resp) => resp
             .body_mut()
             .read_to_vec()
             .map_err(|e| LibraryError::Unreachable(format!("read art body: {e}"))),
+        Err(e) => Err(classify(e)),
+    }
+}
+
+/// Fetches art from a full external URL with the system's default CA trust (no
+/// client cert) — the host's pinned `agent` would reject this CA.
+fn fetch_external_art(url: &str) -> Result<Vec<u8>, LibraryError> {
+    let agent = ureq::Agent::new_with_defaults();
+    match agent.get(url).call() {
+        Ok(mut resp) => resp
+            .body_mut()
+            .read_to_vec()
+            .map_err(|e| LibraryError::Unreachable(format!("read external art body: {e}"))),
         Err(e) => Err(classify(e)),
     }
 }
