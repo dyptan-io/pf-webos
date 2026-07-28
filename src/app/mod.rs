@@ -270,6 +270,11 @@ pub(crate) enum ModalShellKey {
         status: String,
         hover_close: bool,
     },
+    Diagnostics {
+        log_level: store::LogLevelOverride,
+        stats_overlay: bool,
+        hover_close: bool,
+    },
 }
 
 /// Focused widget in the open modal. Each variant carries its content,
@@ -1543,11 +1548,16 @@ impl App {
                 status: self.speed_test_status(),
                 hover_close: self.hover_close,
             }),
+            Screen::Diagnostics => Some(ModalShellKey::Diagnostics {
+                log_level: self.settings.log_level_override,
+                stats_overlay: self.settings.stats_overlay,
+                hover_close: self.hover_close,
+            }),
             // `EditHost` joins `AddHost` in having no shell key: its typed-digit
             // display has no separate focus tile to protect, so it just redraws on
             // any `content_dirty` tick — same for `PinLimit`, which is a fixed
             // message plus one always-focused button.
-            Screen::Home | Screen::AddHost | Screen::EditHost | Screen::PinLimit | Screen::Diagnostics => None,
+            Screen::Home | Screen::AddHost | Screen::EditHost | Screen::PinLimit => None,
         };
         let modal_stale = if modal_shell_key.is_some() {
             self.modal_tile.is_none() || self.modal_shell_key != modal_shell_key
@@ -1767,7 +1777,10 @@ impl App {
                         let rows = self.diagnostics_rows();
                         let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
                         let content = ui::list_modal_content_rect(card, fonts, &subtitle, rows.len());
-                        let dropdown_open = self.dropdown.as_ref().is_some_and(|dd| dd.row == self.diagnostics_focused);
+                        let dropdown_open = self
+                            .dropdown
+                            .as_ref()
+                            .is_some_and(|dd| dd.row == self.diagnostics_focused);
                         ui::render_focus_row_tile(
                             text_cache,
                             fonts,
@@ -2240,7 +2253,10 @@ impl App {
                     Screen::Diagnostics => {
                         let subtitle = self.diagnostics_subtitle();
                         let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
-                        Some((ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT), row))
+                        Some((
+                            ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT),
+                            row,
+                        ))
                     }
                     _ => None,
                 };
@@ -2356,7 +2372,10 @@ impl App {
                     Screen::Diagnostics => {
                         let subtitle = self.diagnostics_subtitle();
                         let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
-                        Some((ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT), row))
+                        Some((
+                            ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT),
+                            row,
+                        ))
                     }
                     _ => None,
                 };

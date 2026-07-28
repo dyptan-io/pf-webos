@@ -47,7 +47,12 @@ fn telemetry_addr() -> Option<&'static str> {
 /// Launch-time log level override from `TELEMETRY_LEVEL` env var.
 /// Folded into settings so Diagnostics can display it. `None` leaves persisted level.
 pub fn launch_level_override() -> Option<LogLevelOverride> {
-    match launch_params().telemetry_level.as_deref()?.to_ascii_lowercase().as_str() {
+    match launch_params()
+        .telemetry_level
+        .as_deref()?
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "debug" => Some(LogLevelOverride::Debug),
         "info" => Some(LogLevelOverride::Info),
         "warn" => Some(LogLevelOverride::Warn),

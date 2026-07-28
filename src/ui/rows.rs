@@ -221,14 +221,16 @@ pub fn draw_focus_row(
     let control_pad = 28;
     match row.kind {
         RowKind::Dropdown => {
-            let pill_w = 264u32.min(row_rect.width() / 2);
-            let pill = Rect::new(
-                row_rect.x() + row_rect.width() as i32 - control_pad - pill_w as i32,
-                row_rect.y() + (row_rect.height() as i32 - 52) / 2,
-                pill_w,
-                52,
-            );
-            draw_dropdown_pill(painter, text_cache, fonts, pill, &row.value, dropdown_open)?;
+            let right_edge = row_rect.x() + row_rect.width() as i32 - control_pad;
+            draw_dropdown_value(
+                painter,
+                text_cache,
+                fonts,
+                row_rect,
+                right_edge,
+                &row.value,
+                dropdown_open,
+            )?;
         }
         RowKind::Slider => {
             let value_w = fonts.value.size_of(&row.value).map_or(0, |(w, _)| w);
@@ -283,47 +285,37 @@ pub fn draw_focus_row(
     Ok(())
 }
 
-/// A rounded pill showing the dropdown value + chevron. Gets bright outline only
-/// when the dropdown overlay itself is expanded.
-pub fn draw_dropdown_pill(
+/// The dropdown value + chevron, right-aligned to `right_edge` and vertically
+/// centered on `row_rect` — no box, the row's own focus state already
+/// provides one. Both tint toward accent when the dropdown overlay itself is
+/// expanded.
+pub fn draw_dropdown_value(
     painter: &mut Painter,
     text_cache: &mut TextCache,
     fonts: &Fonts,
-    rect: Rect,
+    row_rect: Rect,
+    right_edge: i32,
     label: &str,
     open: bool,
 ) -> Result<()> {
-    let radius = rect.height() as i32 / 2;
-    painter.fill_rounded_rect(rect, radius, Color::RGBA(0xff, 0xff, 0xff, 0x12));
-    painter.stroke_rounded_rect(
-        rect,
-        radius,
-        if open {
-            ACCENT_BRIGHT
-        } else {
-            Color::RGBA(0xff, 0xff, 0xff, 0x30)
-        },
-        1.5,
-    );
+    let fg = if open { ACCENT_BRIGHT } else { WHITE };
     let chevron_size = 20u32;
-    let chevron_pad = 16;
     let chevron_rect = Rect::new(
-        rect.x() + rect.width() as i32 - chevron_pad - chevron_size as i32,
-        rect.y() + (rect.height() as i32 - chevron_size as i32) / 2,
+        right_edge - chevron_size as i32,
+        row_rect.y() + (row_rect.height() as i32 - chevron_size as i32) / 2,
         chevron_size,
         chevron_size,
     );
-    draw_icon(painter, text_cache, fonts.icon, chevron_rect, ICON_CHEVRON_DOWN, WHITE)?;
+    draw_icon(painter, text_cache, fonts.icon, chevron_rect, ICON_CHEVRON_DOWN, fg)?;
     let text_w = fonts.value.size_of(label).map_or(0, |(w, _)| w);
-    let text_x = rect.x() + ((rect.width() as i32 - chevron_size as i32 - chevron_pad) - text_w as i32) / 2;
     draw_text(
         painter,
         text_cache,
         fonts.value,
         label,
-        text_x.max(rect.x()),
-        rect.y() + (rect.height() as i32 - fonts.value.height()) / 2,
-        WHITE,
+        right_edge - chevron_size as i32 - 10 - text_w as i32,
+        row_rect.y() + (row_rect.height() as i32 - fonts.value.height()) / 2,
+        fg,
     )?;
     Ok(())
 }

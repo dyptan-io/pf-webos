@@ -220,7 +220,10 @@ pub fn log_level_label(l: LogLevelOverride) -> &'static str {
 /// `dropdown_options`/`dropdown_current_index` but for `Screen::Diagnostics`
 /// rather than a `Settings` row (there is no row-index namespace to share).
 pub fn log_level_dropdown_options() -> Vec<String> {
-    LOG_LEVEL_OPTIONS.iter().map(|&l| log_level_label(l).to_string()).collect()
+    LOG_LEVEL_OPTIONS
+        .iter()
+        .map(|&l| log_level_label(l).to_string())
+        .collect()
 }
 
 pub fn log_level_dropdown_current_index(level: LogLevelOverride) -> usize {
@@ -243,7 +246,11 @@ pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
         FocusRow {
             icon: ICON_SUN,
             label: "Stats overlay".into(),
-            value: if settings.stats_overlay { "On".into() } else { "Off".into() },
+            value: if settings.stats_overlay {
+                "On".into()
+            } else {
+                "Off".into()
+            },
             kind: RowKind::Toggle,
             fraction: 0.0,
             danger: false,
@@ -310,7 +317,7 @@ pub fn dropdown_options(settings: &Settings, row_index: usize) -> Vec<String> {
     match row_index {
         ROW_RESOLUTION => RESOLUTIONS.iter().map(|(w, h, _)| resolution_label(*w, *h)).collect(),
         ROW_FRAMERATE => REFRESH_RATES.iter().map(|hz| format!("{hz} Hz")).collect(),
-        ROW_VIDEO_BACKEND => vec!["NDL".into(), "Starfish".into()],
+        ROW_VIDEO_BACKEND => vec!["NDL (DirectMedia)".into(), "SMP (Starfish Media Pipeline)".into()],
         ROW_CODEC => codec_options(settings)
             .iter()
             .map(|&p| codec_label(p).to_string())

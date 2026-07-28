@@ -266,7 +266,15 @@ pub fn render_log_overlay_tile(font: &Font, screen_w: u32, lines: &[String]) -> 
     );
     for (i, line) in lines.iter().enumerate() {
         let clipped = ellipsize(font, line, inner_w);
-        draw_text(&mut p, &mut tc, font, &clipped, pad, pad + i as i32 * line_h, log_line_color(line))?;
+        draw_text(
+            &mut p,
+            &mut tc,
+            font,
+            &clipped,
+            pad,
+            pad + i as i32 * line_h,
+            log_line_color(line),
+        )?;
     }
     Ok(p)
 }

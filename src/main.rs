@@ -177,9 +177,12 @@ mod real {
         match log_overlay_state() {
             LogOverlayState::Off => None,
             LogOverlayState::Live => Some(crate::logger::recent_lines(crate::ui::LOG_OVERLAY_LINES)),
-            LogOverlayState::Frozen => {
-                Some(frozen_log_lines().lock().unwrap_or_else(PoisonError::into_inner).clone())
-            }
+            LogOverlayState::Frozen => Some(
+                frozen_log_lines()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            ),
         }
     }
 

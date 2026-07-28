@@ -183,11 +183,15 @@ impl ArtLoader {
         // every frame forever.
         self.requested.insert(game.id.clone());
         // Preference order: portrait (right aspect), then header, then hero.
-        let paths: Vec<String> = [game.art.portrait.as_deref(), game.art.header.as_deref(), game.art.hero.as_deref()]
-            .into_iter()
-            .flatten()
-            .map(str::to_string)
-            .collect();
+        let paths: Vec<String> = [
+            game.art.portrait.as_deref(),
+            game.art.header.as_deref(),
+            game.art.hero.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect();
         if paths.is_empty() {
             return;
         }
