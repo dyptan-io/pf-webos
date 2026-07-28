@@ -411,13 +411,22 @@ pub fn connect(
     // this purpose; HDR streams additionally carry mastering metadata.
     let is_hdr = client.color.is_hdr();
     let initial_meta = is_hdr.then(cx_display_hdr);
+    // What the host actually signalled in `Welcome`, before any user override —
+    // the reference point for the washed-out-colour investigation.
+    tracing::info!(
+        "host colour info: hdr={is_hdr} transfer={} primaries={} matrix={} full_range={}",
+        client.color.transfer,
+        client.color.primaries,
+        client.color.matrix,
+        client.color.full_range,
+    );
     let mut color = client.color;
     color_range_override.apply(&mut color);
     if let Err(e) = player.set_color_info(initial_meta.as_ref(), color) {
         tracing::warn!("{} colour metadata failed: {e:#}", player.backend_name());
     }
     tracing::debug!(
-        "colour metadata sent: hdr={is_hdr} transfer={} primaries={} matrix={} full_range={}",
+        "colour metadata sent: transfer={} primaries={} matrix={} full_range={} (override={color_range_override:?})",
         color.transfer,
         color.primaries,
         color.matrix,
@@ -1022,7 +1031,18 @@ fn video_pump(
         }
 
         if is_hdr {
+            // `next_hdr_meta` is a queue drained non-blocking, so an Ok here is a
+            // freshly received / changed mastering-metadata packet, not a repeat.
             if let Ok(meta) = client.next_hdr_meta(Duration::ZERO) {
+                tracing::info!(
+                    "HDR metadata received: primaries={:?} white={:?} max_dml={} min_dml={} max_cll={} max_fall={}",
+                    meta.display_primaries,
+                    meta.white_point,
+                    meta.max_display_mastering_luminance,
+                    meta.min_display_mastering_luminance,
+                    meta.max_cll,
+                    meta.max_fall,
+                );
                 let mut color = client.color;
                 color_range_override.apply(&mut color);
                 if let Err(e) = player.set_color_info(Some(&meta), color) {
