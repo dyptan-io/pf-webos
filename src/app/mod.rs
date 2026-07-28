@@ -66,6 +66,7 @@ pub(crate) const PIN_MOVE_ANIM: Duration = Duration::from_millis(300);
 pub(crate) const CARD_POP: Duration = Duration::from_millis(300);
 pub(crate) const CARD_POP_SHRINK: f32 = 0.14;
 pub(crate) const MODAL_FADE: Duration = Duration::from_millis(200);
+pub(crate) const DROPDOWN_FADE: Duration = MODAL_FADE;
 /// Scale during open — subtle, since fade dominates for full-screen modal.
 pub(crate) const MODAL_POP_SHRINK: f32 = 0.05;
 pub(crate) const SCROLL_INDICATOR_HOLD: Duration = Duration::from_millis(700);
@@ -225,9 +226,11 @@ pub struct DropdownState {
 /// pure focus moves don't (that's `ModalFocusKey`'s job).
 #[derive(PartialEq)]
 pub(crate) enum ModalShellKey {
+    // Only what `render_settings` reads — the whole `Settings` struct (or the
+    // dropdown row) would invalidate this key, forcing a full-screen re-raster,
+    // on every keystroke or dropdown open/close.
     Settings {
-        settings: Settings,
-        open_dropdown_row: Option<usize>,
+        show_bitrate_warning: bool,
         hover_close: bool,
     },
     Wake {
@@ -329,6 +332,9 @@ pub struct App {
     /// Window slice of baked About document.
     pub(crate) content_window: ui::ContentWindow,
     pub dropdown: Option<DropdownState>,
+    /// Dropdown overlay's own open/close fade, payload `(row, focused)` so the
+    /// close-fade can still draw it after `dropdown` goes `None`.
+    pub(crate) dropdown_fade: ui::ModalFade<(usize, usize)>,
     /// The sidebar row `Screen::ForgetHost` is confirming forgetting — set
     /// alongside `screen = Screen::ForgetHost` (see `App::open_forget_host`),
     /// `None` otherwise.
@@ -577,6 +583,7 @@ impl App {
             settings_scroll: ui::ScrollWindow::new(),
             content_window: ui::ContentWindow::new(),
             dropdown: None,
+            dropdown_fade: ui::ModalFade::new(),
             host_menu_index: None,
             host_menu_focused: 1,
             menu_focused: 0,
@@ -849,6 +856,9 @@ impl App {
             animating = true;
         }
         if self.modal_fade.tick(MODAL_FADE) {
+            animating = true;
+        }
+        if self.dropdown_fade.tick(DROPDOWN_FADE) {
             animating = true;
         }
         if self.launch_anim.is_some_and(|t| t.elapsed() < ui::LAUNCH_FADE) {
@@ -1463,8 +1473,7 @@ impl App {
         // `content_dirty` tick, same as every modal did before this split.
         let modal_shell_key = match self.screen {
             Screen::Settings => Some(ModalShellKey::Settings {
-                settings: self.settings,
-                open_dropdown_row: self.dropdown.as_ref().map(|dd| dd.row),
+                show_bitrate_warning: self.settings.bitrate_kbps > ui::BITRATE_WARN_KBPS,
                 hover_close: self.hover_close,
             }),
             Screen::Wake => self.wake.as_ref().map(|w| ModalShellKey::Wake {
@@ -1750,7 +1759,9 @@ impl App {
                 self.dropdown_focus_tile = Some((key, tile));
                 updated.push(Tile::DropdownFocusOption);
             }
-        } else {
+        } else if self.dropdown_fade.closing_frame(DROPDOWN_FADE).is_none() {
+            // Keep the tiles cached while a close-fade is in flight — `draw_list`
+            // still composites them at falling alpha.
             self.dropdown_overlay_tile = None;
             self.dropdown_focus_tile = None;
         }
@@ -2164,9 +2175,9 @@ impl App {
             if matches!(screen, Screen::Settings) {
                 if let Some((total, visible, _, content)) = scroll_geom {
                     let scroll = self.scroll.clamped(total, visible);
-                    if let Some(dd) = &self.dropdown {
-                        let overlay_rect = Self::dropdown_overlay_rect(content, dd.row - scroll);
-                        let options_len = ui::dropdown_options(&self.settings, dd.row).len();
+                    if let Some((row, _, dd_alpha)) = self.dropdown_draw_state() {
+                        let overlay_rect = Self::dropdown_overlay_rect(content, row - scroll);
+                        let options_len = ui::dropdown_options(&self.settings, row).len();
                         cmds.push(DrawCmd::Tex {
                             tile: Tile::DropdownOverlay,
                             dst: Rect::new(
@@ -2175,7 +2186,7 @@ impl App {
                                 overlay_rect.width(),
                                 options_len as u32 * ui::DROPDOWN_OPTION_H,
                             ),
-                            alpha: (255.0 * m) as u8,
+                            alpha: (255.0 * m * dd_alpha) as u8,
                         });
                     }
                 }
@@ -2269,9 +2280,9 @@ impl App {
             if matches!(screen, Screen::Settings) {
                 if let Some((total, visible, _, content)) = scroll_geom {
                     let scroll = self.scroll.clamped(total, visible);
-                    if let Some(dd) = &self.dropdown {
-                        let overlay_rect = Self::dropdown_overlay_rect(content, dd.row - scroll);
-                        let option_rect = ui::dropdown_option_rect(overlay_rect, dd.focused);
+                    if let Some((row, focused, dd_alpha)) = self.dropdown_draw_state() {
+                        let overlay_rect = Self::dropdown_overlay_rect(content, row - scroll);
+                        let option_rect = ui::dropdown_option_rect(overlay_rect, focused);
                         cmds.push(DrawCmd::Tex {
                             tile: Tile::DropdownFocusOption,
                             dst: Rect::new(
@@ -2280,7 +2291,7 @@ impl App {
                                 option_rect.width(),
                                 option_rect.height(),
                             ),
-                            alpha: (255.0 * m) as u8,
+                            alpha: (255.0 * m * dd_alpha) as u8,
                         });
                     }
                 }

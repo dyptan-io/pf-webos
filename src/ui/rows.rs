@@ -99,6 +99,8 @@ pub fn focus_row_rect(content_rect: Rect, index: usize) -> Rect {
 /// than to the label's actual (variable) text width, so the track never
 /// shifts or appears to resize as the label's digit count changes.
 pub const SLIDER_VALUE_SLOT_W: i32 = 150;
+/// Extra gap between the track's right edge and the value slot.
+const SLIDER_TRACK_GAP: i32 = 16;
 
 /// Draws a modal's focus-row list inside `content_rect` — icon + label left,
 /// control right. Only the focused row gets a background card; others bare.
@@ -242,7 +244,7 @@ pub fn draw_focus_row(
             )?;
             let track_w = 220u32.min(row_rect.width() / 3);
             let track = Rect::new(
-                slot_right - SLIDER_VALUE_SLOT_W - track_w as i32,
+                slot_right - SLIDER_VALUE_SLOT_W - SLIDER_TRACK_GAP - track_w as i32,
                 row_rect.y() + (row_rect.height() as i32 - 10) / 2,
                 track_w,
                 10,

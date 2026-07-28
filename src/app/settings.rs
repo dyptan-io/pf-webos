@@ -26,9 +26,13 @@ impl App {
                     // whole Settings screen) saves once for every change made
                     // during this visit, not per-row.
                     ui::apply_dropdown_choice(&mut self.settings, row, choice);
+                    self.dropdown_fade.close((row, dd.focused));
                     self.dropdown = None;
                 }
-                MenuEvent::Back => self.dropdown = None,
+                MenuEvent::Back => {
+                    self.dropdown_fade.close((row, dd.focused));
+                    self.dropdown = None;
+                }
                 MenuEvent::Left | MenuEvent::Right | MenuEvent::Secondary => {}
             }
             return;
@@ -67,6 +71,7 @@ impl App {
                         row: self.settings_focused,
                         focused,
                     });
+                    self.dropdown_fade.reopen();
                 }
                 row => self.apply_setting_adjust(row, true),
             },
@@ -178,5 +183,16 @@ impl App {
     pub(crate) fn dropdown_overlay_rect(content: Rect, row: usize) -> Rect {
         let y = ui::focus_row_rect(content, row + 1).y();
         Rect::new(content.x(), y, content.width(), 0)
+    }
+
+    /// `(row, focused, alpha)` for the open dropdown or its close-fade; `None` if neither.
+    pub(crate) fn dropdown_draw_state(&self) -> Option<(usize, usize, f32)> {
+        if let Some(dd) = &self.dropdown {
+            Some((dd.row, dd.focused, self.dropdown_fade.open_alpha(DROPDOWN_FADE)))
+        } else {
+            self.dropdown_fade
+                .closing_frame(DROPDOWN_FADE)
+                .map(|(alpha, (row, focused))| (row, focused, alpha))
+        }
     }
 }
