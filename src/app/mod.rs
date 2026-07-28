@@ -65,7 +65,10 @@ const PIN_BADGE_MARGIN: i32 = 10;
 pub(crate) const PIN_MOVE_ANIM: Duration = Duration::from_millis(380);
 pub(crate) const CARD_POP: Duration = Duration::from_millis(300);
 pub(crate) const CARD_POP_SHRINK: f32 = 0.14;
-pub(crate) const MODAL_FADE: Duration = Duration::from_millis(170);
+pub(crate) const MODAL_FADE: Duration = Duration::from_millis(200);
+/// Subtler than `CARD_POP_SHRINK` (the modal covers most of the screen) — enough scale
+/// to read as motion where the front-loaded fade alone (`ease`) barely does.
+pub(crate) const MODAL_POP_SHRINK: f32 = 0.05;
 pub(crate) const SCROLL_INDICATOR_HOLD: Duration = Duration::from_millis(700);
 pub(crate) const SCROLL_INDICATOR_FADE: Duration = Duration::from_millis(350);
 pub(crate) const SCROLL_INDICATOR_LIFETIME: Duration =
@@ -83,6 +86,9 @@ pub(crate) const PAIRING_SUBTITLE: &str = "Two ways to pair with this host — e
 
 /// Shared width for Pairing/AddHost/Wake/ForgetHost (consistent window sizing).
 pub(crate) const SIMPLE_MODAL_WIDTH_FRAC: f32 = 0.40;
+
+/// Home status bar's vertical padding; box height is fixed at two text rows.
+const STATUS_BG_PAD: i32 = 12;
 
 /// WOL packet resend interval; silent-mode timeout before showing prompt.
 pub(crate) const WAKE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
@@ -484,8 +490,10 @@ pub struct App {
     /// When the current grid-focus pop started (card scales in over
     /// `ui::FOCUS_POP` — set on every d-pad focus move).
     pub(crate) focus_anim: Option<Instant>,
-    /// When the open modal's fade/slide-in started (`MODAL_FADE`).
-    pub(crate) modal_anim: Option<Instant>,
+    /// Open/close fade for whichever modal is up — see `ui::ModalFade`'s docs. Payload
+    /// is the `Screen` that was open, so a close-fade can keep rendering it after
+    /// `self.screen` has already moved on.
+    pub(crate) modal_fade: ui::ModalFade<Screen>,
     /// When the open modal's focused widget last moved (zooms it in over
     /// `ui::FOCUS_POP`, same GPU-scale technique as `focus_anim` — see
     /// `draw_list`'s `Tile::ModalFocusElement` handling). Shared by every
@@ -619,7 +627,7 @@ impl App {
             grid_scroll: 0,
             grid_scroll_target: 0,
             focus_anim: None,
-            modal_anim: None,
+            modal_fade: ui::ModalFade::new(),
             modal_focus_anim: None,
             switch_anim: None,
             last_screen: Screen::Home,
@@ -644,6 +652,11 @@ impl App {
         // harmless if the spinner is drawn before this thread finishes, redundant work
         // (never a race) if it finishes first.
         std::thread::spawn(ui::spinner_frames);
+        // Same warm-up shape: `supports_av1`'s `OnceLock` byte-scans the platform decoder
+        // plugin on first call, which otherwise lands inline in the first Settings open.
+        std::thread::spawn(|| {
+            crate::device::supports_av1();
+        });
         app
     }
 
@@ -750,7 +763,8 @@ impl App {
     /// through here so the policy lives in one place) and a modal's close (X)
     /// button click (`handle_mouse_click`'s `hover_close` branch below).
     pub fn back(&mut self) -> Option<ConnectTarget> {
-        match self.screen {
+        let from = self.screen;
+        let result = match self.screen {
             // Home has nothing to "back out" of (it's the root screen) — Back is a
             // no-op. (It used to be a shortcut straight to Settings, but that made
             // Back in Settings feel broken: close Settings, press Back again, and
@@ -803,7 +817,14 @@ impl App {
                 self.handle_pin_limit_event(MenuEvent::Back);
                 None
             }
+        };
+        // Any modal-to-something Back (including a sub-nav like WakeSettings ->
+        // HostMenu or About -> Settings, not just landing on Home) fades the modal
+        // just left the same way. `from` is never `Home` here — `back` is a no-op there.
+        if self.screen != from {
+            self.modal_fade.close(from);
         }
+        result
     }
     /// Advances every live animation one tick — the eased scroll, the focus pop,
     /// the modal fade — and reports whether anything is still moving (the main
@@ -834,10 +855,7 @@ impl App {
             }
             animating = true;
         }
-        if let Some(t) = self.modal_anim {
-            if t.elapsed() >= MODAL_FADE {
-                self.modal_anim = None;
-            }
+        if self.modal_fade.tick(MODAL_FADE) {
             animating = true;
         }
         if self.launch_anim.is_some_and(|t| t.elapsed() < ui::LAUNCH_FADE) {
@@ -1205,7 +1223,12 @@ impl App {
         if screen_changed {
             self.last_screen = self.screen;
             if !matches!(self.screen, Screen::Home) {
-                self.modal_anim = Some(Instant::now());
+                self.modal_fade.open();
+                // Reopening the same screen before its close-fade finished — the new
+                // open wins. A close-fade for a *different* screen (e.g. WakeSettings
+                // closing while HostMenu opens behind it) is left alone: `draw_list`
+                // prioritizes it until it expires, then this open is already done.
+                self.modal_fade.cancel_closing(self.screen);
             }
         }
 
@@ -1814,7 +1837,20 @@ impl App {
         screen_h: u32,
         fonts: &ui::Fonts,
     ) -> Option<(usize, usize, Rect, Rect)> {
-        match self.screen {
+        self.scroll_geometry_for(self.screen, screen_w, screen_h, fonts)
+    }
+
+    /// Same as `scroll_geometry`, but for an explicit screen rather than
+    /// `self.screen` — `draw_list`'s closing-fade needs the screen it captured at
+    /// `back()` time, not whatever `self.screen` (already `Home`) says now.
+    pub(crate) fn scroll_geometry_for(
+        &self,
+        screen: Screen,
+        screen_w: u32,
+        screen_h: u32,
+        fonts: &ui::Fonts,
+    ) -> Option<(usize, usize, Rect, Rect)> {
+        match screen {
             Screen::Settings => {
                 let (card, content) = Self::settings_layout(screen_w, screen_h);
                 let visible = Self::settings_visible_rows(screen_h);
@@ -1835,7 +1871,12 @@ impl App {
     /// Settings' fixed row height, or About's wrapped-line height. Only meaningful
     /// when `scroll_geometry` returns `Some`.
     fn scroll_stride(&self, fonts: &ui::Fonts) -> i32 {
-        match self.screen {
+        self.scroll_stride_for(self.screen, fonts)
+    }
+
+    /// Same as `scroll_stride`, but for an explicit screen — see `scroll_geometry_for`.
+    fn scroll_stride_for(&self, screen: Screen, fonts: &ui::Fonts) -> i32 {
+        match screen {
             Screen::Settings => ui::SETTINGS_ROW_H as i32 + ui::SETTINGS_ROW_GAP,
             Screen::About => ui::about_line_stride(fonts.value),
             _ => 1,
@@ -2026,9 +2067,6 @@ impl App {
         }
         if self.selected_host.is_some() && self.home_status.is_some() {
             if let Some((_, p)) = &self.status_tile {
-                // Fixed at two text rows regardless of how many the current message
-                // actually wraps to, so the bar doesn't resize as status text changes.
-                const STATUS_BG_PAD: i32 = 12;
                 let line_h = fonts.label.height() + 6;
                 let box_h = 2 * line_h as u32 + 2 * STATUS_BG_PAD as u32;
                 let box_y = screen_h as i32 - box_h as i32;
@@ -2068,24 +2106,39 @@ impl App {
             });
         }
 
-        if !matches!(self.screen, Screen::Home) {
-            // Modal open: the scrim fades in and the modal slides up its last
-            // ~26px while fading — both pure GPU parameters.
-            let m = ui::anim_frac(self.modal_anim, MODAL_FADE);
+        // While closing, `self.screen` has already moved on — render the fade's
+        // captured screen instead, so the still-uploaded tiles keep drawing for one
+        // more `MODAL_FADE` with alpha running in reverse (see `ui::ModalFade`).
+        let closing_frame = self.modal_fade.closing_frame(MODAL_FADE);
+        let (screen, m) = match closing_frame {
+            Some((alpha, s)) => (s, alpha),
+            None => (self.screen, self.modal_fade.open_alpha(MODAL_FADE)),
+        };
+        if !matches!(screen, Screen::Home) {
             cmds.push(DrawCmd::Fill {
                 rect: Rect::new(0, 0, screen_w, screen_h),
                 color: sdl2::pixels::Color::RGBA(0, 0, 0, (f32::from(ui::MODAL_SCRIM.a) * m) as u8),
             });
             let dy = ((1.0 - m) * 26.0) as i32;
+            let modal_base = Rect::new(0, dy, screen_w, screen_h);
+            // Open also grows in (same pop-in technique as grid cards) — the fade
+            // alone is barely visible since `ease` is front-loaded. Close stays a
+            // plain fade/slide, no scale — already-visible content shrinking away
+            // reads fine without it.
+            let modal_dst = if closing_frame.is_some() {
+                modal_base
+            } else {
+                ui::pop_in_rect(modal_base, m, MODAL_POP_SHRINK)
+            };
             cmds.push(DrawCmd::Tex {
                 tile: Tile::Modal,
-                dst: Rect::new(0, dy, screen_w, screen_h),
+                dst: modal_dst,
                 alpha: (255.0 * m) as u8,
             });
             // Whichever modal's content overflows (Settings' rows, About's document),
             // computed once and reused by every block below instead of each
             // re-deriving it — see `scroll_geometry`'s docs.
-            let scroll_geom = self.scroll_geometry(screen_w, screen_h, fonts);
+            let scroll_geom = self.scroll_geometry_for(screen, screen_w, screen_h, fonts);
             // Its content: cropped/repositioned straight off its own full (unscrolled)
             // tile — a GPU op, so scrolling never re-rasterizes anything (see
             // `Tile::ScrollContent`'s docs). About's tile only ever holds a bounded
@@ -2093,13 +2146,13 @@ impl App {
             // that window begins, so the crop offset is relative to it, not to 0.
             if let Some((total, visible, _, content)) = scroll_geom {
                 let scroll = self.scroll.clamped(total, visible);
-                let window_start = match self.screen {
+                let window_start = match screen {
                     Screen::About => self.content_window.start,
                     _ => 0,
                 };
-                let stride = self.scroll_stride(fonts);
+                let stride = self.scroll_stride_for(screen, fonts);
                 cmds.push(DrawCmd::TexCropped {
-                    tile: Tile::ScrollContent(self.screen),
+                    tile: Tile::ScrollContent(screen),
                     src: Rect::new(
                         0,
                         (scroll - window_start) as i32 * stride,
@@ -2114,7 +2167,7 @@ impl App {
             // other modal has one) — its own tile so it composites *after*
             // `Tile::ScrollContent` (which would otherwise redraw the rows the overlay
             // extends over, on top of it).
-            if matches!(self.screen, Screen::Settings) {
+            if matches!(screen, Screen::Settings) {
                 if let Some((total, visible, _, content)) = scroll_geom {
                     let scroll = self.scroll.clamped(total, visible);
                     if let Some(dd) = &self.dropdown {
@@ -2140,7 +2193,7 @@ impl App {
             // so moving focus needs no modal re-rasterize at all. Same
             // fade/slide as the shell so it stays glued to it during the
             // modal-open animation.
-            let focus_rect = match self.screen {
+            let focus_rect = match screen {
                 Screen::Settings => {
                     let (total, visible, _, content) = scroll_geom.expect("screen is Screen::Settings");
                     let scroll = self.scroll.clamped(total, visible);
@@ -2219,7 +2272,7 @@ impl App {
             // top of the shell's unfocused option list at its actual
             // position, so navigating dropdown options needs no modal
             // re-rasterize either. Settings-only.
-            if matches!(self.screen, Screen::Settings) {
+            if matches!(screen, Screen::Settings) {
                 if let Some((total, visible, _, content)) = scroll_geom {
                     let scroll = self.scroll.clamped(total, visible);
                     if let Some(dd) = &self.dropdown {
@@ -2266,7 +2319,7 @@ impl App {
                             content.height(),
                         );
                         cmds.push(DrawCmd::Tex {
-                            tile: Tile::ScrollIndicator(self.screen),
+                            tile: Tile::ScrollIndicator(screen),
                             dst,
                             alpha: (255.0 * m * scroll_alpha) as u8,
                         });
