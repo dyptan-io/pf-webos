@@ -286,7 +286,8 @@ pub(crate) enum ModalFocusKey {
     SpeedTestButton(usize, String),
     /// Carries label+menu flag for row list shape changes and ⋯ state.
     MenuRow(usize, String, bool),
-    LogLevel(store::LogLevelOverride),
+    /// (focused row, log level, stats-overlay on) — any change invalidates the tile.
+    DiagnosticsRow(usize, store::LogLevelOverride, bool),
 }
 
 /// Scrollable modal content keys. Paired with Screen for staleness checks.
@@ -1150,7 +1151,7 @@ impl App {
             Screen::WakeSettings => {
                 let subtitle = self.wake_settings_subtitle();
                 let card = Self::wake_settings_card_rect(screen_w, screen_h, fonts, &subtitle);
-                let content = ui::list_modal_content_rect(card, fonts, &subtitle, 1);
+                let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT);
                 if ui::focus_row_rect(content, 0).contains_point((x, y)) {
                     self.handle_wake_settings_event(MenuEvent::Confirm);
                 }
@@ -1169,9 +1170,13 @@ impl App {
             Screen::Diagnostics => {
                 let subtitle = self.diagnostics_subtitle();
                 let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
-                let content = ui::list_modal_content_rect(card, fonts, &subtitle, 1);
-                if ui::focus_row_rect(content, 0).contains_point((x, y)) {
-                    self.handle_diagnostics_event(MenuEvent::Confirm);
+                let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT);
+                for row in 0..ui::DIAGNOSTICS_ROW_COUNT {
+                    if ui::focus_row_rect(content, row).contains_point((x, y)) {
+                        self.diagnostics_focused = row;
+                        self.handle_diagnostics_event(MenuEvent::Confirm);
+                        break;
+                    }
                 }
                 None
             }
@@ -1626,7 +1631,11 @@ impl App {
                 };
                 ModalFocusKey::SpeedTestButton(self.speed_test_focused, Self::speed_test_apply_label(recommended))
             }),
-            Screen::Diagnostics => Some(ModalFocusKey::LogLevel(self.settings.log_level_override)),
+            Screen::Diagnostics => Some(ModalFocusKey::DiagnosticsRow(
+                self.diagnostics_focused,
+                self.settings.log_level_override,
+                self.settings.stats_overlay,
+            )),
             // Neither has a single focused widget: the address form is one always-active
             // field, About is a scrolling document, and `PinLimit`'s one button is
             // always drawn focused directly in `render_pin_limit`.
@@ -1758,14 +1767,15 @@ impl App {
                         let rows = self.diagnostics_rows();
                         let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
                         let content = ui::list_modal_content_rect(card, fonts, &subtitle, rows.len());
+                        let dropdown_open = self.dropdown.as_ref().is_some_and(|dd| dd.row == self.diagnostics_focused);
                         ui::render_focus_row_tile(
                             text_cache,
                             fonts,
                             &rows,
                             content.width(),
                             self.diagnostics_focused,
-                            false,
-                            0.0,
+                            dropdown_open,
+                            self.toggle_frac(self.settings.stats_overlay),
                         )?
                     }
                     Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About | Screen::PinLimit => {
@@ -1784,7 +1794,7 @@ impl App {
                 Screen::Diagnostics => {
                     let subtitle = self.diagnostics_subtitle();
                     let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
-                    let content = ui::list_modal_content_rect(card, fonts, &subtitle, 1);
+                    let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT);
                     (ui::log_level_dropdown_options(), content.width())
                 }
                 _ => {
@@ -2230,7 +2240,7 @@ impl App {
                     Screen::Diagnostics => {
                         let subtitle = self.diagnostics_subtitle();
                         let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
-                        Some((ui::list_modal_content_rect(card, fonts, &subtitle, 1), row))
+                        Some((ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT), row))
                     }
                     _ => None,
                 };
@@ -2295,7 +2305,7 @@ impl App {
                 Screen::WakeSettings => {
                     let subtitle = self.wake_settings_subtitle();
                     let card = Self::wake_settings_card_rect(screen_w, screen_h, fonts, &subtitle);
-                    let content = ui::list_modal_content_rect(card, fonts, &subtitle, 1);
+                    let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT);
                     Some(ui::focus_row_rect(content, self.wake_settings_focused))
                 }
                 Screen::SpeedTest => matches!(
@@ -2309,7 +2319,7 @@ impl App {
                 Screen::Diagnostics => {
                     let subtitle = self.diagnostics_subtitle();
                     let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
-                    let content = ui::list_modal_content_rect(card, fonts, &subtitle, 1);
+                    let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT);
                     Some(ui::focus_row_rect(content, self.diagnostics_focused))
                 }
                 Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About | Screen::PinLimit => None,
@@ -2346,7 +2356,7 @@ impl App {
                     Screen::Diagnostics => {
                         let subtitle = self.diagnostics_subtitle();
                         let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
-                        Some((ui::list_modal_content_rect(card, fonts, &subtitle, 1), row))
+                        Some((ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT), row))
                     }
                     _ => None,
                 };

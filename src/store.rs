@@ -245,14 +245,12 @@ pub struct Settings {
     /// investigation; takes effect on the next connect.
     #[serde(default)]
     pub color_range_override: ColorRangeOverride,
-    /// Forces on-device log verbosity — see [`LogLevelOverride`]. Applied live via
-    /// `logger::set_level_override` as soon as it's changed in Diagnostics.
-    /// Deliberately session-only, not persisted: `#[serde(skip)]` means a saved
-    /// `settings.json` never carries a stale verbosity choice into a later,
-    /// non-telemetry launch — every fresh start is `Info` unless
-    /// `logger::launch_level_override` (`TELEMETRY_LEVEL`) says otherwise, applied
-    /// in `load_settings` after deserializing (see there).
-    #[serde(skip)]
+    /// On-device log verbosity — see [`LogLevelOverride`]. Persisted, so a user's
+    /// choice in Diagnostics survives restarts (fresh install defaults to `Info`);
+    /// applied live via `logger::set_level_override` the moment it's changed. A
+    /// `TELEMETRY_LEVEL` launch (`logger::launch_level_override`) still overrides
+    /// the persisted value for that run — see `load_settings`.
+    #[serde(default)]
     pub log_level_override: LogLevelOverride,
 }
 
@@ -294,7 +292,7 @@ pub fn load_settings() -> Settings {
     // `task deploy TELEMETRY=...` dev convenience: TELEMETRY_LEVEL picks the level
     // this launch starts at (and what Diagnostics displays), overriding whatever
     // was last persisted — see `logger::launch_level_override`. Absent, the
-    // persisted/default value (Info) stands.
+    // persisted value stands (Info on a fresh install).
     if let Some(level) = crate::logger::launch_level_override() {
         settings.log_level_override = level;
     }

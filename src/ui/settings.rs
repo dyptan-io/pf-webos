@@ -35,19 +35,24 @@ pub const ROW_VIDEO_BACKEND: usize = 4;
 /// on that row's value (see `codec_options`), and adjacency is what makes the
 /// dependency discoverable without explaining it in copy.
 pub const ROW_CODEC: usize = 5;
-pub const ROW_STATS_OVERLAY: usize = 6;
-pub const ROW_AUDIO: usize = 7;
+pub const ROW_AUDIO: usize = 6;
 /// Forces the VUI range flag sent to the decoder — see `store::ColorRangeOverride`.
 /// Debug aid for the washed-out-colour investigation.
-pub const ROW_COLOR_RANGE: usize = 8;
-/// Not a setting — a link to `Screen::Diagnostics` (log level). A debug aid,
-/// not something a normal user needs to find quickly.
-pub const ROW_DIAGNOSTICS: usize = 9;
+pub const ROW_COLOR_RANGE: usize = 7;
+/// Not a setting — a link to `Screen::Diagnostics` (log level + stats overlay).
+/// A debug aid, not something a normal user needs to find quickly.
+pub const ROW_DIAGNOSTICS: usize = 8;
 /// Not a setting — a link to `Screen::About`. Sits last: every other punktfunk
 /// client puts the version + licences at the very bottom of Settings, and a
 /// `RowKind::Action` row costs nothing extra to render.
-pub const ROW_ABOUT: usize = 10;
-pub const SETTINGS_ROW_COUNT: usize = 11;
+pub const ROW_ABOUT: usize = 9;
+pub const SETTINGS_ROW_COUNT: usize = 10;
+
+/// Diagnostics modal row indices (see `diagnostics_rows`). Log level keeps index
+/// 0 so its dropdown's `(Screen, row)` tile key stays stable.
+pub const DIAG_ROW_LOG_LEVEL: usize = 0;
+pub const DIAG_ROW_STATS_OVERLAY: usize = 1;
+pub const DIAGNOSTICS_ROW_COUNT: usize = 2;
 
 pub const COLOR_RANGE_OPTIONS: [ColorRangeOverride; 3] = [
     ColorRangeOverride::Auto,
@@ -170,19 +175,6 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             menu: None,
         },
         FocusRow {
-            icon: ICON_SUN,
-            label: "Stats overlay".into(),
-            value: if settings.stats_overlay {
-                "On".into()
-            } else {
-                "Off".into()
-            },
-            kind: RowKind::Toggle,
-            fraction: 0.0,
-            danger: false,
-            menu: None,
-        },
-        FocusRow {
             icon: ICON_SIGNAL,
             label: "Audio".into(),
             value: audio_label(settings.audio_channels),
@@ -235,17 +227,29 @@ pub fn log_level_dropdown_current_index(level: LogLevelOverride) -> usize {
     LOG_LEVEL_OPTIONS.iter().position(|&o| o == level).unwrap_or(0)
 }
 
-/// Experimental Flags modal's single row.
-pub fn diagnostics_rows(log_level: LogLevelOverride) -> Vec<FocusRow> {
-    vec![FocusRow {
-        icon: ICON_MONITOR,
-        label: "Log level".into(),
-        value: log_level_label(log_level).into(),
-        kind: RowKind::Dropdown,
-        fraction: 0.0,
-        danger: false,
-        menu: None,
-    }]
+/// Diagnostics modal rows: log level (dropdown) + stats overlay (toggle).
+/// Order must match `DIAG_ROW_*`.
+pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
+    vec![
+        FocusRow {
+            icon: ICON_MONITOR,
+            label: "Log level".into(),
+            value: log_level_label(settings.log_level_override).into(),
+            kind: RowKind::Dropdown,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+        },
+        FocusRow {
+            icon: ICON_SUN,
+            label: "Stats overlay".into(),
+            value: if settings.stats_overlay { "On".into() } else { "Off".into() },
+            kind: RowKind::Toggle,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+        },
+    ]
 }
 
 /// Wake settings modal rows.
@@ -438,10 +442,6 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
             let idx = dropdown_current_index(settings, ROW_CODEC);
             let next = cycle_index(idx, codec_options(settings).len(), forward);
             apply_dropdown_choice(settings, ROW_CODEC, next);
-            true
-        }
-        ROW_STATS_OVERLAY => {
-            settings.stats_overlay = !settings.stats_overlay;
             true
         }
         ROW_AUDIO => {

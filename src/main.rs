@@ -803,7 +803,7 @@ mod real {
             if keyboard_shown != app.keyboard_shown {
                 app.keyboard_shown = keyboard_shown;
                 dirty = true;
-                tracing::info!("on-screen keyboard shown: {keyboard_shown}");
+                tracing::debug!("on-screen keyboard shown: {keyboard_shown}");
             }
             // Toggle text input (edge-triggered; SDL doesn't tolerate repeated calls).
             let wants_text = text_input_screen(app.screen);
@@ -816,7 +816,7 @@ mod real {
                     text_input.stop();
                 }
                 // Log both; separate SDL callbacks — some drivers implement only one.
-                tracing::info!(
+                tracing::debug!(
                     "text input requested: {wants_text} (keyboard shown: {})",
                     text_input.is_screen_keyboard_shown(canvas.window())
                 );

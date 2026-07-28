@@ -102,7 +102,6 @@ impl App {
     pub(crate) fn apply_setting_adjust(&mut self, row: usize, forward: bool) {
         let toggled_from = match row {
             ui::ROW_HDR => Some(self.settings.hdr_enabled),
-            ui::ROW_STATS_OVERLAY => Some(self.settings.stats_overlay),
             _ => None,
         };
         if ui::adjust_setting(&mut self.settings, row, forward) {

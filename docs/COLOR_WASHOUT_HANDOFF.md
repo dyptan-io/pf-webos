@@ -67,8 +67,10 @@ connect** — not live mid-stream.
 ### 2. Settings → Diagnostics → Log level
 
 `app/diagnostics.rs`, reached from a "Diagnostics" row in Settings (not a hidden/remote-button
-menu). Cycles Debug/Info/Warn/Error (Info by default), applied **live** via a reloadable
-`tracing` filter (`logger.rs`) — no reconnect or restart needed.
+menu). Two rows: **Log level** — cycles Debug/Info/Warn/Error (Info on a fresh install),
+applied **live** via a reloadable `tracing` filter (`logger.rs`) with no reconnect, and now
+**persisted** across restarts (a `TELEMETRY_LEVEL` launch still overrides it for that run);
+and the **Stats overlay** toggle (moved here from the main Settings list).
 
 Set this to Debug before testing. The line to look for on every connect:
 

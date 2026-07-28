@@ -413,7 +413,7 @@ pub fn connect(
     let initial_meta = is_hdr.then(cx_display_hdr);
     // What the host actually signalled in `Welcome`, before any user override —
     // the reference point for the washed-out-colour investigation.
-    tracing::debug!(
+    tracing::info!(
         "host colour info: hdr={is_hdr} transfer={} primaries={} matrix={} full_range={}",
         client.color.transfer,
         client.color.primaries,
@@ -1021,7 +1021,7 @@ fn video_pump(
                     // INFO for the same reason as the main heartbeat above — and this
                     // arm is the one that says "nothing is arriving at all", which is a
                     // different fault from "arriving but not presenting".
-                    tracing::info!("video: {frames_received} frames (idle)");
+                    tracing::debug!("video: {frames_received} frames (idle)");
                 }
             }
             Err(e) => {
@@ -1034,7 +1034,7 @@ fn video_pump(
             // `next_hdr_meta` is a queue drained non-blocking, so an Ok here is a
             // freshly received / changed mastering-metadata packet, not a repeat.
             if let Ok(meta) = client.next_hdr_meta(Duration::ZERO) {
-                tracing::debug!(
+                tracing::info!(
                     "HDR metadata received: primaries={:?} white={:?} max_dml={} min_dml={} max_cll={} max_fall={}",
                     meta.display_primaries,
                     meta.white_point,

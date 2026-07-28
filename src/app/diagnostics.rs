@@ -13,23 +13,22 @@ impl App {
     }
 
     pub(crate) fn diagnostics_rows(&self) -> Vec<FocusRow> {
-        ui::diagnostics_rows(self.settings.log_level_override)
+        ui::diagnostics_rows(&self.settings)
     }
 
     pub(crate) fn diagnostics_subtitle(&self) -> String {
-        "Debug aid for on-device investigation. Applies immediately.".to_string()
+        "Debug aids for on-device investigation.".to_string()
     }
 
     pub(crate) fn diagnostics_card_rect(screen_w: u32, screen_h: u32, fonts: &ui::Fonts, subtitle: &str) -> Rect {
-        ui::list_modal_card_rect(screen_w, screen_h, fonts, subtitle, 1)
+        ui::list_modal_card_rect(screen_w, screen_h, fonts, subtitle, ui::DIAGNOSTICS_ROW_COUNT)
     }
 
-    /// Left/Right cycles log level directly; Confirm opens the same dropdown
-    /// picker every other `Settings` dropdown row uses (`ui::ROW_RESOLUTION` etc.
-    /// via `App::handle_settings_event`) — row is always `0` here (Diagnostics'
-    /// only row), disambiguated from `Settings`' row 0 by `self.screen` (see
-    /// `dropdown_overlay_tile`'s docs). Back (row list) saves and returns to
-    /// Settings — same as `About`'s Back, since this is reached from there.
+    /// Two rows (`ui::DIAG_ROW_*`): Log level (Left/Right cycles, Confirm opens the
+    /// same dropdown picker every `Settings` dropdown uses — its row `0` is
+    /// disambiguated from `Settings`' row 0 by `self.screen`, see
+    /// `dropdown_overlay_tile`'s docs) and Stats overlay (Left/Right/Confirm all
+    /// toggle). Back saves and returns to Settings — this is reached from there.
     pub(crate) fn handle_diagnostics_event(&mut self, ev: MenuEvent) {
         if let Some(dd) = self.dropdown.as_mut() {
             let len = ui::LOG_LEVEL_OPTIONS.len();
@@ -38,12 +37,12 @@ impl App {
                 MenuEvent::Down => dd.focused = (dd.focused + 1) % len,
                 MenuEvent::Confirm => {
                     let choice = dd.focused;
-                    self.dropdown_fade.close((0, choice));
+                    self.dropdown_fade.close((ui::DIAG_ROW_LOG_LEVEL, choice));
                     self.dropdown = None;
                     self.set_log_level(ui::LOG_LEVEL_OPTIONS[choice]);
                 }
                 MenuEvent::Back => {
-                    self.dropdown_fade.close((0, dd.focused));
+                    self.dropdown_fade.close((ui::DIAG_ROW_LOG_LEVEL, dd.focused));
                     self.dropdown = None;
                 }
                 MenuEvent::Left | MenuEvent::Right | MenuEvent::Secondary => {}
@@ -55,21 +54,26 @@ impl App {
             self.modal_focus_anim = Some(Instant::now());
             return;
         }
-        match ev {
-            MenuEvent::Left | MenuEvent::Right => self.cycle_log_level(),
-            MenuEvent::Confirm => {
+        match (self.diagnostics_focused, ev) {
+            (ui::DIAG_ROW_LOG_LEVEL, MenuEvent::Left | MenuEvent::Right) => self.cycle_log_level(),
+            (ui::DIAG_ROW_LOG_LEVEL, MenuEvent::Confirm) => {
                 self.dropdown = Some(DropdownState {
-                    row: 0,
+                    row: ui::DIAG_ROW_LOG_LEVEL,
                     focused: ui::log_level_dropdown_current_index(self.settings.log_level_override),
                 });
                 self.dropdown_fade.reopen();
             }
-            MenuEvent::Back => {
+            (ui::DIAG_ROW_STATS_OVERLAY, MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
+                let from = self.settings.stats_overlay;
+                self.settings.stats_overlay = !from;
+                self.switch_anim = Some((Instant::now(), from));
+            }
+            (_, MenuEvent::Back) => {
                 self.settings_writer.save(self.settings);
                 self.screen = Screen::Settings;
                 self.scroll = self.settings_scroll;
             }
-            MenuEvent::Up | MenuEvent::Down | MenuEvent::Secondary => {}
+            _ => {}
         }
     }
 
