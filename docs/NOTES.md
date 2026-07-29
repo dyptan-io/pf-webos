@@ -29,6 +29,7 @@ Hybrid software/GPU design: `tiny_skia` rasterizes tiles, SDL2 composites. Redra
 - **Loss recovery required** — no periodic IDRs in stream. `video_pump` calls `note_frame_index()` every frame (throttled RFI on gaps) + `request_keyframe()` backstop when `frames_dropped()` climbs.
 - **Freeze-until-reanchor adapted for NDL**: NDL does decode+present in one opaque call (no split); client reimplements skip-until-reanchor subset. Forward gap arms `holding` flag; frames withheld until one arrives with `FLAG_SOF` (IDR) or recovery anchor.
 - HDR mastering metadata can change mid-session — drain `next_hdr_meta` every frame.
+- **`NDL_DirectVideoSetHDRInfo` forces the panel into HDR mode on *any* call** (OLED65CX, webOS 5): it ignores the SDR `transfer`/`primaries` triplet and emits an HDR infoframe regardless, so an SDR/H.264 stream got shown in HDR picture mode. Fix: `ndl.rs::set_color_info` no-ops when `meta` is `None` (SDR) — only genuine HDR mastering metadata reaches NDL. Cost: NDL can no longer be used to fix a bitstream's missing VUI colour info; SDR relies on the bitstream VUI. HDR is also gated to HEVC end-to-end (`session::connect`: `apply_hdr = host_hdr && codec==H265`, and an explicit H.264 pick drops the HDR caps + hides the Settings toggle).
 
 ## Known platform limitations (don't retry)
 

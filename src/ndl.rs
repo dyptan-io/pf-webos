@@ -271,30 +271,32 @@ impl NdlVideo {
 
     /// Apply HDR mastering metadata. `meta` and `color` use the same SEI-standard
     /// units NDL expects (G/B/R order per ST.2086), so no conversion is needed.
-    /// Forwards the stream's colorimetry (and, for HDR, its mastering metadata)
-    /// to NDL. `meta: None` = an SDR stream: the mastering/light-level fields are
-    /// zeroed (the SEI "unknown" convention) and only the colour triplet
-    /// (transfer/primaries/matrix) is meaningful — without it, a bitstream with
-    /// missing/unspecified VUI colour info leaves the panel to guess colorimetry
-    /// from resolution, and a 4K SDR stream then decodes as BT.2020 instead of
-    /// the BT.709 punktfunk actually encodes (a visibly washed-out picture).
+    ///
+    /// `meta: None` (an SDR stream) is a **no-op**: on this platform
+    /// `NDL_DirectVideoSetHDRInfo` emits an HDR infoframe on *any* call — it ignores the
+    /// SDR `transfer`/`primaries` triplet and flips the panel into HDR picture mode
+    /// regardless (observed on OLED65CX with an H.264 SDR stream). So an SDR stream must
+    /// not call it at all; its colorimetry rides the bitstream VUI instead. (This means
+    /// NDL can't be used to correct a bitstream with missing/"unspecified" VUI colour
+    /// info — the earlier reason this was called unconditionally — but forcing the panel
+    /// into HDR for SDR content is the worse outcome.)
     pub fn set_color_info(
         &self,
         meta: Option<&punktfunk_core::quic::HdrMeta>,
         color: punktfunk_core::quic::ColorInfo,
     ) -> Result<()> {
-        // G/B/R order (ST.2086 convention; same as starfish.rs).
-        let ([g, b, r], white, max_dml, min_dml, cll, fall) = match meta {
-            Some(m) => (
-                m.display_primaries,
-                m.white_point,
-                m.max_display_mastering_luminance,
-                m.min_display_mastering_luminance,
-                m.max_cll,
-                m.max_fall,
-            ),
-            None => ([[0; 2]; 3], [0; 2], 0, 0, 0, 0),
+        let Some(m) = meta else {
+            return Ok(());
         };
+        // G/B/R order (ST.2086 convention; same as starfish.rs).
+        let ([g, b, r], white, max_dml, min_dml, cll, fall) = (
+            m.display_primaries,
+            m.white_point,
+            m.max_display_mastering_luminance,
+            m.min_display_mastering_luminance,
+            m.max_cll,
+            m.max_fall,
+        );
         let info = NdlHdrInfo {
             display_primaries_x0: c_int::from(g[0]),
             display_primaries_y0: c_int::from(g[1]),

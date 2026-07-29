@@ -254,6 +254,11 @@ pub fn connect(
     codec_pref: CodecPref,
     color_range_override: ColorRangeOverride,
 ) -> Result<Connected> {
+    // HDR only ever applies to HEVC. An explicit H.264 pick disables it end to end
+    // (the Settings toggle is hidden too — see `ui::hdr_row_shown`); on Automatic the
+    // caps are still advertised and the host resolves the codec, with application gated
+    // on the *negotiated* codec being HEVC further below.
+    let hdr_enabled = hdr_enabled && codec_pref != CodecPref::H264;
     // VIDEO_CAP_CHACHA20: unconditional — armv7 has no hardware AES, so ChaCha20 is
     // faster. A ≥0.17.2 host picks it up; older hosts ignore the unknown bit.
     let video_caps = quic::VIDEO_CAP_CHACHA20
@@ -434,12 +439,17 @@ pub fn connect(
     // which shows up as exactly the washed-out/desaturated picture reported
     // on-device. `client.color` arrives out-of-band in `Welcome` for precisely
     // this purpose; HDR streams additionally carry mastering metadata.
-    let is_hdr = client.color.is_hdr();
+    // HDR mastering metadata is applied only when the *negotiated* codec is HEVC: the
+    // `NdlHdrInfo`/`setHdrInfo` fields are HEVC SEI syntax, and no other codec carries
+    // HDR on this platform. Colorimetry (the SDR washed-out fix) is still sent below for
+    // every codec — only the mastering metadata is gated.
+    let host_hdr = client.color.is_hdr();
+    let is_hdr = host_hdr && matches!(codec, NdlCodec::H265);
     let initial_meta = is_hdr.then(cx_display_hdr);
     // What the host actually signalled in `Welcome`, before any user override —
     // the reference point for the washed-out-colour investigation.
     tracing::info!(
-        "host colour info: hdr={is_hdr} transfer={} primaries={} matrix={} full_range={}",
+        "host colour info: hdr={host_hdr} apply_hdr={is_hdr} codec={codec:?} transfer={} primaries={} matrix={} full_range={}",
         client.color.transfer,
         client.color.primaries,
         client.color.matrix,

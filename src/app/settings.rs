@@ -30,6 +30,9 @@ impl App {
                     ui::apply_dropdown_choice(&mut self.settings, logical, choice);
                     self.dropdown_fade.close((row, dd.focused));
                     self.dropdown = None;
+                    // A codec change hides/shows the HDR row above; keep focus on the
+                    // row just edited rather than letting the shift slide it away.
+                    self.refocus_logical(logical);
                 }
                 MenuEvent::Back => {
                     self.dropdown_fade.close((row, dd.focused));
@@ -115,6 +118,19 @@ impl App {
                 self.switch_anim = Some((Instant::now(), from));
             }
         }
+        // Cycling the codec can hide/show the HDR row above; keep focus on `row`.
+        self.refocus_logical(row);
+    }
+
+    /// After a mutation that may have shown or hidden rows (a codec change toggles the
+    /// HDR row's visibility), re-derive the display index of `logical` so focus stays on
+    /// the same setting instead of sliding to whatever now occupies its old slot.
+    fn refocus_logical(&mut self, logical: usize) {
+        let rows = ui::settings_visible_logical_rows(&self.settings);
+        self.settings_focused = rows
+            .iter()
+            .position(|&r| r == logical)
+            .unwrap_or_else(|| self.settings_focused.min(rows.len().saturating_sub(1)));
     }
     /// Settings rows visible on screen (1080p card scrolls if needed). Capped at
     /// the live row count so a hidden row (Color range on NDL) leaves no empty slot.
