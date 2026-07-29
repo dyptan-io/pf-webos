@@ -246,7 +246,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
         },
         FocusRow {
             icon: ICON_SCHEDULE,
-            label: "Video pacing (experimental)".into(),
+            label: "Frame pacer (experimental)".into(),
             value: if settings.video_pacing { "On".into() } else { "Off".into() },
             kind: RowKind::Toggle,
             fraction: 0.0,

@@ -33,7 +33,7 @@ Hybrid software/GPU design: `tiny_skia` rasterizes tiles, SDL2 composites. Redra
 
 ## Known platform limitations (don't retry)
 
-- **Frame rate paces the stream; can't set panel refresh rate.** `webosbrew/SDL-webOS` exposes read-only `SDL_webOSGetRefreshRate` only; no set-side webOS API.
+- **Frame rate paces the stream; can't set panel refresh rate.** `webosbrew/SDL-webOS` exposes read-only `SDL_webOSGetRefreshRate` only; no set-side webOS API. Used by `PtsPacer` (`session.rs::reconciled_pace_interval_ns`): when the measured panel Hz is within ±2 Hz of the stream fps, the paced PTS grid anchors to the panel's cadence instead of the stream's (aurora-tv's `session_worker.c` trick). Still not real vsync — just PTS quantization to the display's rate.
 - **Magic Remote Back requires `SDL_WEBOS_ACCESS_POLICY_KEYS_BACK`** set before window creation. Arrives as `keycode = 2097155`. Same for Home (`SDL_WEBOS_ACCESS_POLICY_KEYS_HOME`) and Guide (`SDL_WEBOS_ACCESS_POLICY_KEYS_GUIDE`). Launcher ribbon overlay needs `SDL_WEBOS_ACCESS_POLICY_RIBBON=false` or it pops over the app.
 - **Hidden window gets no pointer input.** Keep it mapped and fully transparent `RGBA(0,0,0,0)` each frame so NDL plane shows through (not `.hide()`).
 - **Two independent cursors** — webOS draws local cursor; host draws second over network. Hide local cursor during stream (`show_cursor(false)`). `mouse.rs` scales motion by `SENSITIVITY` 0.55.

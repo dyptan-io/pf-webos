@@ -814,6 +814,37 @@ const FEED_BACKPRESSURE_WARN: Duration = Duration::from_millis(20);
 /// three samples per 750 ms report window; see the fold in [`video_pump`].
 const BACKLOG_POLL: Duration = Duration::from_millis(250);
 
+// Read-only panel-refresh query from the `webosbrew/SDL-webOS` fork.
+#[link(name = "SDL2")]
+extern "C" {
+    fn SDL_webOSGetRefreshRate(rate: *mut std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
+/// Returns panel refresh in Hz, or `None` on query failure/implausible values.
+fn panel_refresh_hz() -> Option<u32> {
+    let mut rate: std::os::raw::c_int = 0;
+    // SAFETY: single out-param, no aliasing; read-only panel query.
+    let ok = unsafe { SDL_webOSGetRefreshRate(&mut rate) };
+    (ok != 0 && (20..=240).contains(&rate)).then_some(rate as u32)
+}
+
+/// Returns pacing interval (ns), preferring panel cadence when within ±2 Hz of stream.
+/// Otherwise uses stream rate.
+fn reconciled_pace_interval_ns(stream_hz: u32) -> u64 {
+    let hz = match panel_refresh_hz() {
+        Some(panel_hz) if stream_hz.abs_diff(panel_hz) <= 2 => {
+            tracing::info!("pacing grid anchored to panel {panel_hz}Hz (stream {stream_hz}Hz)");
+            panel_hz
+        }
+        Some(panel_hz) => {
+            tracing::info!("pacing grid on stream {stream_hz}Hz (panel {panel_hz}Hz differs by >2Hz)");
+            stream_hz
+        }
+        None => stream_hz,
+    };
+    1_000_000_000 / u64::from(hz.max(1))
+}
+
 /// Max drift ([`PtsPacer`]) from the unpaced reference, as a fraction of one frame
 /// interval — same figure aurora-tv ships as `SS4S_SMOOTH_PACING_MAX_DRIFT_FRAMES` for
 /// these same NDL/Starfish backends.
@@ -997,10 +1028,14 @@ fn video_pump(
     // frame — three samples per 750 ms ABR report window is plenty, and assuming an NDL
     // query is cheap enough for per-frame use is exactly the mistake docs/NOTES.md warns
     // against; between polls the cached depth is reused.
-    let frame_period_us = 1_000_000 / u64::from(client.mode().refresh_hz.max(1));
+    let stream_hz = client.mode().refresh_hz.max(1);
+    let frame_period_us = 1_000_000 / u64::from(stream_hz);
     // Only instantiated when the setting is on — off means no pacer state at all and a
     // bit-for-bit-unchanged PTS (the raw per-backend reference reaches `play` directly).
-    let mut pacer = video_pacing.then(|| PtsPacer::new(frame_period_us * 1_000));
+    // The pacer interval reconciles against the panel's measured refresh (see
+    // `reconciled_pace_interval_ns`); the ABR backlog folding above stays on the stream
+    // rate, which is the host's actual frame cadence.
+    let mut pacer = video_pacing.then(|| PtsPacer::new(reconciled_pace_interval_ns(stream_hz)));
     let mut backlog_cached: u64 = 0;
     let mut last_backlog_poll: Option<Instant> = None;
     let mut last_dropped_seen = client.frames_dropped();
