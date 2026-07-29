@@ -20,6 +20,7 @@ use punktfunk_core::packet::{FLAG_SOF, USER_FLAG_RECOVERY_ANCHOR};
 use punktfunk_core::quic;
 
 use crate::ndl::{NdlCodec, NdlVideo};
+use crate::pacing::{HostPtsAnchor, PtsPacer};
 use crate::starfish::StarfishVideo;
 use crate::store::{CodecPref, ColorRangeOverride, VideoBackend};
 
@@ -823,131 +824,6 @@ const FEED_BACKPRESSURE_WARN: Duration = Duration::from_millis(20);
 /// three samples per 750 ms report window; see the fold in [`video_pump`].
 const BACKLOG_POLL: Duration = Duration::from_millis(250);
 
-// Read-only panel-refresh query from the `webosbrew/SDL-webOS` fork.
-#[link(name = "SDL2")]
-extern "C" {
-    fn SDL_webOSGetRefreshRate(rate: *mut std::os::raw::c_int) -> std::os::raw::c_int;
-}
-
-/// Returns panel refresh in Hz, or `None` on query failure/implausible values.
-fn panel_refresh_hz() -> Option<u32> {
-    let mut rate: std::os::raw::c_int = 0;
-    // SAFETY: single out-param, no aliasing; read-only panel query.
-    let ok = unsafe { SDL_webOSGetRefreshRate(&mut rate) };
-    (ok != 0 && (20..=240).contains(&rate)).then_some(rate as u32)
-}
-
-/// Returns pacing interval (ns), preferring panel cadence when within ±2 Hz of stream.
-/// Otherwise uses stream rate.
-fn reconciled_pace_interval_ns(stream_hz: u32) -> u64 {
-    let hz = match panel_refresh_hz() {
-        Some(panel_hz) if stream_hz.abs_diff(panel_hz) <= 2 => {
-            tracing::info!("pacing grid anchored to panel {panel_hz}Hz (stream {stream_hz}Hz)");
-            panel_hz
-        }
-        Some(panel_hz) => {
-            tracing::info!("pacing grid on stream {stream_hz}Hz (panel {panel_hz}Hz differs by >2Hz)");
-            stream_hz
-        }
-        None => stream_hz,
-    };
-    1_000_000_000 / u64::from(hz.max(1))
-}
-
-/// Max drift ([`PtsPacer`]) from the unpaced reference, as a fraction of one frame
-/// interval — same figure aurora-tv ships as `SS4S_SMOOTH_PACING_MAX_DRIFT_FRAMES` for
-/// these same NDL/Starfish backends.
-const PACE_MAX_DRIFT_FRAMES: f64 = 0.5;
-/// Minimum step between successive paced PTS values, so NDL's ms-truncation
-/// (`NdlVideo::play`) never sees two equal/decreasing timestamps in a row.
-const PACE_MIN_STEP_NS: u64 = 1_000_000;
-
-/// Maps the host's capture-clock PTS onto NDL's own player clock, anchored once at the
-/// first frame of a run: `base = player_anchor + (host_pts - host_anchor)`. This keeps the
-/// pacer's drift-clamp reference on the host's frame cadence rather than on feed-time
-/// wall-clock, so network delivery jitter no longer leaks into the value the clamp pulls
-/// toward (see [`VideoPlayer::pace_base_ns`]). Same anchoring SS4S's NDL backend does
-/// (`ndl_player.c::SS4S_NDL_webOS5_NextVideoPts`). Reset alongside [`PtsPacer`] after a
-/// freeze-until-reanchor hold, where both the host timeline and player clock have jumped.
-struct HostPtsAnchor {
-    anchor: Option<(u64, u64)>,
-}
-
-impl HostPtsAnchor {
-    fn new() -> Self {
-        Self { anchor: None }
-    }
-
-    fn reset(&mut self) {
-        self.anchor = None;
-    }
-
-    /// Base reference for `host_pts_ns`. The first call after construction/reset anchors on
-    /// the current `player_clock_ns` and returns it verbatim; later calls project the host
-    /// PTS delta forward from that anchor, floored at 0 (a host PTS going backwards vs. the
-    /// anchor would otherwise underflow).
-    fn map(&mut self, host_pts_ns: u64, player_clock_ns: u64) -> u64 {
-        match self.anchor {
-            None => {
-                self.anchor = Some((host_pts_ns, player_clock_ns));
-                player_clock_ns
-            }
-            Some((host0, player0)) => {
-                let delta = host_pts_ns as i64 - host0 as i64;
-                (player0 as i64 + delta).max(0) as u64
-            }
-        }
-    }
-}
-
-/// Smooths the PTS fed to the decoder against delivery jitter — an "ideal" value
-/// advances by a fixed frame interval each call, clamped to a small drift window
-/// around the real (unpaced) reference (see [`VideoPlayer::pace_base_ns`]). Changes
-/// only *what* timestamp is attached, never *when* `play()` runs — the decoder
-/// schedules presentation off the PTS itself, so a burst of frames landing together
-/// still gets spaced one interval apart instead of stamped with ~the same time. Same
-/// technique as aurora-tv's `SS4S_SMOOTH_PACING`.
-struct PtsPacer {
-    interval_ns: u64,
-    max_drift_ns: u64,
-    ideal_ns: Option<u64>,
-}
-
-impl PtsPacer {
-    fn new(interval_ns: u64) -> Self {
-        Self {
-            interval_ns,
-            max_drift_ns: (interval_ns as f64 * PACE_MAX_DRIFT_FRAMES) as u64,
-            ideal_ns: None,
-        }
-    }
-
-    /// Drops the accumulator — call after a freeze-until-reanchor hold, where the real
-    /// timeline just jumped and there's no "ideal" continuation worth preserving.
-    fn reset(&mut self) {
-        self.ideal_ns = None;
-    }
-
-    /// Next paced PTS (ns) for `base_ns`, this frame's unpaced reference value. The
-    /// first call after construction/reset anchors on `base_ns` verbatim; each later
-    /// call advances one interval from the previous paced value, clamped to the drift
-    /// window around `base_ns` and floored to a strictly-increasing step.
-    fn next(&mut self, base_ns: u64) -> u64 {
-        let paced = match self.ideal_ns {
-            None => base_ns,
-            Some(prev) => prev
-                .saturating_add(self.interval_ns)
-                .clamp(
-                    base_ns.saturating_sub(self.max_drift_ns),
-                    base_ns.saturating_add(self.max_drift_ns),
-                )
-                .max(prev.saturating_add(PACE_MIN_STEP_NS)),
-        };
-        self.ideal_ns = Some(paced);
-        paced
-    }
-}
-
 /// Suffix identifying a `GStreamer` pad-task thread (`"<element-name>:<pad-name>"`,
 /// truncated to the kernel's 15-char `comm` limit) — both the NDL and Starfish vendor
 /// `.so`s build their internal decode pipeline out of `GStreamer` elements, each with its
@@ -1082,7 +958,8 @@ fn video_pump(
     // The pacer interval reconciles against the panel's measured refresh (see
     // `reconciled_pace_interval_ns`); the ABR backlog folding above stays on the stream
     // rate, which is the host's actual frame cadence.
-    let mut pacer = video_pacing.then(|| PtsPacer::new(reconciled_pace_interval_ns(stream_hz)));
+    let mut pacer =
+        video_pacing.then(|| PtsPacer::new(crate::pacing::reconciled_pace_interval_ns(stream_hz)));
     // Paired with `pacer`: the NDL host-PTS→player-clock mapping only matters as the pacer's
     // base reference, so it lives and resets in lockstep with it (no-op on Starfish).
     let mut host_anchor = video_pacing.then(HostPtsAnchor::new);

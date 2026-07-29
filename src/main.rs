@@ -27,6 +27,8 @@ mod mouse;
 #[cfg(target_os = "linux")]
 mod ndl;
 #[cfg(target_os = "linux")]
+mod pacing;
+#[cfg(target_os = "linux")]
 mod session;
 #[cfg(target_os = "linux")]
 mod starfish;
