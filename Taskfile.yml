@@ -50,11 +50,13 @@ tasks:
       - git -C vendor/punktfunk apply --check --reverse {{.ROOT_DIR}}/patches/0001-crypto-register-aes128gcm-backend.patch
 
   build:
-    desc: Cross-compile the release binary, inside Docker — the local dev entry point
+    desc: Cross-compile the release binary, inside Docker with thin LTO (fast). Override with RELEASE_LTO=fat for optimized build.
     deps: [submodule:sync]
     cmds:
       - task: toolchain:docker-run
-        vars: {TARGET_TASK: native:build}
+        vars:
+          TARGET_TASK: native:build
+          RELEASE_LTO: '{{.RELEASE_LTO | default "thin"}}'
 
   check:
     desc: Quick cross-target `cargo check`, inside Docker — the local dev entry point
@@ -64,11 +66,13 @@ tasks:
         vars: {TARGET_TASK: native:check}
 
   package:
-    desc: Build and package dist/*.ipk, inside Docker — this is the one you usually want
+    desc: Build and package dist/*.ipk, inside Docker with thin LTO (fast). Override with RELEASE_LTO=fat for optimized.
     deps: [submodule:sync]
     cmds:
       - task: toolchain:docker-run
-        vars: {TARGET_TASK: native:package}
+        vars:
+          TARGET_TASK: native:package
+          RELEASE_LTO: '{{.RELEASE_LTO | default "thin"}}'
 
   lint:
     desc: Cross-target `cargo clippy` (the lint set in Cargo.toml's `[lints.clippy]`), inside Docker
@@ -82,13 +86,6 @@ tasks:
     cmds:
       - cargo fmt
 
-  notices:
-    desc: >-
-      Regenerate THIRD-PARTY-NOTICES.txt (embedded into the About screen), inside Docker —
-      run this whenever the dependency tree changes
-    cmds:
-      - task: toolchain:docker-run
-        vars: {TARGET_TASK: native:notices}
 
   native:build:
     desc: >-
@@ -127,13 +124,6 @@ tasks:
       - rustup component add clippy
       - cargo clippy --target {{.TARGET}} --all-targets -- -D warnings
 
-  native:notices:
-    desc: >-
-      Regenerate THIRD-PARTY-NOTICES.txt, no Docker — reads the local cargo cache offline
-      (used by `notices`; see scripts/gen-third-party-notices.py for why there's no
-      cargo-about path).
-    cmds:
-      - python3 scripts/gen-third-party-notices.py --out THIRD-PARTY-NOTICES.txt
 
   native:package:
     desc: Build and package dist/*.ipk, no Docker (used by CI)
@@ -209,6 +199,5 @@ tasks:
   clean:
     desc: Remove everything — dist/, .toolchains/, target/, and the Docker volumes
     cmds:
-      - rm -rf dist
-      - rm -rf .toolchains target
-      - docker volume rm -f pf-webos-toolchains pf-webos-target pf-webos-cargo pf-webos-apt-cache pf-webos-apt-lists pf-webos-tools
+      - rm -rf ./dist ./.toolchains ./target
+      - docker volume rm -f punktfunk-webos-toolchains punktfunk-webos-target punktfunk-webos-cargo punktfunk-webos-apt-cache punktfunk-webos-apt-lists punktfunk-webos-tools

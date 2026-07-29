@@ -1,20 +1,5 @@
-//! Headless network speed probe — the app's "Test connection" measurement as a CLI, so it
-//! can be run on-device over Dev-Mode SSH (no TV UI, no display) while watching kernel
-//! counters from the outside. Mirrors `session::run_speed_probe` exactly: a decode-less
-//! `NativeClient` connect advertising the same cipher a real session would (the counters
-//! this measurement reads increment *after* AEAD decrypt, so the probe must pay the same
-//! cipher a real session does — see `store::CipherPref`), then one host-driven burst
-//! polled to completion.
-//!
-//! Usage:
-//!   pfprobe <host> <port> <cert.pem> <key.pem> <pin-hex-64> [`target_kbps`] [`duration_ms`] [`cipher`]
-//!
-//! `cipher` is `aes` (default — plain AES-128-GCM, the ARMv8 Crypto Extensions fast path)
-//! or `chacha` (ChaCha20-Poly1305).
-//!
-//! Prints one `progress:` line per 250 ms poll (live `recv_bytes`) and a final `result:`
-//! line with the host-attested figures. Diagnostics from punktfunk-core (`PUNKTFUNK_PERF=1`
-//! pump-stage splits, ABR/probe decisions) go to stderr via `tracing`.
+//! Headless speed probe CLI (mirrors `session::run_speed_probe`). Run on-device over SSH to test connection.
+//! Usage: pfprobe <host> <port> <cert.pem> <key.pem> <pin-hex-64> [`target_kbps`] [`duration_ms`]
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn main() -> anyhow::Result<()> {
@@ -35,8 +20,7 @@ mod real {
     use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
     use punktfunk_core::quic;
 
-    /// Same non-zero pinned session rate as `session::run_speed_probe`: `bitrate_kbps == 0`
-    /// would arm core's own startup capacity probe against the single shared `ProbeState`.
+    /// Non-zero to avoid triggering core's startup probe (`bitrate_kbps` == 0 would).
     const PROBE_SESSION_BITRATE_KBPS: u32 = 20_000;
     const PROBE_REPORT_GRACE: Duration = Duration::from_secs(12);
 
@@ -44,8 +28,7 @@ mod real {
         anyhow::ensure!(hex.len() == 64, "pin must be 64 hex chars");
         let mut pin = [0u8; 32];
         for (i, byte) in pin.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-                .with_context(|| format!("bad hex at byte {i}"))?;
+            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).with_context(|| format!("bad hex at byte {i}"))?;
         }
         Ok(pin)
     }
@@ -75,7 +58,11 @@ mod real {
             Some(other) => anyhow::bail!("unknown cipher {other:?}, expected \"aes\" or \"chacha\""),
         };
 
-        let mode = Mode { width: 1280, height: 720, refresh_hz: 60 };
+        let mode = Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
         let client = NativeClient::connect(
             host,
             port,
@@ -117,7 +104,9 @@ mod real {
             warm_start.elapsed().as_millis()
         );
 
-        client.request_probe(target_kbps, duration_ms).context("request_probe")?;
+        client
+            .request_probe(target_kbps, duration_ms)
+            .context("request_probe")?;
         let started = Instant::now();
         let deadline = started + Duration::from_millis(u64::from(duration_ms)) + PROBE_REPORT_GRACE;
         loop {

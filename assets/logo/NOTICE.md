@@ -12,3 +12,4 @@ rsvg-convert -w 190 --keep-aspect-ratio logo_full.svg -o logo-sidebar.png
 
 `packaging/splash.png` is generated from the same artwork (mark only, tight
 viewBox, centered on the brand-dark `#1c1530` 1920x1080 canvas).
+

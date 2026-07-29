@@ -1,29 +1,17 @@
-//! The anti-aliased software rendering backend every `draw_*` is built from.
-//!
-//! Split out of the former single-file `ui.rs`; see `super`'s module docs.
-use std::collections::HashMap;
+//! Anti-aliased software rendering backend (`tiny_skia` Pixmap framebuffer).
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
-use tiny_skia::{Color as SkColor, FillRule, FilterQuality, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform};
-
-// The AA rendering backend: a `tiny_skia::Pixmap` framebuffer plus the handful of
-// primitive ops every higher-level `draw_*` function below is built from. Nothing
-// past this section touches SDL2 rendering at all — `Font`/`Surface` still come
-// from `SDL2_ttf` (text metrics/rasterization; see the text/font section), but the
-// actual pixels always end up composited into this same buffer.
+use std::cell::RefCell;
+use std::collections::HashMap;
+use tiny_skia::{
+    Color as SkColor, FillRule, FilterQuality, IntSize, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform,
+};
 
 pub fn sk_color(c: Color) -> SkColor {
     SkColor::from_rgba8(c.r, c.g, c.b, c.a)
 }
 
-/// A flat-color `Paint` — every fill/stroke in this module uses one of these and
-/// nothing fancier (no gradients/patterns needed for this UI).
-///
-/// Anti-aliasing off: tiny-skia dispatches to a genuinely separate, cheaper
-/// scan-conversion path when `anti_alias` is off (`scan::path::fill_path`/
-/// `scan::fill_rect` vs. the `_aa` variants) — measured on real webOS hardware,
-/// worth a real (if modest, ~15-25%) chunk of render time on larger fills like the
-/// Settings modal card. See docs/NOTES.md's "UI performance, round 2" entry.
+/// Flat-color paint (no gradients/patterns). Anti-aliasing off for cheaper scan-conversion (~15-25% faster).
 pub fn solid_paint(color: Color) -> Paint<'static> {
     let mut paint = Paint::default();
     paint.set_color(sk_color(color));
@@ -31,12 +19,8 @@ pub fn solid_paint(color: Color) -> Paint<'static> {
     paint
 }
 
-/// Builds a rounded-rect as a Bezier path — tiny-skia (unlike full Skia) has no
-/// built-in rounded-rect primitive. `k` is the standard cubic-Bezier
-/// circular-arc-approximation constant. Falls back to a plain rect once `radius`
-/// clamps to ~0.
+/// Rounded-rect as Bezier path (`tiny_skia` has no built-in); falls back to plain rect if radius ~0.
 pub fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
-    /// The standard cubic-Bezier circular-arc-approximation constant.
     const K: f32 = 0.552_284_7;
 
     let r = radius.max(0.0).min(w / 2.0).min(h / 2.0);
@@ -65,12 +49,6 @@ pub fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<
 /// version did.
 pub struct Painter {
     pixmap: Pixmap,
-    /// Rendered (padded, box-blurred) shadow shapes, keyed by the params that
-    /// fully determine their pixels — every card of a given size/style shares
-    /// one entry instead of re-running the blur every dirty frame. Small and
-    /// bounded: the UI only ever draws a handful of distinct card sizes
-    /// (poster cards, sidebar rows, modals).
-    shadow_cache: HashMap<ShadowKey, Pixmap>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -82,11 +60,37 @@ pub struct ShadowKey {
     opacity: u8,
 }
 
+thread_local! {
+    /// Rendered (padded, box-blurred) shadow shapes, keyed by the params that fully
+    /// determine their pixels — shared process-wide, not a `Painter` field: every
+    /// grid card gets its own fresh `Painter` (`render_card_tile` calls
+    /// `Painter::new` per card), so a cache on `Painter` itself would never hit past
+    /// the first card of a build. `thread_local` (not a plain `static`) is safe here
+    /// without `unsafe`/atomics since every `Painter` is built on the single
+    /// SDL/render thread.
+    static SHADOW_CACHE: RefCell<HashMap<ShadowKey, Pixmap>> = RefCell::new(HashMap::new());
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GlowKey {
+    w: u32,
+    h: u32,
+    radius: i32,
+    blur_bits: u32,
+    color: u32,
+}
+
+thread_local! {
+    /// Same cached-shape technique as `SHADOW_CACHE`, for the focused-card glow
+    /// (`fill_glow`) — one blurred colored shape shared by every card of the same
+    /// size, since focus only ever moves, it never changes card dimensions.
+    static GLOW_CACHE: RefCell<HashMap<GlowKey, Pixmap>> = RefCell::new(HashMap::new());
+}
+
 impl Painter {
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             pixmap: Pixmap::new(width.max(1), height.max(1)).expect("nonzero framebuffer size"),
-            shadow_cache: HashMap::new(),
         }
     }
 
@@ -181,23 +185,105 @@ impl Painter {
             blur_bits: blur.to_bits(),
             opacity,
         };
-        let shape = match self.shadow_cache.entry(key) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let Some(shape) = render_shadow_shape(rect.width(), rect.height(), radius, pad, blur, opacity) else {
-                    return;
-                };
-                e.insert(shape)
-            }
+        SHADOW_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let shape = match cache.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let Some(shape) = render_shadow_shape(rect.width(), rect.height(), radius, pad, blur, opacity)
+                    else {
+                        return;
+                    };
+                    e.insert(shape)
+                }
+            };
+            self.pixmap.draw_pixmap(
+                rect.x() - pad + dx.round() as i32,
+                rect.y() - pad + dy.round() as i32,
+                shape.as_ref(),
+                &PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
+        });
+    }
+
+    /// A soft colored glow centered on a rounded-rect shape — same cached-shape,
+    /// box-blurred technique as `fill_shadow`, just tinted and un-offset (a glow
+    /// surrounds its shape evenly; a shadow falls to one side).
+    pub fn fill_glow(&mut self, rect: Rect, radius: i32, color: Color, blur: f32) {
+        if rect.width() == 0 || rect.height() == 0 {
+            return;
+        }
+        let pad = blur.ceil().max(0.0) as i32 + 1;
+        let key = GlowKey {
+            w: rect.width(),
+            h: rect.height(),
+            radius,
+            blur_bits: blur.to_bits(),
+            color: u32::from_be_bytes([color.r, color.g, color.b, color.a]),
         };
-        self.pixmap.draw_pixmap(
-            rect.x() - pad + dx.round() as i32,
-            rect.y() - pad + dy.round() as i32,
-            shape.as_ref(),
-            &PixmapPaint::default(),
-            Transform::identity(),
-            None,
-        );
+        GLOW_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let shape = match cache.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let Some(shape) = render_glow_shape(rect.width(), rect.height(), radius, pad, blur, color) else {
+                        return;
+                    };
+                    e.insert(shape)
+                }
+            };
+            self.pixmap.draw_pixmap(
+                rect.x() - pad,
+                rect.y() - pad,
+                shape.as_ref(),
+                &PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
+        });
+    }
+
+    /// Blurs the pixmap content already drawn within `rect`, in place (clamped to bounds).
+    pub fn blur_rect(&mut self, rect: Rect, radius: usize) {
+        if radius == 0 {
+            return;
+        }
+        let (pw, ph) = (self.pixmap.width() as i32, self.pixmap.height() as i32);
+        let x0 = rect.x().max(0);
+        let y0 = rect.y().max(0);
+        let x1 = (rect.x() + rect.width() as i32).min(pw);
+        let y1 = (rect.y() + rect.height() as i32).min(ph);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
+        let row_bytes = w * 4;
+        let src_stride = pw as usize * 4;
+        let data = self.pixmap.data_mut();
+
+        let mut region = vec![0u8; row_bytes * h];
+        for y in 0..h {
+            let src = (y0 as usize + y) * src_stride + x0 as usize * 4;
+            region[y * row_bytes..(y + 1) * row_bytes].copy_from_slice(&data[src..src + row_bytes]);
+        }
+
+        let mut scratch = vec![0u8; w * h];
+        for channel in 0..4 {
+            box_blur_channel(&mut region, &mut scratch, w, h, channel, radius);
+        }
+
+        for y in 0..h {
+            let dst = (y0 as usize + y) * src_stride + x0 as usize * 4;
+            data[dst..dst + row_bytes].copy_from_slice(&region[y * row_bytes..(y + 1) * row_bytes]);
+        }
+    }
+
+    /// Frosted-glass panel: blurs whatever's under `rect`, then tints it.
+    pub fn fill_frosted_rect(&mut self, rect: Rect, radius: i32, tint: Color, blur_radius: usize) {
+        self.blur_rect(rect, blur_radius);
+        self.fill_rounded_rect(rect, radius, tint);
     }
 
     pub fn draw_pixmap(&mut self, x: i32, y: i32, src: &Pixmap) {
@@ -262,6 +348,37 @@ pub fn render_shadow_shape(w: u32, h: u32, radius: i32, pad: i32, blur: f32, opa
     Some(shape)
 }
 
+/// Rasterizes a `(w, h)` rounded-rect shape filled with `color` and box-blurs it
+/// on all four channels (unlike `render_shadow_shape`, a colored glow can't
+/// reduce to a single alpha channel) — see `Painter::fill_glow`'s cache, keyed
+/// on everything that determines these pixels.
+pub fn render_glow_shape(w: u32, h: u32, radius: i32, pad: i32, blur: f32, color: Color) -> Option<Pixmap> {
+    let (pw, ph) = (w as i32 + 2 * pad, h as i32 + 2 * pad);
+    if pw <= 0 || ph <= 0 {
+        return None;
+    }
+    let mut shape = Pixmap::new(pw as u32, ph as u32)?;
+    let path = rounded_rect_path(pad as f32, pad as f32, w as f32, h as f32, radius as f32)?;
+    shape.fill_path(
+        &path,
+        &solid_paint(color),
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+
+    let (pwu, phu) = (pw as usize, ph as usize);
+    let mut data = shape.data().to_vec();
+    let mut scratch = vec![0u8; pwu * phu];
+    let radius_px = (blur / 2.0).round().max(1.0) as usize;
+    for _ in 0..3 {
+        for channel in 0..4 {
+            box_blur_channel(&mut data, &mut scratch, pwu, phu, channel, radius_px);
+        }
+    }
+    Pixmap::from_vec(data, IntSize::from_wh(pw as u32, ph as u32)?)
+}
+
 /// Separable box blur (horizontal pass into `tmp`, then vertical back into
 /// `pixels`) — both passes are the same 1D sliding-window average, just walking
 /// the buffer in a different direction (see `blur_1d`).
@@ -275,6 +392,29 @@ pub fn box_blur(pixels: &mut [u8], w: usize, h: usize, radius: usize) {
     }
     for x in 0..w {
         blur_1d(h, radius, |y| tmp[y * w + x], |y, v| pixels[y * w + x] = v);
+    }
+}
+
+/// `box_blur`, but for one channel of a packed RGBA buffer, with a caller-supplied scratch buffer.
+pub fn box_blur_channel(region: &mut [u8], scratch: &mut [u8], w: usize, h: usize, channel: usize, radius: usize) {
+    if radius == 0 {
+        return;
+    }
+    for y in 0..h {
+        blur_1d(
+            w,
+            radius,
+            |x| region[(y * w + x) * 4 + channel],
+            |x, v| scratch[y * w + x] = v,
+        );
+    }
+    for x in 0..w {
+        blur_1d(
+            h,
+            radius,
+            |y| scratch[y * w + x],
+            |y, v| region[(y * w + x) * 4 + channel] = v,
+        );
     }
 }
 
@@ -306,4 +446,3 @@ pub fn premultiply_rgba(rgba: &mut [u8]) {
         px[2] = ((u32::from(px[2]) * a) / 255) as u8;
     }
 }
-

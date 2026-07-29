@@ -1,46 +1,35 @@
-//! Picks where `tracing` writes: a TCP stream to a dev machine when `task deploy`
-//! passed a `telemetry` destination at launch, otherwise a versioned file under the
-//! app's own writable directory (see `store.rs`'s module docs on that directory).
-//! Call sites everywhere else just use plain `tracing::info!`/`warn!`/`debug!`/
-//! `error!` — no handle to thread through; see `main.rs::run` for the one-time
-//! subscriber setup this feeds.
-//!
-//! The destination is read from `argv[1]` at runtime, not baked in at compile time:
-//! webOS's SAM launch passes the `params` object given to
-//! `luna://com.webos.applicationManager/launch` to a native app as a JSON-encoded
-//! first command-line argument on initial launch (confirmed in the webOS OSE native
-//! app docs) — so `task deploy TELEMETRY=<host:port>` just threads it through that
-//! `luna-send` call instead of requiring a rebuild per destination.
+//! Routes `tracing` to TCP (dev machine) or log file. Destination from argv[1] at
+//! runtime (webOS SAM passes launch `params` as JSON argv), not compile-time.
+use std::collections::VecDeque;
 use std::io::Write;
 use std::net::TcpStream;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::layer::{Filter, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{reload, Layer, Registry};
 
-/// Matches `ui.rs`'s version marker: `PKG_VERSION` is threaded in at Docker build
-/// time by the Taskfile (`Cargo.toml` itself stays a fixed `0.0.1`); falls back to
-/// `CARGO_PKG_VERSION` for a plain native `cargo build`.
+use crate::store::LogLevelOverride;
+
+/// `PKG_VERSION` from Docker/Taskfile; falls back to `CARGO_PKG_VERSION`.
 const VERSION: &str = match option_env!("PKG_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
 
-/// `argv[1]`'s shape, as SAM hands it to a native app on initial launch — see this
-/// module's docs. Both fields optional: a plain launch (no `params`, or a `params`
-/// with neither key — e.g. a future unrelated use of `params`) just means "no
-/// telemetry", not a parse error.
+/// argv[1] shape from SAM; both fields optional (no error if missing).
 #[derive(Deserialize, Default)]
 struct LaunchParams {
-    /// `host:port` of the dev machine's listener.
     telemetry: Option<String>,
-    /// `debug`/`info`/`warn`/`error` — parsed via `tracing::Level`'s own `FromStr`.
     telemetry_level: Option<String>,
 }
 
-/// Parsed once (argv doesn't change over the process lifetime) and cached — every
-/// caller below reads through this instead of re-parsing.
+/// Cache launch params once; argv doesn't change over process lifetime.
 fn launch_params() -> &'static LaunchParams {
     static PARAMS: OnceLock<LaunchParams> = OnceLock::new();
     PARAMS.get_or_init(|| {
@@ -55,62 +44,113 @@ fn telemetry_addr() -> Option<&'static str> {
     launch_params().telemetry.as_deref().filter(|s| !s.is_empty())
 }
 
-/// Defaults to `debug` — a configured TCP sink is an explicit opt-in for a dev
-/// session, so send everything unless told otherwise.
-fn telemetry_level() -> tracing::Level {
-    launch_params()
+/// Launch-time log level override from `TELEMETRY_LEVEL` env var.
+/// Folded into settings so Diagnostics can display it. `None` leaves persisted level.
+pub fn launch_level_override() -> Option<LogLevelOverride> {
+    match launch_params()
         .telemetry_level
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(tracing::Level::DEBUG)
+        .as_deref()?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "debug" => Some(LogLevelOverride::Debug),
+        "info" => Some(LogLevelOverride::Info),
+        "warn" => Some(LogLevelOverride::Warn),
+        "error" => Some(LogLevelOverride::Error),
+        _ => None,
+    }
 }
 
-/// Where log lines actually go — a plain `Write` impl handed to
-/// `tracing_appender::non_blocking`, which owns the buffering/background-thread
-/// dispatch (see `main.rs::run`) so a slow disk or a dev machine not draining its
-/// listener fast enough never blocks the caller, in particular the video-pump
-/// thread.
+const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+/// Rotated files kept alongside the active log (`base.log.1`..`.3`). Bounds disk
+/// use at ~`(MAX_LOG_ROTATIONS + 1) * MAX_LOG_BYTES` while preserving history the
+/// old wipe-in-place discarded — which is what left uploaded logs stale.
+const MAX_LOG_ROTATIONS: usize = 3;
+
+/// Log destination (file or TCP). Non-blocking dispatch prevents blocking video pump.
 enum Sink {
-    File(std::fs::File),
+    File {
+        file: std::fs::File,
+        written: u64,
+        /// Active log path, so a full file can be rotated (renamed) and reopened.
+        path: std::path::PathBuf,
+    },
     Tcp(TcpStream),
 }
 
 impl Write for Sink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
-            Self::File(f) => f.write(buf),
+            Self::File { file, written, .. } => {
+                let n = file.write(buf)?;
+                *written += n as u64;
+                Ok(n)
+            }
             Self::Tcp(s) => s.write(buf),
         }
     }
 
+    /// `tracing_appender`'s worker thread flushes after each drained batch, not per
+    /// line — so the size/rotation check runs once per batch instead of per write.
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
-            Self::File(f) => f.flush(),
+            Self::File { file, written, path } => {
+                file.flush()?;
+                if *written >= MAX_LOG_BYTES {
+                    // Rotate rather than truncate: the just-filled file becomes `.1`
+                    // (the newest complete log), and writing continues in a fresh
+                    // active file. Send picks whichever is newest (`latest_log_file`).
+                    rotate_logs(path);
+                    *file = open_fresh(path)?;
+                    *written = 0;
+                }
+                Ok(())
+            }
             Self::Tcp(s) => s.flush(),
         }
     }
 }
 
-/// Truncate (not append) — this file previously grew unbounded across every launch
-/// for the life of the install; each run's log now starts fresh. Info-and-above
-/// only (no debug) so on-device disk usage stays bounded across ordinary
-/// sideloaded runs with no telemetry destination configured.
-fn open_file(app_dir: &Path) -> Result<Sink> {
-    let path = app_dir.join(format!("punktfunk-webos-{VERSION}.log"));
-    let file = std::fs::OpenOptions::new()
+/// `base.log` → `base.log.<n>`.
+fn numbered_log(base: &Path, n: usize) -> std::path::PathBuf {
+    let mut s = base.as_os_str().to_owned();
+    s.push(format!(".{n}"));
+    std::path::PathBuf::from(s)
+}
+
+/// Shift the ring down one: drop the oldest (`.MAX`), rename `.k`→`.k+1`, then
+/// `base`→`.1`. Best-effort — a failed rename just means one lost rotation, never a
+/// lost active log. Called on size overflow and once at launch.
+fn rotate_logs(base: &Path) {
+    let _ = std::fs::remove_file(numbered_log(base, MAX_LOG_ROTATIONS));
+    for n in (1..MAX_LOG_ROTATIONS).rev() {
+        let _ = std::fs::rename(numbered_log(base, n), numbered_log(base, n + 1));
+    }
+    let _ = std::fs::rename(base, numbered_log(base, 1));
+}
+
+/// Create (truncating) a fresh active log at `path`.
+fn open_fresh(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(&path)
-        .with_context(|| format!("open log file {}", path.display()))?;
-    Ok(Sink::File(file))
+        .open(path)
 }
 
-/// `app_dir` is the app's own writable directory (`store::app_dir()`).
-///
-/// A configured address that's unreachable (dev machine off the network, `task
-/// deploy` exited before this launch) falls back to the file sink rather than
-/// failing the whole app over what's meant to be a dev convenience.
+/// A fresh active log each launch; the previous session's file is rotated to `.1`
+/// first, so relaunching to reproduce a bug no longer discards the prior run.
+/// Rotates again mid-run whenever the active file hits `MAX_LOG_BYTES`.
+fn open_file(app_dir: &Path) -> Result<Sink> {
+    let path = log_file_path(app_dir);
+    if path.metadata().is_ok_and(|m| m.len() > 0) {
+        rotate_logs(&path);
+    }
+    let file = open_fresh(&path).with_context(|| format!("open log file {}", path.display()))?;
+    Ok(Sink::File { file, written: 0, path })
+}
+
+/// Open TCP or file sink; fall back to file if unreachable (dev convenience, not critical).
 fn open_sink(app_dir: &Path) -> Result<Sink> {
     if let Some(addr) = telemetry_addr() {
         if let Ok(stream) = TcpStream::connect(addr) {
@@ -120,22 +160,160 @@ fn open_sink(app_dir: &Path) -> Result<Sink> {
     open_file(app_dir)
 }
 
-/// The level the installed subscriber should filter at — `debug` (or whatever
-/// `telemetry_level` was given) when a telemetry address was configured, `info`
-/// for the plain on-device file (see `open_file`'s docs on why).
+/// Absolute path of the active log file (`open_file`'s target).
+pub fn log_file_path(app_dir: &Path) -> std::path::PathBuf {
+    app_dir.join(format!("punktfunk-webos-{VERSION}.log"))
+}
+
+/// The newest log file to upload — the active file, or the most recently modified
+/// rotation if there's no active file (e.g. a TCP-telemetry session wrote none).
+/// `None` if nothing has been logged to disk at all.
+pub fn latest_log_file(app_dir: &Path) -> Option<std::path::PathBuf> {
+    let base = log_file_path(app_dir);
+    (0..=MAX_LOG_ROTATIONS)
+        .map(|n| if n == 0 { base.clone() } else { numbered_log(&base, n) })
+        .filter_map(|p| {
+            let meta = p.metadata().ok()?;
+            (meta.len() > 0).then(|| (p, meta.modified().ok()))
+        })
+        .max_by_key(|(_, mtime)| *mtime)
+        .map(|(p, _)| p)
+}
+
+/// Startup filter level, mapped from persisted/launch-override settings.
 pub fn resolved_level() -> tracing::Level {
-    if telemetry_addr().is_some() {
-        telemetry_level()
-    } else {
-        tracing::Level::INFO
+    override_to_level(crate::store::load_settings().log_level_override)
+}
+
+fn override_to_level(o: LogLevelOverride) -> tracing::Level {
+    match o {
+        LogLevelOverride::Debug => tracing::Level::DEBUG,
+        LogLevelOverride::Info => tracing::Level::INFO,
+        LogLevelOverride::Warn => tracing::Level::WARN,
+        LogLevelOverride::Error => tracing::Level::ERROR,
     }
 }
 
-/// Builds the writer `main.rs::run` installs into `tracing_subscriber::fmt()`.
-/// Returns the `non_blocking` writer plus its `WorkerGuard` — the guard must be
-/// kept alive for the process lifetime (dropping it stops the background writer
-/// thread and flushes whatever's queued).
-pub fn init(
+/// Live reload handle for dynamic level changes (Diagnostics screen).
+static LEVEL_HANDLE: OnceLock<reload::Handle<LevelFilter, Registry>> = OnceLock::new();
+
+/// Mirrors level for `RingBufferLayer` (`reload::Layer` isn't Clone for two-layer attachment).
+static RING_LEVEL: AtomicU8 = AtomicU8::new(3);
+
+fn level_ordinal(level: tracing::Level) -> u8 {
+    match level {
+        tracing::Level::ERROR => 1,
+        tracing::Level::WARN => 2,
+        tracing::Level::INFO => 3,
+        tracing::Level::DEBUG => 4,
+        tracing::Level::TRACE => 5,
+    }
+}
+
+/// Applies immediately from Diagnostics screen; no-op before `init_subscriber`.
+pub fn set_level_override(level: LogLevelOverride) {
+    let resolved = override_to_level(level);
+    RING_LEVEL.store(level_ordinal(resolved), Ordering::Relaxed);
+    if let Some(handle) = LEVEL_HANDLE.get() {
+        let _ = handle.modify(|filter| *filter = LevelFilter::from_level(resolved));
+    }
+}
+
+/// Bounds overlay memory and per-event lock scope (see `RingBufferLayer`).
+const RING_CAPACITY: usize = 200;
+const RING_LINE_MAX_CHARS: usize = 200;
+
+static RING_BUFFER: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+
+fn ring_buffer() -> &'static Mutex<VecDeque<String>> {
+    RING_BUFFER.get_or_init(|| Mutex::new(VecDeque::with_capacity(RING_CAPACITY)))
+}
+
+/// Whether `RingBufferLayer` captures (off by default). Toggled by Yellow button
+/// cycle — sessions not using the overlay pay only one atomic load per event.
+static RING_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Toggle ring-buffer capture on/off; stopping also clears the buffer.
+pub fn set_ring_capture(active: bool) {
+    RING_CAPTURE_ACTIVE.store(active, Ordering::Relaxed);
+    if !active {
+        let mut buf = ring_buffer().lock().unwrap_or_else(PoisonError::into_inner);
+        *buf = VecDeque::new();
+    }
+}
+
+/// Last `n` log lines, oldest first — for the in-stream/menu log-tail overlay
+/// (`ui::tiles::render_log_overlay_tile`). Clones out of the ring buffer only;
+/// never touches the file or TCP sink.
+pub fn recent_lines(n: usize) -> Vec<String> {
+    let buf = ring_buffer().lock().unwrap_or_else(PoisonError::into_inner);
+    let skip = buf.len().saturating_sub(n);
+    buf.iter().skip(skip).cloned().collect()
+}
+
+/// Gates `RingBufferLayer` via the `Filter` trait rather than `Layer::enabled`
+/// directly: `Layer::enabled` returning `false` short-circuits the *entire*
+/// subscriber stack (see `Filtered`'s own docs — this is precisely why it
+/// exists), which silently dropped every event — including to the file/TCP
+/// sink — whenever the ring capture was inactive (i.e. almost always, since the
+/// log overlay is off by default). A `Filter` disables only its own layer;
+/// `fmt_layer` still sees and writes every event regardless of overlay state.
+struct RingBufferFilter;
+
+impl<S> Filter<S> for RingBufferFilter {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>, _cx: &tracing_subscriber::layer::Context<'_, S>) -> bool {
+        RING_CAPTURE_ACTIVE.load(Ordering::Relaxed)
+            && level_ordinal(*metadata.level()) <= RING_LEVEL.load(Ordering::Relaxed)
+    }
+
+    /// Keep the hint bounded to the current ring/file level (`set_level_override`).
+    /// An unbounded filter lowers tracing's global static max-level, forcing
+    /// extra per-event callsite checks (down to `trace!`) instead of cached `never`.
+    /// `handle.modify` in `set_level_override` refreshes interest when this changes.
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(match RING_LEVEL.load(Ordering::Relaxed) {
+            1 => LevelFilter::ERROR,
+            2 => LevelFilter::WARN,
+            3 => LevelFilter::INFO,
+            4 => LevelFilter::DEBUG,
+            _ => LevelFilter::TRACE,
+        })
+    }
+}
+
+/// In-memory ring for log-tail overlay (independent of file/TCP sink).
+/// Formats before lock, holds only for bounded push/pop; zero I/O in render path.
+struct RingBufferLayer;
+
+impl<S: tracing::Subscriber> Layer<S> for RingBufferLayer {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        struct MessageVisitor(String);
+        impl tracing::field::Visit for MessageVisitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                if field.name() == "message" {
+                    let _ = write!(self.0, "{value:?}");
+                } else {
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+        }
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+        let line: String = format!("{:<5} {}", event.metadata().level(), visitor.0)
+            .chars()
+            .take(RING_LINE_MAX_CHARS)
+            .collect();
+        let mut buf = ring_buffer().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if buf.len() >= RING_CAPACITY {
+            buf.pop_front();
+        }
+        buf.push_back(line);
+    }
+}
+
+/// Build non-blocking writer for `tracing_subscriber`. Guard must stay alive for process lifetime.
+fn writer(
     app_dir: &Path,
 ) -> Result<(
     tracing_appender::non_blocking::NonBlocking,
@@ -143,4 +321,26 @@ pub fn init(
 )> {
     let sink = open_sink(app_dir).context("open log sink")?;
     Ok(tracing_appender::non_blocking(sink))
+}
+
+/// Builds writer, installs global subscriber (file/TCP + ring, shared level filter).
+/// Returns `WorkerGuard` (must stay alive for process lifetime).
+pub fn init_subscriber(app_dir: &Path) -> Result<tracing_appender::non_blocking::WorkerGuard> {
+    let (writer, guard) = writer(app_dir)?;
+    let level = resolved_level();
+    let (filter, handle) = reload::Layer::new(LevelFilter::from_level(level));
+    let _ = LEVEL_HANDLE.set(handle);
+    RING_LEVEL.store(level_ordinal(level), std::sync::atomic::Ordering::Relaxed);
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_target(false)
+        .with_filter(filter);
+    // `RingBufferLayer` is gated by its own `RingBufferFilter` via `.with_filter`
+    // (see that type's docs) so an inactive overlay can't silence `fmt_layer`.
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(RingBufferLayer.with_filter(RingBufferFilter))
+        .init();
+    Ok(guard)
 }

@@ -1,8 +1,5 @@
-//! Maps SDL2 mouse events — the webOS Magic Remote's pointer mode surfaces as plain
-//! SDL2 `MouseMotion`/`MouseButtonDown`/`MouseButtonUp`/`MouseWheel` events, same as
-//! any desktop mouse — to punktfunk's wire `InputEvent`s, so pointing/clicking with
-//! the remote drives the host's real cursor during a stream (`main.rs`'s streaming
-//! loop), the same way aurora-tv/moonlight-tv forward their remote's pointer.
+//! Maps SDL2 mouse events (Magic Remote pointer mode) to punktfunk wire `InputEvents`.
+//! Allows pointing/clicking remote to drive host cursor during stream.
 use punktfunk_core::input::{InputEvent, InputKind};
 use sdl2::mouse::MouseButton;
 

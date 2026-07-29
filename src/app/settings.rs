@@ -9,14 +9,16 @@ use std::time::Instant;
 
 impl App {
     /// Handles one menu event on the settings modal. `screen_h` is only used by
-    /// `Up`/`Down` to keep `settings_scroll` following `settings_focused`.
+    /// `Up`/`Down` to keep `self.scroll` following `settings_focused`.
     pub fn handle_settings_event(&mut self, ev: MenuEvent, screen_h: u32) {
         // An open Resolution/Frame rate dropdown intercepts all input until it's
         // closed (by picking an option or backing out) — it's a modal overlay on
         // top of the settings row list.
         if let Some(dd) = self.dropdown.as_mut() {
+            // `dd.row` is the display position; setting lookups need the logical row.
             let row = dd.row;
-            let len = ui::dropdown_options(&self.settings, row).len().max(1);
+            let logical = ui::settings_logical_row(&self.settings, row);
+            let len = ui::dropdown_options(&self.settings, logical).len().max(1);
             match ev {
                 MenuEvent::Up => dd.focused = if dd.focused == 0 { len - 1 } else { dd.focused - 1 },
                 MenuEvent::Down => dd.focused = (dd.focused + 1) % len,
@@ -25,15 +27,19 @@ impl App {
                     // Not persisted here — `MenuEvent::Back` below (leaving the
                     // whole Settings screen) saves once for every change made
                     // during this visit, not per-row.
-                    ui::apply_dropdown_choice(&mut self.settings, row, choice);
+                    ui::apply_dropdown_choice(&mut self.settings, logical, choice);
+                    self.dropdown_fade.close((row, dd.focused));
                     self.dropdown = None;
                 }
-                MenuEvent::Back => self.dropdown = None,
+                MenuEvent::Back => {
+                    self.dropdown_fade.close((row, dd.focused));
+                    self.dropdown = None;
+                }
                 MenuEvent::Left | MenuEvent::Right | MenuEvent::Secondary => {}
             }
             return;
         }
-        let total = ui::SETTINGS_ROW_COUNT;
+        let total = ui::settings_row_count(&self.settings);
         match ev {
             // No wraparound here (unlike most other row lists) — wrapping a scrolled
             // list would silently jump the scroll position across the whole card.
@@ -53,7 +59,7 @@ impl App {
             }
             MenuEvent::Left => self.apply_setting_adjust(self.settings_focused, false),
             MenuEvent::Right => self.apply_setting_adjust(self.settings_focused, true),
-            MenuEvent::Confirm => match self.settings_focused {
+            MenuEvent::Confirm => match ui::settings_logical_row(&self.settings, self.settings_focused) {
                 // Not a setting — a link out to the About screen (see `ui::ROW_ABOUT`).
                 // Settings are saved on the way out so the visit's changes aren't lost
                 // behind the navigation.
@@ -61,14 +67,26 @@ impl App {
                     self.settings_writer.save(self.settings);
                     self.open_about();
                 }
-                ui::ROW_RESOLUTION | ui::ROW_FRAMERATE | ui::ROW_VIDEO_BACKEND | ui::ROW_CODEC | ui::ROW_AUDIO => {
-                    let focused = ui::dropdown_current_index(&self.settings, self.settings_focused);
+                ui::ROW_DIAGNOSTICS => {
+                    self.settings_writer.save(self.settings);
+                    self.open_diagnostics();
+                }
+                logical @ (ui::ROW_RESOLUTION
+                | ui::ROW_FRAMERATE
+                | ui::ROW_VIDEO_BACKEND
+                | ui::ROW_CODEC
+                | ui::ROW_AUDIO
+                | ui::ROW_COLOR_RANGE) => {
+                    let focused = ui::dropdown_current_index(&self.settings, logical);
+                    // `row` is the display position (what the overlay is drawn against);
+                    // the logical row is recovered on lookup via `settings_logical_row`.
                     self.dropdown = Some(DropdownState {
                         row: self.settings_focused,
                         focused,
                     });
+                    self.dropdown_fade.reopen();
                 }
-                row => self.apply_setting_adjust(row, true),
+                _ => self.apply_setting_adjust(self.settings_focused, true),
             },
             // Leaving Settings (Back key or the modal's close-X, both funnel
             // through `App::back`) — save once for whatever changed during
@@ -84,17 +102,12 @@ impl App {
         }
     }
 
-    /// Adjusts settings row `row` in memory (see `ui::adjust_setting`) — the
-    /// one place `Left`/`Right`/`Confirm` all funnel through. Not persisted
-    /// here; `handle_settings_event`'s `Back` arm saves once when the whole
-    /// Settings screen closes. For a `Toggle` row this also starts
-    /// `switch_anim`, capturing the value it's about to flip *from* so the
-    /// switch's render can slide the knob from there instead of snapping to
-    /// the new state.
-    pub(crate) fn apply_setting_adjust(&mut self, row: usize, forward: bool) {
+    /// Adjusts row in memory; persisted on `Back` (not per-keystroke). Starts `switch_anim` for toggle slides.
+    /// `display_row` is the on-screen position; resolved to a logical `ROW_*` first.
+    pub(crate) fn apply_setting_adjust(&mut self, display_row: usize, forward: bool) {
+        let row = ui::settings_logical_row(&self.settings, display_row);
         let toggled_from = match row {
             ui::ROW_HDR => Some(self.settings.hdr_enabled),
-            ui::ROW_STATS_OVERLAY => Some(self.settings.stats_overlay),
             _ => None,
         };
         if ui::adjust_setting(&mut self.settings, row, forward) {
@@ -103,43 +116,25 @@ impl App {
             }
         }
     }
-    /// How many settings rows fit on screen at once, so the card scrolls instead of
-    /// overflowing a 1080p-class panel. Clamped to `[1, SETTINGS_ROW_COUNT]`.
-    pub(crate) fn settings_visible_rows(screen_h: u32) -> usize {
+    /// Settings rows visible on screen (1080p card scrolls if needed). Capped at
+    /// the live row count so a hidden row (Color range on NDL) leaves no empty slot.
+    pub(crate) fn settings_visible_rows(&self, screen_h: u32) -> usize {
         let stride = ui::SETTINGS_ROW_H + ui::SETTINGS_ROW_GAP as u32;
         // 200 header/footer padding (mirrors `settings_layout`) + 160 edge margin.
         let available = screen_h.saturating_sub(200 + 160);
-        ((available / stride) as usize).clamp(1, ui::SETTINGS_ROW_COUNT)
+        ((available / stride) as usize).clamp(1, ui::settings_row_count(&self.settings))
     }
 
-    /// `settings_scroll` is only re-clamped on `Up`/`Down`, so it can be stale after a
-    /// resize; use this instead of the raw field wherever it's subtracted from a row
-    /// index, to avoid underflow.
-    pub(crate) fn clamped_settings_scroll(&self, screen_h: u32) -> usize {
-        let visible = Self::settings_visible_rows(screen_h);
-        self.settings_scroll.min(ui::SETTINGS_ROW_COUNT.saturating_sub(visible))
-    }
-
-    /// Moves `settings_scroll` just enough to keep `settings_focused` in view, and marks
-    /// the scrollbar to show briefly if the position actually moved.
+    /// Scrolls `settings_focused` into view; updates scroll indicator.
     pub(crate) fn scroll_settings_into_view(&mut self, screen_h: u32) {
-        let visible = Self::settings_visible_rows(screen_h);
-        let before = self.settings_scroll;
-        if self.settings_focused < self.settings_scroll {
-            self.settings_scroll = self.settings_focused;
-        } else if self.settings_focused >= self.settings_scroll + visible {
-            self.settings_scroll = self.settings_focused + 1 - visible;
-        }
-        if self.settings_scroll != before {
-            self.settings_scroll_shown_at = Some(Instant::now());
-        }
+        let visible = self.settings_visible_rows(screen_h);
+        self.scroll
+            .scroll_into_view(self.settings_focused, ui::settings_row_count(&self.settings), visible);
     }
 
-    /// The settings modal's card/content rects — shared by `render` and mouse
-    /// hit-testing so they can never disagree. `content`'s height spans only the
-    /// visible row window (`settings_visible_rows`), not the full row list.
-    pub(crate) fn settings_layout(screen_w: u32, screen_h: u32) -> (Rect, Rect) {
-        let visible = Self::settings_visible_rows(screen_h);
+    /// Settings card and content rects (shared by render and hit-test).
+    pub(crate) fn settings_layout(&self, screen_w: u32, screen_h: u32) -> (Rect, Rect) {
+        let visible = self.settings_visible_rows(screen_h);
         let content_h = visible as u32 * (ui::SETTINGS_ROW_H + ui::SETTINGS_ROW_GAP as u32);
         // Room for the title/divider above and the high-bitrate caution below.
         let card_h = content_h + 200;
@@ -161,7 +156,7 @@ impl App {
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
-        let (card, content) = Self::settings_layout(screen_w, screen_h);
+        let (card, content) = self.settings_layout(screen_w, screen_h);
         self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
         ui::draw_text(
             painter,
@@ -177,8 +172,10 @@ impl App {
             sdl2::pixels::Color::RGBA(0xff, 0xff, 0xff, 0x1e),
         );
 
-        // The row list itself is drawn separately — see `Tile::SettingsRows` — so
+        // The row list itself is drawn separately — see `Tile::ScrollContent` — so
         // scrolling never re-rasterizes this shell; only a value/dropdown change does.
+        // The open dropdown's panel is drawn separately too — see `Tile::DropdownOverlay`
+        // — so it composites *after* `Tile::ScrollContent` instead of being covered by it.
 
         if self.settings.bitrate_kbps > ui::BITRATE_WARN_KBPS {
             ui::draw_text(
@@ -191,17 +188,6 @@ impl App {
                 ui::WARNING,
             )?;
         }
-
-        if let Some(dd) = &self.dropdown {
-            let options = ui::dropdown_options(&self.settings, dd.row);
-            // Scroll is always frozen while a dropdown is open (`handle_settings_event`
-            // routes Up/Down to the dropdown itself, not `settings_scroll`), so this
-            // stays correct for the dropdown's whole lifetime.
-            let overlay_rect = Self::dropdown_overlay_rect(content, dd.row - self.clamped_settings_scroll(screen_h));
-            // `usize::MAX` = no option focused; the focused one is a separate
-            // `Tile::DropdownFocusOption` (see `prepare_tiles`).
-            ui::draw_dropdown_overlay(painter, text_cache, fonts.value, &options, usize::MAX, overlay_rect)?;
-        }
         Ok(())
     }
 
@@ -212,5 +198,16 @@ impl App {
     pub(crate) fn dropdown_overlay_rect(content: Rect, row: usize) -> Rect {
         let y = ui::focus_row_rect(content, row + 1).y();
         Rect::new(content.x(), y, content.width(), 0)
+    }
+
+    /// `(row, focused, alpha)` for the open dropdown or its close-fade; `None` if neither.
+    pub(crate) fn dropdown_draw_state(&self) -> Option<(usize, usize, f32)> {
+        if let Some(dd) = &self.dropdown {
+            Some((dd.row, dd.focused, self.dropdown_fade.open_alpha(DROPDOWN_FADE)))
+        } else {
+            self.dropdown_fade
+                .closing_frame(DROPDOWN_FADE)
+                .map(|(alpha, (row, focused))| (row, focused, alpha))
+        }
     }
 }

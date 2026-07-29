@@ -1,26 +1,10 @@
-//! On-demand cover-art loading, with a disk cache.
-//!
-//! Art is fetched over the same mTLS-pinned management API as the library itself, decoded
-//! with the pure-Rust `image` crate (no on-device libjpeg/libpng to find), and handed to
-//! the UI as an owned `tiny_skia::Pixmap` — unlike an SDL2 `Texture` (which isn't `Send`,
-//! borrowing a `TextureCreator` tied to the main thread's GL context), a `Pixmap` crosses
-//! a channel as the actual drawable object.
-//!
-//! **This used to fetch and decode the entire library up front, and keep all of it.** On a
-//! 365-title library that is ~365 sequential mTLS round-trips on every launch and host
-//! switch, and — at `MAX_ART_DIMENSION` — on the order of 200 MB of decoded pixmaps held
-//! for the whole session, in a 32-bit process on a TV with under 2 GB usable. The grid can
-//! only ever show a couple of dozen cards at once.
-//!
-//! So: the UI **requests** the covers it is about to draw ([`ArtLoader::request`]) and
-//! drops the ones it has scrolled far away from, and a disk cache makes coming back cheap.
-//! The cache stores the *encoded* bytes exactly as fetched (tens of KB) rather than decoded
-//! pixels (hundreds of KB), so it stays small and a cache hit still costs only a decode.
+//! On-demand cover-art loading with disk cache (not all-at-once, which caused OOM).
+//! Fetches via mTLS, decodes with pure-Rust `image` crate, handed to UI as `Pixmap`.
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
-use tiny_skia::{IntSize, Pixmap};
+use tiny_skia::{FilterQuality, IntSize, Pixmap, PixmapPaint, Transform};
 
 use crate::library::GameEntry;
 use crate::ui::premultiply_rgba;
@@ -34,25 +18,17 @@ pub struct ArtLoaded {
 /// A cover the UI wants soon.
 struct ArtRequest {
     game_id: String,
-    /// Host-relative art path (`/api/v1/library/art/...`).
-    path: String,
+    /// Candidate art paths (host-relative or external URL), tried in order — a
+    /// host-reported path can 404 even when another variant works fine.
+    paths: Vec<String>,
 }
 
-/// Cap on the longer side of a decoded cover. Source art (Steam CDN capsules etc.) commonly
-/// runs past 1000px, but a card is ~260px wide at 1080p even in the widest layout (see
-/// `ui::grid_card_size`), so anything above this is memory and decode time spent on pixels
-/// the panel cannot show.
+/// Max decoded dimension (panel can't show oversized art anyway).
 const MAX_ART_DIMENSION: u32 = 480;
-
-/// The grid card's fixed portrait aspect (see `ui::grid_card_size`). A card's art is
-/// stretched to exactly fill its rect (`Painter::draw_pixmap_scaled`), so source art at a
-/// different aspect ratio — a lot of it, in the wild (Steam capsules, custom box art) —
-/// would otherwise look visibly squashed or stretched. Center-cropping to this aspect once
-/// at decode time avoids that without ever distorting the image.
+/// Grid card portrait aspect (cropped to avoid distortion).
 const TARGET_ART_ASPECT: f32 = 3.0 / 4.0;
 
-/// Center-crops `img` to `aspect` (width/height), trimming whichever axis is oversized.
-/// A no-op if `img` is already close enough to `aspect`.
+/// Center-crop to aspect ratio (no-op if already close).
 fn crop_to_aspect(img: image::DynamicImage, aspect: f32) -> image::DynamicImage {
     let (w, h) = (img.width(), img.height());
     if w == 0 || h == 0 {
@@ -71,58 +47,47 @@ fn crop_to_aspect(img: image::DynamicImage, aspect: f32) -> image::DynamicImage 
     }
 }
 
-/// Bump when the raw-cache layout or `MAX_ART_DIMENSION` changes, to invalidate stale caches.
-const RAW_CACHE_MAGIC: u32 = 0x50465232; // "PFR2" — bumped for center-cropped art
+/// Cache version magic ("PFR2" — bumped for center-cropped art).
+const RAW_CACHE_MAGIC: u32 = 0x50465232;
 
-/// Root of all cached art, under the app's own writable directory.
 fn cache_root() -> PathBuf {
     let home = std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from);
     home.join("art-cache")
 }
 
-/// A filesystem-safe name for a store-qualified id (`steam:570`, `custom:12`) or a
-/// `host:port` key. Not collision-proof (e.g. `"a:1"` and `"a_1"` sanitize the same).
 fn cache_name(id: &str) -> String {
     id.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
 }
 
-/// One subdirectory per host (keyed by `(host, port)`, same as `store::KnownHost`'s dedup
-/// key) — keeps game-id collisions across hosts from leaking art, and lets a forgotten
-/// host's cache be dropped in one `remove_dir_all`.
 fn cache_dir(host: &str, port: u16) -> PathBuf {
     cache_root().join(cache_name(&format!("{host}_{port}")))
 }
 
-/// Deletes a forgotten host's cached art. Best-effort: a missing or unremovable directory
-/// is not an error the caller needs to react to.
+/// Clear a forgotten host's cached art (best-effort).
 pub fn clear_host_cache(host: &str, port: u16) {
     let _ = std::fs::remove_dir_all(cache_dir(host, port));
 }
 
-/// Decoded/resized/premultiplied pixels, keyed like the encoded cache. A hit here skips
-/// `image::load_from_memory`, `resize`, and `premultiply_rgba` entirely.
 fn raw_cache_path(dir: &std::path::Path, game_id: &str) -> PathBuf {
     dir.join(format!("{}.raw", cache_name(game_id)))
 }
 
-/// Layout: `[magic: u32 LE][width: u32 LE][height: u32 LE][premultiplied RGBA bytes]`.
+/// Write-then-rename (prevents truncated cache files on kill mid-write).
 fn write_raw_cache(path: &std::path::Path, pixmap: &Pixmap) {
     let mut buf = Vec::with_capacity(12 + pixmap.data().len());
     buf.extend_from_slice(&RAW_CACHE_MAGIC.to_le_bytes());
     buf.extend_from_slice(&pixmap.width().to_le_bytes());
     buf.extend_from_slice(&pixmap.height().to_le_bytes());
     buf.extend_from_slice(pixmap.data());
-    // Write-then-rename so a kill mid-write can't leave a truncated file that parses as
-    // garbage forever (same discipline as the encoded cache below).
     let tmp = path.with_extension("raw.tmp");
     if std::fs::write(&tmp, &buf).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
 }
 
-/// Reads back a raw cache entry written by [`write_raw_cache`], if present and well-formed.
+/// Read raw cache, if present and well-formed.
 fn read_raw_cache(path: &std::path::Path) -> Option<Pixmap> {
     let buf = std::fs::read(path).ok()?;
     let magic = u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?);
@@ -136,6 +101,33 @@ fn read_raw_cache(path: &std::path::Path) -> Option<Pixmap> {
     Pixmap::from_vec(pixels, size)
 }
 
+/// Stretch to card size (done here, not in each card build, to save armv7 cost).
+fn resize_pixmap(src: &Pixmap, w: u32, h: u32) -> Option<Pixmap> {
+    let mut dst = Pixmap::new(w, h)?;
+    let (sw, sh) = (src.width() as f32, src.height() as f32);
+    if sw <= 0.0 || sh <= 0.0 {
+        return None;
+    }
+    let transform = Transform::from_scale(w as f32 / sw, h as f32 / sh);
+    let paint = PixmapPaint {
+        quality: FilterQuality::Bilinear,
+        ..PixmapPaint::default()
+    };
+    dst.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
+    Some(dst)
+}
+
+/// `worker`'s fixed, per-host config — bundled to keep its arg count sane.
+struct WorkerConfig {
+    host: String,
+    mgmt_port: u16,
+    identity: (String, String),
+    fingerprint: Option<[u8; 32]>,
+    dir: PathBuf,
+    card_w: u32,
+    card_h: u32,
+}
+
 /// Background fetcher/decoder. Requests go in, decoded covers come out; both ends are
 /// non-blocking for the UI thread.
 pub struct ArtLoader {
@@ -147,21 +139,32 @@ pub struct ArtLoader {
 }
 
 impl ArtLoader {
-    /// `port` is the host's identity port (matches `store::KnownHost::port`); `mgmt_port`
-    /// is what's actually dialed to fetch art.
+    /// Spawn loader. `mgmt_port` is what's dialed (separate from identity `port`).
+    /// Card dimensions determine cover stretch-to size.
     pub fn spawn(
         host: String,
         port: u16,
         mgmt_port: u16,
         identity: (String, String),
         fingerprint: Option<[u8; 32]>,
+        card_w: u32,
+        card_h: u32,
     ) -> Self {
         let (tx_req, rx_req) = std::sync::mpsc::channel::<ArtRequest>();
         let (tx_done, rx_done) = std::sync::mpsc::channel::<ArtLoaded>();
         let dir = cache_dir(&host, port);
+        let config = WorkerConfig {
+            host,
+            mgmt_port,
+            identity,
+            fingerprint,
+            dir,
+            card_w,
+            card_h,
+        };
         std::thread::Builder::new()
             .name("punktfunk-webos-art".into())
-            .spawn(move || worker(&host, mgmt_port, &identity, fingerprint, &dir, &rx_req, &tx_done))
+            .spawn(move || worker(&config, &rx_req, &tx_done))
             .expect("spawn art-loader thread");
         Self {
             tx: tx_req,
@@ -179,13 +182,23 @@ impl ArtLoader {
         // Remember the id either way: a game with no art at all must not be re-queued
         // every frame forever.
         self.requested.insert(game.id.clone());
-        let Some(path) = game.art.portrait.as_deref().or(game.art.header.as_deref()) else {
+        // Preference order: portrait (right aspect), then header, then hero.
+        let paths: Vec<String> = [
+            game.art.portrait.as_deref(),
+            game.art.header.as_deref(),
+            game.art.hero.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect();
+        if paths.is_empty() {
             return;
-        };
+        }
         // A closed channel means the worker is gone; the card keeps its placeholder.
         let _ = self.tx.send(ArtRequest {
             game_id: game.id.clone(),
-            path: path.to_string(),
+            paths,
         });
     }
 
@@ -207,15 +220,17 @@ impl ArtLoader {
     }
 }
 
-fn worker(
-    host: &str,
-    mgmt_port: u16,
-    identity: &(String, String),
-    fingerprint: Option<[u8; 32]>,
-    dir: &std::path::Path,
-    rx: &Receiver<ArtRequest>,
-    tx: &Sender<ArtLoaded>,
-) {
+fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoaded>) {
+    let WorkerConfig {
+        host,
+        mgmt_port,
+        identity,
+        fingerprint,
+        dir,
+        card_w,
+        card_h,
+    } = config;
+    let (host, mgmt_port, fingerprint, card_w, card_h) = (host.as_str(), *mgmt_port, *fingerprint, *card_w, *card_h);
     let _ = std::fs::create_dir_all(dir);
     // One mTLS agent reused for every fetch — a fresh `ureq::Agent` per cover means a
     // fresh TCP+TLS handshake including client-cert auth, real avoidable cost that scales
@@ -229,7 +244,8 @@ fn worker(
     while let Ok(req) = rx.recv() {
         let raw_cached = raw_cache_path(dir, &req.game_id);
         if let Some(pixmap) = read_raw_cache(&raw_cached) {
-            if deliver(tx, req.game_id, pixmap).is_err() {
+            let sized = resize_pixmap(&pixmap, card_w, card_h).unwrap_or(pixmap);
+            if deliver(tx, req.game_id, sized).is_err() {
                 return;
             }
             continue;
@@ -240,13 +256,26 @@ fn worker(
             Ok(b) if !b.is_empty() => b,
             _ => {
                 if agent.is_none() {
-                    let Ok(a) = crate::library::agent(identity, fingerprint) else {
-                        continue;
-                    };
-                    agent = Some(a);
+                    match crate::library::agent(identity, fingerprint) {
+                        Ok(a) => agent = Some(a),
+                        Err(e) => {
+                            tracing::warn!("art: {} building mTLS agent failed: {e}", req.game_id);
+                            continue;
+                        }
+                    }
                 }
                 let Some(a) = agent.as_ref() else { continue };
-                let Ok(fetched) = crate::library::fetch_art(a, host, mgmt_port, &req.path) else {
+                let mut fetched = None;
+                for path in &req.paths {
+                    match crate::library::fetch_art(a, host, mgmt_port, path) {
+                        Ok(b) => {
+                            fetched = Some(b);
+                            break;
+                        }
+                        Err(e) => tracing::warn!("art: {} fetch {} failed: {e}", req.game_id, path),
+                    }
+                }
+                let Some(fetched) = fetched else {
                     continue;
                 };
                 // Write-then-rename, never truncate-in-place: a kill mid-write would
@@ -260,11 +289,15 @@ fn worker(
             }
         };
 
-        let Ok(decoded) = image::load_from_memory(&bytes) else {
-            // Drop a cache entry that won't decode — otherwise it poisons this card for
-            // the life of the install.
-            let _ = std::fs::remove_file(&cached);
-            continue;
+        let decoded = match image::load_from_memory(&bytes) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("art: {} decode failed ({} bytes): {e}", req.game_id, bytes.len());
+                // Drop a cache entry that won't decode — otherwise it poisons this card for
+                // the life of the install.
+                let _ = std::fs::remove_file(&cached);
+                continue;
+            }
         };
         let decoded = crop_to_aspect(decoded, TARGET_ART_ASPECT);
         let longer_side = decoded.width().max(decoded.height());
@@ -280,15 +313,18 @@ fn worker(
         let rgba = decoded.to_rgba8();
         let (width, height) = rgba.dimensions();
         let Some(size) = IntSize::from_wh(width, height) else {
+            tracing::warn!("art: {} decoded to zero size ({width}x{height})", req.game_id);
             continue;
         };
         let mut buf = rgba.into_raw();
         premultiply_rgba(&mut buf);
         let Some(pixmap) = Pixmap::from_vec(buf, size) else {
+            tracing::warn!("art: {} Pixmap::from_vec failed ({width}x{height})", req.game_id);
             continue;
         };
         write_raw_cache(&raw_cached, &pixmap);
-        if deliver(tx, req.game_id, pixmap).is_err() {
+        let sized = resize_pixmap(&pixmap, card_w, card_h).unwrap_or(pixmap);
+        if deliver(tx, req.game_id, sized).is_err() {
             return;
         }
     }

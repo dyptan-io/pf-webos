@@ -1,8 +1,4 @@
-//! Persisted client identity, known hosts, and stream settings — JSON files under
-//! the app's own writable directory (`$HOME`, e.g.
-//! `/media/developer/apps/usr/palm/applications/io.dyptan.punktfunk.webos/`). Mirrors
-//! `pf-client-core::trust`'s file-per-concern layout (identity PEMs / known-hosts
-//! JSON / settings JSON) so the shape is familiar, trimmed to what this client uses.
+//! Persisted identity (PEMs), known hosts, and settings (JSON). Layout mirrors `pf-client-core::trust`.
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -17,7 +13,7 @@ fn identity_paths() -> (PathBuf, PathBuf) {
     (dir.join("client-cert.pem"), dir.join("client-key.pem"))
 }
 
-/// Loads the persisted client identity, generating and saving a new one on first run.
+/// Load or generate identity (on first run).
 pub fn load_or_create_identity() -> Result<(String, String)> {
     let (cert_path, key_path) = identity_paths();
     if let (Ok(cert), Ok(key)) = (std::fs::read_to_string(&cert_path), std::fs::read_to_string(&key_path)) {
@@ -34,19 +30,47 @@ pub struct KnownHost {
     pub name: String,
     pub host: String,
     pub port: u16,
-    /// `None` = discovered but never paired.
+    /// None = discovered but never paired.
     pub fingerprint: Option<[u8; 32]>,
-    /// The management API's port (game library fetch) — `#[serde(default)]` so a
-    /// `known-hosts.json` saved before this field existed still loads. `None` falls
-    /// back to `library::DEFAULT_MGMT_PORT`.
+    /// Management API port (game library); defaults to `library::DEFAULT_MGMT_PORT`.
     #[serde(default)]
     pub mgmt_port: Option<u16>,
-    /// Wake-on-LAN MAC(s) (`aa:bb:cc:dd:ee:ff`), learned from this host's mDNS `mac`
-    /// TXT while it was last seen awake (see `discovery::DiscoveredHost::mac` and
-    /// `app::App::drain_discovery`). Empty if never learned — a host in that state
-    /// can't be woken, so `app.rs` falls back to the plain unreachable message.
+    /// Wake-on-LAN MACs learned from mDNS; empty if never advertised.
     #[serde(default)]
     pub mac: Vec<String>,
+    /// Auto-wake on unreachable (per-host, off by default; lives in Wake settings).
+    #[serde(default)]
+    pub wol_auto: bool,
+    /// Pinned game IDs (up to `MAX_PINNED_GAMES`).
+    #[serde(default)]
+    pub pinned: Vec<String>,
+}
+
+/// Max games pinned to one host's always-visible grid row at once.
+pub const MAX_PINNED_GAMES: usize = 5;
+
+/// Pin ID for "Desktop" card (stored in pinned like games; counts toward `MAX_PINNED_GAMES`).
+pub const DESKTOP_PIN_ID: &str = "__desktop__";
+
+impl KnownHost {
+    pub fn is_pinned(&self, id: &str) -> bool {
+        self.pinned.iter().any(|p| p == id)
+    }
+
+    /// Whether toggling id would do anything (unpin always ok, pin only if under `MAX_PINNED_GAMES`).
+    pub fn can_toggle_pin(&self, id: &str) -> bool {
+        self.is_pinned(id) || self.pinned.len() < MAX_PINNED_GAMES
+    }
+
+    /// Toggles `id`'s pinned state (a `GameEntry::id`, or `DESKTOP_PIN_ID`) —
+    /// a no-op when `can_toggle_pin` is false.
+    pub fn toggle_pin(&mut self, id: &str) {
+        match self.pinned.iter().position(|p| p == id) {
+            Some(i) => drop(self.pinned.remove(i)),
+            None if self.can_toggle_pin(id) => self.pinned.push(id.to_string()),
+            None => {}
+        }
+    }
 }
 
 fn known_hosts_path() -> PathBuf {
@@ -79,7 +103,9 @@ pub fn save_known_hosts(hosts: &[KnownHost]) -> Result<()> {
 /// Upserts by `(host, port)`, keeping the existing fingerprint if the new record
 /// doesn't have one (a fresh mDNS discovery shouldn't clobber a paired fingerprint) —
 /// same reasoning for `mac`, learned separately (see `App::drain_discovery`) and not
-/// necessarily known again at the point something else re-upserts this host.
+/// necessarily known again at the point something else re-upserts this host. `pinned`
+/// is *always* kept from the existing record — only `KnownHost::toggle_pin` ever
+/// changes it, so no add/edit/re-pair flow may clobber it.
 pub fn upsert_known_host(hosts: &mut Vec<KnownHost>, mut new: KnownHost) {
     if let Some(existing) = hosts.iter_mut().find(|h| h.host == new.host && h.port == new.port) {
         if new.fingerprint.is_none() {
@@ -88,6 +114,9 @@ pub fn upsert_known_host(hosts: &mut Vec<KnownHost>, mut new: KnownHost) {
         if new.mac.is_empty() {
             new.mac.clone_from(&existing.mac);
         }
+        new.pinned.clone_from(&existing.pinned);
+        // Per-host preference, not something a re-pair/re-add should reset.
+        new.wol_auto = existing.wol_auto;
         *existing = new;
     } else {
         hosts.push(new);
@@ -153,6 +182,30 @@ pub enum CodecPref {
     Av1,
 }
 
+/// Override for the VUI `video_full_range_flag` sent to the decoder — see
+/// `session::connect`'s colour-info splice. `Auto` forwards the host's own
+/// `ColorInfo.full_range` unchanged; `Full`/`Limited` force it, to test whether the
+/// panel's own default (rather than what the stream signals) is what's washing out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorRangeOverride {
+    #[default]
+    Auto,
+    Full,
+    Limited,
+}
+
+/// Override for the on-device log verbosity, settable live from the Diagnostics
+/// screen — see `logger::set_level_override`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevelOverride {
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
 /// Video cipher preference — not a persisted `Settings` field or a UI option, only
 /// resolved from the `cipher` launch param (see [`launch_cipher_pref`]). Both are AEAD
 /// ciphers of equivalent security; the choice is purely about decrypt throughput on this
@@ -184,14 +237,6 @@ pub struct Settings {
     /// slider — see `ui::BITRATE_MIN_KBPS`/`BITRATE_MAX_KBPS`.
     pub bitrate_kbps: u32,
     pub hdr_enabled: bool,
-    /// Whether a Wake-on-LAN magic packet is sent automatically (no prompt) when a
-    /// known host turns out to be unreachable. Off by default — a first-time
-    /// unreachable host always asks. There's deliberately no settings-screen row for
-    /// this: it's toggled from the wake prompt itself (`app::App::handle_wake_event`),
-    /// which is also the only place that re-surfaces if turning it on doesn't
-    /// actually get the host back within a minute (see `app.rs`'s `tick_wake` docs).
-    #[serde(default)]
-    pub wol_auto_send: bool,
     /// Which hardware decode pipeline to use. Defaults to `Ndl` (stable baseline);
     /// switch to `Starfish` to test `pauseAtDecodeTime` + smooth-pacing above 1080p.
     /// Persisted across restarts; takes effect on the next stream.
@@ -213,6 +258,23 @@ pub struct Settings {
     /// pinned at stereo. `#[serde(default …)]` so an existing settings.json loads as 2.
     #[serde(default = "default_audio_channels")]
     pub audio_channels: u8,
+    /// Forces the VUI range flag sent to the decoder regardless of what the host
+    /// signals — see [`ColorRangeOverride`]. Debug aid for the washed-out-colour
+    /// investigation; takes effect on the next connect.
+    #[serde(default)]
+    pub color_range_override: ColorRangeOverride,
+    /// On-device log verbosity — see [`LogLevelOverride`]. Persisted, so a user's
+    /// choice in Diagnostics survives restarts (fresh install defaults to `Info`);
+    /// applied live via `logger::set_level_override` the moment it's changed. A
+    /// `TELEMETRY_LEVEL` launch (`logger::launch_level_override`) still overrides
+    /// the persisted value for that run — see `load_settings`.
+    #[serde(default)]
+    pub log_level_override: LogLevelOverride,
+    /// Diagnostics' "Show logs" toggle, applied at startup (`App::new`). Distinct
+    /// from the Yellow-button overlay cycle (`main.rs`'s `LOG_OVERLAY_STATE`),
+    /// which stays ephemeral and never writes here.
+    #[serde(default)]
+    pub show_logs: bool,
 }
 
 fn default_audio_channels() -> u8 {
@@ -231,11 +293,13 @@ impl Default for Settings {
             // own client-side AIMD controller does — see `ui::BITRATE_AUTOMATIC`.
             bitrate_kbps: 0,
             hdr_enabled: true,
-            wol_auto_send: false,
             stats_overlay: false,
             video_backend: VideoBackend::Ndl,
             codec: CodecPref::Auto,
             audio_channels: default_audio_channels(),
+            color_range_override: ColorRangeOverride::Auto,
+            log_level_override: LogLevelOverride::Info,
+            show_logs: false,
         }
     }
 }
@@ -245,10 +309,18 @@ fn settings_path() -> PathBuf {
 }
 
 pub fn load_settings() -> Settings {
-    std::fs::read_to_string(settings_path())
+    let mut settings: Settings = std::fs::read_to_string(settings_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // `task deploy TELEMETRY=...` dev convenience: TELEMETRY_LEVEL picks the level
+    // this launch starts at (and what Diagnostics displays), overriding whatever
+    // was last persisted — see `logger::launch_level_override`. Absent, the
+    // persisted value stands (Info on a fresh install).
+    if let Some(level) = crate::logger::launch_level_override() {
+        settings.log_level_override = level;
+    }
+    settings
 }
 
 pub fn save_settings(settings: &Settings) -> Result<()> {

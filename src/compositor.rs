@@ -14,56 +14,57 @@ use sdl2::rect::Rect;
 use sdl2::render::{BlendMode, Canvas, Texture, TextureCreator};
 use sdl2::video::{Window, WindowContext};
 
+use crate::app::Screen;
 use crate::ui::Painter;
 
-/// Identity of one cached tile/texture. `Card` is keyed by grid index.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// Identity of one cached tile/texture. `Card` is keyed by pin id (a
+/// `GameEntry::id`, or `store::DESKTOP_PIN_ID`) rather than grid index, so a
+/// pin/unpin reorder — which only shuffles positions, not which games exist —
+/// never needs to re-upload a card's texture.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Tile {
     /// The focus-free sidebar strip (opaque, screen-height).
     Sidebar,
     /// The currently focused sidebar row (transparent padding + shadow).
     FocusRow,
-    /// One grid card, shadow included (transparent padding).
-    Card(usize),
+    /// One grid card, shadow included (transparent padding), keyed by pin id.
+    Card(String),
     /// The shared focus-ring glow (all cards are the same size).
     Ring,
+    /// The focused card's crisp edge outline, composited on top of the card
+    /// art (unlike `Ring`, which sits behind it). Shared, like `Ring`.
+    CardOutline,
+    /// The pinned badge composited over the focused grid card's top-right
+    /// corner, only when that card is pinned. Shared by every card, like `Ring`.
+    PinBadge,
     /// The active modal, full-screen with transparent surroundings.
     Modal,
-    /// Whichever modal's single focused, zoom-animated widget is currently
-    /// cached — a settings/Wake row, a pairing PIN digit or button, or a
-    /// Forget-host confirm button (see `app::ModalFocusKey`). Composited over
-    /// `Modal`'s shell (which draws every widget unfocused) so moving focus,
-    /// or zooming it in, recomposites this instead of re-rasterizing the
-    /// whole modal. Only one modal is ever open at a time, so one tile
-    /// suffices for all of them.
+    /// One modal's focused, zoom-animated widget (row, PIN digit, button, etc).
+    /// Composited over Modal's shell; one tile covers all modals.
     ModalFocusElement,
-    /// An open dropdown's focused option, as its own small tile — composited
-    /// over `Modal`'s shell (which draws the dropdown's option list
-    /// unfocused) so moving the dropdown's own focus recomposites this
-    /// instead of re-rasterizing the whole modal.
+    /// Open dropdown panel + option list. Own tile so it composites after `ScrollContent`.
+    DropdownOverlay,
+    /// Open dropdown's focused option. Composited over `DropdownOverlay`.
     DropdownFocusOption,
     /// The Home status line block (bottom of the grid panel).
     Status,
     /// The "No host selected" hint line.
     NoHost,
-    /// The Settings modal's scroll indicator (`ui::render_list_scrollbar_tile`).
-    SettingsScrollbar,
-    /// Every Settings row, unfocused, at its *unscrolled* position — full row-list
-    /// height, not just the visible window. Scrolling crops/repositions this via
-    /// `DrawCmd::TexCropped` (a GPU op), so it only needs rebuilding when a value or
-    /// the open dropdown changes, never when the list merely scrolls.
-    SettingsRows,
-    /// The loading spinner shown over the grid while it fills in (`ui::render_spinner_tile`).
-    Spinner,
+    /// Modal scrollbar tile, keyed by Screen (covers all scrollable modals).
+    ScrollIndicator(Screen),
+    /// Modal scrollable content at unscrolled position. GPU crops/repositions via
+    /// `TexCropped`; rebuilds only when content changes, not on scroll.
+    ScrollContent(Screen),
+    /// Spinner frame texture, keyed by frame index. Held in VRAM until stream starts.
+    SpinnerFrame(usize),
     /// The in-stream stats overlay panel (`ui::render_stats_overlay_tile`).
     StatsOverlay,
-    /// The in-stream disconnect-confirmation dialog's shell — card, title,
-    /// both buttons unfocused (`ui::render_disconnect_dialog_shell`).
+    /// The log-tail overlay (`ui::render_log_overlay_tile`) — Yellow-button debug
+    /// aid, shown on every screen (menu UI and stream), not just while streaming.
+    LogOverlay,
+    /// Disconnect dialog shell (card + title + unfocused buttons).
     DisconnectDialog,
-    /// The disconnect dialog's focused button, as its own small zoom-animated
-    /// tile (`ui::render_confirm_button_tile`) — composited over
-    /// `DisconnectDialog`'s shell, same shell/focus-tile split as every
-    /// pre-stream modal.
+    /// Disconnect dialog focused button. Composited over `DisconnectDialog` shell.
     DisconnectFocusButton,
 }
 
@@ -72,9 +73,7 @@ pub enum DrawCmd {
     /// Copy `tile`'s texture to `dst` (scaled by the GPU if sizes differ),
     /// modulated by `alpha`.
     Tex { tile: Tile, dst: Rect, alpha: u8 },
-    /// Same as `Tex`, but samples only `src` (in the tile's own pixel space) —
-    /// how the Settings row list scrolls: cropping/repositioning a fixed texture
-    /// is a GPU op, so scrolling never needs the tile re-rasterized.
+    /// Copy with source crop — how scrolling works: GPU crops fixed texture.
     TexCropped {
         tile: Tile,
         src: Rect,
@@ -87,9 +86,8 @@ pub enum DrawCmd {
 
 pub struct Compositor {
     textures: HashMap<Tile, Texture>,
-    /// Reused un-premultiply staging buffer (tiny-skia pixmaps are premultiplied;
-    /// SDL's `BlendMode::Blend` expects straight alpha — converted once per
-    /// *upload*, never per frame).
+    /// Reused staging buffer for the premultiplied → straight-alpha conversion
+    /// performed once per `upload` call (never per frame).
     staging: Vec<u8>,
 }
 
@@ -101,9 +99,31 @@ impl Compositor {
         }
     }
 
-    /// Creates/updates `tile`'s texture from a freshly rasterized painter.
-    /// Opaque tiles (`Sidebar`) upload their bytes directly with blending off;
-    /// everything else is un-premultiplied into `staging` and alpha-blended.
+    /// Uploads straight-RGBA8 bytes to a new GPU texture. No-op if already cached.
+    pub fn upload_raw(
+        &mut self,
+        creator: &TextureCreator<WindowContext>,
+        tile: Tile,
+        w: u32,
+        h: u32,
+        rgba_straight: &[u8],
+    ) -> Result<()> {
+        if self.textures.contains_key(&tile) {
+            return Ok(());
+        }
+        let mut tex = creator
+            .create_texture_static(PixelFormatEnum::RGBA32, w, h)
+            .map_err(|e| anyhow::anyhow!("create texture {tile:?} {w}x{h}: {e}"))?;
+        let pitch = w as usize * 4;
+        tex.update(None, rgba_straight, pitch)
+            .map_err(|e| anyhow::anyhow!("upload {tile:?}: {e}"))?;
+        tex.set_blend_mode(BlendMode::Blend);
+        self.textures.insert(tile, tex);
+        Ok(())
+    }
+
+    /// Creates/updates tile's texture from a rasterized painter. Opaque tiles
+    /// upload directly; others un-premultiply and alpha-blend.
     pub fn upload(&mut self, creator: &TextureCreator<WindowContext>, tile: Tile, pm: &Painter) -> Result<()> {
         let (w, h) = (pm.width(), pm.height());
         let recreate = match self.textures.get(&tile) {
@@ -117,7 +137,7 @@ impl Compositor {
             let tex = creator
                 .create_texture_static(PixelFormatEnum::RGBA32, w, h)
                 .map_err(|e| anyhow::anyhow!("create texture {tile:?} {w}x{h}: {e}"))?;
-            self.textures.insert(tile, tex);
+            self.textures.insert(tile.clone(), tex);
         }
         let tex = self.textures.get_mut(&tile).expect("just inserted");
         let pitch = w as usize * 4;
@@ -149,19 +169,22 @@ impl Compositor {
         Ok(())
     }
 
-    /// Drops `tile`'s GPU texture, if it has one.
-    ///
-    /// Needed because card tiles are now windowed: a texture for a card scrolled far out
-    /// of view is pure retained memory, and with `unsafe_textures` a `Texture` is not
-    /// freed by dropping the map entry alone — the SDL object must be destroyed. Safe to
-    /// call for a tile that was never uploaded.
+    /// Destroys all cached GPU textures (call on stream start to free VRAM).
+    pub fn clear_all(&mut self) {
+        // SAFETY: `unsafe_textures` detaches each `Texture` from its creator's
+        // lifetime, making the owner responsible for destruction. We drain the
+        // map so nothing can reach these textures again, then destroy each one
+        // exactly once. Same invariant as `drop_tile`.
+        for (_, tex) in self.textures.drain() {
+            unsafe { tex.destroy() };
+        }
+    }
+
+    /// Drops tile's GPU texture. Needed for windowed card tiles to free VRAM
+    /// when scrolled out of view (SDL object must be explicitly destroyed).
     pub fn drop_tile(&mut self, tile: Tile) {
         if let Some(tex) = self.textures.remove(&tile) {
-            // SAFETY: `unsafe_textures` detaches a `Texture` from its `TextureCreator`'s
-            // lifetime, making destruction the owner's responsibility. This texture came
-            // from `self`'s own creator, is removed from the map above so nothing can
-            // reach it again, and every draw goes through `execute`, which only ever
-            // borrows from that same map.
+            // SAFETY: see `clear_all`.
             unsafe { tex.destroy() };
         }
     }

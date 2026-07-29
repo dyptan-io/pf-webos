@@ -8,7 +8,7 @@ use sdl2::rect::Rect;
 use sdl2::ttf::Font;
 use tiny_skia::Pixmap;
 
-// ------------------------------------------------------------------ GPU tiles --
+// ---------------------------------GPU tiles-----------------------------------
 // The compositor path (see `compositor.rs` + `App::prepare_tiles`): widgets are
 // rasterized by tiny-skia into standalone padded tiles ONCE (keeping the AA/soft
 // shadow look), then composed per frame by the GPU — position, scroll, the focus
@@ -18,9 +18,7 @@ use tiny_skia::Pixmap;
 /// blur 14) fits inside the tile instead of clipping at its edge.
 pub const CARD_TILE_PAD: i32 = 20;
 
-/// One grid card pre-composited into its own padded transparent tile, drawn
-/// unfocused — the focused look is the GPU scaling this same tile up slightly
-/// plus the shared [`render_focus_ring_tile`] composited over it.
+/// Grid card as padded tile (unfocused). GPU scales + composites focus ring.
 pub fn render_card_tile(
     text_cache: &mut TextCache,
     fonts: &Fonts,
@@ -43,44 +41,86 @@ pub fn render_card_tile(
     Ok(p)
 }
 
-/// Fixed size of the loading spinner drawn over the grid — see `App::grid_reveal_ready`.
-pub const SPINNER_SIZE: u32 = 64;
+/// The animated loading spinner (purple, from
+/// lottiefiles.com/free-animation/purple-spinner-peYjszu1K5, embedded as
+/// `assets/logo/punktfunk-spinner.gif`).
+static SPINNER_GIF_BYTES: &[u8] = include_bytes!("../../assets/logo/punktfunk-spinner.gif");
 
-/// A 12-dot activity indicator. `phase` is seconds elapsed since the spinner started
-/// (`App::spinner_since`) — the lead dot advances continuously, trailing dots fading out.
-pub fn render_spinner_tile(phase: f32) -> Painter {
-    const DOTS: usize = 12;
-    const REVOLUTION_SECS: f32 = 1.4;
-    let size = SPINNER_SIZE;
-    let mut p = Painter::new(size, size);
-    let (cx, cy) = (size as f32 / 2.0, size as f32 / 2.0);
-    let orbit = size as f32 / 2.0 - 6.0;
-    let dot_r = size as f32 / 16.0;
-    let lead = (phase / REVOLUTION_SECS).rem_euclid(1.0);
-    for i in 0..DOTS {
-        let t = i as f32 / DOTS as f32;
-        let angle = t * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
-        let (x, y) = (cx + orbit * angle.cos(), cy + orbit * angle.sin());
-        // Distance behind the lead dot, wrapped — farther behind fades more.
-        let behind = (t - lead).rem_euclid(1.0);
-        let alpha = (255.0 * (1.0 - behind)).clamp(40.0, 255.0) as u8;
-        p.fill_circle(
-            x,
-            y,
-            dot_r,
-            Color::RGBA(ACCENT_BRIGHT.r, ACCENT_BRIGHT.g, ACCENT_BRIGHT.b, alpha),
-        );
-    }
-    p
+/// One decoded spinner frame (straight RGBA8) and how long it stays on screen.
+pub struct SpinnerFrame {
+    pub width: u32,
+    pub height: u32,
+    pub delay: std::time::Duration,
+    pub pixels: Vec<u8>,
 }
 
-/// Transparent padding around the focus-ring tile (the ring's outer glow pass
-/// sits 6px out + stroke width).
-pub const FOCUS_RING_PAD: i32 = 12;
+/// Decodes `SPINNER_GIF_BYTES` once into pre-decoded straight RGBA8 frames.
+pub fn spinner_frames() -> &'static [SpinnerFrame] {
+    static FRAMES: std::sync::OnceLock<Vec<SpinnerFrame>> = std::sync::OnceLock::new();
+    FRAMES.get_or_init(|| {
+        use image::{codecs::gif::GifDecoder, AnimationDecoder};
+        let Ok(decoder) = GifDecoder::new(std::io::Cursor::new(SPINNER_GIF_BYTES)) else {
+            return Vec::new();
+        };
+        let Ok(raw_frames) = decoder.into_frames().collect::<image::ImageResult<Vec<_>>>() else {
+            return Vec::new();
+        };
+        let mut frames = Vec::with_capacity(raw_frames.len());
+        for frame in raw_frames {
+            let (w, h) = frame.buffer().dimensions();
+            let (numer, denom) = frame.delay().numer_denom_ms();
+            let raw_delay = numer.checked_div(denom).unwrap_or(0);
+            // WHY: clamp to ~30 FPS min to avoid busy-looping the render thread.
+            let delay_ms = if raw_delay < 20 { 33 } else { raw_delay };
+            let delay = std::time::Duration::from_millis(u64::from(delay_ms));
+            let pixels = frame.into_buffer().into_raw();
+            frames.push(SpinnerFrame {
+                width: w,
+                height: h,
+                delay,
+                pixels,
+            });
+        }
+        frames
+    })
+}
 
-/// The focus-ring glow for a `(w, h)` card, in its own transparent tile — one
-/// shared tile serves every card (they're all the same size), scaled by the GPU
-/// together with the focused card and faded in via texture alpha.
+/// Returns `SpinnerFrame` at index `idx`, or `None` when the GIF decoded to zero frames.
+pub fn spinner_frame(idx: usize) -> Option<&'static SpinnerFrame> {
+    spinner_frames().get(idx)
+}
+
+/// Returns the frame index and reference for `phase` seconds after the spinner started.
+/// Falls back to a 1×1 transparent dummy if the GIF decoded to zero frames.
+pub fn spinner_frame_at(phase: f32) -> (usize, &'static SpinnerFrame) {
+    let frames = spinner_frames();
+    if let Some(first) = frames.first() {
+        let total: std::time::Duration = frames.iter().map(|f| f.delay).sum();
+        let mut elapsed = std::time::Duration::from_secs_f32(phase.max(0.0)).as_nanos() % total.as_nanos().max(1);
+        for (idx, f) in frames.iter().enumerate() {
+            if elapsed < f.delay.as_nanos() {
+                return (idx, f);
+            }
+            elapsed -= f.delay.as_nanos();
+        }
+        (0, first)
+    } else {
+        static DUMMY: std::sync::OnceLock<SpinnerFrame> = std::sync::OnceLock::new();
+        let dummy = DUMMY.get_or_init(|| SpinnerFrame {
+            width: 1,
+            height: 1,
+            delay: std::time::Duration::from_millis(100),
+            pixels: vec![0, 0, 0, 0],
+        });
+        (0, dummy)
+    }
+}
+
+/// Transparent padding around the focus-ring tile — must clear
+/// `FOCUS_GLOW_BLUR`'s blur radius or the glow clips against the canvas edge.
+pub const FOCUS_RING_PAD: i32 = 20;
+
+/// Focus-ring glow as shared tile (all cards same size). GPU scales + fades.
 pub fn render_focus_ring_tile(w: u32, h: u32) -> Painter {
     let pad = FOCUS_RING_PAD;
     let mut p = Painter::new(w + 2 * pad as u32, h + 2 * pad as u32);
@@ -88,21 +128,40 @@ pub fn render_focus_ring_tile(w: u32, h: u32) -> Painter {
     p
 }
 
-/// Transparent padding around a focused-row tile, generous enough for a
-/// row's shadow bleed (~20px) plus, for rows that still bake their own ~2%
-/// inflate (sidebar rows — see [`draw_selectable`]), that growth too.
-/// Settings rows animate their zoom via GPU scale instead (see
-/// [`draw_selectable_fixed`]) and so don't need the second allowance, but
-/// share this same constant for simplicity.
+/// Transparent padding around the card-outline tile — just enough for the
+/// stroke's own width/AA, not a blur radius like `FOCUS_RING_PAD`.
+pub const CARD_OUTLINE_PAD: i32 = 4;
+
+/// The focused card's crisp edge outline as a shared tile (all cards same
+/// size), composited on top of the card art — see `draw_card_outline`.
+pub fn render_card_outline_tile(w: u32, h: u32) -> Painter {
+    let pad = CARD_OUTLINE_PAD;
+    let mut p = Painter::new(w + 2 * pad as u32, h + 2 * pad as u32);
+    draw_card_outline(&mut p, Rect::new(pad, pad, w, h));
+    p
+}
+
+/// Diameter of the pinned badge composited over the focused grid/pinned
+/// card's top-right corner (see `Tile::PinBadge`).
+pub const PIN_BADGE_SIZE: u32 = 28;
+
+/// Pinned badge: dark disc with PIN icon. Single shared tile.
+pub fn render_pin_badge_tile(text_cache: &mut TextCache, icon_font: &Font) -> Result<Painter> {
+    let d = PIN_BADGE_SIZE;
+    let mut p = Painter::new(d, d);
+    let c = d as f32 / 2.0;
+    p.fill_circle(c, c, c, Color::RGBA(0x00, 0x00, 0x00, 0x70));
+    let icon = (d as f32 * 0.6) as u32;
+    let icon_rect = Rect::new(((d - icon) / 2) as i32, ((d - icon) / 2) as i32, icon, icon);
+    draw_icon(&mut p, text_cache, icon_font, icon_rect, ICON_PIN, MUTED)?;
+    Ok(p)
+}
+
+/// Padding for row tile shadow + sidebar inflate. Settings rows use GPU scale.
 pub const ROW_TILE_PAD: i32 = 28;
 
-/// Sidebar row `index`, focused, as its own padded transparent tile — composited
-/// by the GPU over the focus-free sidebar layer. Mirrors `draw_sidebar`'s row
-/// order (hosts, "+ Add host", bottom-pinned "Settings"); all three row kinds
-/// share one rect size, so the tile dimensions are constant.
-/// `menu_focused` picks out the row's ⋯ actions button instead of the row body: both
-/// states reuse this one tile (the row still renders focused either way), so moving
-/// between a host and its actions button costs one small re-rasterize, not a modal.
+/// Focused sidebar row as padded tile. `menu_focused` flags the actions button.
+/// Both button states reuse one tile; moving between them costs one re-rasterize.
 pub fn render_focused_row_tile(
     text_cache: &mut TextCache,
     fonts: &Fonts,
@@ -124,6 +183,7 @@ pub fn render_focused_row_tile(
             entry.name(),
             entry.is_paired(),
             true,
+            false,
             menu_focused,
             online,
         )?;
@@ -160,47 +220,98 @@ pub fn render_wrapped_text_tile(
     Ok(p)
 }
 
-/// A worst-case stat line (max resolution + longest codec/HDR tag), measured to
-/// fix the overlay's width — see `render_stats_overlay_tile`.
-pub const STATS_OVERLAY_REF_LINE: &str = "3840x2160@120 HEVC HDR";
+/// Worst-case stat line used to lock overlay width.
+pub const STATS_OVERLAY_REF_LINE: &str = "3840x2160@120 HEVC HDR Starfish";
 
-/// The in-stream stats overlay panel: a translucent brand-dark rounded card with
-/// one line of text per stat. Rebuilt at the overlay's ~2Hz refresh with a
-/// THROWAWAY `TextCache` — the numeric lines change every refresh, so a
-/// persistent cache would only accumulate dead entries for the whole stream's
-/// duration.
-///
-/// Width is FIXED — measured from `STATS_OVERLAY_REF_LINE` plus a safety margin,
-/// not from the live content — so the right-anchored panel keeps a constant left
-/// edge instead of jittering horizontally as the numbers change digit count.
-/// Lines are ellipsized to the inner width as a further safety, so an unexpectedly
-/// long line can never overflow the card.
-pub fn render_stats_overlay_tile(font: &Font, lines: &[String]) -> Result<Painter> {
+/// In-stream stats overlay with fixed width and centered hint.
+/// `lines[0]` is highlighted; remaining lines are muted.
+pub fn render_stats_overlay_tile(font: &Font, caption_font: &Font, lines: &[String], hint: &str) -> Result<Painter> {
     let pad = 18i32;
-    let safety = 16u32; // extra slack past the reference width, so nothing touches the edge
-    let line_h = font.height() + 6;
-    let inner_w = font.size_of(STATS_OVERLAY_REF_LINE).map_or(0, |(w, _)| w) + safety;
+    let content_safety = 16u32;
+    let line_font = font;
+    let line_h = line_font.height() + 6;
+    let caption_h = caption_font.height();
+    let hint_h = caption_h + 8;
+    let line_count = lines.len() as i32;
+
+    let inner_w = line_font.size_of(STATS_OVERLAY_REF_LINE).map_or(0, |(w, _)| w) + content_safety;
     let w = inner_w + 2 * pad as u32;
-    let h = (lines.len() as i32 * line_h + 2 * pad) as u32;
+    let h = (line_count * line_h + hint_h + 2 * pad) as u32;
+    let content_w_i32 = w as i32 - 2 * pad;
+
     let mut p = Painter::new(w.max(1), h.max(1));
     let mut tc = TextCache::new();
-    p.fill_rounded_rect(Rect::new(0, 0, w, h), 14, Color::RGBA(0x14, 0x10, 0x1f, 0xd2));
+    p.fill_rounded_rect(Rect::new(0, 0, w, h), 14, Color::RGBA(0x14, 0x10, 0x1f, 0x90));
+
     for (i, line) in lines.iter().enumerate() {
-        // First line (mode/codec header) pops; the measurements below are muted.
         let color = if i == 0 { WHITE } else { MUTED };
-        let clipped = ellipsize(font, line, inner_w);
-        draw_text(&mut p, &mut tc, font, &clipped, pad, pad + i as i32 * line_h, color)?;
+        let y = pad + i as i32 * line_h;
+        draw_text(&mut p, &mut tc, line_font, line, pad, y, color)?;
+    }
+
+    let hint_y = pad + line_count * line_h + (hint_h - caption_h);
+    let hint_w = caption_font.size_of(hint).map_or(0, |(w, _)| w) as i32;
+    let hint_x = pad + (content_w_i32 - hint_w) / 2;
+    draw_text(&mut p, &mut tc, caption_font, hint, hint_x, hint_y, MUTED)?;
+    Ok(p)
+}
+
+/// Number of lines shown in the log-tail overlay.
+pub const LOG_OVERLAY_LINES: usize = 12;
+
+/// Color for log line by level prefix; errors/warnings highlighted to stand out.
+fn log_line_color(line: &str) -> Color {
+    match line.split_whitespace().next() {
+        Some("ERROR") => ERROR_RED,
+        Some("WARN") => WARNING,
+        Some("INFO") => WHITE,
+        _ => MUTED,
+    }
+}
+
+/// Left indent for a wrapped log line's 2nd+ row, so it reads as a continuation.
+const LOG_OVERLAY_WRAP_INDENT: i32 = 20;
+
+/// Full-width log-tail at screen bottom (all screens, unlike stats overlay).
+/// Long lines word-wrap instead of clipping.
+pub fn render_log_overlay_tile(font: &Font, screen_w: u32, lines: &[String]) -> Result<Painter> {
+    let pad = 14i32;
+    let line_h = font.height() + 4;
+    let inner_w = screen_w.saturating_sub(2 * pad as u32);
+    // Narrowed by the indent so continuation rows fit too; first row just has slack.
+    let wrap_w = inner_w.saturating_sub(LOG_OVERLAY_WRAP_INDENT as u32).max(1);
+    let wrapped: Vec<(Vec<String>, Color)> = lines
+        .iter()
+        .map(|line| (wrap_text(font, line, wrap_w), log_line_color(line)))
+        .collect();
+    let total_rows: usize = wrapped.iter().map(|(rows, _)| rows.len().max(1)).sum();
+    let h = (total_rows.max(1) as i32 * line_h + 2 * pad).max(1) as u32;
+    let mut p = Painter::new(screen_w.max(1), h);
+    let mut tc = TextCache::new();
+    p.fill_rounded_rect(
+        Rect::new(0, 0, screen_w.max(1), h),
+        14,
+        Color::RGBA(0x14, 0x10, 0x1f, 0x90),
+    );
+    let mut row = 0i32;
+    for (wrapped_rows, color) in &wrapped {
+        // Empty line wraps to zero rows — still reserve one so later lines don't creep up.
+        if wrapped_rows.is_empty() {
+            row += 1;
+            continue;
+        }
+        for (i, text) in wrapped_rows.iter().enumerate() {
+            let x = if i == 0 { pad } else { pad + LOG_OVERLAY_WRAP_INDENT };
+            draw_text(&mut p, &mut tc, font, text, x, pad + row * line_h, *color)?;
+            row += 1;
+        }
     }
     Ok(p)
 }
 
-/// The Stop/Cancel button pair — shared by the shell and the
-/// focused-button tile (`render_confirm_button_tile`), so their
-/// `ConfirmButton` data can't drift apart.
+/// Stop/Cancel button pair for shell and focused-button tile.
 pub fn disconnect_dialog_buttons() -> [ConfirmButton<'static>; 2] {
     [
-        // Echoes the question's own verb ("Stop streaming?"), the same way the Forget
-        // confirmation's button echoes its title.
         ConfirmButton {
             icon: Some(ICON_CLOSE),
             label: "Stop streaming",
@@ -214,17 +325,9 @@ pub fn disconnect_dialog_buttons() -> [ConfirmButton<'static>; 2] {
     ]
 }
 
-/// The disconnect dialog's card rect and its button row's rect — the one
-/// place this layout lives, shared by `render_disconnect_dialog_shell` and
-/// `main.rs` (which needs the button rect, without drawing, to position the
-/// focused-button tile).
+/// Disconnect dialog card + button row rects (shared with main.rs for layout).
 pub fn disconnect_dialog_layout(screen_w: u32, screen_h: u32, font_label: &Font) -> (Rect, Rect) {
-    // Wide enough for the buttons' own labels, and never narrower than the 34%
-    // this has always been. The labels are real words at a font size that scales
-    // with the panel, while 34% of the screen knows nothing about either — which
-    // is how "Stop streaming" ended up ellipsized here at 1080p but not at 4K.
-    // Capped at 90% so a hypothetical very long label still leaves a margin
-    // rather than running to the screen edges.
+    // Width: at least 34%, enough for button labels, capped at 90% for margin.
     let needed = confirm_row_min_width(font_label, &disconnect_dialog_buttons()) + 64;
     let frac = (needed as f32 / screen_w.max(1) as f32).clamp(0.34, 0.90);
     let card = modal_card_rect(screen_w, screen_h, frac, 200);
@@ -237,14 +340,8 @@ pub fn disconnect_dialog_layout(screen_w: u32, screen_h: u32, font_label: &Font)
     (card, content)
 }
 
-/// The in-stream disconnect-confirmation dialog's shell: card, title, and
-/// both confirm buttons unfocused — full-screen sized like `App`'s
-/// `Tile::Modal` so `main.rs` can place it at `(0, 0)`. No backdrop dim baked
-/// in — `main.rs` draws that as its own compositor `Fill`, same as
-/// `App::draw_list` scrims `Tile::Modal`. The actually focused button
-/// composites on top as its own small, zoom-animated tile (see
-/// `render_confirm_button_tile`) — same shell/focus-tile split as every other
-/// modal in the app.
+/// Disconnect dialog shell (full-screen): card + title + unfocused buttons.
+/// Focused button composites on top as own small tile (shell/focus-tile split).
 pub fn render_disconnect_dialog_shell(screen_w: u32, screen_h: u32, fonts: &Fonts) -> Result<Painter> {
     let mut p = Painter::new(screen_w, screen_h);
     let mut tc = TextCache::new();

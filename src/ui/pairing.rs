@@ -6,7 +6,6 @@ use anyhow::Result;
 use sdl2::rect::Rect;
 use sdl2::ttf::Font;
 
-
 /// PIN digit box size/gap — shared by `pairing_digit_rect` and the digit
 /// tiles so they can never disagree.
 pub const PAIRING_DIGIT_W: u32 = 64;
@@ -54,7 +53,13 @@ pub fn render_card_text_tile(text_cache: &mut TextCache, font: &Font, text: &str
 /// GPU over the shell's unfocused digit boxes, same pattern as
 /// `render_focus_row_tile`.
 pub fn render_pairing_digit_tile(text_cache: &mut TextCache, font_title: &Font, digit: u8) -> Result<Painter> {
-    render_card_text_tile(text_cache, font_title, &digit.to_string(), PAIRING_DIGIT_W, PAIRING_DIGIT_H)
+    render_card_text_tile(
+        text_cache,
+        font_title,
+        &digit.to_string(),
+        PAIRING_DIGIT_W,
+        PAIRING_DIGIT_H,
+    )
 }
 
 /// The "Request access" button, focused, as its own zoom-animated tile — accent-filled
@@ -72,4 +77,3 @@ pub fn render_pairing_button_tile(text_cache: &mut TextCache, font_label: &Font,
     )?;
     Ok(p)
 }
-

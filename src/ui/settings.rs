@@ -1,21 +1,17 @@
-//! Settings-screen data: presets, row indices, and the row list/adjust logic.
-//!
-//! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 use super::*;
-use crate::store::{CodecPref, Settings, VideoBackend};
+use crate::store::{CodecPref, ColorRangeOverride, LogLevelOverride, Settings, VideoBackend};
 
-/// Resolution presets — the three the user asked for, matching `pf-console-ui`'s
-/// existing 1080p/1440p/4K entries (a subset of its full list; no 720p/800p here).
+/// User-requested presets: 1080p, 1440p, 4K.
 pub const RESOLUTIONS: [(u32, u32, &str); 3] = [
     (1920, 1080, "1920 x 1080"),
     (2560, 1440, "2560 x 1440"),
     (3840, 2160, "3840 x 2160"),
 ];
 
-/// Framerate presets — sent to the host as the exact wire refresh rate.
+/// Sent to host as exact wire refresh rate.
 pub const REFRESH_RATES: [u32; 3] = [30, 60, 120];
 
-/// Bitrate slider range/step, in kbps — the user's explicit ask ("10-200 Mbps max").
+/// Slider range: 10-200 Mbps, 5 Mbps steps.
 pub const BITRATE_MIN_KBPS: u32 = 10_000;
 pub const BITRATE_MAX_KBPS: u32 = 200_000;
 pub const BITRATE_STEP_KBPS: u32 = 5_000;
@@ -26,13 +22,10 @@ pub const BITRATE_STEP_KBPS: u32 = 5_000;
 /// or climbing every ~750ms. A fixed Mbps number, however carefully picked, never adapts to a link
 /// that degrades mid-session — this does.
 pub const BITRATE_AUTOMATIC: u32 = 0;
-/// Above this, stability drops off on typical Wi-Fi — shown as an amber
-/// caution, matching the reference's settings pane (not a hard cap, the
-/// slider still allows up to `BITRATE_MAX_KBPS`).
+/// Above this, shown as amber caution (not a hard cap).
 pub const BITRATE_WARN_KBPS: u32 = 150_000;
 
-/// Settings-modal row indices — shared by `settings_rows`, `adjust_setting`, and
-/// `app.rs`'s event handling so the mapping only lives in one place.
+/// Row indices for settings modal.
 pub const ROW_RESOLUTION: usize = 0;
 pub const ROW_FRAMERATE: usize = 1;
 pub const ROW_BITRATE: usize = 2;
@@ -42,15 +35,69 @@ pub const ROW_VIDEO_BACKEND: usize = 4;
 /// on that row's value (see `codec_options`), and adjacency is what makes the
 /// dependency discoverable without explaining it in copy.
 pub const ROW_CODEC: usize = 5;
-pub const ROW_STATS_OVERLAY: usize = 6;
-pub const ROW_AUDIO: usize = 7;
-/// Not a setting — a link to `Screen::About`. It lives in this list (rather than as
-/// separate chrome) because that is where every other punktfunk client puts the
-/// version + licences, and a `RowKind::Action` row costs nothing extra to render.
-pub const ROW_ABOUT: usize = 8;
-pub const SETTINGS_ROW_COUNT: usize = 9;
+pub const ROW_AUDIO: usize = 6;
+/// Forces the VUI range flag sent to the decoder — see `store::ColorRangeOverride`.
+/// Debug aid for the washed-out-colour investigation.
+pub const ROW_COLOR_RANGE: usize = 7;
+/// Not a setting — a link to `Screen::Diagnostics` (log level + stats overlay).
+/// A debug aid, not something a normal user needs to find quickly.
+pub const ROW_DIAGNOSTICS: usize = 8;
+/// Not a setting — a link to `Screen::About`. Sits last: every other punktfunk
+/// client puts the version + licences at the very bottom of Settings, and a
+/// `RowKind::Action` row costs nothing extra to render.
+pub const ROW_ABOUT: usize = 9;
+pub const SETTINGS_ROW_COUNT: usize = 10;
 
-/// Cycles `current` to the next/previous value in a preset slice, wrapping.
+/// Diagnostics modal row indices (see `diagnostics_rows`). Log level keeps index
+/// 0 so its dropdown's `(Screen, row)` tile key stays stable.
+pub const DIAG_ROW_LOG_LEVEL: usize = 0;
+pub const DIAG_ROW_STATS_OVERLAY: usize = 1;
+/// Menu-driven mirror of the Yellow-button log overlay — for remotes without one.
+pub const DIAG_ROW_SHOW_LOGS: usize = 2;
+/// Uploads the current session's log file to the developer (see `app::sendlogs`).
+/// An action row, not a setting — Confirm opens a warning/confirmation modal first.
+pub const DIAG_ROW_SEND_LOGS: usize = 3;
+pub const DIAGNOSTICS_ROW_COUNT: usize = 4;
+
+pub const COLOR_RANGE_OPTIONS: [ColorRangeOverride; 3] = [
+    ColorRangeOverride::Auto,
+    ColorRangeOverride::Full,
+    ColorRangeOverride::Limited,
+];
+
+/// Only Starfish honours the VUI full-range flag; NDL has no equivalent field,
+/// so the row is hidden there rather than shown disabled.
+pub fn color_range_row_shown(settings: &Settings) -> bool {
+    settings.video_backend == VideoBackend::Starfish
+}
+
+/// Live row count (vs. `SETTINGS_ROW_COUNT`, the maximum).
+pub fn settings_row_count(settings: &Settings) -> usize {
+    if color_range_row_shown(settings) {
+        SETTINGS_ROW_COUNT
+    } else {
+        SETTINGS_ROW_COUNT - 1
+    }
+}
+
+/// On-screen row position -> logical `ROW_*` index, shifted past Color range when hidden.
+pub fn settings_logical_row(settings: &Settings, display: usize) -> usize {
+    if !color_range_row_shown(settings) && display >= ROW_COLOR_RANGE {
+        display + 1
+    } else {
+        display
+    }
+}
+
+pub fn color_range_label(o: ColorRangeOverride) -> &'static str {
+    match o {
+        ColorRangeOverride::Auto => "Automatic",
+        ColorRangeOverride::Full => "Full",
+        ColorRangeOverride::Limited => "Limited",
+    }
+}
+
+/// Cycle through options, wrapping.
 pub fn cycle<T: Copy + PartialEq>(options: &[T], current: T, forward: bool) -> T {
     let idx = options.iter().position(|&o| o == current).unwrap_or(0);
     let len = options.len();
@@ -83,7 +130,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
     } else {
         (settings.bitrate_kbps.saturating_sub(BITRATE_MIN_KBPS)) as f32 / (BITRATE_MAX_KBPS - BITRATE_MIN_KBPS) as f32
     };
-    vec![
+    let mut rows = vec![
         FocusRow {
             icon: ICON_MONITOR,
             label: "Resolution".into(),
@@ -91,6 +138,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             kind: RowKind::Dropdown,
             fraction: 0.0,
             danger: false,
+            menu: None,
         },
         FocusRow {
             icon: ICON_SCHEDULE,
@@ -99,6 +147,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             kind: RowKind::Dropdown,
             fraction: 0.0,
             danger: false,
+            menu: None,
         },
         FocusRow {
             icon: ICON_SIGNAL,
@@ -111,6 +160,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             kind: RowKind::Slider,
             fraction: bitrate_frac,
             danger: false,
+            menu: None,
         },
         FocusRow {
             icon: ICON_SUN,
@@ -123,9 +173,10 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             kind: RowKind::Toggle,
             fraction: 0.0,
             danger: false,
+            menu: None,
         },
         FocusRow {
-            icon: ICON_TV,
+            icon: ICON_MEMORY,
             label: "Video backend".into(),
             value: match settings.video_backend {
                 VideoBackend::Ndl => "NDL".into(),
@@ -134,9 +185,10 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             kind: RowKind::Dropdown,
             fraction: 0.0,
             danger: false,
+            menu: None,
         },
         FocusRow {
-            icon: ICON_MONITOR,
+            icon: ICON_MOVIE,
             label: "Codec".into(),
             // A persisted choice that is no longer offered (AV1 after Starfish proved it
             // won't load this run) says so, rather than displaying a codec the session
@@ -149,9 +201,84 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             kind: RowKind::Dropdown,
             fraction: 0.0,
             danger: false,
+            menu: None,
         },
         FocusRow {
-            icon: ICON_SUN,
+            icon: ICON_SIGNAL,
+            label: "Audio".into(),
+            value: audio_label(settings.audio_channels),
+            kind: RowKind::Dropdown,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+        },
+        FocusRow {
+            icon: ICON_PALETTE,
+            label: "Color range".into(),
+            value: color_range_label(settings.color_range_override).into(),
+            kind: RowKind::Dropdown,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+        },
+        FocusRow::action(ICON_WRENCH, "Diagnostics"),
+        // The build version rides along as this row's value, so it's visible without
+        // opening the screen — matching where the other clients surface it. Last row:
+        // every other punktfunk client puts version + licences at the very bottom.
+        FocusRow::action_with_value(ICON_INFO, "About & licenses", format!("v{VERSION}")),
+    ];
+    // Mirrors `settings_logical_row`: drop rather than disable when hidden.
+    if !color_range_row_shown(settings) {
+        rows.remove(ROW_COLOR_RANGE);
+    }
+    rows
+}
+
+pub const LOG_LEVEL_OPTIONS: [LogLevelOverride; 4] = [
+    LogLevelOverride::Debug,
+    LogLevelOverride::Info,
+    LogLevelOverride::Warn,
+    LogLevelOverride::Error,
+];
+
+pub fn log_level_label(l: LogLevelOverride) -> &'static str {
+    match l {
+        LogLevelOverride::Debug => "Debug",
+        LogLevelOverride::Info => "Info",
+        LogLevelOverride::Warn => "Warn",
+        LogLevelOverride::Error => "Error",
+    }
+}
+
+/// Diagnostics' one dropdown row — options list + current index, same shape as
+/// `dropdown_options`/`dropdown_current_index` but for `Screen::Diagnostics`
+/// rather than a `Settings` row (there is no row-index namespace to share).
+pub fn log_level_dropdown_options() -> Vec<String> {
+    LOG_LEVEL_OPTIONS
+        .iter()
+        .map(|&l| log_level_label(l).to_string())
+        .collect()
+}
+
+pub fn log_level_dropdown_current_index(level: LogLevelOverride) -> usize {
+    LOG_LEVEL_OPTIONS.iter().position(|&o| o == level).unwrap_or(0)
+}
+
+/// Diagnostics modal rows: log level (dropdown), stats overlay (toggle), and
+/// show logs (toggle). Order must match `DIAG_ROW_*`.
+pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
+    vec![
+        FocusRow {
+            icon: ICON_BUG,
+            label: "Log level".into(),
+            value: log_level_label(settings.log_level_override).into(),
+            kind: RowKind::Dropdown,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+        },
+        FocusRow {
+            icon: ICON_CHART,
             label: "Stats overlay".into(),
             value: if settings.stats_overlay {
                 "On".into()
@@ -161,36 +288,31 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             kind: RowKind::Toggle,
             fraction: 0.0,
             danger: false,
+            menu: None,
         },
         FocusRow {
-            icon: ICON_SIGNAL,
-            label: "Audio".into(),
-            value: audio_label(settings.audio_channels),
-            kind: RowKind::Dropdown,
+            icon: ICON_VISIBILITY,
+            label: "Show logs".into(),
+            value: if settings.show_logs { "On".into() } else { "Off".into() },
+            kind: RowKind::Toggle,
             fraction: 0.0,
             danger: false,
+            menu: None,
         },
-        // The build version rides along as this row's value, so it's visible without
-        // opening the screen — matching where the other clients surface it.
-        FocusRow::action_with_value(ICON_INFO, "About & licenses", format!("v{VERSION}")),
+        FocusRow::action(ICON_SEND, "Send logs to developer"),
     ]
 }
 
-/// The Wake modal's one row — the "Always send automatically" toggle (see
-/// `app::WakeState`) — as a single-element `FocusRow` list, so it draws and
-/// zoom-animates through the exact same `draw_focus_rows`/
-/// `render_focus_row_tile` machinery as the settings modal. The actual
-/// "Wake"/"Cancel" actions are a `draw_confirm_buttons` row below this one
-/// (see `app.rs`'s `render_wake`), not rows here — mirroring the
-/// Forget-host confirmation's shell/buttons split.
-pub fn wake_rows(auto_send: bool) -> Vec<FocusRow> {
+/// Wake settings modal rows.
+pub fn wake_settings_rows(auto_send: bool) -> Vec<FocusRow> {
     vec![FocusRow {
-        icon: ICON_SETTINGS,
-        label: "Wake automatically in future".into(),
+        icon: ICON_POWER,
+        label: "Wake automatically".into(),
         value: if auto_send { "On".into() } else { "Off".into() },
         kind: RowKind::Toggle,
         fraction: 0.0,
         danger: false,
+        menu: None,
     }]
 }
 
@@ -224,7 +346,7 @@ pub fn codec_label(pref: CodecPref) -> &'static str {
     }
 }
 
-/// Channel counts punktfunk negotiates, and how they read on screen.
+/// Supported channel counts.
 pub const AUDIO_CHANNELS: [(u8, &str); 3] = [(2, "Stereo"), (6, "5.1 surround"), (8, "7.1 surround")];
 
 fn audio_label(channels: u8) -> String {
@@ -234,21 +356,26 @@ fn audio_label(channels: u8) -> String {
         .map_or_else(|| format!("{channels} channels"), |(_, s)| (*s).to_string())
 }
 
-/// The option labels for a dropdown row (`Resolution`/`Frame rate`/`Video backend`/
-/// `Codec`/`Audio`). Takes the live `Settings` because the Codec row's list is
-/// state-dependent (see `codec_options`).
+/// Dropdown labels for a row. Codec list depends on `video_backend`.
 pub fn dropdown_options(settings: &Settings, row_index: usize) -> Vec<String> {
     match row_index {
         ROW_RESOLUTION => RESOLUTIONS.iter().map(|(w, h, _)| resolution_label(*w, *h)).collect(),
         ROW_FRAMERATE => REFRESH_RATES.iter().map(|hz| format!("{hz} Hz")).collect(),
-        ROW_VIDEO_BACKEND => vec!["NDL".into(), "Starfish".into()],
-        ROW_CODEC => codec_options(settings).iter().map(|&p| codec_label(p).to_string()).collect(),
+        ROW_VIDEO_BACKEND => vec!["NDL (DirectMedia)".into(), "SMP (Starfish Media Pipeline)".into()],
+        ROW_CODEC => codec_options(settings)
+            .iter()
+            .map(|&p| codec_label(p).to_string())
+            .collect(),
         ROW_AUDIO => AUDIO_CHANNELS.iter().map(|(_, s)| (*s).to_string()).collect(),
+        ROW_COLOR_RANGE => COLOR_RANGE_OPTIONS
+            .iter()
+            .map(|&o| color_range_label(o).to_string())
+            .collect(),
         _ => Vec::new(),
     }
 }
 
-/// Which option index in `dropdown_options(row_index)` matches the current setting.
+/// Current dropdown index for a row's setting.
 pub fn dropdown_current_index(settings: &Settings, row_index: usize) -> usize {
     match row_index {
         ROW_RESOLUTION => RESOLUTIONS
@@ -270,6 +397,10 @@ pub fn dropdown_current_index(settings: &Settings, row_index: usize) -> usize {
         ROW_AUDIO => AUDIO_CHANNELS
             .iter()
             .position(|(c, _)| *c == settings.audio_channels)
+            .unwrap_or(0),
+        ROW_COLOR_RANGE => COLOR_RANGE_OPTIONS
+            .iter()
+            .position(|&o| o == settings.color_range_override)
             .unwrap_or(0),
         _ => 0,
     }
@@ -310,12 +441,16 @@ pub fn apply_dropdown_choice(settings: &mut Settings, row_index: usize, choice_i
                 settings.audio_channels = *channels;
             }
         }
+        ROW_COLOR_RANGE => {
+            if let Some(&o) = COLOR_RANGE_OPTIONS.get(choice_index) {
+                settings.color_range_override = o;
+            }
+        }
         _ => {}
     }
 }
 
-/// Applies a left/right adjustment to `settings` for the given settings-row index.
-/// Returns `true` if it changed.
+/// Apply left/right adjustment to a setting row. Returns true if changed.
 pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) -> bool {
     match row_index {
         ROW_RESOLUTION => {
@@ -360,14 +495,16 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
             apply_dropdown_choice(settings, ROW_CODEC, next);
             true
         }
-        ROW_STATS_OVERLAY => {
-            settings.stats_overlay = !settings.stats_overlay;
-            true
-        }
         ROW_AUDIO => {
             let idx = dropdown_current_index(settings, ROW_AUDIO);
             let next = cycle_index(idx, AUDIO_CHANNELS.len(), forward);
             apply_dropdown_choice(settings, ROW_AUDIO, next);
+            true
+        }
+        ROW_COLOR_RANGE => {
+            let idx = dropdown_current_index(settings, ROW_COLOR_RANGE);
+            let next = cycle_index(idx, COLOR_RANGE_OPTIONS.len(), forward);
+            apply_dropdown_choice(settings, ROW_COLOR_RANGE, next);
             true
         }
         _ => false,

@@ -1,26 +1,18 @@
-//! Font loading, the rasterized-text cache, and text/icon drawing.
-//!
-//! Split out of the former single-file `ui.rs`; see `super`'s module docs.
+//! Font loading, text/icon cache and drawing (Geist + icon font).
 use super::*;
-use std::collections::HashMap;
 use anyhow::{Context, Result};
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 use sdl2::ttf::Font;
+use std::collections::HashMap;
 use tiny_skia::{IntSize, Pixmap};
 
-
-/// The bundled Geist family (punktfunk's brand font, the same OTFs every other
-/// punktfunk client ships — copied verbatim from `pf-console-ui/assets/fonts/`;
-/// license in `assets/fonts/Geist-OFL.txt`). Embedded like the icon font, so
-/// nothing needs staging alongside the `.ipk`.
+/// Bundled Geist family (punktfunk brand font); embedded so no asset staging needed.
 pub static GEIST_REGULAR: &[u8] = include_bytes!("../../assets/fonts/Geist-Regular.otf");
 pub static GEIST_MEDIUM: &[u8] = include_bytes!("../../assets/fonts/Geist-Medium.otf");
 pub static GEIST_SEMIBOLD: &[u8] = include_bytes!("../../assets/fonts/Geist-SemiBold.otf");
 
-/// Which Geist weight to load. (Geist-Bold.otf also sits in `assets/fonts/`,
-/// unembedded — add a variant if a Bold use appears; the logo lockup that
-/// briefly used it is real artwork now, not text.)
+/// Geist weight to load (Bold unembedded; add variant if needed).
 #[derive(Clone, Copy)]
 pub enum FontWeight {
     Regular,
@@ -28,20 +20,17 @@ pub enum FontWeight {
     SemiBold,
 }
 
-/// The app's four UI fonts, bundled so the many functions needing several of
-/// them take one `&Fonts` instead of threading each separately. Borrow-only —
-/// the fonts are owned in `main.rs`'s `run_inner` for the whole menu/stream
-/// cycle (see `load_font`), so this never needs storing anywhere.
+/// App UI fonts bundled for convenience (borrow-only, owned in `main.rs::run_inner`).
 pub struct Fonts<'a, 'ttf> {
     pub label: &'a Font<'ttf, 'static>,
     pub value: &'a Font<'ttf, 'static>,
     pub title: &'a Font<'ttf, 'static>,
     pub icon: &'a Font<'ttf, 'static>,
+    /// Smallest weight (stats overlay Green-button hint).
+    pub caption: &'a Font<'ttf, 'static>,
 }
 
-/// Loads a bundled Geist weight at a size proportional to the display height
-/// (design reference: a 720px-tall reference screen —
-/// `size = design_size * height / 720`).
+/// Load Geist weight at size proportional to display height (720px reference).
 pub fn load_font(
     ttf: &sdl2::ttf::Sdl2TtfContext,
     height_px: u32,
@@ -59,20 +48,13 @@ pub fn load_font(
         .map_err(|e| anyhow::anyhow!("load_font (Geist): {e}"))
 }
 
-/// The bundled icon font's raw bytes (see the icons section above) — embedded into
-/// the binary at compile time, so there's no install-time asset to stage/ship
-/// alongside the `.ipk` and no runtime path to resolve.
+/// Icon font bytes, embedded at compile time (no asset staging or runtime path needed).
 pub static ICON_FONT_BYTES: &[u8] = include_bytes!("../../assets/icons/MaterialIcons-subset.ttf");
 
-/// The punktfunk logo lockup (mark + FUNK wordmark) — rasterized from the brand's
-/// actual vector artwork (`assets/logo/punktfunk-logo-dark.svg`, the dark/no-border
-/// variant) at the sidebar's exact display size, so it draws 1:1 with no scaling.
-/// See `assets/logo/NOTICE.md` for regeneration.
+/// Punktfunk logo (rasterized at sidebar size, 1:1 no scaling). See assets/logo/NOTICE.md.
 pub static LOGO_PNG: &[u8] = include_bytes!("../../assets/logo/logo-sidebar.png");
 
-/// Decodes the embedded logo once, lazily (premultiplied, ready to composite).
-/// `None` only if the embedded PNG were somehow invalid — the sidebar then just
-/// draws without a logo rather than failing.
+/// Decode embedded logo once, lazily (premultiplied, ready to composite). None if PNG invalid.
 pub fn logo_pixmap() -> Option<&'static Pixmap> {
     static LOGO: std::sync::OnceLock<Option<Pixmap>> = std::sync::OnceLock::new();
     LOGO.get_or_init(|| {
@@ -206,14 +188,7 @@ pub fn draw_text(
 /// process — on a TV with no eviction path. These lines are drawn at most a couple of
 /// times each (once per scroll position that shows them), so rasterizing fresh is both
 /// cheaper overall and bounded in memory.
-pub fn draw_text_uncached(
-    painter: &mut Painter,
-    font: &Font,
-    text: &str,
-    x: i32,
-    y: i32,
-    color: Color,
-) -> Result<u32> {
+pub fn draw_text_uncached(painter: &mut Painter, font: &Font, text: &str, x: i32, y: i32, color: Color) -> Result<u32> {
     if text.is_empty() {
         return Ok(0);
     }
@@ -266,20 +241,35 @@ pub fn ellipsize(font: &Font, text: &str, max_w: u32) -> String {
 /// Greedily word-wraps `text` into lines no wider than `max_w` px in `font` — for modal
 /// copy that's a full sentence or two (status/explanation text), unlike `ellipsize`'s
 /// single-line truncation for card titles.
+///
+/// Tracks the running line width instead of re-measuring the whole (growing) line on
+/// every word — the original did `font.size_of(&candidate)` on the full prefix each
+/// time, which is O(line length) per word and so O(n²) over a line, cheap for a
+/// sentence but the dominant cost of wrapping About's ~10,000-line document on open
+/// (see `ui::wrap_document`). Assumes negligible word-to-word kerning at the space
+/// boundary, same as every other width-budget calculation in this UI already does.
 pub fn wrap_text(font: &Font, text: &str, max_w: u32) -> Vec<String> {
+    let space_w = font.size_of(" ").map_or(0, |(w, _)| w);
     let mut lines = Vec::new();
     let mut current = String::new();
+    let mut current_w = 0u32;
     for word in text.split_whitespace() {
-        let candidate = if current.is_empty() {
-            word.to_string()
+        let word_w = font.size_of(word).map_or(0, |(w, _)| w);
+        let candidate_w = if current.is_empty() {
+            word_w
         } else {
-            format!("{current} {word}")
+            current_w + space_w + word_w
         };
-        if current.is_empty() || font.size_of(&candidate).map_or(0, |(w, _)| w) <= max_w {
-            current = candidate;
+        if current.is_empty() || candidate_w <= max_w {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+            current_w = candidate_w;
         } else {
             lines.push(std::mem::take(&mut current));
-            current = word.to_string();
+            current.push_str(word);
+            current_w = word_w;
         }
     }
     if !current.is_empty() {
@@ -343,8 +333,26 @@ pub fn draw_modal_header(
     subtitle_color: Color,
 ) -> Result<i32> {
     let (text_x, subtitle_y, max_w) = modal_header_geometry(title_font, card);
-    draw_text(painter, text_cache, title_font, title, text_x, card.y() + 28, title_color)?;
-    draw_text_wrapped(painter, text_cache, subtitle_font, subtitle, text_x, subtitle_y, max_w, subtitle_color, 6)
+    draw_text(
+        painter,
+        text_cache,
+        title_font,
+        title,
+        text_x,
+        card.y() + 28,
+        title_color,
+    )?;
+    draw_text_wrapped(
+        painter,
+        text_cache,
+        subtitle_font,
+        subtitle,
+        text_x,
+        subtitle_y,
+        max_w,
+        subtitle_color,
+        6,
+    )
 }
 
 /// The same `y` [`draw_modal_header`] would return, computed without drawing —
@@ -356,4 +364,3 @@ pub fn modal_header_end_y(title_font: &Font, subtitle_font: &Font, card: Rect, s
     let lines = wrap_text(subtitle_font, subtitle, max_w).len() as i32;
     subtitle_y + lines * (subtitle_font.height() + 6)
 }
-

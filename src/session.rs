@@ -21,24 +21,32 @@ use punktfunk_core::quic;
 
 use crate::ndl::{NdlCodec, NdlVideo};
 use crate::starfish::StarfishVideo;
-use crate::store::{CipherPref, CodecPref, VideoBackend};
+use crate::store::{CipherPref, CodecPref, ColorRangeOverride, VideoBackend};
 
-// ─────────────────────────────────────────────────────────── VideoPlayer ──
+impl ColorRangeOverride {
+    /// Force the VUI `full_range` flag per the user override before it's handed to
+    /// the decoder; `Auto` leaves the host-signalled value untouched. Applied on
+    /// both the NDL and Starfish paths (via `VideoPlayer::set_color_info`), though
+    /// NDL's native HDR-info struct has no range field so it's a no-op there — see
+    /// `ndl.rs`/`starfish.rs` `set_color_info`.
+    fn apply(self, color: &mut quic::ColorInfo) {
+        match self {
+            Self::Full => color.full_range = 1,
+            Self::Limited => color.full_range = 0,
+            Self::Auto => {}
+        }
+    }
+}
 
-/// Unified video-decode backend, selected at connect time via [`VideoBackend`].
-///
-/// The NDL arm is an `Arc` because the audio-offload path shares the handle with a
-/// dedicated audio-drain thread ([`ndl_audio_pump`]): `NdlVideo::drop` unloads NDL
-/// process-globally, so the unload must not happen until *both* threads are done with
-/// it — which is exactly what last-`Arc`-drop gives, with no ordering to get wrong.
+/// Unified video-decode backend. NDL arm is Arc'd because audio-offload shares it with
+/// `ndl_audio_pump`; NDL unloads process-globally, so unload waits for both threads (`Arc::drop`).
 enum VideoPlayer {
     Starfish(StarfishVideo),
     Ndl(Arc<NdlVideo>),
 }
 
 impl VideoPlayer {
-    /// Feed one access unit. `pts_ns` is nanoseconds (`frame.pts_ns` from the host).
-    /// Returns the feed duration for ABR decode-latency reporting.
+    /// Feed access unit; return (result, `feed_duration`) for ABR latency reporting.
     fn play(&self, au: &[u8], pts_ns: u64) -> (anyhow::Result<()>, Duration) {
         let t = Instant::now();
         let result = match self {
@@ -62,8 +70,7 @@ impl VideoPlayer {
         }
     }
 
-    /// Whether the active backend is decoding audio itself (NDL only — the Starfish
-    /// payload sets `needAudio: false`, so that path always uses the software decoder).
+    /// Whether backend decodes audio itself (NDL only; Starfish always uses software decoder).
     fn audio_offloaded(&self) -> bool {
         match self {
             Self::Ndl(ndl) => ndl.audio_offloaded(),
@@ -71,8 +78,7 @@ impl VideoPlayer {
         }
     }
 
-    /// The shared NDL handle when it took the Opus stream — what the dedicated
-    /// audio-drain thread holds. `None` on Starfish or a video-only NDL load.
+    /// Shared NDL handle when audio-offloaded; None on Starfish or video-only NDL.
     fn ndl_audio_handle(&self) -> Option<Arc<NdlVideo>> {
         match self {
             Self::Ndl(ndl) if ndl.audio_offloaded() => Some(ndl.clone()),
@@ -80,9 +86,7 @@ impl VideoPlayer {
         }
     }
 
-    /// NDL's undecoded/unpresented backlog, when the active backend can report it.
-    /// Starfish exposes no equivalent through the wrapper, so it reports `None` — the
-    /// overlay and the log then simply omit the figure rather than showing a fake zero.
+    /// NDL render-buffer backlog; None on Starfish (overlay/log omit the figure).
     fn render_buffer_length(&self) -> Option<i32> {
         match self {
             Self::Ndl(ndl) => ndl.render_buffer_length(),
@@ -92,7 +96,7 @@ impl VideoPlayer {
 
     fn backend_name(&self) -> &'static str {
         match self {
-            Self::Starfish(_) => "Starfish/SMP",
+            Self::Starfish(_) => "Starfish",
             Self::Ndl(_) => "NDL",
         }
     }
@@ -101,33 +105,30 @@ impl VideoPlayer {
 pub struct Connected {
     pub client: Arc<NativeClient>,
     pub stop: Arc<AtomicBool>,
-    /// Live pump counters for the stats overlay — see [`StreamStats`].
+    /// Live pump counters for stats overlay; see `StreamStats`.
     pub stats: Arc<StreamStats>,
-    /// Kept alive so [`Connected::shutdown`] can join it and ensure `NativeClient::Drop`
-    /// (which sends the QUIC close frame) runs to completion before process exit.
+    /// Kept alive so `shutdown()` can join and ensure QUIC close frame is sent before exit.
     video_thread: std::thread::JoinHandle<()>,
-    /// The dedicated NDL audio-drain thread ([`ndl_audio_pump`]) — present only when
-    /// `audio_offloaded`. Joined by [`Connected::shutdown`] like the video thread.
+    /// Dedicated NDL audio-drain thread (present only when `audio_offloaded`).
     audio_thread: Option<std::thread::JoinHandle<()>>,
-    /// Set when NDL accepted the Opus config and is decoding audio itself, so the caller
-    /// must NOT also open an SDL2 audio device — see `ndl_audio_config`.
+    /// True when NDL accepted Opus config; prevents opening SDL2 audio device.
     pub audio_offloaded: bool,
+    /// Resolved decode backend name for the stats overlay — the *actual* player,
+    /// which can differ from the requested `VideoBackend` (Starfish falls back to NDL).
+    pub backend_name: &'static str,
 }
 
-/// Live video-pump counters shared with the main thread for the in-stream stats
-/// overlay (`Settings::stats_overlay`): plain relaxed atomics, written per frame
-/// by [`video_pump`], read at the overlay's ~2Hz refresh. Dropped-frame counts
-/// come straight from `NativeClient::frames_dropped()` at read time instead.
+/// Live video-pump counters for stats overlay (read at ~2Hz); relaxed atomics written per frame.
 #[derive(Default)]
 pub struct StreamStats {
-    /// Total frames received from the host so far.
     pub frames: std::sync::atomic::AtomicU64,
-    /// Whether the freeze-until-reanchor hold is currently active.
+    /// Bytes received; deltas give measured bitrate.
+    pub bytes: std::sync::atomic::AtomicU64,
+    /// Freeze-until-reanchor hold active.
     pub holding: AtomicBool,
-    /// The most recent decoder feed duration, in µs.
+    /// Most recent decoder feed duration (µs).
     pub feed_us: std::sync::atomic::AtomicU32,
-    /// NDL's render-buffer backlog at the last heartbeat, or `-1` when the active
-    /// backend can't report one (see `VideoPlayer::render_buffer_length`).
+    /// NDL render-buffer backlog or -1 if unavailable.
     pub render_backlog: std::sync::atomic::AtomicI32,
 }
 
@@ -141,11 +142,30 @@ pub fn codec_name(codec: u8) -> &'static str {
     }
 }
 
+/// Process CPU time (user+sys clock ticks, see `clock_ticks_per_sec`) and resident
+/// memory (bytes), for the stats overlay's CPU/RAM line. Plain `/proc/self` reads.
+pub fn process_cpu_mem() -> Option<(u64, u64)> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // `comm` (field 2) may contain spaces/parens, so split after the last ')'.
+    let after_comm = stat.rsplit_once(')')?.1;
+    let mut fields = after_comm.split_whitespace();
+    let utime: u64 = fields.nth(11)?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let rss_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64; // SAFETY: no pointers
+
+    Some((utime + stime, rss_pages * page_size))
+}
+
+/// Clock ticks per second, for converting `process_cpu_mem`'s ticks to seconds.
+pub fn clock_ticks_per_sec() -> u64 {
+    (unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64).max(1) // SAFETY: no pointers
+}
+
 impl Connected {
-    /// Stops and joins the video thread, then drops the `NativeClient` reference.
-    ///
-    /// Call `self.client.disconnect_quit()` before this for a deliberate stop
-    /// (app quit, long-press Back); omit it when the host ended the session.
+    /// Stop and join threads, then drop `NativeClient`. Call `disconnect_quit()` first for graceful shutdown.
     pub fn shutdown(self) {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.video_thread.join();
@@ -156,17 +176,8 @@ impl Connected {
     }
 }
 
-/// Whether to ask NDL to decode the audio stream, given the host-resolved channel count.
-///
-/// **Stereo only, by construction.** `NDL_DIRECTMEDIA_AUDIO_OPUS_INFO_T` carries a channel
-/// count and a sample rate and nothing else — it has no multistream mapping field, so it
-/// cannot describe the 5.1/7.1 layouts `punktfunk_core::audio::layout_for` negotiates
-/// (those are Opus multistream, with a per-layout stream/coupled/mapping triple). Handing
-/// NDL a `channels: 6` it would decode as plain 6-channel Opus would produce noise, not
-/// surround, so anything above stereo stays on the software decoder.
-///
-/// Whether the *device* implements the Opus path at all is a separate question, answered
-/// by probe rather than assumption — see `NdlVideo::load`.
+/// Whether NDL should decode audio (stereo only). NDL struct has no multistream mapping field,
+/// so 5.1/7.1 layouts would produce noise; anything >stereo stays on software decoder.
 fn ndl_audio_config(resolved_channels: u8) -> Option<crate::ndl::NdlAudioConfig> {
     if !crate::store::dev_override_enable_ndl_audio_offload() {
         return None;
@@ -241,6 +252,7 @@ pub fn connect(
     display_h: i32,
     video_backend: VideoBackend,
     codec_pref: CodecPref,
+    color_range_override: ColorRangeOverride,
 ) -> Result<Connected> {
     // `launch_cipher_pref` (see its docs) resolves the `cipher` launch param, i.e.
     // `task deploy CIPHER=...` — the only way to pick a cipher, no rebuild needed.
@@ -425,17 +437,29 @@ pub fn connect(
     // this purpose; HDR streams additionally carry mastering metadata.
     let is_hdr = client.color.is_hdr();
     let initial_meta = is_hdr.then(cx_display_hdr);
-    if let Err(e) = player.set_color_info(initial_meta.as_ref(), client.color) {
-        tracing::warn!("{} colour metadata failed: {e:#}", player.backend_name());
-    }
-    tracing::debug!(
-        "colour metadata sent: hdr={is_hdr} transfer={} primaries={} matrix={} full_range={}",
+    // What the host actually signalled in `Welcome`, before any user override —
+    // the reference point for the washed-out-colour investigation.
+    tracing::info!(
+        "host colour info: hdr={is_hdr} transfer={} primaries={} matrix={} full_range={}",
         client.color.transfer,
         client.color.primaries,
         client.color.matrix,
         client.color.full_range,
     );
+    let mut color = client.color;
+    color_range_override.apply(&mut color);
+    if let Err(e) = player.set_color_info(initial_meta.as_ref(), color) {
+        tracing::warn!("{} colour metadata failed: {e:#}", player.backend_name());
+    }
+    tracing::debug!(
+        "colour metadata sent: transfer={} primaries={} matrix={} full_range={} (override={color_range_override:?})",
+        color.transfer,
+        color.primaries,
+        color.matrix,
+        color.full_range,
+    );
 
+    let backend_name = player.backend_name();
     let audio_offloaded = player.audio_offloaded();
     tracing::info!(
         "audio path: {} (host resolved {} channel(s))",
@@ -455,7 +479,16 @@ pub fn connect(
     let video_stats = stats.clone();
     let video_thread = std::thread::Builder::new()
         .name("punktfunk-webos-video".into())
-        .spawn(move || video_pump(video_client, player, video_stop, video_stats, is_hdr))
+        .spawn(move || {
+            video_pump(
+                video_client,
+                player,
+                video_stop,
+                video_stats,
+                is_hdr,
+                color_range_override,
+            )
+        })
         .context("spawn video thread")?;
     let audio_thread = match ndl_audio {
         Some(ndl) => {
@@ -478,6 +511,7 @@ pub fn connect(
         video_thread,
         audio_thread,
         audio_offloaded,
+        backend_name,
     })
 }
 
@@ -840,7 +874,14 @@ fn spawn_vendor_decode_thread_renicer() {
     });
 }
 
-fn video_pump(client: Arc<NativeClient>, player: VideoPlayer, stop: Arc<AtomicBool>, stats: Arc<StreamStats>, is_hdr: bool) {
+fn video_pump(
+    client: Arc<NativeClient>,
+    player: VideoPlayer,
+    stop: Arc<AtomicBool>,
+    stats: Arc<StreamStats>,
+    is_hdr: bool,
+    color_range_override: ColorRangeOverride,
+) {
     client.register_hot_thread();
     // Summarized at info, not left as per-tid debug lines: whether these renices work at
     // all is install-mode-dependent (they need CAP_SYS_NICE or a nonzero RLIMIT_NICE —
@@ -855,15 +896,16 @@ fn video_pump(client: Arc<NativeClient>, player: VideoPlayer, stop: Arc<AtomicBo
             reniced += 1;
         } else {
             failed += 1;
-            tracing::debug!(
-                "setpriority(tid={tid}) failed: {}",
-                std::io::Error::last_os_error()
-            );
+            tracing::debug!("setpriority(tid={tid}) failed: {}", std::io::Error::last_os_error());
         }
     }
     tracing::info!(
         "hot-thread renice: {reniced} boosted, {failed} failed{}",
-        if failed > 0 { " (no CAP_SYS_NICE — priorities unchanged)" } else { "" },
+        if failed > 0 {
+            " (no CAP_SYS_NICE — priorities unchanged)"
+        } else {
+            ""
+        },
     );
     spawn_vendor_decode_thread_renicer();
 
@@ -897,6 +939,7 @@ fn video_pump(client: Arc<NativeClient>, player: VideoPlayer, stop: Arc<AtomicBo
             Ok(frame) => {
                 frames_received += 1;
                 stats.frames.store(frames_received, Ordering::Relaxed);
+                stats.bytes.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
                 if last_heartbeat.elapsed() >= Duration::from_secs(2) {
                     last_heartbeat = Instant::now();
                     let backlog = player.render_buffer_length();
@@ -911,7 +954,7 @@ fn video_pump(client: Arc<NativeClient>, player: VideoPlayer, stop: Arc<AtomicBo
                     // exactly the situation it exists for, a freeze reported off a
                     // plain sideloaded run with no telemetry listener. Half a line per
                     // second is affordable; a second round trip to reproduce is not.
-                    tracing::info!(
+                    tracing::debug!(
                         "video: {frames_received} frames, holding={holding}, dropped={}, backlog={}",
                         client.frames_dropped(),
                         backlog.map_or_else(|| "n/a".to_string(), |b| b.to_string()),
@@ -1012,7 +1055,7 @@ fn video_pump(client: Arc<NativeClient>, player: VideoPlayer, stop: Arc<AtomicBo
                     // INFO for the same reason as the main heartbeat above — and this
                     // arm is the one that says "nothing is arriving at all", which is a
                     // different fault from "arriving but not presenting".
-                    tracing::info!("video: {frames_received} frames (idle)");
+                    tracing::debug!("video: {frames_received} frames (idle)");
                 }
             }
             Err(e) => {
@@ -1022,8 +1065,21 @@ fn video_pump(client: Arc<NativeClient>, player: VideoPlayer, stop: Arc<AtomicBo
         }
 
         if is_hdr {
+            // `next_hdr_meta` is a queue drained non-blocking, so an Ok here is a
+            // freshly received / changed mastering-metadata packet, not a repeat.
             if let Ok(meta) = client.next_hdr_meta(Duration::ZERO) {
-                if let Err(e) = player.set_color_info(Some(&meta), client.color) {
+                tracing::info!(
+                    "HDR metadata received: primaries={:?} white={:?} max_dml={} min_dml={} max_cll={} max_fall={}",
+                    meta.display_primaries,
+                    meta.white_point,
+                    meta.max_display_mastering_luminance,
+                    meta.min_display_mastering_luminance,
+                    meta.max_cll,
+                    meta.max_fall,
+                );
+                let mut color = client.color;
+                color_range_override.apply(&mut color);
+                if let Err(e) = player.set_color_info(Some(&meta), color) {
                     tracing::warn!("{} set_color_info: {e:#}", player.backend_name());
                 }
             }

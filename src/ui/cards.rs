@@ -1,20 +1,15 @@
-//! Focus rings, selectable cards, and the game-grid poster card.
-//!
-//! Split out of the former single-file `ui.rs`; see `super`'s module docs.
+//! Focus rings, selectable cards, game-grid poster card.
 use super::*;
 use anyhow::Result;
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 use tiny_skia::Pixmap;
 
-
-/// A slight softening of moonlight-tv's near-square (~2px) tile radius.
+/// Card corner radius (softened from moonlight-tv's ~2px).
 pub const CARD_RADIUS: i32 = 10;
 pub const MODAL_RADIUS: i32 = 20;
 
-/// Approximates moonlight-tv's 102%/99% focus/press zoom (a real `transform_zoom`
-/// isn't worth a transform pipeline here) by inflating the drawn rect a few percent
-/// from its own center when focused.
+/// Approximate moonlight-tv's 2% focus zoom by inflating rect from center.
 pub fn inflate(rect: Rect, focused: bool) -> Rect {
     if !focused {
         return rect;
@@ -29,39 +24,38 @@ pub fn inflate(rect: Rect, focused: bool) -> Rect {
     )
 }
 
-/// A soft, real drop shadow (see [`Painter::fill_shadow`]) — matches the reference's
-/// shadowed-card look.
+/// Soft drop shadow matching moonlight-tv's card look.
 pub fn draw_card_shadow(painter: &mut Painter, rect: Rect, radius: i32) {
     painter.fill_shadow(rect, radius, 3.0, 5.0, SHADOW_BLUR, 0x60);
 }
 
-/// moonlight-tv's focus cue is an outline ring offset outward from the tile, not a
-/// filled/background change — bright accent blue, invisible unless focused. Two
-/// passes at increasing offset/decreasing alpha approximate a soft glow. Only
-/// `draw_poster_card` (game/Desktop grid selection) uses this — every other
-/// selectable row/button relies on [`draw_selectable`]'s zoom, focus-only card,
-/// and text-color change instead, per an explicit request to drop rings
-/// everywhere except game selection.
+/// How far the focused-card glow's blur extends past the card edge — the
+/// pad `render_focus_ring_tile`'s canvas must leave for it not to clip.
+pub const FOCUS_GLOW_BLUR: f32 = 16.0;
+
+/// Soft glow behind a focused card — a blurred halo in the accent color,
+/// replacing the old hard double-outline ring for a more pleasant look. Same
+/// cached-shape technique as a drop shadow (`Painter::fill_glow`), so it costs
+/// one shared texture, reused by every card, not a per-frame re-blur. Rounded
+/// noticeably less than the card itself (`radius`) — a smaller pre-blur radius
+/// leaves more straight edge for the blur to soften, which reads as hugging
+/// the card's actual corners rather than blooming into a big round blob.
 pub fn draw_focus_ring(painter: &mut Painter, rect: Rect, radius: i32) {
-    let passes = [(3, 0xff), (6, 0x60)];
-    for (offset, alpha) in passes {
-        let ring = Rect::new(
-            rect.x() - offset,
-            rect.y() - offset,
-            rect.width() + 2 * offset as u32,
-            rect.height() + 2 * offset as u32,
-        );
-        let color = Color::RGBA(ACCENT_BRIGHT.r, ACCENT_BRIGHT.g, ACCENT_BRIGHT.b, alpha);
-        painter.stroke_rounded_rect(ring, radius + offset, color, 2.0);
-    }
+    painter.fill_glow(rect, radius / 2, ACCENT_BRIGHT, FOCUS_GLOW_BLUR);
 }
 
-/// Draws a plain surface card for a text-entry field (PIN/IP digit boxes) — always
-/// visible, so every slot reads as "a box you can fill in", not just the current
-/// one — shadow and `SURFACE` fill, zoom-inflated slightly when focused. Returns
-/// the (possibly zoom-inflated) rect actually drawn, so callers can center content
-/// inside it. Selectable rows/buttons use [`draw_selectable`] instead, which only
-/// paints the box when focused.
+/// A crisp thin outline right at the card's own edge — composited on top of
+/// the card art (unlike the soft glow behind it), so the transition from
+/// glow to art reads as a clean rectangle rather than a smudge. Square, not
+/// `CARD_RADIUS`-rounded: the art itself is a plain blit with square corners
+/// (see `draw_poster_card`), so a rounded outline would float visibly outside
+/// the actual art edge whenever a cover is loaded.
+pub fn draw_card_outline(painter: &mut Painter, rect: Rect) {
+    let color = Color::RGBA(ACCENT_BRIGHT.r, ACCENT_BRIGHT.g, ACCENT_BRIGHT.b, 0xd0);
+    painter.stroke_rounded_rect(rect, 0, color, 1.5);
+}
+
+/// Draw text-entry card (PIN/IP boxes); always visible, zoom when focused.
 pub fn draw_card(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
     let r = inflate(rect, focused);
     draw_card_shadow(painter, r, CARD_RADIUS);
@@ -69,10 +63,7 @@ pub fn draw_card(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
     r
 }
 
-/// Same card as [`draw_card`], but only painted when focused — an unfocused
-/// row/button has no background at all. Used by every selectable row/button
-/// (sidebar, Wake, confirm) except settings rows, which use
-/// [`draw_selectable_fixed`] instead (see its docs).
+/// Card painted only when focused (no background for unfocused). Used by rows/buttons.
 pub fn draw_selectable(painter: &mut Painter, rect: Rect, focused: bool) -> Rect {
     let r = inflate(rect, focused);
     if focused {
@@ -133,6 +124,12 @@ pub fn draw_poster_card(
 
     let strip_h = (fonts.value.height() + 16).min(r.height() as i32 / 3);
     match art {
+        // Already stretched to this card size by `art::ArtLoader` (see
+        // `art::resize_pixmap`) — a plain blit, not `draw_pixmap_scaled`. Falls back
+        // to scaling if a pixmap ever arrives at some other size.
+        Some(pixmap) if pixmap.width() == r.width() && pixmap.height() == r.height() => {
+            painter.draw_pixmap(r.x(), r.y(), pixmap);
+        }
         Some(pixmap) => {
             painter.draw_pixmap_scaled(r, pixmap);
         }
@@ -159,12 +156,12 @@ pub fn draw_poster_card(
     }
 
     let strip = Rect::new(
-        r.x() + 2,
+        r.x(),
         r.y() + r.height() as i32 - strip_h,
-        r.width().saturating_sub(4),
+        r.width(),
         strip_h.max(0) as u32,
     );
-    painter.fill_rect(strip, Color::RGBA(0x00, 0x00, 0x00, 0x70));
+    painter.fill_frosted_rect(strip, 0, Color::RGBA(0x00, 0x00, 0x00, 0x68), 6);
     let label = ellipsize(fonts.value, title, strip.width().saturating_sub(16));
     draw_text(
         painter,
@@ -181,4 +178,3 @@ pub fn draw_poster_card(
     }
     Ok(())
 }
-

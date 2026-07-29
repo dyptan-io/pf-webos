@@ -1,24 +1,16 @@
-//! Shared animation clocks and the GPU zoom-pop rect math.
-//!
-//! Split out of the former single-file `ui.rs`; see `super`'s module docs.
-use std::time::{Duration, Instant};
 use sdl2::rect::Rect;
+use std::time::{Duration, Instant};
 
-// Shared by every GPU-scale zoom-pop in the app — the grid's card focus-pop
-// (`app.rs`), every pre-stream modal's focused-widget tile, and the in-stream
-// disconnect dialog's (`main.rs`) — so there's exactly one implementation of
-// "ease a clock, then scale a rect around its center" instead of one per caller.
-
-/// How long a focus-pop (zoom-in) animation runs — the grid's card, every
-/// pre-stream modal's focused widget, and the disconnect dialog's button.
+/// Durations for focus-pop and launch-fade animations.
 pub const FOCUS_POP: Duration = Duration::from_millis(140);
+pub const LAUNCH_FADE: Duration = Duration::from_millis(600);
 
-/// Cubic ease-out for the animation fractions below.
+/// Cubic ease-out function.
 pub fn ease(f: f32) -> f32 {
     1.0 - (1.0 - f).powi(3)
 }
 
-/// Eased 0..=1 progress of an animation started at `t`; 1.0 when done/absent.
+/// Eased progress 0..=1 of animation; 1.0 when done/absent.
 pub fn anim_frac(anim: Option<Instant>, dur: Duration) -> f32 {
     match anim {
         Some(t) => ease((t.elapsed().as_secs_f32() / dur.as_secs_f32()).min(1.0)),
@@ -40,3 +32,11 @@ pub fn zoom_rect(base: Rect, frac: f32, growth: f32) -> Rect {
     Rect::new((cx - tw / 2.0) as i32, (cy - th / 2.0) as i32, tw as u32, th as u32)
 }
 
+/// Scale up from (1.0 - shrink) to full size. "Pop in" counterpart to `zoom_rect`.
+pub fn pop_in_rect(base: Rect, frac: f32, shrink: f32) -> Rect {
+    if frac >= 1.0 {
+        base
+    } else {
+        zoom_rect(base, 1.0 - frac, -shrink)
+    }
+}
