@@ -34,10 +34,10 @@ pub struct WebosAes128Gcm {
     key: [u8; 16],
 }
 
-/// Registers [`WebosAes128Gcm`] as `punktfunk_core::crypto`'s AES-128-GCM backend. Must run
+/// Installs [`WebosAes128Gcm`] as `punktfunk_core::crypto`'s AES-128-GCM provider. Must run
 /// before the first `SessionCrypto` (i.e. before `session::connect`).
 pub fn register() -> Result<()> {
-    punktfunk_core::crypto::register_aes128gcm_backend(|key| Box::new(WebosAes128Gcm { key: *key }))
+    punktfunk_core::crypto::install_aes128gcm_provider(|key| Box::new(WebosAes128Gcm { key: *key }))
 }
 
 impl Aes128GcmBackend for WebosAes128Gcm {
