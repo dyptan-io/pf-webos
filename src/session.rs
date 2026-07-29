@@ -96,7 +96,7 @@ impl VideoPlayer {
 
     fn backend_name(&self) -> &'static str {
         match self {
-            Self::Starfish(_) => "Starfish/SMP",
+            Self::Starfish(_) => "Starfish",
             Self::Ndl(_) => "NDL",
         }
     }
@@ -113,6 +113,9 @@ pub struct Connected {
     audio_thread: Option<std::thread::JoinHandle<()>>,
     /// True when NDL accepted Opus config; prevents opening SDL2 audio device.
     pub audio_offloaded: bool,
+    /// Resolved decode backend name for the stats overlay — the *actual* player,
+    /// which can differ from the requested `VideoBackend` (Starfish falls back to NDL).
+    pub backend_name: &'static str,
 }
 
 /// Live video-pump counters for stats overlay (read at ~2Hz); relaxed atomics written per frame.
@@ -137,6 +140,28 @@ pub fn codec_name(codec: u8) -> &'static str {
         c if c == quic::CODEC_AV1 => "AV1",
         _ => "?",
     }
+}
+
+/// Process CPU time (user+sys clock ticks, see `clock_ticks_per_sec`) and resident
+/// memory (bytes), for the stats overlay's CPU/RAM line. Plain `/proc/self` reads.
+pub fn process_cpu_mem() -> Option<(u64, u64)> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // `comm` (field 2) may contain spaces/parens, so split after the last ')'.
+    let after_comm = stat.rsplit_once(')')?.1;
+    let mut fields = after_comm.split_whitespace();
+    let utime: u64 = fields.nth(11)?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let rss_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64; // SAFETY: no pointers
+
+    Some((utime + stime, rss_pages * page_size))
+}
+
+/// Clock ticks per second, for converting `process_cpu_mem`'s ticks to seconds.
+pub fn clock_ticks_per_sec() -> u64 {
+    (unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64).max(1) // SAFETY: no pointers
 }
 
 impl Connected {
@@ -433,6 +458,7 @@ pub fn connect(
         color.full_range,
     );
 
+    let backend_name = player.backend_name();
     let audio_offloaded = player.audio_offloaded();
     tracing::info!(
         "audio path: {} (host resolved {} channel(s))",
@@ -484,6 +510,7 @@ pub fn connect(
         video_thread,
         audio_thread,
         audio_offloaded,
+        backend_name,
     })
 }
 

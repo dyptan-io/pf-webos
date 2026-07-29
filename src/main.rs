@@ -1122,6 +1122,7 @@ mod real {
             let mut overlay_last: Option<Instant> = None;
             let mut overlay_prev_frames: u64 = 0;
             let mut overlay_prev_bytes: u64 = 0;
+            let mut overlay_prev_cpu_ticks: Option<u64> = None;
             let mut overlay_prev_at = Instant::now();
             // 0 = "Disconnect" focused, 1 = "Cancel" (default on open — safer).
             let mut disconnect = DisconnectDialog::new();
@@ -1429,14 +1430,32 @@ mod real {
                         let mode = connected.client.mode();
                         let feed_ms = connected.stats.feed_us.load(Ordering::Relaxed) as f32 / 1000.0;
                         let holding = connected.stats.holding.load(Ordering::Relaxed);
-                        let lines = vec![
+                        // CPU% (of one core) + RSS; only read while the overlay is up.
+                        let cpu_mem_line = session::process_cpu_mem().map(|(cpu_ticks, mem_bytes)| {
+                            // No baseline on the first sample, so CPU shows only from the 2nd on.
+                            let cpu = overlay_prev_cpu_ticks.map(|prev| {
+                                let pct = (cpu_ticks.saturating_sub(prev)) as f32
+                                    / session::clock_ticks_per_sec() as f32
+                                    / dt
+                                    * 100.0;
+                                format!("CPU {pct:.0}% · ")
+                            });
+                            overlay_prev_cpu_ticks = Some(cpu_ticks);
                             format!(
-                                "{}x{}@{} {}{}",
+                                "{}RAM {:.0} MB",
+                                cpu.unwrap_or_default(),
+                                mem_bytes as f32 / (1024.0 * 1024.0)
+                            )
+                        });
+                        let mut lines = vec![
+                            format!(
+                                "{}x{}@{} {}{} · {}",
                                 mode.width,
                                 mode.height,
                                 mode.refresh_hz,
                                 session::codec_name(connected.client.codec),
                                 if connected.client.color.is_hdr() { " HDR" } else { "" },
+                                connected.backend_name,
                             ),
                             format!("Video {fps:.1} fps · {frames} frames"),
                             {
@@ -1462,6 +1481,9 @@ mod real {
                                 connected.client.resolved_bitrate_kbps / 1000,
                             ),
                         ];
+                        if let Some(line) = cpu_mem_line {
+                            lines.push(line);
+                        }
                         match crate::ui::render_stats_overlay_tile(
                             fonts.value,
                             fonts.caption,

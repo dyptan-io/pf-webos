@@ -220,33 +220,38 @@ pub fn render_wrapped_text_tile(
     Ok(p)
 }
 
-/// A worst-case stat line, measured to fix the overlay's width — see
-/// `render_stats_overlay_tile`. The Drop/FEC/hold/buf line is the widest of the
-/// bunch once all four counters hit multiple digits.
-pub const STATS_OVERLAY_REF_LINE: &str = "Drop 99  FEC 99  hold yes  buf 99";
+/// Worst-case stat line used to lock overlay width.
+pub const STATS_OVERLAY_REF_LINE: &str = "3840x2160@120 HEVC HDR Starfish";
 
-/// In-stream stats overlay: translucent card with stat lines + Green-button hint.
-/// Width is FIXED (measured from `STATS_OVERLAY_REF_LINE`) so panel doesn't jitter
-/// as numbers change digit count. `lines[0]` is highlighted; rest muted.
+/// In-stream stats overlay with fixed width and centered hint.
+/// `lines[0]` is highlighted; remaining lines are muted.
 pub fn render_stats_overlay_tile(font: &Font, caption_font: &Font, lines: &[String], hint: &str) -> Result<Painter> {
     let pad = 18i32;
-    let safety = 16u32;
-    let line_h = font.height() + 6;
-    let hint_h = caption_font.height() + 8;
-    let inner_w = font.size_of(STATS_OVERLAY_REF_LINE).map_or(0, |(w, _)| w) + safety;
+    let content_safety = 16u32;
+    let line_font = font;
+    let line_h = line_font.height() + 6;
+    let caption_h = caption_font.height();
+    let hint_h = caption_h + 8;
+    let line_count = lines.len() as i32;
+
+    let inner_w = line_font.size_of(STATS_OVERLAY_REF_LINE).map_or(0, |(w, _)| w) + content_safety;
     let w = inner_w + 2 * pad as u32;
-    let h = (lines.len() as i32 * line_h + hint_h + 2 * pad) as u32;
+    let h = (line_count * line_h + hint_h + 2 * pad) as u32;
+    let content_w_i32 = w as i32 - 2 * pad;
+
     let mut p = Painter::new(w.max(1), h.max(1));
     let mut tc = TextCache::new();
     p.fill_rounded_rect(Rect::new(0, 0, w, h), 14, Color::RGBA(0x14, 0x10, 0x1f, 0x90));
+
     for (i, line) in lines.iter().enumerate() {
         let color = if i == 0 { WHITE } else { MUTED };
-        let clipped = ellipsize(font, line, inner_w);
-        draw_text(&mut p, &mut tc, font, &clipped, pad, pad + i as i32 * line_h, color)?;
+        let y = pad + i as i32 * line_h;
+        draw_text(&mut p, &mut tc, line_font, line, pad, y, color)?;
     }
-    let hint_y = pad + lines.len() as i32 * line_h + (hint_h - caption_font.height());
+
+    let hint_y = pad + line_count * line_h + (hint_h - caption_h);
     let hint_w = caption_font.size_of(hint).map_or(0, |(w, _)| w) as i32;
-    let hint_x = pad + (w as i32 - 2 * pad - hint_w) / 2;
+    let hint_x = pad + (content_w_i32 - hint_w) / 2;
     draw_text(&mut p, &mut tc, caption_font, hint, hint_x, hint_y, MUTED)?;
     Ok(p)
 }
