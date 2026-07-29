@@ -47,13 +47,26 @@ enum VideoPlayer {
 
 impl VideoPlayer {
     /// Feed access unit; return (result, `feed_duration`) for ABR latency reporting.
+    /// `pts_ns` must already be in this backend's PTS clock domain (see
+    /// [`Self::pace_base_ns`]).
     fn play(&self, au: &[u8], pts_ns: u64) -> (anyhow::Result<()>, Duration) {
         let t = Instant::now();
         let result = match self {
             Self::Starfish(sf) => sf.play(au, pts_ns),
-            Self::Ndl(ndl) => ndl.play(au),
+            Self::Ndl(ndl) => ndl.play(au, pts_ns),
         };
         (result, t.elapsed())
+    }
+
+    /// Unpaced PTS reference for `frame` in this backend's clock domain: nanoseconds
+    /// since `load()` for NDL (it has none of its own — see `NdlVideo::elapsed_ns`),
+    /// or the host's capture-clock PTS untouched for Starfish. [`PtsPacer`] smooths
+    /// this before it reaches [`Self::play`].
+    fn pace_base_ns(&self, frame_pts_ns: u64) -> u64 {
+        match self {
+            Self::Starfish(_) => frame_pts_ns,
+            Self::Ndl(ndl) => ndl.elapsed_ns(),
+        }
     }
 
     fn flush(&self) -> anyhow::Result<()> {
@@ -130,6 +143,8 @@ pub struct StreamStats {
     pub feed_us: std::sync::atomic::AtomicU32,
     /// NDL render-buffer backlog or -1 if unavailable.
     pub render_backlog: std::sync::atomic::AtomicI32,
+    /// Latency `PtsPacer` added vs. the unpaced reference (ns); 0 when pacing is off.
+    pub pacing_delta_ns: std::sync::atomic::AtomicI64,
 }
 
 /// Short display name for a resolved wire codec id (the stats overlay's header).
@@ -253,6 +268,7 @@ pub fn connect(
     video_backend: VideoBackend,
     codec_pref: CodecPref,
     color_range_override: ColorRangeOverride,
+    video_pacing: bool,
 ) -> Result<Connected> {
     // HDR only ever applies to HEVC. An explicit H.264 pick disables it end to end
     // (the Settings toggle is hidden too — see `ui::hdr_row_shown`); on Automatic the
@@ -496,6 +512,7 @@ pub fn connect(
                 video_stats,
                 is_hdr,
                 color_range_override,
+                video_pacing,
             )
         })
         .context("spawn video thread")?;
@@ -797,6 +814,62 @@ const FEED_BACKPRESSURE_WARN: Duration = Duration::from_millis(20);
 /// three samples per 750 ms report window; see the fold in [`video_pump`].
 const BACKLOG_POLL: Duration = Duration::from_millis(250);
 
+/// Max drift ([`PtsPacer`]) from the unpaced reference, as a fraction of one frame
+/// interval — same figure aurora-tv ships as `SS4S_SMOOTH_PACING_MAX_DRIFT_FRAMES` for
+/// these same NDL/Starfish backends.
+const PACE_MAX_DRIFT_FRAMES: f64 = 0.5;
+/// Minimum step between successive paced PTS values, so NDL's ms-truncation
+/// (`NdlVideo::play`) never sees two equal/decreasing timestamps in a row.
+const PACE_MIN_STEP_NS: u64 = 1_000_000;
+
+/// Smooths the PTS fed to the decoder against delivery jitter — an "ideal" value
+/// advances by a fixed frame interval each call, clamped to a small drift window
+/// around the real (unpaced) reference (see [`VideoPlayer::pace_base_ns`]). Changes
+/// only *what* timestamp is attached, never *when* `play()` runs — the decoder
+/// schedules presentation off the PTS itself, so a burst of frames landing together
+/// still gets spaced one interval apart instead of stamped with ~the same time. Same
+/// technique as aurora-tv's `SS4S_SMOOTH_PACING`.
+struct PtsPacer {
+    interval_ns: u64,
+    max_drift_ns: u64,
+    ideal_ns: Option<u64>,
+}
+
+impl PtsPacer {
+    fn new(interval_ns: u64) -> Self {
+        Self {
+            interval_ns,
+            max_drift_ns: (interval_ns as f64 * PACE_MAX_DRIFT_FRAMES) as u64,
+            ideal_ns: None,
+        }
+    }
+
+    /// Drops the accumulator — call after a freeze-until-reanchor hold, where the real
+    /// timeline just jumped and there's no "ideal" continuation worth preserving.
+    fn reset(&mut self) {
+        self.ideal_ns = None;
+    }
+
+    /// Next paced PTS (ns) for `base_ns`, this frame's unpaced reference value. The
+    /// first call after construction/reset anchors on `base_ns` verbatim; each later
+    /// call advances one interval from the previous paced value, clamped to the drift
+    /// window around `base_ns` and floored to a strictly-increasing step.
+    fn next(&mut self, base_ns: u64) -> u64 {
+        let paced = match self.ideal_ns {
+            None => base_ns,
+            Some(prev) => prev
+                .saturating_add(self.interval_ns)
+                .clamp(
+                    base_ns.saturating_sub(self.max_drift_ns),
+                    base_ns.saturating_add(self.max_drift_ns),
+                )
+                .max(prev.saturating_add(PACE_MIN_STEP_NS)),
+        };
+        self.ideal_ns = Some(paced);
+        paced
+    }
+}
+
 /// Suffix identifying a `GStreamer` pad-task thread (`"<element-name>:<pad-name>"`,
 /// truncated to the kernel's 15-char `comm` limit) — both the NDL and Starfish vendor
 /// `.so`s build their internal decode pipeline out of `GStreamer` elements, each with its
@@ -884,6 +957,7 @@ fn video_pump(
     stats: Arc<StreamStats>,
     is_hdr: bool,
     color_range_override: ColorRangeOverride,
+    video_pacing: bool,
 ) {
     client.register_hot_thread();
     // Summarized at info, not left as per-tid debug lines: whether these renices work at
@@ -924,6 +998,9 @@ fn video_pump(
     // query is cheap enough for per-frame use is exactly the mistake docs/NOTES.md warns
     // against; between polls the cached depth is reused.
     let frame_period_us = 1_000_000 / u64::from(client.mode().refresh_hz.max(1));
+    // Only instantiated when the setting is on — off means no pacer state at all and a
+    // bit-for-bit-unchanged PTS (the raw per-backend reference reaches `play` directly).
+    let mut pacer = video_pacing.then(|| PtsPacer::new(frame_period_us * 1_000));
     let mut backlog_cached: u64 = 0;
     let mut last_backlog_poll: Option<Instant> = None;
     let mut last_dropped_seen = client.frames_dropped();
@@ -1001,12 +1078,26 @@ fn video_pump(
                             frame.frame_index,
                             frame.flags,
                         );
+                        // The real timeline just jumped (freeze then reanchor/give-up) —
+                        // nothing about the pre-hold accumulator is worth continuing.
+                        if let Some(pacer) = pacer.as_mut() {
+                            pacer.reset();
+                        }
                     }
                     holding = false;
                     stats.holding.store(false, Ordering::Relaxed);
                     hold_started = None;
 
-                    let pts_ns = frame.pts_ns;
+                    let base_ns = player.pace_base_ns(frame.pts_ns);
+                    let pts_ns = if let Some(pacer) = pacer.as_mut() {
+                        let paced = pacer.next(base_ns);
+                        stats
+                            .pacing_delta_ns
+                            .store(paced as i64 - base_ns as i64, Ordering::Relaxed);
+                        paced
+                    } else {
+                        base_ns
+                    };
                     let (play_result, feed_elapsed) = player.play(&frame.data, pts_ns);
                     stats.feed_us.store(
                         u32::try_from(feed_elapsed.as_micros()).unwrap_or(u32::MAX),

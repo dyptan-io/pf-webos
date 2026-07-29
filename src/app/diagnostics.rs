@@ -26,12 +26,10 @@ impl App {
         ui::list_modal_card_rect(screen_w, screen_h, fonts, subtitle, ui::DIAGNOSTICS_ROW_COUNT)
     }
 
-    /// Three rows (`ui::DIAG_ROW_*`): Log level (Left/Right cycles, Confirm opens the
-    /// same dropdown picker every `Settings` dropdown uses — its row `0` is
-    /// disambiguated from `Settings`' row 0 by `self.screen`, see
-    /// `dropdown_overlay_tile`'s docs), Stats overlay, and Show logs (both
-    /// Left/Right/Confirm toggle). Back saves and returns to Settings — this is
-    /// reached from there.
+    /// `ui::DIAG_ROW_*` rows: Log level opens the same dropdown picker every
+    /// `Settings` dropdown uses (its row `0` is disambiguated from `Settings`' row 0
+    /// by `self.screen`, see `dropdown_overlay_tile`'s docs); the rest are plain
+    /// Left/Right/Confirm toggles. Back saves and returns to Settings.
     pub(crate) fn handle_diagnostics_event(&mut self, ev: MenuEvent) {
         if let Some(dd) = self.dropdown.as_mut() {
             let len = ui::LOG_LEVEL_OPTIONS.len();

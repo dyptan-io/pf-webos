@@ -254,11 +254,15 @@ impl NdlVideo {
         Ok(())
     }
 
-    /// Feed one access unit. The host's `pts_ns` is deliberately ignored — NDL wants
-    /// milliseconds since `load`, not wall-clock or the host's capture clock, so the
-    /// PTS is derived from `load_instant` instead (see the [`NdlVideo`] doc comment).
-    pub fn play(&self, au: &[u8]) -> Result<()> {
-        let pts_ms = self.load_instant.elapsed().as_millis() as c_longlong;
+    /// Nanoseconds since `load()` (NDL PTS domain). `video_pump`'s pacer clamps its accumulator around this.
+    pub(crate) fn elapsed_ns(&self) -> u64 {
+        self.load_instant.elapsed().as_nanos() as u64
+    }
+
+    /// Feed one access unit at `pts_ns` (ns since `load()`), truncated to ms for NDL.
+    /// Pass a paced value, not raw `elapsed_ns()`, to preserve inter-frame spacing.
+    pub fn play(&self, au: &[u8], pts_ns: u64) -> Result<()> {
+        let pts_ms = (pts_ns / 1_000_000) as c_longlong;
         let _ffi = self.ffi.lock().expect("NDL FFI mutex poisoned");
         // SAFETY: NDL reads `size` bytes from `buffer` synchronously and does not
         // retain the pointer.

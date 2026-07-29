@@ -43,14 +43,17 @@ pub const ROW_CODEC: usize = 5;
 /// H.264 pick (see `hdr_row_shown`) — adjacency keeps that dependency discoverable.
 pub const ROW_HDR: usize = 6;
 pub const ROW_AUDIO: usize = 7;
+/// Experimental PTS smoothing (`session::PtsPacer`) — off by default, untested on
+/// real hardware; the "(experimental)" suffix in its label is the user-facing warning.
+pub const ROW_VIDEO_PACING: usize = 8;
 /// Not a setting — a link to `Screen::Diagnostics` (log level + stats overlay).
 /// A debug aid, not something a normal user needs to find quickly.
-pub const ROW_DIAGNOSTICS: usize = 8;
+pub const ROW_DIAGNOSTICS: usize = 9;
 /// Not a setting — a link to `Screen::About`. Sits last: every other punktfunk
 /// client puts the version + licences at the very bottom of Settings, and a
 /// `RowKind::Action` row costs nothing extra to render.
-pub const ROW_ABOUT: usize = 9;
-pub const SETTINGS_ROW_COUNT: usize = 10;
+pub const ROW_ABOUT: usize = 10;
+pub const SETTINGS_ROW_COUNT: usize = 11;
 
 /// Diagnostics modal row indices (see `diagnostics_rows`). Log level keeps index
 /// 0 so its dropdown's `(Screen, row)` tile key stays stable.
@@ -237,6 +240,15 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             label: "Audio".into(),
             value: audio_label(settings.audio_channels),
             kind: RowKind::Dropdown,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+        },
+        FocusRow {
+            icon: ICON_SCHEDULE,
+            label: "Video pacing (experimental)".into(),
+            value: if settings.video_pacing { "On".into() } else { "Off".into() },
+            kind: RowKind::Toggle,
             fraction: 0.0,
             danger: false,
             menu: None,
@@ -505,6 +517,10 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
         }
         ROW_HDR => {
             settings.hdr_enabled = !settings.hdr_enabled;
+            true
+        }
+        ROW_VIDEO_PACING => {
+            settings.video_pacing = !settings.video_pacing;
             true
         }
         ROW_VIDEO_BACKEND => {

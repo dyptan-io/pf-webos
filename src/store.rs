@@ -257,6 +257,10 @@ pub struct Settings {
     /// which stays ephemeral and never writes here.
     #[serde(default)]
     pub show_logs: bool,
+    /// Experimental PTS smoothing for the video pump (see `session::PtsPacer`). Off
+    /// by default — untested on real hardware; takes effect on the next stream.
+    #[serde(default)]
+    pub video_pacing: bool,
 }
 
 fn default_audio_channels() -> u8 {
@@ -282,6 +286,7 @@ impl Default for Settings {
             color_range_override: ColorRangeOverride::Auto,
             log_level_override: LogLevelOverride::Info,
             show_logs: false,
+            video_pacing: false,
         }
     }
 }
@@ -323,25 +328,36 @@ pub fn save_settings(settings: &Settings) -> Result<()> {
 /// out of order the way N independently-spawned threads racing the filesystem could.
 pub struct SettingsWriter {
     pending: std::sync::Arc<(std::sync::Mutex<Option<Settings>>, std::sync::Condvar)>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `None` only after `Drop` has taken and joined it.
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SettingsWriter {
     pub fn spawn() -> Self {
         let state = std::sync::Arc::new((std::sync::Mutex::new(None::<Settings>), std::sync::Condvar::new()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_state = state.clone();
-        std::thread::spawn(move || {
+        let worker_stop = stop.clone();
+        let thread = std::thread::spawn(move || {
             let (lock, cvar) = &*worker_state;
             loop {
                 let mut guard = lock.lock().expect("settings-writer mutex poisoned");
-                while guard.is_none() {
+                while guard.is_none() && !worker_stop.load(std::sync::atomic::Ordering::Relaxed) {
                     guard = cvar.wait(guard).expect("settings-writer mutex poisoned");
                 }
-                let settings = guard.take().expect("just checked Some");
+                let Some(settings) = guard.take() else {
+                    return; // stopped with nothing pending
+                };
                 drop(guard);
                 let _ = save_settings(&settings);
             }
         });
-        Self { pending: state }
+        Self {
+            pending: state,
+            stop,
+            thread: Some(thread),
+        }
     }
 
     /// Queues `settings` to be written, replacing any not-yet-written value already
@@ -350,6 +366,19 @@ impl SettingsWriter {
         let (lock, cvar) = &*self.pending;
         *lock.lock().expect("settings-writer mutex poisoned") = Some(settings);
         cvar.notify_one();
+    }
+}
+
+impl Drop for SettingsWriter {
+    /// Wakes the worker with `stop` set so it exits after flushing any pending save,
+    /// then joins it — otherwise every menu re-entry (a fresh `App`, a fresh
+    /// `SettingsWriter`) leaked one thread parked forever on the `Condvar`.
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.pending.1.notify_one();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 

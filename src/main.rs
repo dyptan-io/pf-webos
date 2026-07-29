@@ -103,6 +103,7 @@ mod real {
                     settings.video_backend,
                     settings.codec,
                     settings.color_range_override,
+                    settings.video_pacing,
                 )
             })
             .context("spawn connect thread")
@@ -522,6 +523,14 @@ mod real {
                     const WHEEL_STEP: i32 = 120;
                     *dirty |= app.scroll_grid_by(-wheel_y * WHEEL_STEP, w, h);
                 }
+                // List-modal screens (row-per-page, not pixel scroll): one detent
+                // moves focus exactly one row, same as an Up/Down key press.
+                Screen::Settings | Screen::HostMenu | Screen::WakeSettings | Screen::Diagnostics
+                    if wheel_y != 0 =>
+                {
+                    let menu_ev = if wheel_y > 0 { MenuEvent::Up } else { MenuEvent::Down };
+                    dispatch_menu_event(app, menu_ev, display_mode, fonts);
+                }
                 _ => {}
             }
             return EventAction::Next;
@@ -769,7 +778,11 @@ mod real {
                 app.launch_anim = Some(Instant::now());
                 dirty = true;
                 if let Some(target) = app.take_ready_launch() {
-                    let settings = store::load_settings();
+                    // In-memory settings, not `store::load_settings()`: a just-flipped
+                    // toggle (e.g. video pacing) is persisted asynchronously by
+                    // `SettingsWriter`, so re-reading disk here could race the write and
+                    // connect with the stale value. `app.settings` is updated synchronously.
+                    let settings = app.settings;
                     let handle = spawn_connect(
                         identity.clone(),
                         target.host,
@@ -1117,6 +1130,10 @@ mod real {
             // Settings-screen default; the Green button below flips it live for the rest
             // of this stream only, without writing back to `settings`.
             let mut stats_enabled = settings.stats_overlay;
+            // Not live-toggleable like `stats_enabled` — pacing takes effect at connect
+            // time (`spawn_connect`'s `session::connect` call), so flipping it mid-stream
+            // wouldn't do anything.
+            let pacing_enabled = settings.video_pacing;
             let mut green_held = false;
             let mut yellow_held = false;
             let mut overlay_last: Option<Instant> = None;
@@ -1483,6 +1500,11 @@ mod real {
                         ];
                         if let Some(line) = cpu_mem_line {
                             lines.push(line);
+                        }
+                        if pacing_enabled {
+                            let delta_ms =
+                                connected.stats.pacing_delta_ns.load(Ordering::Relaxed) as f32 / 1_000_000.0;
+                            lines.push(format!("Pace {delta_ms:+.1} ms (experimental)"));
                         }
                         match crate::ui::render_stats_overlay_tile(
                             fonts.value,
