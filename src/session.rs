@@ -58,14 +58,23 @@ impl VideoPlayer {
         (result, t.elapsed())
     }
 
-    /// Unpaced PTS reference for `frame` in this backend's clock domain: nanoseconds
-    /// since `load()` for NDL (it has none of its own — see `NdlVideo::elapsed_ns`),
-    /// or the host's capture-clock PTS untouched for Starfish. [`PtsPacer`] smooths
-    /// this before it reaches [`Self::play`].
-    fn pace_base_ns(&self, frame_pts_ns: u64) -> u64 {
+    /// Unpaced PTS reference for `frame` in this backend's clock domain, smoothed by
+    /// [`PtsPacer`] before it reaches [`Self::play`]. Starfish already runs on the host's
+    /// capture clock, so its reference is the host PTS untouched. NDL has no PTS clock of
+    /// its own (see `NdlVideo::elapsed_ns`); with `anchor` present the host PTS is mapped
+    /// onto NDL's player clock ([`HostPtsAnchor`]) so the reference tracks host frame
+    /// cadence instead of feed-time wall-clock, keeping delivery jitter out of the pacer's
+    /// drift-clamp anchor. Without `anchor` (pacing off) NDL falls back to raw player time.
+    fn pace_base_ns(&self, frame_pts_ns: u64, anchor: Option<&mut HostPtsAnchor>) -> u64 {
         match self {
             Self::Starfish(_) => frame_pts_ns,
-            Self::Ndl(ndl) => ndl.elapsed_ns(),
+            Self::Ndl(ndl) => {
+                let player_clock_ns = ndl.elapsed_ns();
+                match anchor {
+                    Some(a) => a.map(frame_pts_ns, player_clock_ns),
+                    None => player_clock_ns,
+                }
+            }
         }
     }
 
@@ -853,6 +862,44 @@ const PACE_MAX_DRIFT_FRAMES: f64 = 0.5;
 /// (`NdlVideo::play`) never sees two equal/decreasing timestamps in a row.
 const PACE_MIN_STEP_NS: u64 = 1_000_000;
 
+/// Maps the host's capture-clock PTS onto NDL's own player clock, anchored once at the
+/// first frame of a run: `base = player_anchor + (host_pts - host_anchor)`. This keeps the
+/// pacer's drift-clamp reference on the host's frame cadence rather than on feed-time
+/// wall-clock, so network delivery jitter no longer leaks into the value the clamp pulls
+/// toward (see [`VideoPlayer::pace_base_ns`]). Same anchoring SS4S's NDL backend does
+/// (`ndl_player.c::SS4S_NDL_webOS5_NextVideoPts`). Reset alongside [`PtsPacer`] after a
+/// freeze-until-reanchor hold, where both the host timeline and player clock have jumped.
+struct HostPtsAnchor {
+    anchor: Option<(u64, u64)>,
+}
+
+impl HostPtsAnchor {
+    fn new() -> Self {
+        Self { anchor: None }
+    }
+
+    fn reset(&mut self) {
+        self.anchor = None;
+    }
+
+    /// Base reference for `host_pts_ns`. The first call after construction/reset anchors on
+    /// the current `player_clock_ns` and returns it verbatim; later calls project the host
+    /// PTS delta forward from that anchor, floored at 0 (a host PTS going backwards vs. the
+    /// anchor would otherwise underflow).
+    fn map(&mut self, host_pts_ns: u64, player_clock_ns: u64) -> u64 {
+        match self.anchor {
+            None => {
+                self.anchor = Some((host_pts_ns, player_clock_ns));
+                player_clock_ns
+            }
+            Some((host0, player0)) => {
+                let delta = host_pts_ns as i64 - host0 as i64;
+                (player0 as i64 + delta).max(0) as u64
+            }
+        }
+    }
+}
+
 /// Smooths the PTS fed to the decoder against delivery jitter — an "ideal" value
 /// advances by a fixed frame interval each call, clamped to a small drift window
 /// around the real (unpaced) reference (see [`VideoPlayer::pace_base_ns`]). Changes
@@ -1036,6 +1083,9 @@ fn video_pump(
     // `reconciled_pace_interval_ns`); the ABR backlog folding above stays on the stream
     // rate, which is the host's actual frame cadence.
     let mut pacer = video_pacing.then(|| PtsPacer::new(reconciled_pace_interval_ns(stream_hz)));
+    // Paired with `pacer`: the NDL host-PTS→player-clock mapping only matters as the pacer's
+    // base reference, so it lives and resets in lockstep with it (no-op on Starfish).
+    let mut host_anchor = video_pacing.then(HostPtsAnchor::new);
     let mut backlog_cached: u64 = 0;
     let mut last_backlog_poll: Option<Instant> = None;
     let mut last_dropped_seen = client.frames_dropped();
@@ -1118,12 +1168,15 @@ fn video_pump(
                         if let Some(pacer) = pacer.as_mut() {
                             pacer.reset();
                         }
+                        if let Some(anchor) = host_anchor.as_mut() {
+                            anchor.reset();
+                        }
                     }
                     holding = false;
                     stats.holding.store(false, Ordering::Relaxed);
                     hold_started = None;
 
-                    let base_ns = player.pace_base_ns(frame.pts_ns);
+                    let base_ns = player.pace_base_ns(frame.pts_ns, host_anchor.as_mut());
                     let pts_ns = if let Some(pacer) = pacer.as_mut() {
                         let paced = pacer.next(base_ns);
                         stats
