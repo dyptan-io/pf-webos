@@ -20,6 +20,7 @@ use punktfunk_core::packet::{FLAG_SOF, USER_FLAG_RECOVERY_ANCHOR};
 use punktfunk_core::quic;
 
 use crate::ndl::{NdlCodec, NdlVideo};
+use crate::pacing::{HostPtsAnchor, PtsPacer};
 use crate::starfish::StarfishVideo;
 use crate::store::{CipherPref, CodecPref, ColorRangeOverride, VideoBackend};
 
@@ -47,13 +48,35 @@ enum VideoPlayer {
 
 impl VideoPlayer {
     /// Feed access unit; return (result, `feed_duration`) for ABR latency reporting.
+    /// `pts_ns` must already be in this backend's PTS clock domain (see
+    /// [`Self::pace_base_ns`]).
     fn play(&self, au: &[u8], pts_ns: u64) -> (anyhow::Result<()>, Duration) {
         let t = Instant::now();
         let result = match self {
             Self::Starfish(sf) => sf.play(au, pts_ns),
-            Self::Ndl(ndl) => ndl.play(au),
+            Self::Ndl(ndl) => ndl.play(au, pts_ns),
         };
         (result, t.elapsed())
+    }
+
+    /// Unpaced PTS reference for `frame` in this backend's clock domain, smoothed by
+    /// [`PtsPacer`] before it reaches [`Self::play`]. Starfish already runs on the host's
+    /// capture clock, so its reference is the host PTS untouched. NDL has no PTS clock of
+    /// its own (see `NdlVideo::elapsed_ns`); with `anchor` present the host PTS is mapped
+    /// onto NDL's player clock ([`HostPtsAnchor`]) so the reference tracks host frame
+    /// cadence instead of feed-time wall-clock, keeping delivery jitter out of the pacer's
+    /// drift-clamp anchor. Without `anchor` (pacing off) NDL falls back to raw player time.
+    fn pace_base_ns(&self, frame_pts_ns: u64, anchor: Option<&mut HostPtsAnchor>) -> u64 {
+        match self {
+            Self::Starfish(_) => frame_pts_ns,
+            Self::Ndl(ndl) => {
+                let player_clock_ns = ndl.elapsed_ns();
+                match anchor {
+                    Some(a) => a.map(frame_pts_ns, player_clock_ns),
+                    None => player_clock_ns,
+                }
+            }
+        }
     }
 
     fn flush(&self) -> anyhow::Result<()> {
@@ -130,6 +153,12 @@ pub struct StreamStats {
     pub feed_us: std::sync::atomic::AtomicU32,
     /// NDL render-buffer backlog or -1 if unavailable.
     pub render_backlog: std::sync::atomic::AtomicI32,
+    /// Latency `PtsPacer` added vs. the unpaced reference (ns); 0 when pacing is off.
+    pub pacing_delta_ns: std::sync::atomic::AtomicI64,
+    /// Frame pacing active. Seeded from the setting at connect, then flipped live by the
+    /// Blue button (main writes, `video_pump` reads per frame). Pure PTS math, no decoder
+    /// state — safe to toggle mid-stream.
+    pub pacing_enabled: AtomicBool,
 }
 
 /// Short display name for a resolved wire codec id (the stats overlay's header).
@@ -253,16 +282,21 @@ pub fn connect(
     video_backend: VideoBackend,
     codec_pref: CodecPref,
     color_range_override: ColorRangeOverride,
+    video_pacing: bool,
 ) -> Result<Connected> {
-    // `launch_cipher_pref` (see its docs) resolves the `cipher` launch param, i.e.
-    // `task deploy CIPHER=...` — the only way to pick a cipher, no rebuild needed.
-    let video_caps = match crate::store::launch_cipher_pref() {
-        // punktfunk-core's `webos-arm-aes` branch decrypts plain AES-128-GCM with the
-        // ARMv8 Crypto Extensions on this 32-bit ARM target (see docs/NOTES.md), so this
-        // is the fast path and no longer needs VIDEO_CAP_CHACHA20 to be advertised.
-        CipherPref::Aes128Gcm => 0,
-        CipherPref::ChaCha20 => quic::VIDEO_CAP_CHACHA20,
-    } | if hdr_enabled { quic::VIDEO_CAP_10BIT | quic::VIDEO_CAP_HDR } else { 0 };
+    // HDR only ever applies to HEVC. An explicit H.264 pick disables it end to end
+    // (the Settings toggle is hidden too — see `ui::hdr_row_shown`); on Automatic the
+    // caps are still advertised and the host resolves the codec, with application gated
+    // on the *negotiated* codec being HEVC further below.
+    let hdr_enabled = hdr_enabled && codec_pref != CodecPref::H264;
+    // VIDEO_CAP_CHACHA20: unconditional — armv7 has no hardware AES, so ChaCha20 is
+    // faster. A ≥0.17.2 host picks it up; older hosts ignore the unknown bit.
+    let video_caps = quic::VIDEO_CAP_CHACHA20
+        | if hdr_enabled {
+            quic::VIDEO_CAP_10BIT | quic::VIDEO_CAP_HDR
+        } else {
+            0
+        };
     let display_hdr = hdr_enabled.then(cx_display_hdr);
 
     // Advertised decode set + soft preference. H.264/HEVC decode on both backends,
@@ -435,12 +469,17 @@ pub fn connect(
     // which shows up as exactly the washed-out/desaturated picture reported
     // on-device. `client.color` arrives out-of-band in `Welcome` for precisely
     // this purpose; HDR streams additionally carry mastering metadata.
-    let is_hdr = client.color.is_hdr();
+    // HDR mastering metadata is applied only when the *negotiated* codec is HEVC: the
+    // `NdlHdrInfo`/`setHdrInfo` fields are HEVC SEI syntax, and no other codec carries
+    // HDR on this platform. Colorimetry (the SDR washed-out fix) is still sent below for
+    // every codec — only the mastering metadata is gated.
+    let host_hdr = client.color.is_hdr();
+    let is_hdr = host_hdr && matches!(codec, NdlCodec::H265);
     let initial_meta = is_hdr.then(cx_display_hdr);
     // What the host actually signalled in `Welcome`, before any user override —
     // the reference point for the washed-out-colour investigation.
     tracing::info!(
-        "host colour info: hdr={is_hdr} transfer={} primaries={} matrix={} full_range={}",
+        "host colour info: hdr={host_hdr} apply_hdr={is_hdr} codec={codec:?} transfer={} primaries={} matrix={} full_range={}",
         client.color.transfer,
         client.color.primaries,
         client.color.matrix,
@@ -473,6 +512,8 @@ pub fn connect(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(StreamStats::default());
+    // Seed the live pacing flag from the setting; the Blue button flips it from here on.
+    stats.pacing_enabled.store(video_pacing, Ordering::Relaxed);
     let ndl_audio = player.ndl_audio_handle();
     let video_client = client.clone();
     let video_stop = stop.clone();
@@ -920,7 +961,17 @@ fn video_pump(
     // frame — three samples per 750 ms ABR report window is plenty, and assuming an NDL
     // query is cheap enough for per-frame use is exactly the mistake docs/NOTES.md warns
     // against; between polls the cached depth is reused.
-    let frame_period_us = 1_000_000 / u64::from(client.mode().refresh_hz.max(1));
+    let stream_hz = client.mode().refresh_hz.max(1);
+    let frame_period_us = 1_000_000 / u64::from(stream_hz);
+    // Always instantiated — the Blue button can flip pacing on mid-stream, so the state must
+    // exist even when it starts off. Pacer interval reconciles against the panel's measured
+    // refresh (`reconciled_pace_interval_ns`); ABR backlog folding above stays on the stream
+    // rate (host's actual cadence). `host_anchor` is the NDL host-PTS→player-clock mapping,
+    // reset in lockstep with the pacer (no-op on Starfish).
+    let mut pacer = PtsPacer::new(crate::pacing::reconciled_pace_interval_ns(stream_hz));
+    let mut host_anchor = HostPtsAnchor::new();
+    // Previous-frame pacing state, so an off→on flip can re-anchor cleanly.
+    let mut pacing_was_on = stats.pacing_enabled.load(Ordering::Relaxed);
     let mut backlog_cached: u64 = 0;
     let mut last_backlog_poll: Option<Instant> = None;
     let mut last_dropped_seen = client.frames_dropped();
@@ -998,12 +1049,35 @@ fn video_pump(
                             frame.frame_index,
                             frame.flags,
                         );
+                        // The real timeline just jumped (freeze then reanchor/give-up) —
+                        // nothing about the pre-hold accumulator is worth continuing.
+                        pacer.reset();
+                        host_anchor.reset();
                     }
                     holding = false;
                     stats.holding.store(false, Ordering::Relaxed);
                     hold_started = None;
 
-                    let pts_ns = frame.pts_ns;
+                    // Live pacing toggle (Blue button): re-anchor on the off→on edge so the
+                    // pacer picks up from the current frame rather than a stale grid.
+                    let pacing_on = stats.pacing_enabled.load(Ordering::Relaxed);
+                    if pacing_on && !pacing_was_on {
+                        pacer.reset();
+                        host_anchor.reset();
+                    }
+                    pacing_was_on = pacing_on;
+
+                    let base_ns = player.pace_base_ns(frame.pts_ns, pacing_on.then_some(&mut host_anchor));
+                    let pts_ns = if pacing_on {
+                        let paced = pacer.next(base_ns);
+                        stats
+                            .pacing_delta_ns
+                            .store(paced as i64 - base_ns as i64, Ordering::Relaxed);
+                        paced
+                    } else {
+                        stats.pacing_delta_ns.store(0, Ordering::Relaxed);
+                        base_ns
+                    };
                     let (play_result, feed_elapsed) = player.play(&frame.data, pts_ns);
                     stats.feed_us.store(
                         u32::try_from(feed_elapsed.as_micros()).unwrap_or(u32::MAX),

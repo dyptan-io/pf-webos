@@ -29,24 +29,35 @@ pub const BITRATE_WARN_KBPS: u32 = 150_000;
 pub const ROW_RESOLUTION: usize = 0;
 pub const ROW_FRAMERATE: usize = 1;
 pub const ROW_BITRATE: usize = 2;
-pub const ROW_HDR: usize = 3;
-pub const ROW_VIDEO_BACKEND: usize = 4;
-/// Directly below Video backend, deliberately: the AV1 option's availability depends
-/// on that row's value (see `codec_options`), and adjacency is what makes the
-/// dependency discoverable without explaining it in copy.
+pub const ROW_VIDEO_BACKEND: usize = 3;
+/// Directly below Video backend: only Starfish honours the VUI range flag, so the row
+/// is hidden on NDL (see `color_range_row_shown`) — adjacency keeps that dependency
+/// discoverable. Forces the VUI range flag sent to the decoder — see
+/// `store::ColorRangeOverride`. Debug aid for the washed-out-colour investigation.
+pub const ROW_COLOR_RANGE: usize = 4;
+/// Below Video backend, deliberately: the AV1 option's availability depends on that
+/// row's value (see `codec_options`), and adjacency is what makes the dependency
+/// discoverable without explaining it in copy.
 pub const ROW_CODEC: usize = 5;
-pub const ROW_AUDIO: usize = 6;
-/// Forces the VUI range flag sent to the decoder — see `store::ColorRangeOverride`.
-/// Debug aid for the washed-out-colour investigation.
-pub const ROW_COLOR_RANGE: usize = 7;
+/// Directly below Codec: HDR applies only to HEVC, so the row is hidden on an explicit
+/// H.264 pick (see `hdr_row_shown`) — adjacency keeps that dependency discoverable.
+pub const ROW_HDR: usize = 6;
+pub const ROW_AUDIO: usize = 7;
+/// Not a setting — a link to `Screen::Experimental` (unstable toggles, currently the
+/// frame pacer). Grouped off the main list so an untested option isn't one keystroke away.
+pub const ROW_EXPERIMENTAL: usize = 8;
 /// Not a setting — a link to `Screen::Diagnostics` (log level + stats overlay).
 /// A debug aid, not something a normal user needs to find quickly.
-pub const ROW_DIAGNOSTICS: usize = 8;
+pub const ROW_DIAGNOSTICS: usize = 9;
 /// Not a setting — a link to `Screen::About`. Sits last: every other punktfunk
 /// client puts the version + licences at the very bottom of Settings, and a
 /// `RowKind::Action` row costs nothing extra to render.
-pub const ROW_ABOUT: usize = 9;
-pub const SETTINGS_ROW_COUNT: usize = 10;
+pub const ROW_ABOUT: usize = 10;
+pub const SETTINGS_ROW_COUNT: usize = 11;
+
+/// Experimental modal row indices (see `experimental_rows`).
+pub const EXP_ROW_FRAME_PACER: usize = 0;
+pub const EXPERIMENTAL_ROW_COUNT: usize = 1;
 
 /// Diagnostics modal row indices (see `diagnostics_rows`). Log level keeps index
 /// 0 so its dropdown's `(Screen, row)` tile key stays stable.
@@ -71,22 +82,38 @@ pub fn color_range_row_shown(settings: &Settings) -> bool {
     settings.video_backend == VideoBackend::Starfish
 }
 
-/// Live row count (vs. `SETTINGS_ROW_COUNT`, the maximum).
-pub fn settings_row_count(settings: &Settings) -> usize {
-    if color_range_row_shown(settings) {
-        SETTINGS_ROW_COUNT
-    } else {
-        SETTINGS_ROW_COUNT - 1
-    }
+/// HDR only applies to HEVC — the host never resolves HDR for an explicit H.264
+/// session, and the toggle would be a no-op. On Automatic the row stays (the host may
+/// still resolve HEVC); it's hidden only when H.264 is picked explicitly. Application
+/// is gated on the *negotiated* codec too — see `session::connect`.
+pub fn hdr_row_shown(settings: &Settings) -> bool {
+    settings.codec != CodecPref::H264
 }
 
-/// On-screen row position -> logical `ROW_*` index, shifted past Color range when hidden.
+/// Logical `ROW_*` indices currently visible, in display order. Some rows are dropped
+/// (rather than shown disabled) depending on other settings — Color range off NDL, HDR
+/// on explicit H.264. Every visibility-aware helper derives from this one list.
+pub fn settings_visible_logical_rows(settings: &Settings) -> Vec<usize> {
+    (0..SETTINGS_ROW_COUNT)
+        .filter(|&row| match row {
+            ROW_HDR => hdr_row_shown(settings),
+            ROW_COLOR_RANGE => color_range_row_shown(settings),
+            _ => true,
+        })
+        .collect()
+}
+
+/// Live row count (vs. `SETTINGS_ROW_COUNT`, the maximum).
+pub fn settings_row_count(settings: &Settings) -> usize {
+    settings_visible_logical_rows(settings).len()
+}
+
+/// On-screen row position -> logical `ROW_*` index, skipping past any hidden rows.
 pub fn settings_logical_row(settings: &Settings, display: usize) -> usize {
-    if !color_range_row_shown(settings) && display >= ROW_COLOR_RANGE {
-        display + 1
-    } else {
-        display
-    }
+    settings_visible_logical_rows(settings)
+        .get(display)
+        .copied()
+        .unwrap_or(display)
 }
 
 pub fn color_range_label(o: ColorRangeOverride) -> &'static str {
@@ -163,25 +190,21 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             menu: None,
         },
         FocusRow {
-            icon: ICON_SUN,
-            label: "HDR".into(),
-            value: if settings.hdr_enabled {
-                "On".into()
-            } else {
-                "Off".into()
-            },
-            kind: RowKind::Toggle,
-            fraction: 0.0,
-            danger: false,
-            menu: None,
-        },
-        FocusRow {
             icon: ICON_MEMORY,
             label: "Video backend".into(),
             value: match settings.video_backend {
                 VideoBackend::Ndl => "NDL".into(),
                 VideoBackend::Starfish => "Starfish".into(),
             },
+            kind: RowKind::Dropdown,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+        },
+        FocusRow {
+            icon: ICON_PALETTE,
+            label: "Color range".into(),
+            value: color_range_label(settings.color_range_override).into(),
             kind: RowKind::Dropdown,
             fraction: 0.0,
             danger: false,
@@ -204,6 +227,19 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             menu: None,
         },
         FocusRow {
+            icon: ICON_SUN,
+            label: "HDR".into(),
+            value: if settings.hdr_enabled {
+                "On".into()
+            } else {
+                "Off".into()
+            },
+            kind: RowKind::Toggle,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+        },
+        FocusRow {
             icon: ICON_SIGNAL,
             label: "Audio".into(),
             value: audio_label(settings.audio_channels),
@@ -212,22 +248,18 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             danger: false,
             menu: None,
         },
-        FocusRow {
-            icon: ICON_PALETTE,
-            label: "Color range".into(),
-            value: color_range_label(settings.color_range_override).into(),
-            kind: RowKind::Dropdown,
-            fraction: 0.0,
-            danger: false,
-            menu: None,
-        },
+        FocusRow::action(ICON_BUG, "Experimental"),
         FocusRow::action(ICON_WRENCH, "Diagnostics"),
         // The build version rides along as this row's value, so it's visible without
         // opening the screen — matching where the other clients surface it. Last row:
         // every other punktfunk client puts version + licences at the very bottom.
         FocusRow::action_with_value(ICON_INFO, "About & licenses", format!("v{VERSION}")),
     ];
-    // Mirrors `settings_logical_row`: drop rather than disable when hidden.
+    // Mirrors `settings_visible_logical_rows`: drop rather than disable when hidden.
+    // Remove highest index first so an earlier removal doesn't shift a later one.
+    if !hdr_row_shown(settings) {
+        rows.remove(ROW_HDR);
+    }
     if !color_range_row_shown(settings) {
         rows.remove(ROW_COLOR_RANGE);
     }
@@ -301,6 +333,25 @@ pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
         },
         FocusRow::action(ICON_SEND, "Send logs to developer"),
     ]
+}
+
+/// Experimental modal rows: the frame pacer toggle (`session::PtsPacer`). Off by default,
+/// untested on hardware, live-toggleable mid-stream with the Blue button. Order must match
+/// `EXP_ROW_*`.
+pub fn experimental_rows(settings: &Settings) -> Vec<FocusRow> {
+    vec![FocusRow {
+        icon: ICON_SCHEDULE,
+        label: "Frame pacer".into(),
+        value: if settings.video_pacing {
+            "On".into()
+        } else {
+            "Off".into()
+        },
+        kind: RowKind::Toggle,
+        fraction: 0.0,
+        danger: false,
+        menu: None,
+    }]
 }
 
 /// Wake settings modal rows.
