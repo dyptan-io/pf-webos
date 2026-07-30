@@ -37,6 +37,8 @@ mod store;
 #[cfg(target_os = "linux")]
 mod ui;
 #[cfg(target_os = "linux")]
+mod webos;
+#[cfg(target_os = "linux")]
 mod wol;
 
 #[cfg(target_os = "linux")]
@@ -204,6 +206,8 @@ mod real {
 
     pub fn run() -> Result<()> {
         install_signal_handlers();
+        // Must happen before the first SessionCrypto (session::connect).
+        crate::webos::aes::register()?;
         // Streams to a dev machine when `task deploy TELEMETRY=...` passed a
         // destination as a launch param; otherwise a versioned file under the app's
         // own writable directory (falls back to `/tmp` off-device, e.g. when

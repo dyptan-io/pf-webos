@@ -22,7 +22,7 @@ use punktfunk_core::quic;
 use crate::ndl::{NdlCodec, NdlVideo};
 use crate::pacing::{HostPtsAnchor, PtsPacer};
 use crate::starfish::StarfishVideo;
-use crate::store::{CodecPref, ColorRangeOverride, VideoBackend};
+use crate::store::{CipherPref, CodecPref, ColorRangeOverride, VideoBackend};
 
 impl ColorRangeOverride {
     /// Force the VUI `full_range` flag per the user override before it's handed to
@@ -580,7 +580,7 @@ pub fn request_access(host: &str, port: u16, identity: (String, String), timeout
         CompositorPref::Auto,
         punktfunk_core::config::GamepadPref::Auto,
         1_000, // minimal bitrate — connection is closed as soon as trust is established
-        quic::VIDEO_CAP_CHACHA20,
+        0,     // AES-128-GCM (host default; hardware-decrypted on this target)
         2,
         quic::CODEC_H264,
         0,
@@ -662,11 +662,11 @@ pub struct SpeedProbeResult {
 /// is never touched — the host builds a virtual output, but nothing is decoded or
 /// presented. Blocks; run it on a worker thread.
 ///
-/// **`video_caps` must advertise `VIDEO_CAP_CHACHA20` exactly as a real session does.**
-/// `punktfunk-core` counts the delivered bytes this measurement is derived from *after*
-/// AEAD decrypt, so a probe that negotiated AES-GCM would measure a ceiling this armv7
-/// CPU can't reach with the cipher an actual stream uses — reporting a number no session
-/// could ever deliver. See `docs/NOTES.md` on why `ChaCha20` exists on this client at all.
+/// **The negotiated cipher must match what a real session would use (see [`connect`] and
+/// [`crate::store::CipherPref`]).** `punktfunk-core` counts the delivered bytes this
+/// measurement is derived from *after* AEAD decrypt, so a probe that negotiated a
+/// different cipher would measure a ceiling this CPU can't reach (or can exceed) with the
+/// cipher an actual stream uses — reporting a number no session could ever deliver.
 ///
 /// `progress` is called with each partial poll so the UI can show the figure climbing.
 pub fn run_speed_probe(
@@ -677,6 +677,12 @@ pub fn run_speed_probe(
     timeout: Duration,
     mut progress: impl FnMut(ProbeOutcome),
 ) -> Result<SpeedProbeResult> {
+    // Same resolution as `connect`, so a `task deploy CIPHER=...` launch param applies
+    // to the speed test too, not just a real stream.
+    let video_caps = match crate::store::launch_cipher_pref() {
+        CipherPref::Aes128Gcm => 0,
+        CipherPref::ChaCha20 => quic::VIDEO_CAP_CHACHA20,
+    };
     let mode = Mode {
         width: 1280,
         height: 720,
@@ -697,7 +703,7 @@ pub fn run_speed_probe(
         // rate disarms core's probe entirely; the value is irrelevant since nothing is
         // decoded here.
         PROBE_SESSION_BITRATE_KBPS,
-        quic::VIDEO_CAP_CHACHA20,
+        video_caps,
         2, // stereo baseline
         quic::CODEC_HEVC | quic::CODEC_H264,
         0,    // no preferred codec
@@ -717,7 +723,7 @@ pub fn run_speed_probe(
         client.codec,
         client.audio_channels,
         client.resolved_bitrate_kbps,
-        quic::VIDEO_CAP_CHACHA20,
+        video_caps,
     );
 
     // Don't burst into a dead plane — see PROBE_WARMUP_CAP. `next_frame` drains the session's

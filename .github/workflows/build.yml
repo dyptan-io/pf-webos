@@ -17,6 +17,7 @@ jobs:
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.sha }}
           fetch-depth: 0
+          submodules: true
 
       - name: Install Rust (stable, prebuilt) + cross target
         uses: dtolnay/rust-toolchain@stable

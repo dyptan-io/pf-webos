@@ -206,6 +206,24 @@ pub enum LogLevelOverride {
     Warn,
     Error,
 }
+/// Video cipher preference — not a persisted `Settings` field or a UI option, only
+/// resolved from the `cipher` launch param (see [`launch_cipher_pref`]). Both are AEAD
+/// ciphers of equivalent security; the choice is purely about decrypt throughput on this
+/// SoC — see `docs/NOTES.md`'s cipher-decrypt-cost history. `session::connect` and
+/// `session::run_speed_probe` both negotiate whichever this resolves to, so the speed
+/// test always measures the cipher a real stream would actually use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CipherPref {
+    /// Plain AES-128-GCM, decrypted via `src/webos/aes_gcm_arm.c`'s ARMv8 Crypto
+    /// Extensions backend — the fast path on this hardware (see the hardware AES
+    /// backend entry in `docs/NOTES.md`).
+    #[default]
+    Aes128Gcm,
+    /// ChaCha20-Poly1305 (`VIDEO_CAP_CHACHA20`) — the earlier fallback, kept as a
+    /// fast-in-pure-software option for a host or device without the AES backend.
+    ChaCha20,
+}
 
 /// Stream settings: resolution/framerate/bitrate/HDR/video-backend.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -432,6 +450,30 @@ pub fn dev_override_enable_ndl_audio_offload() -> bool {
 pub fn dev_override_enable_av1() -> bool {
     let path = Path::new(&app_dir()).join("av1.conf");
     std::fs::read_to_string(path).is_ok_and(|s| matches!(s.trim(), "1" | "on" | "true"))
+}
+
+/// Which video cipher to negotiate — not a `Settings`/UI option, only settable at
+/// launch: `task deploy CIPHER=aes|chacha` threads a `cipher` key through the same SAM
+/// launch `params` JSON blob `logger.rs`'s `telemetry`/`telemetry_level` use (see its
+/// module docs — `argv[1]` on initial launch), so A/B-ing a cipher on-device needs no
+/// rebuild. Absent, or an unrecognised value, resolves to [`CipherPref::default`]
+/// (plain AES-128-GCM, the fast path on this hardware — see docs/NOTES.md).
+pub fn launch_cipher_pref() -> CipherPref {
+    #[derive(Deserialize, Default)]
+    struct LaunchParams {
+        cipher: Option<String>,
+    }
+    static PARAMS: std::sync::OnceLock<LaunchParams> = std::sync::OnceLock::new();
+    let params = PARAMS.get_or_init(|| {
+        std::env::args()
+            .nth(1)
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default()
+    });
+    match params.cipher.as_deref() {
+        Some("chacha") | Some("chacha20") => CipherPref::ChaCha20,
+        _ => CipherPref::Aes128Gcm,
+    }
 }
 
 /// Test/dev override: a config file dropped alongside sideloading skips straight to

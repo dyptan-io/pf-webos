@@ -52,6 +52,11 @@ mod real {
         let pin = parse_pin(&args[5])?;
         let target_kbps: u32 = args.get(6).map_or(Ok(320_000), |s| s.parse()).context("target_kbps")?;
         let duration_ms: u32 = args.get(7).map_or(Ok(3_000), |s| s.parse()).context("duration_ms")?;
+        let video_caps = match args.get(8).map(String::as_str) {
+            None | Some("aes") => 0,
+            Some("chacha") => quic::VIDEO_CAP_CHACHA20,
+            Some(other) => anyhow::bail!("unknown cipher {other:?}, expected \"aes\" or \"chacha\""),
+        };
 
         let mode = Mode {
             width: 1280,
@@ -65,7 +70,7 @@ mod real {
             CompositorPref::Auto,
             GamepadPref::Auto,
             PROBE_SESSION_BITRATE_KBPS,
-            quic::VIDEO_CAP_CHACHA20,
+            video_caps,
             2,
             quic::CODEC_HEVC | quic::CODEC_H264,
             0,

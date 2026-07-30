@@ -38,8 +38,20 @@ vars:
       fi
 
 tasks:
+  submodule:sync:
+    desc: >-
+      Ensure vendor/punktfunk (the punktfunk-core submodule, see Cargo.toml) is checked
+      out and patched with patches/0001-crypto-register-aes128gcm-backend.patch.
+    cmds:
+      - git submodule update --init vendor/punktfunk
+      - git -C vendor/punktfunk apply {{.ROOT_DIR}}/patches/0001-crypto-register-aes128gcm-backend.patch
+    # Skip re-applying if the patch is already present (reversing it would succeed).
+    status:
+      - git -C vendor/punktfunk apply --check --reverse {{.ROOT_DIR}}/patches/0001-crypto-register-aes128gcm-backend.patch
+
   build:
     desc: Cross-compile the release binary, inside Docker with thin LTO (fast). Override with RELEASE_LTO=fat for optimized build.
+    deps: [submodule:sync]
     cmds:
       - task: toolchain:docker-run
         vars:
@@ -48,12 +60,14 @@ tasks:
 
   check:
     desc: Quick cross-target `cargo check`, inside Docker — the local dev entry point
+    deps: [submodule:sync]
     cmds:
       - task: toolchain:docker-run
         vars: {TARGET_TASK: native:check}
 
   package:
     desc: Build and package dist/*.ipk, inside Docker with thin LTO (fast). Override with RELEASE_LTO=fat for optimized.
+    deps: [submodule:sync]
     cmds:
       - task: toolchain:docker-run
         vars:
@@ -62,6 +76,7 @@ tasks:
 
   lint:
     desc: Cross-target `cargo clippy` (the lint set in Cargo.toml's `[lints.clippy]`), inside Docker
+    deps: [submodule:sync]
     cmds:
       - task: toolchain:docker-run
         vars: {TARGET_TASK: native:lint}
@@ -77,7 +92,7 @@ tasks:
       Cross-compile directly on the host, no Docker — only meaningful on a Linux
       aarch64 box with Rust already installed (used by CI; `build` is the local
       dev entry point).
-    deps: [toolchain:all]
+    deps: [toolchain:all, submodule:sync]
     env:
       # Modern CMake refuses vendored libopus's old cmake_minimum_required
       # (audiopus_sys, pulled in transitively by punktfunk-core's `quic` feature).
@@ -92,7 +107,7 @@ tasks:
 
   native:check:
     desc: Quick cross-target `cargo check`, no Docker (used by CI)
-    deps: [toolchain:all]
+    deps: [toolchain:all, submodule:sync]
     env:
       CMAKE_POLICY_VERSION_MINIMUM: '3.5'
     cmds:
@@ -101,7 +116,7 @@ tasks:
 
   native:lint:
     desc: Cross-target `cargo clippy`, no Docker (used by CI)
-    deps: [toolchain:all]
+    deps: [toolchain:all, submodule:sync]
     env:
       CMAKE_POLICY_VERSION_MINIMUM: '3.5'
     cmds:
@@ -128,7 +143,10 @@ tasks:
       initial launch — see src/logger.rs — no rebuild needed), or TELEMETRY=auto to
       use this machine's own LAN IP on a random port (printed once the listener is
       up, in case you need to connect to it manually). TELEMETRY_LEVEL
-      (debug/info/warn/error, default debug) sets the minimum level sent.
+      (debug/info/warn/error, default debug) sets the minimum level sent. Pass
+      CIPHER=aes (default) or CIPHER=chacha to pick the negotiated video cipher for this
+      launch (see src/store.rs's `launch_cipher_pref` — same launch-param mechanism as
+      TELEMETRY, no rebuild needed).
     deps: [package]
     requires:
       vars: [TV_HOST]
@@ -152,8 +170,8 @@ tasks:
           TELEMETRY="${IP}:${PORT}"
         fi
 
-        PARAMS=""
         NC_PID=""
+        FIELDS=""
         if [ -n "$TELEMETRY" ]; then
           PORT="${TELEMETRY##*:}"
           ( while true; do nc -l "$PORT"; done ) &
@@ -161,7 +179,17 @@ tasks:
           trap 'kill "$NC_PID" 2>/dev/null || true' EXIT
           sleep 0.5
           echo "listening on :${PORT} (destination sent to device: $TELEMETRY)" >&2
-          PARAMS=",\"params\":{\"telemetry\":\"$TELEMETRY\",\"telemetry_level\":\"{{.TELEMETRY_LEVEL}}\"}"
+          FIELDS="\"telemetry\":\"$TELEMETRY\",\"telemetry_level\":\"{{.TELEMETRY_LEVEL}}\""
+        fi
+        CIPHER="{{.CIPHER}}"
+        if [ -n "$CIPHER" ]; then
+          [ -n "$FIELDS" ] && FIELDS="${FIELDS},"
+          FIELDS="${FIELDS}\"cipher\":\"$CIPHER\""
+          echo "cipher sent to device: $CIPHER" >&2
+        fi
+        PARAMS=""
+        if [ -n "$FIELDS" ]; then
+          PARAMS=",\"params\":{${FIELDS}}"
         fi
         ssh -tt {{.TV_HOST}} "luna-send -n 1 -f luna://com.webos.applicationManager/launch '{\"id\":\"io.dyptan.punktfunk.webos\"${PARAMS}}'"
         if [ -n "$NC_PID" ]; then
