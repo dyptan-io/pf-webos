@@ -43,9 +43,9 @@ pub const ROW_CODEC: usize = 5;
 /// H.264 pick (see `hdr_row_shown`) — adjacency keeps that dependency discoverable.
 pub const ROW_HDR: usize = 6;
 pub const ROW_AUDIO: usize = 7;
-/// Experimental PTS smoothing (`session::PtsPacer`) — off by default, untested on
-/// real hardware; the "(experimental)" suffix in its label is the user-facing warning.
-pub const ROW_VIDEO_PACING: usize = 8;
+/// Not a setting — a link to `Screen::Experimental` (unstable toggles, currently the
+/// frame pacer). Grouped off the main list so an untested option isn't one keystroke away.
+pub const ROW_EXPERIMENTAL: usize = 8;
 /// Not a setting — a link to `Screen::Diagnostics` (log level + stats overlay).
 /// A debug aid, not something a normal user needs to find quickly.
 pub const ROW_DIAGNOSTICS: usize = 9;
@@ -54,6 +54,10 @@ pub const ROW_DIAGNOSTICS: usize = 9;
 /// `RowKind::Action` row costs nothing extra to render.
 pub const ROW_ABOUT: usize = 10;
 pub const SETTINGS_ROW_COUNT: usize = 11;
+
+/// Experimental modal row indices (see `experimental_rows`).
+pub const EXP_ROW_FRAME_PACER: usize = 0;
+pub const EXPERIMENTAL_ROW_COUNT: usize = 1;
 
 /// Diagnostics modal row indices (see `diagnostics_rows`). Log level keeps index
 /// 0 so its dropdown's `(Screen, row)` tile key stays stable.
@@ -244,15 +248,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             danger: false,
             menu: None,
         },
-        FocusRow {
-            icon: ICON_SCHEDULE,
-            label: "Frame pacer (experimental)".into(),
-            value: if settings.video_pacing { "On".into() } else { "Off".into() },
-            kind: RowKind::Toggle,
-            fraction: 0.0,
-            danger: false,
-            menu: None,
-        },
+        FocusRow::action(ICON_BUG, "Experimental"),
         FocusRow::action(ICON_WRENCH, "Diagnostics"),
         // The build version rides along as this row's value, so it's visible without
         // opening the screen — matching where the other clients surface it. Last row:
@@ -337,6 +333,25 @@ pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
         },
         FocusRow::action(ICON_SEND, "Send logs to developer"),
     ]
+}
+
+/// Experimental modal rows: the frame pacer toggle (`session::PtsPacer`). Off by default,
+/// untested on hardware, live-toggleable mid-stream with the Blue button. Order must match
+/// `EXP_ROW_*`.
+pub fn experimental_rows(settings: &Settings) -> Vec<FocusRow> {
+    vec![FocusRow {
+        icon: ICON_SCHEDULE,
+        label: "Frame pacer".into(),
+        value: if settings.video_pacing {
+            "On".into()
+        } else {
+            "Off".into()
+        },
+        kind: RowKind::Toggle,
+        fraction: 0.0,
+        danger: false,
+        menu: None,
+    }]
 }
 
 /// Wake settings modal rows.
@@ -517,10 +532,6 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
         }
         ROW_HDR => {
             settings.hdr_enabled = !settings.hdr_enabled;
-            true
-        }
-        ROW_VIDEO_PACING => {
-            settings.video_pacing = !settings.video_pacing;
             true
         }
         ROW_VIDEO_BACKEND => {

@@ -59,6 +59,9 @@ pub enum Tile {
     SpinnerFrame(usize),
     /// The in-stream stats overlay panel (`ui::render_stats_overlay_tile`).
     StatsOverlay,
+    /// Transient toast notification (`ui::render_notification_tile`), e.g. the
+    /// frame-pacing on/off confirmation after a mid-stream Blue-button toggle.
+    Notification,
     /// The log-tail overlay (`ui::render_log_overlay_tile`) — Yellow-button debug
     /// aid, shown on every screen (menu UI and stream), not just while streaming.
     LogOverlay,

@@ -482,6 +482,7 @@ mod real {
             Screen::About => app.handle_about_event(menu_ev, w, h, fonts),
             Screen::PinLimit => app.handle_pin_limit_event(menu_ev),
             Screen::Diagnostics => app.handle_diagnostics_event(menu_ev),
+            Screen::Experimental => app.handle_experimental_event(menu_ev),
             Screen::SendLogs => app.handle_send_logs_event(menu_ev),
         }
         EventAction::Next
@@ -527,7 +528,11 @@ mod real {
                 }
                 // List-modal screens (row-per-page, not pixel scroll): one detent
                 // moves focus exactly one row, same as an Up/Down key press.
-                Screen::Settings | Screen::HostMenu | Screen::WakeSettings | Screen::Diagnostics
+                Screen::Settings
+                | Screen::HostMenu
+                | Screen::WakeSettings
+                | Screen::Diagnostics
+                | Screen::Experimental
                     if wheel_y != 0 =>
                 {
                     let menu_ev = if wheel_y > 0 { MenuEvent::Up } else { MenuEvent::Down };
@@ -745,7 +750,7 @@ mod real {
                 return Ok(None);
             }
             // Raw scancode poll (not SDL2 event); edge-detected like streaming loop.
-            let yellow_down = crate::ui::webos_yellow_button_down();
+            let yellow_down = crate::ui::webos_scancode_down(crate::ui::WEBOS_YELLOW_SCANCODE);
             if yellow_down && !yellow_held {
                 cycle_log_overlay();
                 dirty = true; // force an immediate redraw with the new state
@@ -1132,12 +1137,19 @@ mod real {
             // Settings-screen default; the Green button below flips it live for the rest
             // of this stream only, without writing back to `settings`.
             let mut stats_enabled = settings.stats_overlay;
-            // Not live-toggleable like `stats_enabled` — pacing takes effect at connect
-            // time (`spawn_connect`'s `session::connect` call), so flipping it mid-stream
-            // wouldn't do anything.
-            let pacing_enabled = settings.video_pacing;
             let mut green_held = false;
             let mut yellow_held = false;
+            // Blue button flips pacing live via `stats.pacing_enabled` (`video_pump` reads it
+            // per frame). Pure PTS math, no decoder state — safe to toggle mid-stream.
+            let mut blue_held = false;
+            // Transient toasts (frame-pacing on/off, etc). `notif_was_active` catches the
+            // fade-out edge so the canvas gets wiped once (nothing else clears it). `stats_dst`
+            // lets the tile recomposite every frame while its content stays on a 500ms cadence
+            // (`stats_built_at`).
+            let mut notif = crate::ui::Notification::new();
+            let mut notif_was_active = false;
+            let mut stats_dst: Option<sdl2::rect::Rect> = None;
+            let mut stats_built_at: Option<Instant> = None;
             let mut overlay_last: Option<Instant> = None;
             let mut overlay_prev_frames: u64 = 0;
             let mut overlay_prev_bytes: u64 = 0;
@@ -1289,11 +1301,11 @@ mod real {
                         }
                     }
                 }
-                // Green button: local-only stats-overlay toggle, edge-detected here
-                // (not via the event queue — see `ui::webos_green_button_down`'s docs
-                // on why the safe SDL2 event API can't see this key at all). Skipped
-                // while the disconnect dialog owns input, same as scancode forwarding.
-                let green_down = !disconnect.is_open() && crate::ui::webos_green_button_down();
+                // Green button: local-only stats-overlay toggle, edge-detected here (raw
+                // scancode poll — the safe SDL2 event API can't see this key at all).
+                // Skipped while the disconnect dialog owns input, same as scancode forwarding.
+                let green_down =
+                    !disconnect.is_open() && crate::ui::webos_scancode_down(crate::ui::WEBOS_GREEN_SCANCODE);
                 if green_down && !green_held {
                     stats_enabled = !stats_enabled;
                     if stats_enabled {
@@ -1311,10 +1323,10 @@ mod real {
                 }
                 green_held = green_down;
                 // Yellow button: log-tail overlay Off -> Live -> Frozen -> Off, same
-                // edge-detect technique as Green above (raw scancode poll — see
-                // `ui::webos_yellow_button_down`'s docs). Works on every screen, not
-                // just while streaming — see the matching handling in `run_ui_flow`.
-                let yellow_down = !disconnect.is_open() && crate::ui::webos_yellow_button_down();
+                // edge-detect technique as Green above. Works on every screen, not just
+                // while streaming — see the matching handling in `run_ui_flow`.
+                let yellow_down =
+                    !disconnect.is_open() && crate::ui::webos_scancode_down(crate::ui::WEBOS_YELLOW_SCANCODE);
                 if yellow_down && !yellow_held {
                     cycle_log_overlay();
                     overlay_last = None; // force an immediate redraw with the new state
@@ -1329,6 +1341,21 @@ mod real {
                     }
                 }
                 yellow_held = yellow_down;
+                // Blue button: live frame-pacing toggle, same edge-detect as Green/Yellow above
+                // (Red is OS-intercepted on-device). Force a redraw so Pace reflects the new state.
+                let blue_down = !disconnect.is_open() && crate::ui::webos_scancode_down(crate::ui::WEBOS_BLUE_SCANCODE);
+                if blue_down && !blue_held {
+                    let now_on = !connected.stats.pacing_enabled.load(Ordering::Relaxed);
+                    connected.stats.pacing_enabled.store(now_on, Ordering::Relaxed);
+                    tracing::info!("frame pacing {} (Blue button)", if now_on { "on" } else { "off" });
+                    notif.show(if now_on {
+                        "Frame pacing enabled"
+                    } else {
+                        "Frame pacing disabled"
+                    });
+                    overlay_last = None;
+                }
+                blue_held = blue_down;
                 // Captured once: reused below to skip the stats overlay for exactly the
                 // ticks the dialog block itself owns the canvas — that's wider than
                 // `is_open()`, since a dismissed dialog still draws (fading out) for a
@@ -1430,13 +1457,34 @@ mod real {
                 // own `canvas.clear()` otherwise, which would erase whichever tile the
                 // other just drew.
                 let log_lines = log_overlay_lines();
-                if (stats_enabled || log_lines.is_some())
+                let notif_frame = if dialog_frame.is_none() { notif.frame() } else { None };
+                let notif_active = notif_frame.is_some();
+                if notif_was_active && !notif_active && !stats_enabled && log_lines.is_none() {
+                    // Same "nothing else clears this canvas" wipe as Green's toggle-off — the
+                    // faded-out toast's last frame would otherwise stick over the video.
+                    canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
+                    canvas.clear();
+                    canvas.present();
+                    canvas.clear();
+                    canvas.present();
+                }
+                notif_was_active = notif_active;
+                // A fading toast needs frequent frames; stats/log alone are fine at ~2Hz.
+                let redraw_interval = if notif_active {
+                    Duration::from_millis(33)
+                } else {
+                    Duration::from_millis(500)
+                };
+                if (stats_enabled || log_lines.is_some() || notif_active)
                     && dialog_frame.is_none()
-                    && overlay_last.is_none_or(|t| t.elapsed() >= Duration::from_millis(500))
+                    && overlay_last.is_none_or(|t| t.elapsed() >= redraw_interval)
                 {
                     overlay_last = Some(Instant::now());
                     let mut cmds: Vec<DrawCmd> = Vec::new();
-                    if stats_enabled {
+                    // Content stays on a 500ms cadence even when the loop runs faster for a
+                    // toast fade; `stats_dst` lets the retained texture recomposite every frame.
+                    if stats_enabled && stats_built_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(500)) {
+                        stats_built_at = Some(Instant::now());
                         let frames = connected.stats.frames.load(Ordering::Relaxed);
                         let bytes = connected.stats.bytes.load(Ordering::Relaxed);
                         let dt = overlay_prev_at.elapsed().as_secs_f32().max(0.001);
@@ -1503,10 +1551,9 @@ mod real {
                         if let Some(line) = cpu_mem_line {
                             lines.push(line);
                         }
-                        if pacing_enabled {
-                            let delta_ms =
-                                connected.stats.pacing_delta_ns.load(Ordering::Relaxed) as f32 / 1_000_000.0;
-                            lines.push(format!("Pace {delta_ms:+.1} ms (experimental)"));
+                        if connected.stats.pacing_enabled.load(Ordering::Relaxed) {
+                            let delta_ms = connected.stats.pacing_delta_ns.load(Ordering::Relaxed) as f32 / 1_000_000.0;
+                            lines.push(format!("Pace {delta_ms:+.1} ms"));
                         }
                         match crate::ui::render_stats_overlay_tile(
                             fonts.value,
@@ -1517,13 +1564,18 @@ mod real {
                             Ok(tile) => {
                                 let (tw, th) = (tile.width(), tile.height());
                                 compositor.upload(&texture_creator, Tile::StatsOverlay, &tile)?;
-                                cmds.push(DrawCmd::Tex {
-                                    tile: Tile::StatsOverlay,
-                                    dst: sdl2::rect::Rect::new(display_mode.w - tw as i32 - 24, 24, tw, th),
-                                    alpha: 0xff,
-                                });
+                                stats_dst = Some(sdl2::rect::Rect::new(display_mode.w - tw as i32 - 24, 24, tw, th));
                             }
                             Err(e) => tracing::warn!("stats overlay render failed: {e:#}"),
+                        }
+                    }
+                    if stats_enabled {
+                        if let Some(dst) = stats_dst {
+                            cmds.push(DrawCmd::Tex {
+                                tile: Tile::StatsOverlay,
+                                dst,
+                                alpha: 0xff,
+                            });
                         }
                     }
                     if let Some(lines) = log_lines {
@@ -1538,6 +1590,22 @@ mod real {
                                 });
                             }
                             Err(e) => tracing::warn!("log overlay render failed: {e:#}"),
+                        }
+                    }
+                    if let Some((text, alpha)) = &notif_frame {
+                        match crate::ui::render_notification_tile(fonts.value, text) {
+                            Ok(tile) => {
+                                let (tw, th) = (tile.width(), tile.height());
+                                compositor.upload(&texture_creator, Tile::Notification, &tile)?;
+                                // Top-centre: clears the top-right stats overlay and the
+                                // bottom log overlay, so it never overlaps either.
+                                cmds.push(DrawCmd::Tex {
+                                    tile: Tile::Notification,
+                                    dst: sdl2::rect::Rect::new((display_mode.w - tw as i32) / 2, 24, tw, th),
+                                    alpha: (alpha * 255.0) as u8,
+                                });
+                            }
+                            Err(e) => tracing::warn!("toast render failed: {e:#}"),
                         }
                     }
                     if !cmds.is_empty() {

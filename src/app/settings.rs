@@ -70,6 +70,10 @@ impl App {
                     self.settings_writer.save(self.settings);
                     self.open_about();
                 }
+                ui::ROW_EXPERIMENTAL => {
+                    self.settings_writer.save(self.settings);
+                    self.open_experimental();
+                }
                 ui::ROW_DIAGNOSTICS => {
                     self.settings_writer.save(self.settings);
                     self.open_diagnostics();
@@ -111,7 +115,6 @@ impl App {
         let row = ui::settings_logical_row(&self.settings, display_row);
         let toggled_from = match row {
             ui::ROW_HDR => Some(self.settings.hdr_enabled),
-            ui::ROW_VIDEO_PACING => Some(self.settings.video_pacing),
             _ => None,
         };
         if ui::adjust_setting(&mut self.settings, row, forward) {

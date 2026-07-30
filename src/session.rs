@@ -155,6 +155,10 @@ pub struct StreamStats {
     pub render_backlog: std::sync::atomic::AtomicI32,
     /// Latency `PtsPacer` added vs. the unpaced reference (ns); 0 when pacing is off.
     pub pacing_delta_ns: std::sync::atomic::AtomicI64,
+    /// Frame pacing active. Seeded from the setting at connect, then flipped live by the
+    /// Blue button (main writes, `video_pump` reads per frame). Pure PTS math, no decoder
+    /// state — safe to toggle mid-stream.
+    pub pacing_enabled: AtomicBool,
 }
 
 /// Short display name for a resolved wire codec id (the stats overlay's header).
@@ -508,6 +512,8 @@ pub fn connect(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(StreamStats::default());
+    // Seed the live pacing flag from the setting; the Blue button flips it from here on.
+    stats.pacing_enabled.store(video_pacing, Ordering::Relaxed);
     let ndl_audio = player.ndl_audio_handle();
     let video_client = client.clone();
     let video_stop = stop.clone();
@@ -522,7 +528,6 @@ pub fn connect(
                 video_stats,
                 is_hdr,
                 color_range_override,
-                video_pacing,
             )
         })
         .context("spawn video thread")?;
@@ -911,7 +916,6 @@ fn video_pump(
     stats: Arc<StreamStats>,
     is_hdr: bool,
     color_range_override: ColorRangeOverride,
-    video_pacing: bool,
 ) {
     client.register_hot_thread();
     // Summarized at info, not left as per-tid debug lines: whether these renices work at
@@ -953,16 +957,15 @@ fn video_pump(
     // against; between polls the cached depth is reused.
     let stream_hz = client.mode().refresh_hz.max(1);
     let frame_period_us = 1_000_000 / u64::from(stream_hz);
-    // Only instantiated when the setting is on — off means no pacer state at all and a
-    // bit-for-bit-unchanged PTS (the raw per-backend reference reaches `play` directly).
-    // The pacer interval reconciles against the panel's measured refresh (see
-    // `reconciled_pace_interval_ns`); the ABR backlog folding above stays on the stream
-    // rate, which is the host's actual frame cadence.
-    let mut pacer =
-        video_pacing.then(|| PtsPacer::new(crate::pacing::reconciled_pace_interval_ns(stream_hz)));
-    // Paired with `pacer`: the NDL host-PTS→player-clock mapping only matters as the pacer's
-    // base reference, so it lives and resets in lockstep with it (no-op on Starfish).
-    let mut host_anchor = video_pacing.then(HostPtsAnchor::new);
+    // Always instantiated — the Blue button can flip pacing on mid-stream, so the state must
+    // exist even when it starts off. Pacer interval reconciles against the panel's measured
+    // refresh (`reconciled_pace_interval_ns`); ABR backlog folding above stays on the stream
+    // rate (host's actual cadence). `host_anchor` is the NDL host-PTS→player-clock mapping,
+    // reset in lockstep with the pacer (no-op on Starfish).
+    let mut pacer = PtsPacer::new(crate::pacing::reconciled_pace_interval_ns(stream_hz));
+    let mut host_anchor = HostPtsAnchor::new();
+    // Previous-frame pacing state, so an off→on flip can re-anchor cleanly.
+    let mut pacing_was_on = stats.pacing_enabled.load(Ordering::Relaxed);
     let mut backlog_cached: u64 = 0;
     let mut last_backlog_poll: Option<Instant> = None;
     let mut last_dropped_seen = client.frames_dropped();
@@ -1042,25 +1045,31 @@ fn video_pump(
                         );
                         // The real timeline just jumped (freeze then reanchor/give-up) —
                         // nothing about the pre-hold accumulator is worth continuing.
-                        if let Some(pacer) = pacer.as_mut() {
-                            pacer.reset();
-                        }
-                        if let Some(anchor) = host_anchor.as_mut() {
-                            anchor.reset();
-                        }
+                        pacer.reset();
+                        host_anchor.reset();
                     }
                     holding = false;
                     stats.holding.store(false, Ordering::Relaxed);
                     hold_started = None;
 
-                    let base_ns = player.pace_base_ns(frame.pts_ns, host_anchor.as_mut());
-                    let pts_ns = if let Some(pacer) = pacer.as_mut() {
+                    // Live pacing toggle (Blue button): re-anchor on the off→on edge so the
+                    // pacer picks up from the current frame rather than a stale grid.
+                    let pacing_on = stats.pacing_enabled.load(Ordering::Relaxed);
+                    if pacing_on && !pacing_was_on {
+                        pacer.reset();
+                        host_anchor.reset();
+                    }
+                    pacing_was_on = pacing_on;
+
+                    let base_ns = player.pace_base_ns(frame.pts_ns, pacing_on.then_some(&mut host_anchor));
+                    let pts_ns = if pacing_on {
                         let paced = pacer.next(base_ns);
                         stats
                             .pacing_delta_ns
                             .store(paced as i64 - base_ns as i64, Ordering::Relaxed);
                         paced
                     } else {
+                        stats.pacing_delta_ns.store(0, Ordering::Relaxed);
                         base_ns
                     };
                     let (play_result, feed_elapsed) = player.play(&frame.data, pts_ns);

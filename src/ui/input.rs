@@ -87,23 +87,15 @@ impl StickMenuNav {
     }
 }
 
-/// webOS Green button scancode (outside rust-sdl2's enum; needs raw polling).
-const WEBOS_GREEN_SCANCODE: i32 = 487;
-/// webOS Yellow button scancode — confirmed against `webosbrew/SDL-webOS`'s
-/// `SDL_scancode.h` (`SDL_SCANCODE_WEBOS_YELLOW = 488`), sequential after Green.
-const WEBOS_YELLOW_SCANCODE: i32 = 488;
+/// webOS Magic Remote scancodes — outside rust-sdl2's enum, needs raw polling.
+/// `SDL_SCANCODE_WEBOS_{RED,GREEN,YELLOW,BLUE} = 486..489` in `webosbrew/SDL-webOS`'s `SDL_scancode.h`.
+/// Red (486) never reaches the app on-device (OS-intercepted), so Blue drives the pacing toggle.
+pub const WEBOS_GREEN_SCANCODE: i32 = 487;
+pub const WEBOS_YELLOW_SCANCODE: i32 = 488;
+pub const WEBOS_BLUE_SCANCODE: i32 = 489;
 
-/// Check Magic Remote Green button via raw SDL keyboard state (safe after `sdl2::init`).
-pub fn webos_green_button_down() -> bool {
-    webos_scancode_down(WEBOS_GREEN_SCANCODE)
-}
-
-/// Check Magic Remote Yellow button via raw SDL keyboard state (safe after `sdl2::init`).
-pub fn webos_yellow_button_down() -> bool {
-    webos_scancode_down(WEBOS_YELLOW_SCANCODE)
-}
-
-fn webos_scancode_down(scancode: i32) -> bool {
+/// Check a Magic Remote button via raw SDL keyboard state (safe after `sdl2::init`).
+pub fn webos_scancode_down(scancode: i32) -> bool {
     unsafe {
         let mut count = 0;
         let state = sdl2::sys::SDL_GetKeyboardState(&mut count);
