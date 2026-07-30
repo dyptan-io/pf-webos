@@ -521,6 +521,23 @@ pub struct App {
     /// height — keyed by `(Screen, ScrollContentKey)`. Scrolling within the
     /// baked window never invalidates this; see `Tile::ScrollContent`'s docs.
     pub(crate) scroll_content_tile: Option<((Screen, ScrollContentKey), Painter)>,
+    /// The bottom scroll fade. Unkeyed and built at most once per run: a fixed-size alpha
+    /// ramp the GPU stretches to each list's width (see `Tile::ScrollFade`).
+    pub(crate) scroll_fade_tile: Option<Painter>,
+    /// The mirrored fade for the top edge (see `Tile::ScrollFadeTop`).
+    pub(crate) scroll_fade_top_tile: Option<Painter>,
+    /// Where the scrolling modal's viewport is *rendered*, in pixels, and where it is heading.
+    ///
+    /// `scroll.offset` stays an integral row/line index — focus logic and the scrollbar are
+    /// defined in those units, and quantized steps are what make keyboard navigation land
+    /// predictably. Only the rendered crop is continuous, which is what makes the motion
+    /// smooth, and it is also what lets the last row sit flush against the viewport's bottom
+    /// (an integral offset overshoots by whatever the peek strip is worth).
+    pub(crate) modal_scroll_px: i32,
+    pub(crate) modal_scroll_target_px: i32,
+    /// Which screen `modal_scroll_px` describes, so opening a different modal snaps instead of
+    /// gliding from the previous one's offset.
+    pub(crate) modal_scroll_screen: Option<Screen>,
     /// Home's status line block, keyed by its text.
     pub(crate) status_tile: Option<(String, Painter)>,
     /// The static "No host selected" hint line.
@@ -675,6 +692,11 @@ impl App {
             dropdown_overlay_tile: None,
             dropdown_focus_tile: None,
             scroll_indicator_tile: None,
+            scroll_fade_tile: None,
+            scroll_fade_top_tile: None,
+            modal_scroll_px: 0,
+            modal_scroll_target_px: 0,
+            modal_scroll_screen: None,
             scroll_content_tile: None,
             status_tile: None,
             nohost_tile: None,
@@ -906,6 +928,24 @@ impl App {
                 }
             };
             self.grid_scroll += step;
+            animating = true;
+        }
+        // The scrolling modal's viewport, on the same ease-out as the grid above so both
+        // lists feel identical. `scroll.offset` has already jumped to its new row; this is
+        // only the rendered crop catching up.
+        let d = self.modal_scroll_target_px - self.modal_scroll_px;
+        if d != 0 {
+            let step = if d.abs() <= 3 {
+                d
+            } else {
+                let s = (f64::from(d) * 0.35) as i32;
+                if s == 0 {
+                    d.signum()
+                } else {
+                    s
+                }
+            };
+            self.modal_scroll_px += step;
             animating = true;
         }
         if let Some(t) = self.focus_anim {
@@ -1993,6 +2033,18 @@ impl App {
                 self.scroll_indicator_tile = Some((ind_key, tile));
                 updated.push(Tile::ScrollIndicator(self.screen));
             }
+            // Static ramp, so this is a once-per-run bake rather than a keyed rebuild —
+            // scrolling and resizing both leave it valid (the GPU restretches it).
+            if self.scroll_fade_tile.is_none() {
+                self.scroll_fade_tile = Some(ui::render_scroll_fade_tile(ui::FadeEdge::Bottom));
+                updated.push(Tile::ScrollFade);
+            }
+            if self.scroll_fade_top_tile.is_none() {
+                self.scroll_fade_top_tile = Some(ui::render_scroll_fade_tile(ui::FadeEdge::Top));
+                updated.push(Tile::ScrollFadeTop);
+            }
+            let stride = self.scroll_stride(fonts);
+            self.sync_modal_scroll(self.screen, total, visible, content.height(), stride);
 
             match self.screen {
                 Screen::Settings => {
@@ -2082,6 +2134,68 @@ impl App {
         }
     }
 
+    /// Clips a tile's destination to `clip`, returning `(source crop, clipped destination)`.
+    ///
+    /// The tile's full extent is assumed to map onto `dst`, so the crop is proportional —
+    /// which keeps this correct even while `dst` is being zoom-animated. `None` when nothing
+    /// of it remains inside.
+    fn clip_tile(dst: Rect, clip: Rect, tile_w: u32, tile_h: u32) -> Option<(Rect, Rect)> {
+        let visible = dst.intersection(clip)?;
+        if visible == dst {
+            return Some((Rect::new(0, 0, tile_w, tile_h), dst));
+        }
+        if dst.width() == 0 || dst.height() == 0 {
+            return None;
+        }
+        let fx = |v: i32| (f64::from(v) / f64::from(dst.width())) * f64::from(tile_w);
+        let fy = |v: i32| (f64::from(v) / f64::from(dst.height())) * f64::from(tile_h);
+        let src = Rect::new(
+            fx(visible.x() - dst.x()).round() as i32,
+            fy(visible.y() - dst.y()).round() as i32,
+            (fx(visible.width() as i32).round() as u32).max(1),
+            (fy(visible.height() as i32).round() as u32).max(1),
+        );
+        Some((src, visible))
+    }
+
+    /// The furthest the viewport may be cropped down: the last unit sits flush with the
+    /// viewport's bottom edge rather than scrolling past it.
+    ///
+    /// This is why the rendered offset is pixels and not units — `offset * stride` overshoots
+    /// by exactly the peek strip at the end of the list, which would show a dead band below
+    /// the final row (and is what the row-quantized version did).
+    fn max_scroll_px(total: usize, stride: i32, viewport_h: u32) -> i32 {
+        (total as i32 * stride - viewport_h as i32).max(0)
+    }
+
+    /// Re-derives `modal_scroll_target_px` from the integral offset, snapping rather than
+    /// gliding when the scrolling modal changed. Called once per frame from `update_tiles`,
+    /// which is where the geometry (and the fonts About's stride needs) is already in hand.
+    ///
+    /// Kept in absolute content pixels, *not* relative to the baked window: About re-bakes its
+    /// window later in the same pass, and a window-relative target would jump by the whole
+    /// window offset on the frame that happens — a full-document glide instead of a scroll.
+    /// `draw_list` subtracts the window when it crops.
+    fn sync_modal_scroll(&mut self, screen: Screen, total: usize, visible: usize, viewport_h: u32, stride: i32) {
+        let offset = self.scroll.clamped(total, visible);
+        // Biased back by one peek so the *top* edge also cuts mid-row: sitting on the row grid
+        // would put nothing but the gap between rows under the top fade, which is invisible
+        // (see `ui::SETTINGS_PEEK`). The clamps then pin the first and last positions flush,
+        // where there is genuinely nothing beyond the edge to hint at.
+        let bias = match screen {
+            Screen::Settings => ui::SETTINGS_PEEK as i32,
+            _ => 0,
+        };
+        let target = (offset as i32 * stride - bias)
+            .min(Self::max_scroll_px(total, stride, viewport_h))
+            .max(0);
+        self.modal_scroll_target_px = target;
+        if self.modal_scroll_screen != Some(screen) {
+            self.modal_scroll_screen = Some(screen);
+            self.modal_scroll_px = target;
+        }
+    }
+
     /// Pixel stride between two consecutive units of whichever modal is scrolling —
     /// Settings' fixed row height, or About's wrapped-line height. Only meaningful
     /// when `scroll_geometry` returns `Some`.
@@ -2113,6 +2227,8 @@ impl App {
             Tile::DropdownFocusOption => self.dropdown_focus_tile.as_ref().map(|(_, p)| p),
             Tile::ScrollIndicator(_) => self.scroll_indicator_tile.as_ref().map(|(_, p)| p),
             Tile::ScrollContent(_) => self.scroll_content_tile.as_ref().map(|(_, p)| p),
+            Tile::ScrollFade => self.scroll_fade_tile.as_ref(),
+            Tile::ScrollFadeTop => self.scroll_fade_top_tile.as_ref(),
             Tile::Status => self.status_tile.as_ref().map(|(_, p)| p),
             Tile::NoHost => self.nohost_tile.as_ref(),
             // `SpinnerFrame` is uploaded directly from its raw decoded pixels (see
@@ -2350,45 +2466,82 @@ impl App {
             // Scrollable content geometry (Settings rows or About document), computed
             // once and reused. Scrolling crops the full baked tile, never re-rasterizes.
             let scroll_geom = self.scroll_geometry_for(screen, screen_w, screen_h, fonts);
-            if let Some((total, visible, _, content)) = scroll_geom {
-                let scroll = self.scroll.clamped(total, visible);
+            if let Some((total, _, _, content)) = scroll_geom {
                 // About uses a bounded window; for other screens, window_start is 0.
                 let window_start = match screen {
                     Screen::About => self.content_window.start,
                     _ => 0,
                 };
                 let stride = self.scroll_stride_for(screen, fonts);
+                // The animated offset (see `sync_modal_scroll`), in absolute content pixels,
+                // rebased onto whatever slice is currently baked into the tile.
+                let scroll_px = self
+                    .modal_scroll_px
+                    .clamp(0, Self::max_scroll_px(total, stride, content.height()));
+                let src_y = scroll_px - window_start as i32 * stride;
                 cmds.push(DrawCmd::TexCropped {
                     tile: Tile::ScrollContent(screen),
-                    src: Rect::new(
-                        0,
-                        (scroll - window_start) as i32 * stride,
-                        content.width(),
-                        content.height(),
-                    ),
+                    src: Rect::new(0, src_y, content.width(), content.height()),
                     dst: Rect::new(content.x(), content.y() + dy, content.width(), content.height()),
                     alpha: (255.0 * m) as u8,
                 });
+                // Bottom fade, only while rows remain below the viewport — it is the
+                // "there is more" signal, so it has to vanish exactly when scrolling has
+                // reached the end, or it reads as content that can never be got to.
+                //
+                // Pushed here, between the content and the focused-row tile below, on
+                // purpose: focus must never look dimmed just because it sits on the last
+                // visible row, and an open dropdown (pushed next) must cover the band
+                // rather than show through it.
+                // Keyed off pixels, not rows: at either end of the list the offset is clamped
+                // mid-row, so a row-based test would keep claiming there is more beyond.
+                let fade_h = ui::SCROLL_FADE_H.min(content.height());
+                if scroll_px > 0 {
+                    cmds.push(DrawCmd::Tex {
+                        tile: Tile::ScrollFadeTop,
+                        dst: Rect::new(content.x(), content.y() + dy, content.width(), fade_h),
+                        alpha: (255.0 * m) as u8,
+                    });
+                }
+                if scroll_px < Self::max_scroll_px(total, stride, content.height()) {
+                    cmds.push(DrawCmd::Tex {
+                        tile: Tile::ScrollFade,
+                        dst: Rect::new(
+                            content.x(),
+                            content.y() + dy + (content.height() - fade_h) as i32,
+                            content.width(),
+                            fade_h,
+                        ),
+                        alpha: (255.0 * m) as u8,
+                    });
+                }
             }
             // Dropdown overlay (Settings or Diagnostics).
             if let Some((row, _, dd_alpha)) = self.dropdown_draw_state() {
                 // Diagnostics isn't scrollable, so compute its content rect directly.
-                let content_and_row_in_view = match screen {
-                    Screen::Settings => scroll_geom.map(|(total, visible, _, content)| {
-                        (content, row.saturating_sub(self.scroll.clamped(total, visible)))
+                // `(viewport, pixel scroll offset)`. Settings anchors to the animated offset
+                // like the focus tile above, so an open dropdown stays attached to its row
+                // while the list is still settling; Diagnostics doesn't scroll, so 0.
+                let content_and_scroll = match screen {
+                    Screen::Settings => scroll_geom.map(|(total, _, _, content)| {
+                        let stride = ui::settings_row_stride() as i32;
+                        let px = self
+                            .modal_scroll_px
+                            .clamp(0, Self::max_scroll_px(total, stride, content.height()));
+                        (content, px)
                     }),
                     Screen::Diagnostics => {
                         let subtitle = self.diagnostics_subtitle();
                         let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
                         Some((
                             ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT),
-                            row,
+                            0,
                         ))
                     }
                     _ => None,
                 };
-                if let Some((content, row_in_view)) = content_and_row_in_view {
-                    let overlay_rect = Self::dropdown_overlay_rect(content, row_in_view);
+                if let Some((content, scroll_px)) = content_and_scroll {
+                    let overlay_rect = Self::dropdown_overlay_rect_at_px(content, row, scroll_px);
                     let options_len = match screen {
                         Screen::Diagnostics => ui::LOG_LEVEL_OPTIONS.len(),
                         _ => ui::dropdown_options(&self.settings, ui::settings_logical_row(&self.settings, row)).len(),
@@ -2409,10 +2562,16 @@ impl App {
             // composites on shell at its on-screen position (no re-rasterize on move).
             let focus_rect = match screen {
                 Screen::Settings => {
-                    let (total, visible, _, content) = scroll_geom.expect("screen is Screen::Settings");
-                    let scroll = self.scroll.clamped(total, visible);
-                    // Translate focused row's global index to local (within visible window).
-                    Some(ui::focus_row_rect(content, self.settings_focused - scroll))
+                    let (total, _, _, content) = scroll_geom.expect("screen is Screen::Settings");
+                    // Positioned from the animated pixel offset, not the row index: the baked
+                    // list is cropped at that offset, and the focus tile *is* the focused row
+                    // re-rendered — so anchoring it to the quantized row would show that row's
+                    // content twice, in two places, for the length of every scroll.
+                    let stride = ui::settings_row_stride() as i32;
+                    let px = self
+                        .modal_scroll_px
+                        .clamp(0, Self::max_scroll_px(total, stride, content.height()));
+                    Some(ui::focus_row_rect_at_px(content, self.settings_focused, px))
                 }
                 Screen::Wake => self.wake.as_ref().filter(|w| !w.mac.is_empty()).map(|w| {
                     let card = Self::wake_card_rect(screen_w, screen_h, w, fonts);
@@ -2492,33 +2651,65 @@ impl App {
                 // this (except while `switch_anim` animates its content, see
                 // `prepare_tiles`).
                 let f = ui::anim_frac(self.modal_focus_anim, ui::FOCUS_POP);
-                cmds.push(DrawCmd::Tex {
-                    tile: Tile::ModalFocusElement,
-                    dst: ui::zoom_rect(base, f, 0.02),
-                    alpha: (255.0 * m) as u8,
-                });
+                let dst = ui::zoom_rect(base, f, 0.02);
+                let alpha = (255.0 * m) as u8;
+                // In a scrolling modal the focused row can hang past the viewport's bottom
+                // edge mid-glide (the crop lags the row offset by up to one stride), so it is
+                // clipped rather than left to paint over the card's chrome. Every other modal
+                // keeps the plain unclipped path — none of them scrolls.
+                let tile_size = self.modal_focus_tile.as_ref().map(|(_, p)| (p.width(), p.height()));
+                match (scroll_geom, tile_size) {
+                    (Some((_, _, _, content)), Some((tw, th))) => {
+                        let viewport = Rect::new(
+                            content.x() - pad,
+                            content.y() - pad + dy,
+                            content.width() + 2 * pad as u32,
+                            content.height() + 2 * pad as u32,
+                        );
+                        if let Some((src, visible)) = Self::clip_tile(dst, viewport, tw, th) {
+                            cmds.push(DrawCmd::TexCropped {
+                                tile: Tile::ModalFocusElement,
+                                src,
+                                dst: visible,
+                                alpha,
+                            });
+                        }
+                    }
+                    _ => cmds.push(DrawCmd::Tex {
+                        tile: Tile::ModalFocusElement,
+                        dst,
+                        alpha,
+                    }),
+                }
             }
             // The open dropdown's focused option — same idea, composited on
             // top of the shell's unfocused option list at its actual
             // position, so navigating dropdown options needs no modal
             // re-rasterize either. `Settings` or `Diagnostics`.
             if let Some((row, focused, dd_alpha)) = self.dropdown_draw_state() {
-                let content_and_row_in_view = match screen {
-                    Screen::Settings => scroll_geom.map(|(total, visible, _, content)| {
-                        (content, row.saturating_sub(self.scroll.clamped(total, visible)))
+                // `(viewport, pixel scroll offset)`. Settings anchors to the animated offset
+                // like the focus tile above, so an open dropdown stays attached to its row
+                // while the list is still settling; Diagnostics doesn't scroll, so 0.
+                let content_and_scroll = match screen {
+                    Screen::Settings => scroll_geom.map(|(total, _, _, content)| {
+                        let stride = ui::settings_row_stride() as i32;
+                        let px = self
+                            .modal_scroll_px
+                            .clamp(0, Self::max_scroll_px(total, stride, content.height()));
+                        (content, px)
                     }),
                     Screen::Diagnostics => {
                         let subtitle = self.diagnostics_subtitle();
                         let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
                         Some((
                             ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT),
-                            row,
+                            0,
                         ))
                     }
                     _ => None,
                 };
-                if let Some((content, row_in_view)) = content_and_row_in_view {
-                    let overlay_rect = Self::dropdown_overlay_rect(content, row_in_view);
+                if let Some((content, scroll_px)) = content_and_scroll {
+                    let overlay_rect = Self::dropdown_overlay_rect_at_px(content, row, scroll_px);
                     let option_rect = ui::dropdown_option_rect(overlay_rect, focused);
                     cmds.push(DrawCmd::Tex {
                         tile: Tile::DropdownFocusOption,

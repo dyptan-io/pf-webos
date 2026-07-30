@@ -69,9 +69,10 @@ mod real {
             2,
             quic::CODEC_HEVC | quic::CODEC_H264,
             0,
-            None,
-            0,
-            None,
+            None, // no HDR display metadata
+            0,    // client_caps
+            None, // no launch
+            None, // name: keep the host's fingerprint-derived label
             Some(pin),
             Some((cert, key)),
             Duration::from_secs(10),

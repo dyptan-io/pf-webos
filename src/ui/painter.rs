@@ -121,6 +121,40 @@ impl Painter {
         self.fill_rounded_rect(rect, 0, color);
     }
 
+    /// Fills the whole pixmap with `color` under a vertical alpha ramp running from
+    /// `top_alpha` to `bottom_alpha` — the scroll-fade tiles (see
+    /// [`super::render_scroll_fade_tile`]). Reversing the two arguments gives the mirrored
+    /// ramp the top edge needs.
+    ///
+    /// Written straight into the buffer rather than through `fill_rect` per row: a
+    /// scanline-at-a-time gradient is exactly the "many small fills" shape that measured
+    /// ~300ms full-screen on this hardware (docs/NOTES.md), and going through the rasterizer buys
+    /// nothing for axis-aligned solid rows.
+    ///
+    /// Eased with smoothstep rather than a straight line or a square. Linear puts visible
+    /// tint across the whole band; squaring (the first attempt) held so much of the band near
+    /// clear that the fade barely read at all. Smoothstep is symmetric — half-strength at the
+    /// midpoint — with both ends easing out, so neither edge shows a seam.
+    pub fn fill_vertical_fade(&mut self, color: Color, top_alpha: u8, bottom_alpha: u8) {
+        let (w, h) = (self.pixmap.width(), self.pixmap.height());
+        let last_row = f32::from(u16::try_from(h.saturating_sub(1)).unwrap_or(u16::MAX)).max(1.0);
+        let row_bytes = w as usize * 4;
+        let (from, to) = (f32::from(top_alpha), f32::from(bottom_alpha));
+        for (y, row) in self.pixmap.data_mut().chunks_exact_mut(row_bytes).enumerate() {
+            let t = (y as f32 / last_row).clamp(0.0, 1.0);
+            let eased = t * t * (3.0 - 2.0 * t);
+            let alpha = (from + (to - from) * eased).round().clamp(0.0, 255.0) as u8;
+            // Premultiplied, because that is what a tile's buffer holds — `Compositor::upload`
+            // un-premultiplies on the way to the GPU (docs/NOTES.md). Writing straight alpha
+            // here would show up as a fade that washes toward white at its dense end.
+            let premul = |c: u8| ((u16::from(c) * u16::from(alpha)) / 255) as u8;
+            let px = [premul(color.r), premul(color.g), premul(color.b), alpha];
+            for pixel in row.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&px);
+            }
+        }
+    }
+
     pub fn fill_rounded_rect(&mut self, rect: Rect, radius: i32, color: Color) {
         let (w, h) = (rect.width() as f32, rect.height() as f32);
         if w <= 0.0 || h <= 0.0 {

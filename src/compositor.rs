@@ -55,6 +55,15 @@ pub enum Tile {
     /// Modal scrollable content at unscrolled position. GPU crops/repositions via
     /// `TexCropped`; rebuilds only when content changes, not on scroll.
     ScrollContent(Screen),
+    /// Bottom-edge fade over a scrollable modal's content, composited between
+    /// `ScrollContent` and the focused row so it hints at more rows without dimming
+    /// whatever is focused. Static (a fixed alpha ramp), stretched to the list width —
+    /// not keyed by Screen, since one texture serves every scrollable modal.
+    ScrollFade,
+    /// The same fade mirrored for the top edge, shown while content is scrolled off above.
+    /// A second tile rather than a flipped blit: `DrawCmd` has no flip, and the ramp is
+    /// 8x44 px.
+    ScrollFadeTop,
     /// Spinner frame texture, keyed by frame index. Held in VRAM until stream starts.
     SpinnerFrame(usize),
     /// The in-stream stats overlay panel (`ui::render_stats_overlay_tile`).

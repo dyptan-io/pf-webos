@@ -83,6 +83,7 @@ impl App {
                 | ui::ROW_VIDEO_BACKEND
                 | ui::ROW_CODEC
                 | ui::ROW_AUDIO
+                | ui::ROW_GAMEPAD
                 | ui::ROW_COLOR_RANGE) => {
                     let focused = ui::dropdown_current_index(&self.settings, logical);
                     // `row` is the display position (what the overlay is drawn against);
@@ -136,13 +137,46 @@ impl App {
             .position(|&r| r == logical)
             .unwrap_or_else(|| self.settings_focused.min(rows.len().saturating_sub(1)));
     }
-    /// Settings rows visible on screen (1080p card scrolls if needed). Capped at
-    /// the live row count so a hidden row (Color range on NDL) leaves no empty slot.
+    /// How many settings rows are *fully* visible. Capped at the live row count so a hidden
+    /// row (Color range on NDL) leaves no empty slot.
+    ///
+    /// When the list overflows, one row's worth of budget is spent on `SETTINGS_PEEK` instead
+    /// — the partially-visible sliver the bottom fade dissolves. Computed without the peek
+    /// first, because a list that fits entirely has nothing below to peek at and should not
+    /// give up the space.
     pub(crate) fn settings_visible_rows(&self, screen_h: u32) -> usize {
-        let stride = ui::SETTINGS_ROW_H + ui::SETTINGS_ROW_GAP as u32;
-        // 200 header/footer padding (mirrors `settings_layout`) + 160 edge margin.
-        let available = screen_h.saturating_sub(200 + 160);
-        ((available / stride) as usize).clamp(1, ui::settings_row_count(&self.settings))
+        let stride = ui::settings_row_stride();
+        let total = ui::settings_row_count(&self.settings);
+        let budget = screen_h.saturating_sub(
+            ui::SETTINGS_CHROME_TOP + self.settings_chrome_bottom() + ui::SETTINGS_EDGE_MARGIN,
+        );
+        if (budget / stride) as usize >= total {
+            return total.max(1);
+        }
+        // Both peeks come out of the budget, not just the bottom one — see `SETTINGS_PEEK`.
+        ((budget.saturating_sub(2 * ui::SETTINGS_PEEK) / stride) as usize).clamp(1, total)
+    }
+
+    /// Card space below the list: minimal, unless the high-bitrate caution line needs room.
+    pub(crate) fn settings_chrome_bottom(&self) -> u32 {
+        if self.settings.bitrate_kbps > ui::BITRATE_WARN_KBPS {
+            ui::SETTINGS_WARN_CHROME
+        } else {
+            ui::SETTINGS_CHROME_BOTTOM
+        }
+    }
+
+    /// Height of the scrolling viewport: the fully-visible rows plus a peek strip past each
+    /// edge while the list overflows. Deliberately *not* a whole multiple of the row stride
+    /// when scrolling — see [`ui::SETTINGS_PEEK`].
+    pub(crate) fn settings_content_h(&self, screen_h: u32) -> u32 {
+        let visible = self.settings_visible_rows(screen_h);
+        let peeks = if visible < ui::settings_row_count(&self.settings) {
+            2 * ui::SETTINGS_PEEK
+        } else {
+            0
+        };
+        visible as u32 * ui::settings_row_stride() + peeks
     }
 
     /// Scrolls `settings_focused` into view; updates scroll indicator.
@@ -154,15 +188,13 @@ impl App {
 
     /// Settings card and content rects (shared by render and hit-test).
     pub(crate) fn settings_layout(&self, screen_w: u32, screen_h: u32) -> (Rect, Rect) {
-        let visible = self.settings_visible_rows(screen_h);
-        let content_h = visible as u32 * (ui::SETTINGS_ROW_H + ui::SETTINGS_ROW_GAP as u32);
-        // Room for the title/divider above and the high-bitrate caution below.
-        let card_h = content_h + 200;
+        let content_h = self.settings_content_h(screen_h);
+        let card_h = content_h + ui::SETTINGS_CHROME_TOP + self.settings_chrome_bottom();
         // Widened from 0.56 to fit the scroll indicator on the right edge.
         let card = ui::modal_card_rect(screen_w, screen_h, 0.62, card_h);
         let content = Rect::new(
             card.x() + 40,
-            card.y() + 120,
+            card.y() + ui::SETTINGS_CHROME_TOP as i32,
             card.width().saturating_sub(80),
             content_h,
         );
@@ -215,8 +247,11 @@ impl App {
     /// overlay — one row below it. Shared by `render_settings` and `draw_list`,
     /// which both need it (as a whole, or per-option via
     /// `ui::dropdown_option_rect`).
-    pub(crate) fn dropdown_overlay_rect(content: Rect, row: usize) -> Rect {
-        let y = ui::focus_row_rect(content, row + 1).y();
+    /// Positioned from a pixel scroll offset rather than a viewport-local row index, since a
+    /// gliding list puts its rows at continuous offsets. `scroll_px` of 0 is the unscrolled
+    /// case (Diagnostics).
+    pub(crate) fn dropdown_overlay_rect_at_px(content: Rect, row: usize, scroll_px: i32) -> Rect {
+        let y = ui::focus_row_rect_at_px(content, row + 1, scroll_px).y();
         Rect::new(content.x(), y, content.width(), 0)
     }
 

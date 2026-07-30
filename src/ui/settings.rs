@@ -1,5 +1,5 @@
 use super::*;
-use crate::store::{CodecPref, ColorRangeOverride, LogLevelOverride, Settings, VideoBackend};
+use crate::store::{CodecPref, ColorRangeOverride, GamepadType, LogLevelOverride, Settings, VideoBackend};
 
 /// User-requested presets: 1080p, 1440p, 4K.
 pub const RESOLUTIONS: [(u32, u32, &str); 3] = [
@@ -25,6 +25,48 @@ pub const BITRATE_AUTOMATIC: u32 = 0;
 /// Above this, shown as amber caution (not a hard cap).
 pub const BITRATE_WARN_KBPS: u32 = 150_000;
 
+/// Card space above the row list: title, divider, and their padding.
+pub const SETTINGS_CHROME_TOP: u32 = 120;
+
+/// Card space below the row list: just enough to clear the card's rounded corner, so the
+/// list runs to the card's edge and the bottom fade dissolves into it.
+///
+/// Anything more shows as a band of flat card background under the fade — the fade already
+/// *is* the bottom edge, so padding beneath it reads as dead space rather than breathing room.
+pub const SETTINGS_CHROME_BOTTOM: u32 = 16;
+
+/// Extra bottom chrome while the high-bitrate caution line is showing, which is the only
+/// thing that ever needs room below the list. Conditional so the other 99% of the time the
+/// card isn't padded out for a line that isn't there.
+pub const SETTINGS_WARN_CHROME: u32 = 52;
+
+/// Minimum gap between the settings card and the screen edges, top and bottom combined.
+///
+/// Trimmed from 160 when the second peek strip arrived: two 44px peeks cost a whole visible
+/// row out of a 1080p budget, and the card had more inset to spare than the list had rows.
+pub const SETTINGS_EDGE_MARGIN: u32 = 120;
+
+/// How much of the adjacent row stays visible past each edge of the viewport while the list
+/// overflows — the strip an edge fade dissolves. Applied to the top and bottom alike.
+///
+/// Load-bearing, not decoration: a viewport edge landing exactly on a row boundary has
+/// nothing but card background in its outermost pixels (unfocused rows draw no fill of their
+/// own), so a fade there blends the card colour into the card colour and is *mathematically
+/// invisible*. Both cuts have to land mid-row for either fade to read at all — which is also
+/// why the rendered offset is biased by one peek (see `App::sync_modal_scroll`) instead of
+/// sitting on the row grid.
+///
+/// Independent of [`SCROLL_FADE_H`], which is taller: this is how much of the next row is
+/// *exposed*, while that is how far the fade reaches back over what is already visible. Deep
+/// enough to expose a row's icon and label, which sit in the middle third of its height — a
+/// shallower peek shows only the row's internal padding, i.e. nothing to dissolve.
+pub const SETTINGS_PEEK: u32 = 44;
+
+/// Pixels between the tops of consecutive settings rows.
+pub const fn settings_row_stride() -> u32 {
+    SETTINGS_ROW_H + SETTINGS_ROW_GAP as u32
+}
+
 /// Row indices for settings modal.
 pub const ROW_RESOLUTION: usize = 0;
 pub const ROW_FRAMERATE: usize = 1;
@@ -43,17 +85,21 @@ pub const ROW_CODEC: usize = 5;
 /// H.264 pick (see `hdr_row_shown`) — adjacency keeps that dependency discoverable.
 pub const ROW_HDR: usize = 6;
 pub const ROW_AUDIO: usize = 7;
+/// Which controller the host presents to the game — see `store::GamepadType`. Last of the
+/// real settings: it's the only input-side one, and picking `DualSense` is what turns on
+/// adaptive triggers (`crate::dualsense`).
+pub const ROW_GAMEPAD: usize = 8;
 /// Not a setting — a link to `Screen::Experimental` (unstable toggles, currently the
 /// frame pacer). Grouped off the main list so an untested option isn't one keystroke away.
-pub const ROW_EXPERIMENTAL: usize = 8;
+pub const ROW_EXPERIMENTAL: usize = 9;
 /// Not a setting — a link to `Screen::Diagnostics` (log level + stats overlay).
 /// A debug aid, not something a normal user needs to find quickly.
-pub const ROW_DIAGNOSTICS: usize = 9;
+pub const ROW_DIAGNOSTICS: usize = 10;
 /// Not a setting — a link to `Screen::About`. Sits last: every other punktfunk
 /// client puts the version + licences at the very bottom of Settings, and a
 /// `RowKind::Action` row costs nothing extra to render.
-pub const ROW_ABOUT: usize = 10;
-pub const SETTINGS_ROW_COUNT: usize = 11;
+pub const ROW_ABOUT: usize = 11;
+pub const SETTINGS_ROW_COUNT: usize = 12;
 
 /// Experimental modal row indices (see `experimental_rows`).
 pub const EXP_ROW_FRAME_PACER: usize = 0;
@@ -248,6 +294,15 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             danger: false,
             menu: None,
         },
+        FocusRow {
+            icon: ICON_GAMEPAD,
+            label: "Controller".into(),
+            value: gamepad_label(settings.gamepad_type).into(),
+            kind: RowKind::Dropdown,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+        },
         FocusRow::action(ICON_BUG, "Experimental"),
         FocusRow::action(ICON_WRENCH, "Diagnostics"),
         // The build version rides along as this row's value, so it's visible without
@@ -397,6 +452,30 @@ pub fn codec_label(pref: CodecPref) -> &'static str {
     }
 }
 
+/// Controller types offered, in display order. `Automatic` first (the default, and what an
+/// existing install already has); the rest are ordered by how likely a TV user is to own one.
+pub const GAMEPAD_TYPES: [GamepadType; 7] = [
+    GamepadType::Auto,
+    GamepadType::DualSense,
+    GamepadType::DualSenseEdge,
+    GamepadType::DualShock4,
+    GamepadType::Xbox360,
+    GamepadType::XboxOne,
+    GamepadType::SwitchPro,
+];
+
+pub fn gamepad_label(t: GamepadType) -> &'static str {
+    match t {
+        GamepadType::Auto => "Automatic",
+        GamepadType::Xbox360 => "Xbox 360",
+        GamepadType::XboxOne => "Xbox One",
+        GamepadType::DualShock4 => "DualShock 4",
+        GamepadType::DualSense => "DualSense",
+        GamepadType::DualSenseEdge => "DualSense Edge",
+        GamepadType::SwitchPro => "Switch Pro",
+    }
+}
+
 /// Supported channel counts.
 pub const AUDIO_CHANNELS: [(u8, &str); 3] = [(2, "Stereo"), (6, "5.1 surround"), (8, "7.1 surround")];
 
@@ -418,6 +497,7 @@ pub fn dropdown_options(settings: &Settings, row_index: usize) -> Vec<String> {
             .map(|&p| codec_label(p).to_string())
             .collect(),
         ROW_AUDIO => AUDIO_CHANNELS.iter().map(|(_, s)| (*s).to_string()).collect(),
+        ROW_GAMEPAD => GAMEPAD_TYPES.iter().map(|&t| gamepad_label(t).to_string()).collect(),
         ROW_COLOR_RANGE => COLOR_RANGE_OPTIONS
             .iter()
             .map(|&o| color_range_label(o).to_string())
@@ -448,6 +528,10 @@ pub fn dropdown_current_index(settings: &Settings, row_index: usize) -> usize {
         ROW_AUDIO => AUDIO_CHANNELS
             .iter()
             .position(|(c, _)| *c == settings.audio_channels)
+            .unwrap_or(0),
+        ROW_GAMEPAD => GAMEPAD_TYPES
+            .iter()
+            .position(|&t| t == settings.gamepad_type)
             .unwrap_or(0),
         ROW_COLOR_RANGE => COLOR_RANGE_OPTIONS
             .iter()
@@ -490,6 +574,11 @@ pub fn apply_dropdown_choice(settings: &mut Settings, row_index: usize, choice_i
         ROW_AUDIO => {
             if let Some((channels, _)) = AUDIO_CHANNELS.get(choice_index) {
                 settings.audio_channels = *channels;
+            }
+        }
+        ROW_GAMEPAD => {
+            if let Some(&t) = GAMEPAD_TYPES.get(choice_index) {
+                settings.gamepad_type = t;
             }
         }
         ROW_COLOR_RANGE => {
@@ -550,6 +639,12 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
             let idx = dropdown_current_index(settings, ROW_AUDIO);
             let next = cycle_index(idx, AUDIO_CHANNELS.len(), forward);
             apply_dropdown_choice(settings, ROW_AUDIO, next);
+            true
+        }
+        ROW_GAMEPAD => {
+            let idx = dropdown_current_index(settings, ROW_GAMEPAD);
+            let next = cycle_index(idx, GAMEPAD_TYPES.len(), forward);
+            apply_dropdown_choice(settings, ROW_GAMEPAD, next);
             true
         }
         ROW_COLOR_RANGE => {

@@ -195,6 +195,58 @@ pub enum ColorRangeOverride {
     Limited,
 }
 
+/// Which controller the host should present to the game, selectable in Settings.
+///
+/// This is the *virtual* pad the host builds, not what the user is holding — the host
+/// translates. It matters beyond glyphs: a game only emits adaptive-trigger effects when it
+/// sees a `DualSense`, so [`GamepadType::DualSense`] is what makes `crate::dualsense` have
+/// anything to replay. The host resolves the choice against what its platform can actually
+/// build (the `PlayStation` and Switch backends need Linux UHID) and falls back on its own if
+/// not, so an unbuildable pick degrades to a working session rather than none.
+///
+/// A deliberate subset of `punktfunk_core::config::GamepadPref`'s eleven variants: the Steam
+/// Controller/Deck backends exist for clients running *on* that hardware, which a TV is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GamepadType {
+    /// Mirror whichever controller is attached, falling back to the host's own choice (an
+    /// Xbox 360 pad) when the pad isn't one this client recognizes — see
+    /// `gamepad::detect_type`. Resolved per session, so the stored preference stays "match my
+    /// pad" rather than freezing to whatever was plugged in once.
+    #[default]
+    Auto,
+    Xbox360,
+    XboxOne,
+    DualShock4,
+    /// Adaptive triggers, lightbar, touchpad, motion — see [`crate::dualsense`].
+    DualSense,
+    /// `DualSense` plus the two back buttons and two Fn buttons.
+    DualSenseEdge,
+    SwitchPro,
+}
+
+impl GamepadType {
+    /// The wire preference sent in the handshake, which becomes the session-default pad kind.
+    pub fn to_core(self) -> punktfunk_core::config::GamepadPref {
+        use punktfunk_core::config::GamepadPref as P;
+        match self {
+            Self::Auto => P::Auto,
+            Self::Xbox360 => P::Xbox360,
+            Self::XboxOne => P::XboxOne,
+            Self::DualShock4 => P::DualShock4,
+            Self::DualSense => P::DualSense,
+            Self::DualSenseEdge => P::DualSenseEdge,
+            Self::SwitchPro => P::SwitchPro,
+        }
+    }
+
+    /// Whether a host pad of this kind can emit `DualSense` HID feedback (adaptive triggers,
+    /// lightbar). The Edge is a `DualSense` plus extra buttons, so it carries the same effects.
+    pub fn is_dualsense(self) -> bool {
+        matches!(self, Self::DualSense | Self::DualSenseEdge)
+    }
+}
+
 /// Override for the on-device log verbosity, settable live from the Diagnostics
 /// screen — see `logger::set_level_override`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -261,6 +313,12 @@ pub struct Settings {
     /// by default — untested on real hardware; takes effect on the next stream.
     #[serde(default)]
     pub video_pacing: bool,
+    /// Which controller the host presents to the game — see [`GamepadType`]. Defaults to
+    /// `Auto`, which mirrors the attached pad (so a `DualSense` gets adaptive triggers without
+    /// anyone having to find this setting); pick a kind explicitly to override that. Takes
+    /// effect on the next stream, since it rides the handshake.
+    #[serde(default)]
+    pub gamepad_type: GamepadType,
 }
 
 fn default_audio_channels() -> u8 {
@@ -287,6 +345,7 @@ impl Default for Settings {
             log_level_override: LogLevelOverride::Info,
             show_logs: false,
             video_pacing: false,
+            gamepad_type: GamepadType::Auto,
         }
     }
 }

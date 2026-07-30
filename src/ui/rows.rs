@@ -391,6 +391,56 @@ pub fn render_list_scrollbar_tile(tile_w: u32, tile_h: u32, total: usize, visibl
     painter
 }
 
+/// A settings row's on-screen rect at a pixel scroll offset — the smooth-scroll counterpart
+/// of [`focus_row_rect`], which indexes rows within the viewport instead. Can land partly (or
+/// wholly) outside `content_rect` while the viewport is gliding; callers clip.
+pub fn focus_row_rect_at_px(content_rect: Rect, index: usize, scroll_px: i32) -> Rect {
+    let y = content_rect.y() + index as i32 * settings_row_stride() as i32 - scroll_px;
+    Rect::new(content_rect.x(), y, content_rect.width(), SETTINGS_ROW_H)
+}
+
+/// How tall an edge fade is: exactly one row.
+///
+/// Deliberately taller than the peek strip it dissolves (`SETTINGS_PEEK`), so the band
+/// reaches past the partial row and into the full row beyond it. Sized to the peek instead,
+/// the ramp only reached ~35% alpha by the time it crossed the partial row's text — enough to
+/// render, not enough to read as a fade. Being taller also means the dense end lands on the
+/// partial row while the row above it takes only the ramp's first, near-clear pixels.
+pub const SCROLL_FADE_H: u32 = SETTINGS_ROW_H;
+
+/// Tile width for the scroll fade. The ramp is uniform horizontally, so the GPU stretches
+/// this to whatever the list's width is — a fixed narrow tile means one static texture for
+/// every modal instead of one per content width. Not 1px: under linear filtering a
+/// single-column texture has no interior samples to stretch from.
+const SCROLL_FADE_TILE_W: u32 = 8;
+
+/// Which edge of the viewport a fade tile dissolves into.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FadeEdge {
+    /// Dense at the top, clear at the bottom — shown while content is scrolled off above.
+    Top,
+    /// Clear at the top, dense at the bottom — shown while content remains below.
+    Bottom,
+}
+
+/// An edge fade that signals "the list continues this way".
+///
+/// Exists because the scrollbar alone doesn't answer the question on arrival: it's
+/// hold-then-fade (see `SCROLL_INDICATOR_HOLD`), so a list that opens already overflowing
+/// shows nothing at all once the hold lapses, and the last row looks like the final row.
+///
+/// Fades to the modal card's own background (`SIDEBAR_BG`), not to black: the band has to
+/// look like the card surface swallowing the row, and any other colour reads as a shadow
+/// sitting on top of the list.
+pub fn render_scroll_fade_tile(edge: FadeEdge) -> Painter {
+    let mut painter = Painter::new(SCROLL_FADE_TILE_W, SCROLL_FADE_H);
+    match edge {
+        FadeEdge::Top => painter.fill_vertical_fade(SIDEBAR_BG, 0xff, 0x00),
+        FadeEdge::Bottom => painter.fill_vertical_fade(SIDEBAR_BG, 0x00, 0xff),
+    }
+    painter
+}
+
 /// Renders dropdown options as an overlay list anchored below the opener row.
 /// One panel background+shadow instead of per-row cards to avoid shadow smearing.
 pub fn draw_dropdown_overlay(

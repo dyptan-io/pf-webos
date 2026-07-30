@@ -283,6 +283,7 @@ pub fn connect(
     codec_pref: CodecPref,
     color_range_override: ColorRangeOverride,
     video_pacing: bool,
+    gamepad_type: crate::store::GamepadType,
 ) -> Result<Connected> {
     // HDR only ever applies to HEVC. An explicit H.264 pick disables it end to end
     // (the Settings toggle is hidden too — see `ui::hdr_row_shown`); on Automatic the
@@ -341,7 +342,11 @@ pub fn connect(
         port,
         mode,
         CompositorPref::Auto,
-        punktfunk_core::config::GamepadPref::Auto,
+        // Session-default pad kind. A per-pad `InputKind::GamepadArrival` could override this
+        // for mixed setups, but this client drives one pad (index 0), for which the handshake
+        // default is exactly equivalent — and it also reaches hosts too old to advertise
+        // `HOST_CAP_GAMEPAD_STATE`.
+        gamepad_type.to_core(),
         bitrate_kbps,
         video_caps,
         // Requested only — the host clamps to what it can capture, and
@@ -353,6 +358,11 @@ pub fn connect(
         display_hdr,
         0, // client_caps: this client composites the host cursor into the video, not locally
         launch,
+        // Device name for the host's pending-approval list. `None` keeps the host's
+        // fingerprint-derived label ("device abcd1234"), i.e. exactly the behaviour before
+        // core gained this parameter — sending a real TV name is a separate, user-visible
+        // change and does not belong in a dependency bump.
+        None,
         pin,
         Some(identity),
         timeout,
@@ -587,6 +597,7 @@ pub fn request_access(host: &str, port: u16, identity: (String, String), timeout
         None, // no HDR display metadata
         0,    // client_caps: no local cursor rendering
         None, // no launch
+        None, // name: keep the host's fingerprint-derived label (see `connect`)
         None, // pin = None → trust-on-first-use, host parks until operator approval
         Some(identity),
         timeout,
@@ -704,6 +715,7 @@ pub fn run_speed_probe(
         None, // no HDR display metadata: nothing presents
         0,    // client_caps: nothing renders a cursor
         None, // no launch
+        None, // name: keep the host's fingerprint-derived label (see `connect`)
         pin,
         Some(identity),
         timeout,
@@ -1241,4 +1253,63 @@ pub fn pump_audio_once(client: &NativeClient, audio: &mut crate::audio::AudioPla
 /// Sends one input event to the host.
 pub fn send_input(client: &NativeClient, ev: &InputEvent) -> Result<()> {
     client.send_input(ev).context("send_input")
+}
+
+/// Ceiling on feedback events handled per tick.
+///
+/// Both planes are human-paced (a rumble change, a weapon swap), so this is never reached in
+/// normal play — it exists so a host that floods, or a plane that backed up while a modal was
+/// open, cannot starve rendering and input for a tick.
+const FEEDBACK_DRAIN_BUDGET: usize = 32;
+
+/// Drains the host→client gamepad feedback planes (non-blocking) and applies them to the
+/// physical pad. Call once per main-loop tick, like [`pump_audio_once`].
+///
+/// The two planes go to different places, because each has one route that works for every
+/// controller rather than only one:
+///   * **rumble** → SDL's evdev force feedback (`GameController::set_rumble`), which works on
+///     any pad the TV has bound, `DualSense` included;
+///   * **`DualSense` HID feedback** (adaptive triggers, lightbar, player LEDs) → the Bluetooth
+///     service, since SDL's own `DualSense` path needs a hidraw node the app's jail doesn't have
+///     (see [`crate::dualsense`]).
+///
+/// Both drains run even when their sink is absent: the planes are bounded queues, and leaving
+/// one unread would let it fill and then discard the *newest* events — including, for rumble,
+/// the zero that stops a motor.
+pub fn pump_feedback_once(
+    client: &NativeClient,
+    mut controller: Option<&mut sdl2::controller::GameController>,
+    mut feedback: Option<&mut crate::dualsense::Feedback>,
+) {
+    // `next_rumble_command` is the policy-engine API: it already resolves lease expiry, stale
+    // legacy hosts and close-drain zeros, so commands apply verbatim — `(0, 0)` stops now.
+    let mut budget = FEEDBACK_DRAIN_BUDGET;
+    while budget > 0 {
+        let Ok(cmd) = client.next_rumble_command(Duration::ZERO) else {
+            break; // NoFrame (empty) or Closed (session over)
+        };
+        budget -= 1;
+        if let Some(pad) = controller.as_deref_mut() {
+            // `backstop_ms` passes straight through, including 0: SDL2 reads a zero duration as
+            // "no expiration" (`rumble_expiration = 0`, run until changed), not "stop now", which
+            // is exactly the semantics wanted here — the policy engine guarantees an explicit
+            // zero-level command at every stop, so a self-expiring effect would only risk
+            // cutting a held rumble short. Don't "fix" this into a floor.
+            //
+            // Errors here are the common "this pad has no rumble motors" case, not a fault:
+            // logging per command would spam a tick loop, and there is no recovery to attempt.
+            let _ = pad.set_rumble(cmd.low, cmd.high, cmd.backstop_ms);
+        }
+    }
+
+    let mut budget = FEEDBACK_DRAIN_BUDGET;
+    while budget > 0 {
+        let Ok(event) = client.next_hidout(Duration::ZERO) else {
+            break;
+        };
+        budget -= 1;
+        if let Some(fb) = feedback.as_deref_mut() {
+            fb.apply(&event);
+        }
+    }
 }

@@ -18,7 +18,9 @@ Hybrid software/GPU design: `tiny_skia` rasterizes tiles, SDL2 composites. Redra
 - **Never use `tiny_skia::Painter::draw_pixmap/fill_rect` for large areas** (~300ms for full-screen). Use `pixmap.data_mut()` loop or `copy_from_slice` instead. Verify with on-device timing, never assume a call is cheap.
 - Tiles use premultiplied-alpha; `Compositor::upload` un-premultiplies (SDL `BlendMode::Blend` expects straight alpha).
 - `FilterQuality::Nearest` and `anti_alias=false` in paints are cheaper scan-conversion paths.
-- Fonts: Geist (OTF, embedded). Icons: Material Icons subset (~1.7 KB). Assume Latin only.
+- Fonts: Geist (OTF, embedded). Icons: Material Icons subset (~1.7 KB) — **a subset, so a new `ICON_*` codepoint needs the font regenerated** (`assets/icons/NOTICE.md` has the `pyftsubset` line and the codepoint list). Assume Latin only.
+- **A scroll fade needs the viewport to cut mid-row, or it is invisible.** Unfocused rows draw no background of their own (`draw_selectable_fixed` fills only when focused), so a viewport ending on a row boundary has nothing but card background in its last pixels — fading `SIDEBAR_BG` into `SIDEBAR_BG` is a mathematical no-op, and the first attempt at this shipped as a feature that rendered nothing at all. `ui::SETTINGS_PEEK` deliberately leaves a partial row for `SCROLL_FADE_H` to dissolve.
+- **Modal scrolling is pixel-based, offsets are row-based.** `scroll.offset` stays integral (focus logic and the scrollbar are defined in rows) while `App::modal_scroll_px` is the animated *rendered* crop, eased like the Home grid. Pixels are also what lets the last row sit flush at the end of the list — `offset * stride` overshoots by the peek strip. Anything positioned against the list (focus tile, dropdown anchor) **must** derive from the same pixel offset: the focus tile is the focused row re-rendered, so anchoring it to the quantized row shows that row's content in two places for the length of every scroll. It can also hang past the viewport mid-glide, hence the clip in `draw_list`.
 
 ## Video decode (NDL DirectMedia)
 
@@ -31,10 +33,26 @@ Hybrid software/GPU design: `tiny_skia` rasterizes tiles, SDL2 composites. Redra
 - HDR mastering metadata can change mid-session — drain `next_hdr_meta` every frame.
 - **`NDL_DirectVideoSetHDRInfo` forces the panel into HDR mode on *any* call** (OLED65CX, webOS 5): it ignores the SDR `transfer`/`primaries` triplet and emits an HDR infoframe regardless, so an SDR/H.264 stream got shown in HDR picture mode. Fix: `ndl.rs::set_color_info` no-ops when `meta` is `None` (SDR) — only genuine HDR mastering metadata reaches NDL. Cost: NDL can no longer be used to fix a bitstream's missing VUI colour info; SDR relies on the bitstream VUI. HDR is also gated to HEVC end-to-end (`session::connect`: `apply_hdr = host_hdr && codec==H265`, and an explicit H.264 pick drops the HDR caps + hides the Settings toggle).
 
+## DualSense feedback: Bluetooth service, not hidraw
+
+Adaptive triggers work on a **non-rooted** TV, but not through SDL. Verified end-to-end on a G5 (webOS 10.3, dev-mode install, `DualSense` over Bluetooth): trigger resistance, section walls, and lightbar colour all confirmed on real hardware.
+
+- **No `/dev/hidraw*` in the app jail** — not even with the pad connected, and no `hidraw` or `leds` class in `/sys` either. So SDL's HIDAPI PS5 driver and `SDL_GameControllerSendEffect` (both present in the bundled fork) can never reach the pad. **Don't re-attempt via SDL, and don't bump to SDL3** — there is no webOS SDL3 fork, and the blocker is jail policy, not SDL's API.
+- **What works instead**: `luna://com.webos.service.bluetooth2/hid/internal/sendData` writes an arbitrary HID output report to the pad. Permitted because `compat.api.json` places it in the **`public`** API group, and `/usr/share/luna-service2/devmode_certificate.json` grants a dev-mode app `["ares.webos.cli", "public"]`. The restricted `devices`/`bluetooth.manage` groups are *not* needed.
+- **Payload traps** (each cost hours): `reportData` must be an int array **with no `reportId` key** — one extra property fails the whole call with a generic "does not match the expected schema" that names nothing. `setReport` never works (always error 4 "operation can not be performed at this time"); only `sendData` does. `getReport` *hangs* on a pad that doesn't answer, so anything calling it needs a deadline.
+- **Report must be CRC-signed** exactly as the kernel's `hid-playstation` does it: 78 bytes (`0x31`, seq<<4, `0x10` tag, 47-byte common block, 24 reserved, CRC32-LE), CRC computed over a `0xA2` seed byte plus the report body. **A wrong CRC is silently ignored by the pad while the service still answers `returnValue: true`** — the single most misleading failure mode here. Do not prepend `0xA2` to `reportData`; the stack adds the HIDP header itself.
+- LG backported `hid-playstation` to kernel 5.4, so the pad binds as three input devices (pad/motion/touchpad) sharing one `U: Uniq=` MAC — that's where `dualsense::find_address` reads it from.
+- **Rumble does not use this path**: the pad's event node advertises `EV_FF` and is group-writable by `compositor` (which the app's uid is in), so rumble goes through SDL's evdev force feedback, working for any pad type. Reports built in `dualsense.rs` deliberately never set the compatible-vibration valid-flag, so the two paths can't fight.
+- `hid/internal/*` is undocumented vendor surface — feature-detected and failing soft, never assumed.
+- **Feedback sends must be throttled, or the video plane goes black.** Each send forks/execs `luna-send-pub`, copying the page tables of a process holding SDL, the decoder and its buffers. A Steam/Gamescope host *animates* the `DualSense` lightbar, so an unthrottled sender spawned dozens of processes per second on a 2-3 core TV — and the observed failure was a **black panel with the frame counter climbing, `dropped=0`, `backlog=0`**: the decode thread is priority-boosted so it kept running while the compositor never got to present (audio underruns were the other tell). `dualsense.rs` drops identical states and spaces the rest by `MIN_SEND_INTERVAL`. Do not assume host feedback is human-paced; the lightbar alone is not.
+
+Host side: a game only emits trigger effects when it sees a `DualSense`, so the pad kind in the handshake decides whether this feature does anything. Settings' **Controller** row (`store::GamepadType`) defaults to `Automatic`, which **mirrors the attached pad** (`gamepad::detect_type`) rather than sending wire `GamepadPref::Auto` — that wire value means "host decides", and the host decides Xbox 360, which is why a `DualSense` first showed up as an Xbox pad with no effects. Resolution happens per session (`main::resolve_gamepad_type`) and deliberately does not write back, so the stored preference keeps meaning "match my pad". Host env `PUNKTFUNK_TEST_FEEDBACK` makes the host send a scripted lightbar/LED/trigger burst — use it to test without a game.
+
 ## Known platform limitations (don't retry)
 
 - **Frame rate paces the stream; can't set panel refresh rate.** `webosbrew/SDL-webOS` exposes read-only `SDL_webOSGetRefreshRate` only; no set-side webOS API. Used by `PtsPacer` (`session.rs::reconciled_pace_interval_ns`): when the measured panel Hz is within ±2 Hz of the stream fps, the paced PTS grid anchors to the panel's cadence instead of the stream's (aurora-tv's `session_worker.c` trick). Still not real vsync — just PTS quantization to the display's rate.
 - **Magic Remote Back requires `SDL_WEBOS_ACCESS_POLICY_KEYS_BACK`** set before window creation. Arrives as `keycode = 2097155`. Same for Home (`SDL_WEBOS_ACCESS_POLICY_KEYS_HOME`) and Guide (`SDL_WEBOS_ACCESS_POLICY_KEYS_GUIDE`). Launcher ribbon overlay needs `SDL_WEBOS_ACCESS_POLICY_RIBBON=false` or it pops over the app.
+- **Gamepad disconnect shortcuts must be holds, not presses** (`main::DisconnectChord`, 2 s). Guide, both shoulders, or Start+Back opens the in-stream disconnect dialog — and every one of those buttons is also forwarded as real game input, which is the whole constraint: L1+R1 in particular is a common in-game binding, so a press-to-fire shortcut would kill streams mid-play. The chord state is tracked from transitions (SDL reports no held-state here) and **cleared when it fires or the pad unplugs** — an open dialog swallows controller events and an unplugged pad sends no releases, so without that the buttons stay logically down and the dialog reopens the moment it's dismissed.
 - **Hidden window gets no pointer input.** Keep it mapped and fully transparent `RGBA(0,0,0,0)` each frame so NDL plane shows through (not `.hide()`).
 - **Two independent cursors** — webOS draws local cursor; host draws second over network. Hide local cursor during stream (`show_cursor(false)`). `mouse.rs` scales motion by `SENSITIVITY` 0.55.
 - **Color buttons (Red/Green/Yellow/Blue) require raw scancode polling.** `SDL_SCANCODE_WEBOS_RED=486`... not in vanilla SDL2. `ui::webos_red_button_down()` reads raw keyboard-state array directly.
@@ -71,6 +89,24 @@ CX/G5 are 32-bit userland on ARMv8-A. RustCrypto's `aes` crate has ARMv8 intrins
 ## AV1 support (unreliable, opt-in)
 
 Advertised by G5's silicon, unusable in practice. Silicon accepts AV1 load then silently presents nothing (or black screen, or process dies). NDL ignores it. Starfish sometimes times out. Gate: Starfish backend selected, decoder claims AV1, `store::dev_override_enable_av1() = 1` (file `$HOME/av1.conf = 1`). Settings row labels stranded choice `AV1 (unavailable)` rather than showing unused option. Keep wired for future testing; promote to real setting when a device plays it.
+
+## ABR startup probe: 2 Gbps, upstream-hardcoded
+
+**"Automatic" bitrate fires a 2 Gbps burst ~2 s into every session, and on Wi-Fi that can cost the session its video entirely** — not a slow start but a flow that never establishes. Measured on the G5: a "successful" probe still reported `send_dropped=20211`, i.e. the link is hammered far past what it can carry (~245 Mbps airlink ceiling), and probes that get nothing back sit on core's 6 s timeout. Capped at 300 Mbps the same link reports `send_dropped=0-167` and stream starts are reliable.
+
+Don't read a slow *start* as this bug — a host compositor coming up has its own startup time, and video legitimately arrives late on the first connect of a session. The signal that matters here is packet drops on the probe and video that never arrives at all.
+
+This is `CAPACITY_PROBE_KBPS` in `punktfunk-core`'s `client/pump/data.rs` — a **hardcoded const with no cap knob**, still 2 Gbps as of core v0.22.2, and directly at odds with this client's own speed test being deliberately capped at 320 Mbps for the very same "unbounded firehose starves the app" reason (below).
+
+**Fixed by capping the burst**: `main.rs` sets `PUNKTFUNK_ABR_PROBE_KBPS=300000` before anything spawns a thread (`setenv` isn't thread-safe, and core reads it while building its data-plane pump). 300 Mbps matches what this client already burst-tests its *own* speed probe at, and still sits above the ~245 Mbps airlink ceiling this hardware reaches — it measures the link without knocking it over. The knob is core-side; **core v0.22.3 is the first release carrying it**, which is why the pin moved off v0.21.0. Against an older core the variable is simply ignored.
+
+That bump also brought a `connect` signature change — a `name: Option<String>` (the label the host's pending-approval list shows) between `launch` and `pin`. All four call sites pass `None`, preserving the fingerprint-derived label; sending a real TV name is a separate user-visible change.
+
+Blind alleys, so they aren't re-tried:
+- `bitrate_kbps == 0` (Automatic) arms **both** the AIMD controller and this probe — the client cannot separate them.
+- `PUNKTFUNK_ABR_PROBE=0` disables the probe but leaves the climb ceiling at the negotiated start rate (~20 Mbps), which core's own comment calls a box "Automatic could NEVER climb out of".
+- Running our own capped probe instead does **not** work: `request_probe` completes, but `abr.set_ceiling` is only called from core's own probe path (gated on its `capacity_probe_deadline`), so the ceiling never moves. There is no public bitrate/ceiling setter on `NativeClient`.
+- Pinning a fixed bitrate also disarms the probe, but costs mid-session adaptation entirely.
 
 ## Network speed test quirks
 

@@ -13,6 +13,8 @@ mod device;
 #[cfg(target_os = "linux")]
 mod discovery;
 #[cfg(target_os = "linux")]
+mod dualsense;
+#[cfg(target_os = "linux")]
 mod errors;
 #[cfg(target_os = "linux")]
 mod gamepad;
@@ -22,6 +24,8 @@ mod keyboard;
 mod library;
 #[cfg(target_os = "linux")]
 mod logger;
+#[cfg(target_os = "linux")]
+mod luna;
 #[cfg(target_os = "linux")]
 mod mouse;
 #[cfg(target_os = "linux")]
@@ -60,6 +64,28 @@ mod real {
 
     /// `ConnectOutcome`: connect thread (started early to overlap animation) + settings.
     type ConnectOutcome = (std::thread::JoinHandle<Result<session::Connected>>, store::Settings);
+
+    /// Resolves a `GamepadType::Auto` preference against the attached controller, for this
+    /// session only.
+    ///
+    /// Session-only on purpose: the returned `Settings` drives the handshake and the stream
+    /// loop, while `App`'s own copy (what `SettingsWriter` persists and what the Settings row
+    /// displays) keeps saying `Automatic`. Resolving into the stored value instead would turn
+    /// a preference that means "match my pad" into a fixed pad kind the next time a different
+    /// controller was plugged in.
+    fn resolve_gamepad_type(
+        mut settings: store::Settings,
+        game_controller: &sdl2::GameControllerSubsystem,
+    ) -> store::Settings {
+        if settings.gamepad_type != store::GamepadType::Auto {
+            return settings;
+        }
+        if let Some(detected) = gamepad::detect_type(game_controller) {
+            tracing::info!("controller Automatic → {detected:?} (mirroring the attached pad)");
+            settings.gamepad_type = detected;
+        }
+        settings
+    }
 
     /// Start `session::connect` on its own thread. Caller joins after animation (or immediately).
     #[allow(clippy::too_many_arguments)]
@@ -106,6 +132,7 @@ mod real {
                     settings.codec,
                     settings.color_range_override,
                     settings.video_pacing,
+                    settings.gamepad_type,
                 )
             })
             .context("spawn connect thread")
@@ -246,10 +273,15 @@ mod real {
         }
     }
 
-    /// How long the Xbox/PS "Guide" button must be held during a stream before the
-    /// disconnect dialog opens. A plain Back/B press is real game input and must reach
-    /// the host, so the gamepad's only route to the dialog is this deliberate hold.
-    const GUIDE_HOLD: Duration = Duration::from_secs(2);
+    /// How long a disconnect shortcut ([`DisconnectChord`]) must be held during a stream
+    /// before the dialog opens.
+    ///
+    /// Every button in every one of these shortcuts is also real game input that must reach
+    /// the host, so a hold — not a press — is the only safe trigger. This matters most for
+    /// the shoulder pair: plenty of games bind L1+R1 together, and on a press-to-fire binding
+    /// those games would drop the stream mid-play. Two seconds is far longer than any such
+    /// binding holds both buttons deliberately.
+    const DISCONNECT_HOLD: Duration = Duration::from_secs(2);
 
     /// How long OK must be held on a focused Home game card to pin/unpin it instead
     /// of launching it — see `pin_hold_gate`.
@@ -263,6 +295,66 @@ mod real {
         since: Instant,
         focus: HomeFocus,
         fired: bool,
+    }
+
+    /// The gamepad routes to the in-stream disconnect dialog: Guide, both shoulders, or
+    /// Start+Back, each held for [`DISCONNECT_HOLD`].
+    ///
+    /// Tracked as button state rather than read back from SDL because SDL only reports
+    /// transitions here — and a chord needs to know what is down *now*, not what changed
+    /// last. Three shortcuts share one timer: the gesture is "some disconnect chord has been
+    /// complete for long enough", so sliding from one chord into another (releasing Start
+    /// while both shoulders stay down) is one continuous hold rather than a restart.
+    #[derive(Default)]
+    struct DisconnectChord {
+        guide: bool,
+        left_shoulder: bool,
+        right_shoulder: bool,
+        start: bool,
+        back: bool,
+        /// When the currently-held chord became complete; `None` when none is.
+        since: Option<Instant>,
+    }
+
+    impl DisconnectChord {
+        /// Records one button transition and arms or disarms the hold timer.
+        fn set(&mut self, button: sdl2::controller::Button, down: bool) {
+            use sdl2::controller::Button;
+            match button {
+                Button::Guide => self.guide = down,
+                Button::LeftShoulder => self.left_shoulder = down,
+                Button::RightShoulder => self.right_shoulder = down,
+                Button::Start => self.start = down,
+                Button::Back => self.back = down,
+                _ => return,
+            }
+            // Re-derived after every transition, so releasing any part of a chord restarts
+            // the hold instead of leaving a stale deadline armed.
+            self.since = match (self.complete(), self.since) {
+                (true, Some(t)) => Some(t),
+                (true, None) => Some(Instant::now()),
+                (false, _) => None,
+            };
+        }
+
+        fn complete(&self) -> bool {
+            self.guide || (self.left_shoulder && self.right_shoulder) || (self.start && self.back)
+        }
+
+        /// Whether a chord has now been held long enough to fire.
+        fn held_for(&self, hold: Duration) -> bool {
+            self.since.is_some_and(|t| t.elapsed() >= hold)
+        }
+
+        /// Forgets all held buttons.
+        ///
+        /// Called when the chord fires and when the pad disconnects, because in both cases
+        /// the releases that follow never reach [`set`](Self::set) — the open dialog swallows
+        /// controller events, and an unplugged pad sends none. Without this the buttons would
+        /// stay "down" forever and the dialog would reopen the instant it was dismissed.
+        fn clear(&mut self) {
+            *self = Self::default();
+        }
     }
 
     /// In-stream disconnect dialog — same open/close fade as pre-stream modals.
@@ -292,7 +384,8 @@ mod real {
             self.focus.is_some()
         }
 
-        /// Opens (or reopens) with `focus` focused — the Back key or a Guide hold.
+        /// Opens (or reopens) with `focus` focused — the Back key or a held
+        /// [`DisconnectChord`].
         fn open(&mut self, focus: usize) {
             self.focus = Some(focus);
             self.fade.reopen();
@@ -674,7 +767,7 @@ mod real {
         // Bypasses the library screen too (`launch: None`, a plain desktop session).
         if let Some((host, port)) = store::dev_override_connect() {
             tracing::info!("dev override: connecting to {host}:{port}");
-            let settings = store::load_settings();
+            let settings = resolve_gamepad_type(store::load_settings(), game_controller);
             let handle = spawn_connect(
                 identity.clone(),
                 host,
@@ -789,7 +882,7 @@ mod real {
                     // toggle (e.g. video pacing) is persisted asynchronously by
                     // `SettingsWriter`, so re-reading disk here could race the write and
                     // connect with the stale value. `app.settings` is updated synchronously.
-                    let settings = app.settings;
+                    let settings = resolve_gamepad_type(app.settings, game_controller);
                     let handle = spawn_connect(
                         identity.clone(),
                         target.host,
@@ -1129,6 +1222,26 @@ mod real {
                 );
             }
 
+            // DualSense HID feedback (adaptive triggers, lightbar), only when the host is
+            // actually presenting a DualSense — anything else never emits these events, so
+            // starting the sender thread would be pure overhead. Absent for any other reason
+            // (pad on USB rather than Bluetooth, no `luna-send-pub`) is not an error: the
+            // stream is unaffected, so it's logged once and the feature is simply off.
+            let mut ds_feedback = if settings.gamepad_type.is_dualsense() {
+                match crate::dualsense::find_address() {
+                    Some(addr) => crate::dualsense::Feedback::new(addr),
+                    None => {
+                        tracing::info!(
+                            "no Bluetooth DualSense found in /proc/bus/input/devices — \
+                             adaptive triggers off for this session"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let mut scroll_acc = mouse::ScrollAccumulator::default();
             // In-stream stats overlay: refreshed at ~2Hz onto the otherwise-transparent
             // stream window, composited OVER the punch-through video plane via the
@@ -1157,9 +1270,8 @@ mod real {
             let mut overlay_prev_at = Instant::now();
             // 0 = "Disconnect" focused, 1 = "Cancel" (default on open — safer).
             let mut disconnect = DisconnectDialog::new();
-            // Gamepad path to the disconnect dialog (see `GUIDE_HOLD`): `Some(t)` =
-            // Guide pressed at `t` and still held; cleared on release or once it fires.
-            let mut guide_held_since: Option<Instant> = None;
+            // Gamepad routes to the disconnect dialog — see `DisconnectChord`.
+            let mut chord = DisconnectChord::default();
             // Delayed outcome: waits for close-fade to finish.
             let mut pending_outcome: Option<StreamOutcome> = None;
             let outcome = 'running: loop {
@@ -1186,6 +1298,9 @@ mod real {
                         }
                         Event::ControllerDeviceRemoved { .. } => {
                             controller = None;
+                            // An unplugged pad sends no releases, so a chord held at the
+                            // moment it vanished would otherwise stay armed forever.
+                            chord.clear();
                         }
                         // Dialog open: navigate it only, don't forward input to the
                         // host. Non-repeat keys/fresh controller presses only, so the
@@ -1241,16 +1356,14 @@ mod real {
                             }
                         }
                         Event::ControllerButtonDown { button, .. } => {
-                            if button == sdl2::controller::Button::Guide {
-                                guide_held_since = Some(Instant::now());
-                            }
+                            chord.set(button, true);
+                            // Still forwarded: every shortcut button is also game input, and
+                            // the hold requirement is what keeps the two uses apart.
                             let ev = gamepad::button_event(button, true, 0);
                             let _ = session::send_input(&connected.client, &ev);
                         }
                         Event::ControllerButtonUp { button, .. } => {
-                            if button == sdl2::controller::Button::Guide {
-                                guide_held_since = None;
-                            }
+                            chord.set(button, false);
                             let ev = gamepad::button_event(button, false, 0);
                             let _ = session::send_input(&connected.client, &ev);
                         }
@@ -1291,15 +1404,13 @@ mod real {
                         _ => {}
                     }
                 }
-                // Guide held long enough (and the dialog isn't already up) —
-                // open it, then disarm so it fires once per hold.
-                if !disconnect.is_open() {
-                    if let Some(since) = guide_held_since {
-                        if since.elapsed() >= GUIDE_HOLD {
-                            guide_held_since = None;
-                            disconnect.open(1);
-                        }
-                    }
+                // A disconnect chord held long enough (and the dialog isn't already up) —
+                // open it, then forget the chord so it fires once per hold rather than
+                // repeatedly while the buttons stay down.
+                if !disconnect.is_open() && chord.held_for(DISCONNECT_HOLD) {
+                    tracing::info!("disconnect shortcut held — opening dialog");
+                    chord.clear();
+                    disconnect.open(1);
                 }
                 // Green button: local-only stats-overlay toggle, edge-detected here (raw
                 // scancode poll — the safe SDL2 event API can't see this key at all).
@@ -1451,6 +1562,10 @@ mod real {
                 if let Some(player) = &mut audio_player {
                     session::pump_audio_once(&connected.client, player);
                 }
+                // Host→client gamepad feedback: rumble onto the pad via SDL, DualSense
+                // trigger/lightbar effects via the Bluetooth service. Called unconditionally
+                // so both planes keep draining even with no pad attached — see the fn's docs.
+                session::pump_feedback_once(&connected.client, controller.as_mut(), ds_feedback.as_mut());
                 // Skipped whenever the dialog block drew this tick (open or still
                 // fading out) — its own redraw above already owns the canvas. Stats
                 // and the log overlay share one clear/execute/present: each does its
@@ -1630,6 +1745,17 @@ mod real {
                 std::thread::sleep(Duration::from_millis(2));
             };
 
+            // Hand the pad back before anything else: trigger resistance is firmware state
+            // that outlives the session, so a game that ended with R2 stiff would leave it
+            // stiff on the TV's home screen (and after the app exits) with nothing to connect
+            // it to punktfunk. Dropping the sender flushes and joins it — see `Feedback::drop`.
+            if let Some(mut fb) = ds_feedback.take() {
+                fb.release();
+            }
+            // Any rumble still running is likewise the pad's own state, not the stream's.
+            if let Some(pad) = controller.as_mut() {
+                let _ = pad.set_rumble(0, 0, 0);
+            }
             // `disconnect_quit()` was already called above for every deliberate-stop path;
             // `shutdown()` joins the video thread and drops `client` so the QUIC close
             // frame actually gets sent before this function returns (see its docs).
@@ -1657,6 +1783,24 @@ mod real {
     }
 }
 
+/// Ceiling for `punktfunk-core`'s startup link-capacity probe, in kbps.
+///
+/// Core bursts at 2 Gbps by default, deliberately far above any plausible link so the burst
+/// measures the link rather than itself. On a TV's Wi-Fi that backfires: measured on the G5,
+/// three back-to-back connects split two ways — the two whose probe finished in ~1-2 s had
+/// video within 2-4 s, the one that hit core's 6 s timeout showed **no video for 14 seconds**
+/// (a black screen the user reads as a failed connect), and even a "successful" probe on that
+/// link had the host dropping 20k packets.
+///
+/// 300 Mbps matches what this client already burst-tests its own speed probe at
+/// (`session::run_speed_probe`, capped for the same reason: an unbounded firehose starves a
+/// 2-3 core TV), and still sits well above the ~245 Mbps airlink ceiling this hardware can
+/// reach — so it measures the link without knocking it over.
+const ABR_PROBE_KBPS: &str = "300000";
+
 fn main() -> anyhow::Result<()> {
+    // Set before anything spawns a thread: `set_var` is not thread-safe, and core reads this
+    // while building its data-plane pump during `connect`. An older core simply ignores it.
+    std::env::set_var("PUNKTFUNK_ABR_PROBE_KBPS", ABR_PROBE_KBPS);
     real::run()
 }

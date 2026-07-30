@@ -41,3 +41,4 @@ pub const ICON_MEMORY: &str = "\u{E322}";
 pub const ICON_MOVIE: &str = "\u{E02C}";
 pub const ICON_VISIBILITY: &str = "\u{E8F4}";
 pub const ICON_SEND: &str = "\u{E163}";
+pub const ICON_GAMEPAD: &str = "\u{E338}";

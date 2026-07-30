@@ -31,6 +31,48 @@ fn button_bit(button: Button) -> u32 {
     }
 }
 
+/// The controller kind to present to the host when Settings says `Automatic`, derived from
+/// whichever attached pad SDL recognizes first — `None` to leave the choice to the host.
+///
+/// `Automatic` used to send wire `GamepadPref::Auto`, which means *the host* picks, and the
+/// host picks an Xbox 360 pad. So a `DualSense` owner who never opened Settings held a
+/// `DualSense` while the game saw an Xbox pad: wrong glyphs, and — the reason this matters —
+/// no adaptive-trigger effects at all, since a game only emits those for a `DualSense`
+/// ([`crate::dualsense`]).
+///
+/// Only pads the Xbox default actually misrepresents are mapped. An Xbox pad, or anything
+/// unrecognized, stays `None`: the host's default is already right for the former, and for
+/// the latter naming a specific backend the host may not be able to build is worse than
+/// letting it choose.
+pub fn detect_type(subsystem: &sdl2::GameControllerSubsystem) -> Option<crate::store::GamepadType> {
+    let count = subsystem.num_joysticks().ok()?;
+    (0..count)
+        .filter(|&i| subsystem.is_game_controller(i))
+        .filter_map(|i| subsystem.name_for_index(i).ok())
+        .find_map(|name| type_for_name(&name))
+}
+
+/// Maps an SDL controller name to the kind to present. Names come from SDL's controller
+/// database (`SDL_GameControllerNameForIndex`), so they are stable strings like
+/// "`DualSense` Wireless Controller" rather than raw USB product strings.
+fn type_for_name(name: &str) -> Option<crate::store::GamepadType> {
+    use crate::store::GamepadType;
+    let name = name.to_ascii_lowercase();
+    // Edge before plain: the Edge's SDL name contains "dualsense" too, so testing the
+    // broader pattern first would silently downgrade every Edge to a plain DualSense.
+    if name.contains("dualsense edge") {
+        Some(GamepadType::DualSenseEdge)
+    } else if name.contains("dualsense") {
+        Some(GamepadType::DualSense)
+    } else if name.contains("dualshock") || name.contains("ps4 controller") {
+        Some(GamepadType::DualShock4)
+    } else if name.contains("switch pro") || name.contains("pro controller") {
+        Some(GamepadType::SwitchPro)
+    } else {
+        None
+    }
+}
+
 /// SDL2's `Axis` enum → punktfunk's `AXIS_*` wire id.
 fn axis_id(axis: Axis) -> u32 {
     match axis {
@@ -76,5 +118,43 @@ pub fn axis_event(axis: Axis, value: i16, pad: u8) -> InputEvent {
         x: scaled,
         y: 0,
         flags: u32::from(pad),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::type_for_name;
+    use crate::store::GamepadType;
+
+    /// The Edge's SDL name contains "dualsense", so pattern order is load-bearing — a
+    /// regression here silently costs the Edge its two back buttons and Fn buttons.
+    #[test]
+    fn edge_is_not_mistaken_for_a_plain_dualsense() {
+        assert_eq!(
+            type_for_name("DualSense Edge Wireless Controller"),
+            Some(GamepadType::DualSenseEdge)
+        );
+        assert_eq!(
+            type_for_name("DualSense Wireless Controller"),
+            Some(GamepadType::DualSense)
+        );
+    }
+
+    /// An Xbox pad (and anything unknown) must stay unmapped so the host keeps choosing —
+    /// its default already presents an Xbox pad.
+    #[test]
+    fn xbox_and_unknown_pads_defer_to_the_host() {
+        assert_eq!(type_for_name("Xbox 360 Controller"), None);
+        assert_eq!(type_for_name("Xbox Wireless Controller"), None);
+        assert_eq!(type_for_name("Some Unknown Gamepad"), None);
+    }
+
+    #[test]
+    fn playstation_and_switch_pads_are_mirrored() {
+        assert_eq!(type_for_name("PS4 Controller"), Some(GamepadType::DualShock4));
+        assert_eq!(
+            type_for_name("Nintendo Switch Pro Controller"),
+            Some(GamepadType::SwitchPro)
+        );
     }
 }
