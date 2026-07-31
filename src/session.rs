@@ -284,6 +284,7 @@ pub fn connect(
     color_range_override: ColorRangeOverride,
     video_pacing: bool,
     gamepad_type: crate::store::GamepadType,
+    cursor_capture: bool,
 ) -> Result<Connected> {
     // HDR only ever applies to HEVC. An explicit H.264 pick disables it end to end
     // (the Settings toggle is hidden too — see `ui::hdr_row_shown`); on Automatic the
@@ -356,7 +357,8 @@ pub fn connect(
         video_codecs,
         preferred_codec,
         display_hdr,
-        0, // client_caps: this client composites the host cursor into the video, not locally
+        // client_caps: see `store::Settings::cursor_capture` for the on/off split.
+        if cursor_capture { 0 } else { quic::CLIENT_CAP_CURSOR },
         launch,
         // Device name for the host's pending-approval list. `None` keeps the host's
         // fingerprint-derived label ("device abcd1234"), i.e. exactly the behaviour before

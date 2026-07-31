@@ -1018,55 +1018,118 @@ impl App {
             self.keyboard_shown,
         )
     }
-    /// Updates focus/hover to whatever the Magic Remote's pointer is over.
-    /// Returns whether that actually changed anything visible — Magic Remote
-    /// pointer mode fires a `MouseMotion` event continuously while the remote is
-    /// moving, and each one otherwise forced a full-frame redraw regardless of
-    /// whether the pointer was still over the same card (see `main.rs`'s dirty
-    /// tracking).
-    /// Deliberately does NOT move `home_focus`/`settings_focused` — that's the
-    /// outline+zoom "focused element" state, and moving it on every hover (the
-    /// previous behavior) popped rows/cards in and out of that treatment just from
-    /// the pointer drifting across the screen. Only keyboard/remote navigation or a
-    /// click (`handle_mouse_click` below) moves it now. Hover still drives the
-    /// close (X) button's highlight, a conventional affordance this excludes.
+    /// Updates focus/hover to whatever the Magic Remote's pointer is over, returning
+    /// whether that changed anything visible — Magic Remote pointer mode fires
+    /// `MouseMotion` continuously while moving, so callers redraw only when this is
+    /// `true` rather than on every event.
     pub fn handle_mouse_motion(&mut self, x: i32, y: i32, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> bool {
+        let focus_changed = self.hover_focus_at(x, y, screen_w, screen_h, fonts);
+        let close_changed = self.hover_close_at(x, y, screen_w, screen_h, fonts);
+        focus_changed || close_changed
+    }
+
+    /// Moves the positional focus/selection onto whatever interactive element sits
+    /// under the pointer, so the Magic Remote's pointer highlights elements on hover
+    /// exactly where a click would land. Returns whether the selection actually
+    /// moved. Hovering empty space (gaps, row padding, the area between rows) leaves
+    /// the current selection put rather than clearing it, so a resting pointer never
+    /// fights the D-pad.
+    fn hover_focus_at(&mut self, x: i32, y: i32, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> bool {
+        // An open dropdown overlays the row list — hover moves its option cursor and
+        // nothing behind it. Shared by whichever screen owns the dropdown (Settings or
+        // Diagnostics), and uses the same overlay geometry the renderer draws against.
+        if let Some(i) = self.dropdown_option_at(x, y, screen_w, screen_h, fonts) {
+            let dd = self
+                .dropdown
+                .as_mut()
+                .expect("dropdown_option_at yields Some only when one is open");
+            let changed = dd.focused != i;
+            dd.focused = i;
+            return changed;
+        }
+        // A dropdown open but not hovered still swallows hover — the row list behind
+        // it must not take the selection.
+        if self.dropdown.is_some() {
+            return false;
+        }
         match self.screen {
             Screen::Home => {
-                // Home has no close button, but `hover_close` is only ever set by
-                // the modal branches below — without clearing it here, hovering a
-                // modal's close button and then backing out to Home left it stuck
-                // `true` forever (nothing on Home ever set it back to `false`), so
-                // `handle_mouse_click`'s `if self.hover_close { ...; return None }`
-                // silently swallowed *every* Home click afterward, no matter where
-                // it landed. Not folded into the returned "did anything visibly
-                // change" bool — Home never draws a close button, so this has no
-                // visual effect of its own.
-                self.hover_close = false;
+                // The ⋯ button sits inside its row, so it's tested first — same order
+                // as `handle_mouse_click`, so hover previews exactly what a click hits.
+                if let Some(idx) = ui::hit_test_sidebar_menu_button(x, y, self.entries.len()) {
+                    return self.set_home_focus(HomeFocus::SidebarMenu(idx));
+                }
+                if let Some(idx) = ui::hit_test_sidebar_row(x, y, self.sidebar_len(), screen_h) {
+                    return self.set_home_focus(HomeFocus::Sidebar(idx));
+                }
+                let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
+                let columns = ui::grid_columns(available_w);
+                if let Some(idx) = ui::hit_test_grid_card(
+                    x,
+                    y,
+                    columns,
+                    self.grid_len(columns),
+                    ui::SIDEBAR_W as i32,
+                    available_w,
+                    self.grid_scroll,
+                ) {
+                    // Padding after a partial pinned row isn't a real card — nothing to land on.
+                    if self.is_grid_card(idx, columns) {
+                        return self.set_home_focus(HomeFocus::Grid(idx));
+                    }
+                }
                 false
             }
+            // Dropdown case already handled above.
             Screen::Settings => {
-                let (card, _content) = self.settings_layout(screen_w, screen_h);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
+                let Some(row) = self.settings_row_at(x, y, screen_w, screen_h) else {
+                    return false;
+                };
+                let changed = self.settings_focused != row;
+                self.settings_focused = row;
+                changed
             }
-            // Pairing/AddHost/Wake/ForgetHost are plain single-card modals with
-            // nothing but the close button to hover-test (unlike Settings
-            // above, which also tracks per-row hover) — same shape for all
-            // four, just each its own card rect (see their docs on why that's
-            // no longer a single shared size).
+            Screen::HostMenu => {
+                let subtitle = self.host_menu_subtitle();
+                let rows = self.host_menu_actions().len();
+                let card = Self::host_menu_card_rect(screen_w, screen_h, fonts, &subtitle, rows);
+                let content = ui::list_modal_content_rect(card, fonts, &subtitle, rows);
+                let Some(i) = (0..rows).find(|&i| ui::focus_row_rect(content, i).contains_point((x, y))) else {
+                    return false;
+                };
+                let row = ui::focus_row_rect(content, i);
+                let dots = self.host_menu_row_has_dots() && ui::sidebar_menu_button_rect(row).contains_point((x, y));
+                let changed = self.menu_focused != i || self.host_menu_dots != dots;
+                self.menu_focused = i;
+                self.host_menu_dots = dots;
+                changed
+            }
+            // Identical row-list geometry; only which focus field they carry differs.
+            Screen::Diagnostics | Screen::Experimental => {
+                let Some(row) = self.modal_list_row_at(x, y, screen_w, screen_h, fonts) else {
+                    return false;
+                };
+                let focused = match self.screen {
+                    Screen::Diagnostics => &mut self.diagnostics_focused,
+                    _ => &mut self.experimental_focused,
+                };
+                let changed = *focused != row;
+                *focused = row;
+                changed
+            }
             Screen::Pairing => {
                 let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
+                if Self::pairing_request_button_rect(card, fonts).contains_point((x, y)) {
+                    let changed = self.pairing_focus != PairingFocus::RequestAccess;
+                    self.pairing_focus = PairingFocus::RequestAccess;
+                    changed
+                } else {
+                    false
+                }
             }
-            Screen::AddHost => {
-                let card = self.address_card_rect(screen_w, screen_h, fonts);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
-            }
-            Screen::Wake => {
-                let Some(wake) = &self.wake else { return false };
-                let card = Self::wake_card_rect(screen_w, screen_h, wake, fonts);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
-            }
+            // Two-button confirm modals: hovering a button focuses it so the pointer
+            // can pick Forget-vs-Cancel / Send-vs-Cancel, not just confirm whatever
+            // the D-pad last focused.
             Screen::ForgetHost => {
                 let name = self
                     .host_menu_index
@@ -1074,50 +1137,192 @@ impl App {
                     .map(HostEntry::name)
                     .unwrap_or_default();
                 let card = Self::forget_host_card_rect(screen_w, screen_h, name, fonts);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
+                let content = Self::forget_host_content_rect(card, name, fonts);
+                match (0..2).find(|&i| ui::confirm_button_rect(content, i).contains_point((x, y))) {
+                    Some(i) => {
+                        let changed = self.host_menu_focused != i;
+                        self.host_menu_focused = i;
+                        changed
+                    }
+                    None => false,
+                }
             }
-            Screen::HostMenu => {
-                let subtitle = self.host_menu_subtitle();
-                let rows = self.host_menu_actions().len();
-                let card = Self::host_menu_card_rect(screen_w, screen_h, fonts, &subtitle, rows);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
+            Screen::SendLogs => {
+                let card = Self::send_logs_card_rect(screen_w, screen_h, fonts);
+                let content = Self::send_logs_content_rect(card, fonts);
+                match (0..2).find(|&i| ui::confirm_button_rect(content, i).contains_point((x, y))) {
+                    Some(i) => {
+                        let changed = self.send_logs_focused != i;
+                        self.send_logs_focused = i;
+                        changed
+                    }
+                    None => false,
+                }
             }
-            Screen::WakeSettings => {
-                let subtitle = self.wake_settings_subtitle();
-                let card = Self::wake_settings_card_rect(screen_w, screen_h, fonts, &subtitle);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
-            }
-            Screen::EditHost => {
-                let card = self.edit_host_card_rect(screen_w, screen_h, fonts);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
-            }
-            Screen::About => {
-                let card = Self::about_card_rect(screen_w, screen_h);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
-            }
-            Screen::SpeedTest => {
-                let card = self.speed_test_card_rect(screen_w, screen_h, fonts);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
-            }
-            Screen::PinLimit => {
-                let card = Self::pin_limit_card_rect(screen_w, screen_h, fonts);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
+            // No positional focus to move: single-card info/entry modals (AddHost,
+            // EditHost, About, Wake, WakeSettings, PinLimit, SpeedTest) and Settings
+            // with a dropdown open.
+            _ => false,
+        }
+    }
+
+    /// Sets `home_focus`, reporting whether it actually moved — the hover/click
+    /// helpers redraw only on a real change.
+    fn set_home_focus(&mut self, focus: HomeFocus) -> bool {
+        let changed = self.home_focus != focus;
+        self.home_focus = focus;
+        changed
+    }
+
+    /// The `(content viewport, pixel scroll offset)` an open dropdown anchors its
+    /// option overlay to, matching what `draw_list` renders so hit-testing lands
+    /// exactly where options are drawn. `None` for a screen with no dropdown.
+    /// `screen` is a param (not `self.screen`) so `draw_list`'s close-fade can pass
+    /// the screen it captured at `back()` time.
+    pub(crate) fn dropdown_geom(
+        &self,
+        screen: Screen,
+        screen_w: u32,
+        screen_h: u32,
+        fonts: &ui::Fonts,
+    ) -> Option<(Rect, i32)> {
+        match screen {
+            Screen::Settings => {
+                let (_, content) = self.settings_layout(screen_w, screen_h);
+                let stride = ui::settings_row_stride() as i32;
+                let total = ui::settings_row_count(&self.settings);
+                // Anchor to the animated offset so an open dropdown stays attached to
+                // its row while the list is still settling.
+                let px = self
+                    .modal_scroll_px
+                    .clamp(0, Self::max_scroll_px(total, stride, content.height()));
+                Some((content, px))
             }
             Screen::Diagnostics => {
                 let subtitle = self.diagnostics_subtitle();
                 let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
+                // Diagnostics doesn't scroll, so 0.
+                Some((
+                    ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT),
+                    0,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// The Settings display-row index under the pointer, using the same animated
+    /// `modal_scroll_px` the rows render with — a fixed-offset hit-test drifts a row
+    /// off once the list has scrolled. `None` outside the viewport or in a row gap.
+    fn settings_row_at(&self, x: i32, y: i32, screen_w: u32, screen_h: u32) -> Option<usize> {
+        let (_, content) = self.settings_layout(screen_w, screen_h);
+        if !content.contains_point((x, y)) {
+            return None;
+        }
+        let stride = ui::settings_row_stride() as i32;
+        let total = ui::settings_row_count(&self.settings);
+        let scroll_px = self
+            .modal_scroll_px
+            .clamp(0, Self::max_scroll_px(total, stride, content.height()));
+        (0..total).find(|&r| ui::focus_row_rect_at_px(content, r, scroll_px).contains_point((x, y)))
+    }
+
+    /// The dropdown option index under the pointer, if a dropdown is open and the
+    /// pointer is over one of its options. Shares `dropdown_geom` +
+    /// `ui::dropdown_option_rect` with the renderer so hover previews exactly what a
+    /// click confirms.
+    fn dropdown_option_at(&self, x: i32, y: i32, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Option<usize> {
+        let dd = self.dropdown.as_ref()?;
+        let (content, scroll_px) = self.dropdown_geom(self.screen, screen_w, screen_h, fonts)?;
+        let overlay = Self::dropdown_overlay_rect_at_px(content, dd.row, scroll_px);
+        let options_len = match self.screen {
+            Screen::Diagnostics => ui::LOG_LEVEL_OPTIONS.len(),
+            _ => ui::dropdown_options(&self.settings, ui::settings_logical_row(&self.settings, dd.row)).len(),
+        };
+        (0..options_len).find(|&i| ui::dropdown_option_rect(overlay, i).contains_point((x, y)))
+    }
+
+    /// A click while a dropdown is open: an option under the pointer confirms it,
+    /// anything else dismisses (tap-outside-to-close). The hovered option is already
+    /// the cursor courtesy of `handle_mouse_motion`.
+    fn dropdown_click_event(&self, x: i32, y: i32, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> MenuEvent {
+        if self.dropdown_option_at(x, y, screen_w, screen_h, fonts).is_some() {
+            MenuEvent::Confirm
+        } else {
+            MenuEvent::Back
+        }
+    }
+
+    /// The current screen's modal card rect, or `None` for a screen that draws no
+    /// modal card (Home, or Wake before its payload is set). One place to compute the
+    /// per-screen geometry that hover, click, and the close-button hit-test all share,
+    /// so they can never drift apart.
+    fn modal_card_rect(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Option<Rect> {
+        Some(match self.screen {
+            Screen::Home => return None,
+            Screen::Settings => self.settings_layout(screen_w, screen_h).0,
+            Screen::Pairing => Self::pairing_card_rect(screen_w, screen_h, fonts),
+            Screen::AddHost => self.address_card_rect(screen_w, screen_h, fonts),
+            Screen::Wake => Self::wake_card_rect(screen_w, screen_h, self.wake.as_ref()?, fonts),
+            Screen::ForgetHost => {
+                let name = self
+                    .host_menu_index
+                    .and_then(|i| self.entries.get(i))
+                    .map(HostEntry::name)
+                    .unwrap_or_default();
+                Self::forget_host_card_rect(screen_w, screen_h, name, fonts)
+            }
+            Screen::HostMenu => {
+                let subtitle = self.host_menu_subtitle();
+                Self::host_menu_card_rect(screen_w, screen_h, fonts, &subtitle, self.host_menu_actions().len())
+            }
+            Screen::WakeSettings => {
+                let subtitle = self.wake_settings_subtitle();
+                Self::wake_settings_card_rect(screen_w, screen_h, fonts, &subtitle)
+            }
+            Screen::EditHost => self.edit_host_card_rect(screen_w, screen_h, fonts),
+            Screen::About => Self::about_card_rect(screen_w, screen_h),
+            Screen::SpeedTest => self.speed_test_card_rect(screen_w, screen_h, fonts),
+            Screen::PinLimit => Self::pin_limit_card_rect(screen_w, screen_h, fonts),
+            Screen::Diagnostics => {
+                let subtitle = self.diagnostics_subtitle();
+                Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle)
             }
             Screen::Experimental => {
                 let subtitle = self.experimental_subtitle();
-                let card = Self::experimental_card_rect(screen_w, screen_h, fonts, &subtitle);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
+                Self::experimental_card_rect(screen_w, screen_h, fonts, &subtitle)
             }
-            Screen::SendLogs => {
-                let card = Self::send_logs_card_rect(screen_w, screen_h, fonts);
-                self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
-            }
-        }
+            Screen::SendLogs => Self::send_logs_card_rect(screen_w, screen_h, fonts),
+        })
+    }
+
+    /// The list-modal row index under the pointer, for the plain list modals whose
+    /// rows are laid out by `ui::list_modal_content_rect` + `ui::focus_row_rect`
+    /// (HostMenu/Diagnostics/Experimental). `None` on any other screen or when the
+    /// pointer misses every row. Shared so hover and click hit-test identically.
+    fn modal_list_row_at(&self, x: i32, y: i32, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Option<usize> {
+        let card = self.modal_card_rect(screen_w, screen_h, fonts)?;
+        let (subtitle, rows) = match self.screen {
+            Screen::HostMenu => (self.host_menu_subtitle(), self.host_menu_actions().len()),
+            Screen::Diagnostics => (self.diagnostics_subtitle(), ui::DIAGNOSTICS_ROW_COUNT),
+            Screen::Experimental => (self.experimental_subtitle(), ui::EXPERIMENTAL_ROW_COUNT),
+            _ => return None,
+        };
+        let content = ui::list_modal_content_rect(card, fonts, &subtitle, rows);
+        (0..rows).find(|&r| ui::focus_row_rect(content, r).contains_point((x, y)))
+    }
+
+    fn hover_close_at(&mut self, x: i32, y: i32, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> bool {
+        let Some(card) = self.modal_card_rect(screen_w, screen_h, fonts) else {
+            // Home draws no close button, but `hover_close` is only ever set true by a
+            // modal branch — without clearing it on the way back to Home it stayed stuck
+            // `true` forever (nothing on Home reset it), and `handle_mouse_click`'s
+            // `if self.hover_close { return self.back() }` then swallowed every Home
+            // click. Not reported as a visible change: Home draws no close button.
+            self.hover_close = false;
+            return false;
+        };
+        self.set_hover_close(ui::modal_close_rect(card).contains_point((x, y)))
     }
 
     /// Updates `hover_close` and reports whether it actually changed — every modal
@@ -1183,21 +1388,14 @@ impl App {
                 self.handle_home_event(MenuEvent::Confirm, screen_w, screen_h)
             }
             Screen::Settings => {
-                // An open dropdown has no row grid of its own here — Confirm picks
-                // whatever option `dd.focused` (moved by keyboard/remote only, same
-                // as everywhere else) already points at; unaffected by this change.
-                if self.dropdown.is_none() {
-                    let (_, content) = self.settings_layout(screen_w, screen_h);
-                    let visible = self.settings_visible_rows(screen_h);
-                    // `local` is relative to the visible window; `?` bails if the click
-                    // hit empty space within the card — nothing to focus or confirm.
-                    let local = (0..visible).find(|&i| {
-                        let row_y = content.y() + i as i32 * (ui::SETTINGS_ROW_H as i32 + ui::SETTINGS_ROW_GAP);
-                        Rect::new(content.x(), row_y, content.width(), ui::SETTINGS_ROW_H).contains_point((x, y))
-                    })?;
-                    self.settings_focused =
-                        self.scroll.clamped(ui::settings_row_count(&self.settings), visible) + local;
+                if self.dropdown.is_some() {
+                    let ev = self.dropdown_click_event(x, y, screen_w, screen_h, fonts);
+                    self.handle_settings_event(ev, screen_h);
+                    return None;
                 }
+                // `?` bails if the click hit the gap between rows or outside the
+                // viewport — nothing to focus or confirm.
+                self.settings_focused = self.settings_row_at(x, y, screen_w, screen_h)?;
                 self.handle_settings_event(MenuEvent::Confirm, screen_h);
                 None
             }
@@ -1256,28 +1454,21 @@ impl App {
                 None
             }
             Screen::Diagnostics => {
-                let subtitle = self.diagnostics_subtitle();
-                let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
-                let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT);
-                for row in 0..ui::DIAGNOSTICS_ROW_COUNT {
-                    if ui::focus_row_rect(content, row).contains_point((x, y)) {
-                        self.diagnostics_focused = row;
-                        self.handle_diagnostics_event(MenuEvent::Confirm);
-                        break;
-                    }
+                if self.dropdown.is_some() {
+                    let ev = self.dropdown_click_event(x, y, screen_w, screen_h, fonts);
+                    self.handle_diagnostics_event(ev);
+                    return None;
+                }
+                if let Some(row) = self.modal_list_row_at(x, y, screen_w, screen_h, fonts) {
+                    self.diagnostics_focused = row;
+                    self.handle_diagnostics_event(MenuEvent::Confirm);
                 }
                 None
             }
             Screen::Experimental => {
-                let subtitle = self.experimental_subtitle();
-                let card = Self::experimental_card_rect(screen_w, screen_h, fonts, &subtitle);
-                let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::EXPERIMENTAL_ROW_COUNT);
-                for row in 0..ui::EXPERIMENTAL_ROW_COUNT {
-                    if ui::focus_row_rect(content, row).contains_point((x, y)) {
-                        self.experimental_focused = row;
-                        self.handle_experimental_event(MenuEvent::Confirm);
-                        break;
-                    }
+                if let Some(row) = self.modal_list_row_at(x, y, screen_w, screen_h, fonts) {
+                    self.experimental_focused = row;
+                    self.handle_experimental_event(MenuEvent::Confirm);
                 }
                 None
             }
@@ -2515,29 +2706,7 @@ impl App {
             }
             // Dropdown overlay (Settings or Diagnostics).
             if let Some((row, _, dd_alpha)) = self.dropdown_draw_state() {
-                // Diagnostics isn't scrollable, so compute its content rect directly.
-                // `(viewport, pixel scroll offset)`. Settings anchors to the animated offset
-                // like the focus tile above, so an open dropdown stays attached to its row
-                // while the list is still settling; Diagnostics doesn't scroll, so 0.
-                let content_and_scroll = match screen {
-                    Screen::Settings => scroll_geom.map(|(total, _, _, content)| {
-                        let stride = ui::settings_row_stride() as i32;
-                        let px = self
-                            .modal_scroll_px
-                            .clamp(0, Self::max_scroll_px(total, stride, content.height()));
-                        (content, px)
-                    }),
-                    Screen::Diagnostics => {
-                        let subtitle = self.diagnostics_subtitle();
-                        let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
-                        Some((
-                            ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT),
-                            0,
-                        ))
-                    }
-                    _ => None,
-                };
-                if let Some((content, scroll_px)) = content_and_scroll {
+                if let Some((content, scroll_px)) = self.dropdown_geom(screen, screen_w, screen_h, fonts) {
                     let overlay_rect = Self::dropdown_overlay_rect_at_px(content, row, scroll_px);
                     let options_len = match screen {
                         Screen::Diagnostics => ui::LOG_LEVEL_OPTIONS.len(),
@@ -2684,28 +2853,7 @@ impl App {
             // position, so navigating dropdown options needs no modal
             // re-rasterize either. `Settings` or `Diagnostics`.
             if let Some((row, focused, dd_alpha)) = self.dropdown_draw_state() {
-                // `(viewport, pixel scroll offset)`. Settings anchors to the animated offset
-                // like the focus tile above, so an open dropdown stays attached to its row
-                // while the list is still settling; Diagnostics doesn't scroll, so 0.
-                let content_and_scroll = match screen {
-                    Screen::Settings => scroll_geom.map(|(total, _, _, content)| {
-                        let stride = ui::settings_row_stride() as i32;
-                        let px = self
-                            .modal_scroll_px
-                            .clamp(0, Self::max_scroll_px(total, stride, content.height()));
-                        (content, px)
-                    }),
-                    Screen::Diagnostics => {
-                        let subtitle = self.diagnostics_subtitle();
-                        let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
-                        Some((
-                            ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT),
-                            0,
-                        ))
-                    }
-                    _ => None,
-                };
-                if let Some((content, scroll_px)) = content_and_scroll {
+                if let Some((content, scroll_px)) = self.dropdown_geom(screen, screen_w, screen_h, fonts) {
                     let overlay_rect = Self::dropdown_overlay_rect_at_px(content, row, scroll_px);
                     let option_rect = ui::dropdown_option_rect(overlay_rect, focused);
                     cmds.push(DrawCmd::Tex {

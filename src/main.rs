@@ -133,6 +133,7 @@ mod real {
                     settings.color_range_override,
                     settings.video_pacing,
                     settings.gamepad_type,
+                    settings.cursor_capture,
                 )
             })
             .context("spawn connect thread")
@@ -437,9 +438,51 @@ mod real {
         /// Feeds one SDL event to the open dialog. Fresh presses only, so an
         /// auto-repeating held key can't run an action twice. `None` when the event
         /// isn't the dialog's; `Confirmed` doesn't dismiss — the caller decides.
-        fn handle_event(&mut self, event: &sdl2::event::Event) -> Option<ConfirmAction> {
+        fn handle_event(
+            &mut self,
+            event: &sdl2::event::Event,
+            w: u32,
+            h: u32,
+            fonts: &crate::ui::Fonts,
+        ) -> Option<ConfirmAction> {
             use sdl2::event::Event;
             let focus = self.focus?;
+            // Magic Remote pointer: hovering a button focuses it, a click acts on it —
+            // the same absolute button rects the dialog is drawn with, so it lines up
+            // with what's on screen. `content` is a plain Rect (captured by copy), so
+            // the closure holds no borrow of `self` that `set_focus` would collide with.
+            let (_, content) = crate::ui::confirm_dialog_layout(w, h, fonts, self.subtitle);
+            let button_at =
+                |x: i32, y: i32| (0..2).find(|&i| crate::ui::confirm_button_rect(content, i).contains_point((x, y)));
+            match *event {
+                Event::MouseMotion { x, y, .. } => {
+                    return match button_at(x, y) {
+                        Some(i) if i != focus => {
+                            self.set_focus(i);
+                            Some(ConfirmAction::Navigated)
+                        }
+                        _ => None,
+                    };
+                }
+                // Act on the button under the click; a click off both buttons is ignored
+                // (the dialog stays open) rather than dismissing on a stray tap.
+                Event::MouseButtonDown {
+                    mouse_btn: sdl2::mouse::MouseButton::Left,
+                    x,
+                    y,
+                    ..
+                } => {
+                    return match button_at(x, y) {
+                        Some(0) => Some(ConfirmAction::Confirmed),
+                        Some(_) => {
+                            self.dismiss();
+                            Some(ConfirmAction::Dismissed)
+                        }
+                        None => None,
+                    };
+                }
+                _ => {}
+            }
             let nav = match event {
                 Event::KeyDown {
                     keycode: Some(k),
@@ -606,9 +649,65 @@ mod real {
         event: &sdl2::event::Event,
         input: &mut UiInput,
         display_mode: sdl2::video::DisplayMode,
+        fonts: &crate::ui::Fonts,
         dirty: &mut bool,
     ) -> Option<EventAction> {
         use sdl2::event::Event;
+        let (w, h) = (display_mode.w as u32, display_mode.h as u32);
+        // The Magic Remote's pointer delivers OK as a left mouse button, so give it
+        // the same hold-to-pin gesture the D-pad's Confirm has: a press on a hovered
+        // pinnable Home card starts the hold and is swallowed (the pin fires on the
+        // hold-elapsed tick, same as `PIN_HOLD` above), and the tap/launch comes only
+        // from the release. A press on anything else falls through to the normal
+        // click path.
+        if let Event::MouseButtonDown {
+            mouse_btn: sdl2::mouse::MouseButton::Left,
+            x,
+            y,
+            ..
+        } = *event
+        {
+            if !matches!(app.screen, Screen::Home) {
+                return None;
+            }
+            // Land hover focus on the press point first — a button press can jostle the
+            // remote off the last motion position.
+            *dirty |= app.handle_mouse_motion(x, y, w, h, fonts);
+            if input.pin_held.is_some() {
+                return Some(EventAction::Next);
+            }
+            let columns = crate::ui::grid_columns(w.saturating_sub(crate::ui::SIDEBAR_W));
+            if app.focused_pin_id(columns).is_some() {
+                input.pin_held = Some(PinHold {
+                    since: Instant::now(),
+                    focus: app.home_focus,
+                    fired: false,
+                });
+                return Some(EventAction::Next);
+            }
+            return None;
+        }
+        // Release of a pointer OK: resolve whatever the matching press started. A fired
+        // hold already pinned (swallow); a quick tap confirms whatever's under the
+        // pointer now, exactly as an immediate click would have.
+        if let Event::MouseButtonUp {
+            mouse_btn: sdl2::mouse::MouseButton::Left,
+            x,
+            y,
+            ..
+        } = *event
+        {
+            let hold = input.pin_held.take()?;
+            *dirty = true;
+            if hold.fired {
+                return Some(EventAction::Next);
+            }
+            return Some(if app.handle_mouse_click(x, y, w, h, fonts).is_some() {
+                EventAction::Launch
+            } else {
+                EventAction::Next
+            });
+        }
         // No `repeat: false` filter, deliberately — OS auto-repeats while OK is held
         // have to be caught here too, not dispatched as fresh presses.
         let confirm_down = matches!(
@@ -760,7 +859,7 @@ mod real {
             }
             return EventAction::Next;
         }
-        if let Some(action) = pin_hold_gate(app, &event, input, display_mode, dirty) {
+        if let Some(action) = pin_hold_gate(app, &event, input, display_mode, fonts, dirty) {
             return action;
         }
         // Any other event might change what's on screen (focus/hover, a typed
@@ -1088,7 +1187,7 @@ mod real {
                 // The quit dialog owns input while open — navigate it only, don't let the
                 // event reach the menu underneath (same split as the streaming loop).
                 if quit_dialog.is_open() {
-                    match quit_dialog.handle_event(&event) {
+                    match quit_dialog.handle_event(&event, display_mode.w as u32, display_mode.h as u32, fonts) {
                         Some(ConfirmAction::Confirmed) => {
                             tracing::info!("quit confirmed from menu");
                             return Ok(None);
@@ -1367,10 +1466,11 @@ mod real {
             // `/usr/share/im/...` — confirmed via `SDL_waylandwebos_cursor.c`) tracking
             // the physical remote directly; the host draws a second, independent one
             // wherever our forwarded `MouseMoveAbs` puts it. Two visible cursors reads
-            // as "the pointer doesn't match the remote" — hide the local one so only
-            // the host's shows. Restored when back in the menu (`sdl.mouse()` is the
-            // same standard SDL2 API on any platform, not webOS-specific).
-            sdl.mouse().show_cursor(false);
+            // as "the pointer doesn't match the remote" — hidden here unless "Cursor
+            // capture" is off (see `store::Settings::cursor_capture`). Restored when back
+            // in the menu (`sdl.mouse()` is the same standard SDL2 API on any platform,
+            // not webOS-specific).
+            sdl.mouse().show_cursor(!settings.cursor_capture);
 
             // Already running (started back in `run_ui_flow`, overlapping the launch
             // zoom/fade) — joining just waits out whatever's left of the handshake,
@@ -1515,16 +1615,19 @@ mod real {
                             chord.clear();
                         }
                         // Dialog open: navigate it only, don't forward input to the host.
-                        _ if disconnect.is_open() => match disconnect.handle_event(&event) {
-                            Some(ConfirmAction::Confirmed) => {
-                                tracing::info!("disconnecting to menu");
-                                connected.client.disconnect_quit();
-                                disconnect.dismiss();
-                                pending_outcome = Some(StreamOutcome::ReturnToMenu);
+                        _ if disconnect.is_open() => {
+                            match disconnect.handle_event(&event, display_mode.w as u32, display_mode.h as u32, &fonts)
+                            {
+                                Some(ConfirmAction::Confirmed) => {
+                                    tracing::info!("disconnecting to menu");
+                                    connected.client.disconnect_quit();
+                                    disconnect.dismiss();
+                                    pending_outcome = Some(StreamOutcome::ReturnToMenu);
+                                }
+                                Some(ConfirmAction::Dismissed) => overlay_last = None,
+                                Some(ConfirmAction::Navigated) | None => {}
                             }
-                            Some(ConfirmAction::Dismissed) => overlay_last = None,
-                            Some(ConfirmAction::Navigated) | None => {}
-                        },
+                        }
                         // Scancode keys are real game input (Backspace/Escape/etc.
                         // included) — forward only, never open the dialog.
                         Event::KeyDown { scancode: Some(sc), .. } => {

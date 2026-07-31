@@ -89,17 +89,20 @@ pub const ROW_AUDIO: usize = 7;
 /// real settings: it's the only input-side one, and picking `DualSense` is what turns on
 /// adaptive triggers (`crate::dualsense`).
 pub const ROW_GAMEPAD: usize = 8;
+/// Directly below Controller — the other input-side setting. See
+/// `store::Settings::cursor_capture`.
+pub const ROW_CURSOR_CAPTURE: usize = 9;
 /// Not a setting — a link to `Screen::Experimental` (unstable toggles, currently the
 /// frame pacer). Grouped off the main list so an untested option isn't one keystroke away.
-pub const ROW_EXPERIMENTAL: usize = 9;
+pub const ROW_EXPERIMENTAL: usize = 10;
 /// Not a setting — a link to `Screen::Diagnostics` (log level + stats overlay).
 /// A debug aid, not something a normal user needs to find quickly.
-pub const ROW_DIAGNOSTICS: usize = 10;
+pub const ROW_DIAGNOSTICS: usize = 11;
 /// Not a setting — a link to `Screen::About`. Sits last: every other punktfunk
 /// client puts the version + licences at the very bottom of Settings, and a
 /// `RowKind::Action` row costs nothing extra to render.
-pub const ROW_ABOUT: usize = 11;
-pub const SETTINGS_ROW_COUNT: usize = 12;
+pub const ROW_ABOUT: usize = 12;
+pub const SETTINGS_ROW_COUNT: usize = 13;
 
 /// Experimental modal row indices (see `experimental_rows`).
 pub const EXP_ROW_FRAME_PACER: usize = 0;
@@ -299,6 +302,19 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             label: "Controller".into(),
             value: gamepad_label(settings.gamepad_type).into(),
             kind: RowKind::Dropdown,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+        },
+        FocusRow {
+            icon: ICON_MOUSE,
+            label: "Cursor capture".into(),
+            value: if settings.cursor_capture {
+                "On".into()
+            } else {
+                "Off".into()
+            },
+            kind: RowKind::Toggle,
             fraction: 0.0,
             danger: false,
             menu: None,
@@ -621,6 +637,10 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
         }
         ROW_HDR => {
             settings.hdr_enabled = !settings.hdr_enabled;
+            true
+        }
+        ROW_CURSOR_CAPTURE => {
+            settings.cursor_capture = !settings.cursor_capture;
             true
         }
         ROW_VIDEO_BACKEND => {

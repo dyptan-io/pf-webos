@@ -116,6 +116,7 @@ impl App {
         let row = ui::settings_logical_row(&self.settings, display_row);
         let toggled_from = match row {
             ui::ROW_HDR => Some(self.settings.hdr_enabled),
+            ui::ROW_CURSOR_CAPTURE => Some(self.settings.cursor_capture),
             _ => None,
         };
         if ui::adjust_setting(&mut self.settings, row, forward) {
