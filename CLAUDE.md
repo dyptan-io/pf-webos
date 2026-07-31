@@ -26,65 +26,28 @@ Set `TV_HOST` in `.env` (copy `.env.example`). `task -s` skips echo. No test sui
 
 ## Architecture
 
-Undergoing a layered-module refactor (single crate, no workspace split) — see
-`docs/REFACTOR_PLAN.md` for the full 6-step plan and
-`docs/HANDOFF_layered_refactor.md` for what's actually landed vs. deferred.
-Steps 1-5 are done (on `refactor/layered-architecture`, not yet merged); step 6
-(relocate remaining webOS platform modules, thin `main.rs`) is in progress.
-The layers, innermost first:
+Layered by module: `core/` (domain logic — `Screen`/`MenuEvent`/`Settings`,
+plus `core::state::<screen>` per-screen event handling and a not-yet-fully-wired
+`core::effect::Effect` for side effects) → `ui/` (presentation — `ui::render`'s
+`Rect`/`Color`/`DrawList` instead of raw `sdl2` types, `ui::view::<screen>` for
+per-screen geometry/draw calls, plus shared drawing primitives) → `platform/webos/`
+(the SDL2/hardware boundary — compositor, input mapping, `TextRaster`/SDL2_ttf,
+C build shims) → `services/` (portable I/O: `store`, `discovery`, `library`,
+`art`, `wol`). `app/mod.rs`'s `App` struct still fuses screen state with the
+GPU tile cache (`sidebar_layer`, `card_tiles`, `modal_tile`, etc. — rasterized-once
+`Painter`s that `prepare_tiles`/`draw_list` rebuild and compose per frame) rather
+than living purely in `core::state`, since those fields are `tiny_skia`-typed.
+Remaining webOS-only modules (`ndl.rs`, `starfish.rs`, `luna.rs`, `device.rs`,
+`audio.rs`, `gamepad.rs`, `keyboard.rs`, `mouse.rs`, `dualsense.rs`) still sit at
+crate root, not yet under `platform/`. Add a screen: build on `ui::ListModal`
+(see `core/state/hostmenu.rs` / `ui/view/hostmenu.rs`); `Screen` enum has eight
+dispatch sites across `app/mod.rs` and `main.rs` (compiler finds all at once,
+mechanical but safe). Rendering: `tiny_skia` software framebuffer, redraw-on-change
+(`dirty` flag, no time-based animation).
 
-- **`core/`** — domain logic. No `sdl2`, no `tiny_skia`, no I/O.
-  - `core::screen`/`event`/`model` — `Screen`, `MenuEvent`, `Settings`,
-    `KnownHost`, `GameEntry`, etc.
-  - `core::state::<screen>` — per-screen event handling/state transitions
-    (`handle_*_event`, `open_*`), one module per screen (`home`, `settings`,
-    `pairing`, `hostmenu`, `addhost`, `edithost`, `wake`, `wakesettings`,
-    `forget`, `about`, `speedtest`, `diagnostics`, `experimental`, `pinlimit`,
-    `sendlogs`, `reach`).
-  - `core::effect::Effect` — side-effecting operations logic asks the runtime
-    to perform instead of calling `services`/`session` inline; only partially
-    wired so far (see the handoff doc for the deferred call sites).
-- **`ui/`** — presentation. `tiny_skia` only, no `sdl2`.
-  - `ui::render` — `Rect`/`Color`/`TileId`/`DrawCmd`/`DrawList`, the ui-native
-    replacements for `sdl2::rect`/`sdl2::pixels`.
-  - `ui::text`/`text_raster` — text drawing over a `TextRaster` trait (no
-    `sdl2::ttf` in `ui/`; the SDL2_ttf implementation lives in `platform`).
-  - `ui::view::<screen>` — per-screen geometry (`*_rect`) and `render_*` draw
-    calls, paired 1:1 with `core::state::<screen>`.
-  - `ui::painter`/`theme`/`tiles`/`rows`/`sidebar`/`cards`/`grid`/`modal`/
-    `scroll`/`fade`/`notification`/`listmodal`/`animation` — drawing
-    primitives shared across screens.
-- **`platform/`** — the hardware/OS boundary. `platform::webos` (cfg
-  `target_os = "linux"`) holds `compositor.rs` (uploads `ui::DrawList` to SDL2
-  textures + presents), `input.rs` (SDL2 events → `MenuEvent`), `text_sdl.rs`
-  (`TextRaster` impl backed by SDL2_ttf), and the C build shims
-  (`glibc_compat_shim.c`, `starfish_c_shim.cpp`). The rest of the webOS-only
-  surface (`ndl.rs`, `starfish.rs`, `luna.rs`, `device.rs`, `audio.rs`,
-  `gamepad.rs`, `keyboard.rs`, `mouse.rs`, `dualsense.rs`) still lives at
-  crate root, pending the rest of step 6.
-- **`services/`** — portable I/O: `store.rs` (identity/hosts/settings JSON
-  persistence), `discovery.rs` (mDNS), `library.rs` (mTLS game-library REST),
-  `art.rs` (cover-art fetch/decode), `wol.rs` (Wake-on-LAN).
-- **`app/`** — `App` (in `app/mod.rs`), the fused state-plus-view-tile-cache:
-  owns the `Screen` state machine's actual struct, cross-screen plumbing
-  (`draw_list`, `prepare_tiles`, `tick_animations`, mouse hit-testing,
-  `back()`), and the GPU tile cache (`sidebar_layer`, `card_tiles`,
-  `modal_tile`, etc. — rasterized-once `Painter`s `prepare_tiles` rebuilds and
-  `draw_list` composes per frame). `App` did **not** move into `core::state`
-  per the refactor plan's target layout, because it holds these `tiny_skia`
-  fields directly — see the handoff doc's "Deviation" section. Add a screen:
-  build on `ui::ListModal` (see `core/state/hostmenu.rs` /
-  `ui/view/hostmenu.rs`); `Screen` enum has eight dispatch sites across
-  `app/mod.rs` and `main.rs` (compiler finds all at once, mechanical but
-  safe). Rendering: `tiny_skia` software framebuffer, redraw-on-change
-  (`dirty` flag, no time-based animation).
-
-**Platform gating**: nearly whole crate (`app`, `art`/`services`, `audio`,
-`discovery`/`services`, `gamepad`, `keyboard`, `library`/`services`, `mouse`,
-`ndl`, `session`, `store`/`services`, `ui`, `platform`, `wol`/`services`)
-`#[cfg(target_os = "linux")]` in `main.rs`. webOS target reports Linux same as
-dev box; macOS/Windows get stub `anyhow::bail!` in `main()` — builds stay
-green without SDL2.
+**Platform gating**: nearly whole crate `#[cfg(target_os = "linux")]` in
+`main.rs`. webOS target reports Linux same as dev box; macOS/Windows get stub
+`anyhow::bail!` in `main()` — builds stay green without SDL2.
 
 **Two decode paths**: video via NDL DirectMedia (`ndl.rs`, opaque decode+present), audio client-side Opus (`audio.rs`). Loss recovery: `session.rs`'s `video_pump` reimplements freeze-until-reanchor directly — upstream `ReanchorGate` assumes decode/present split NDL lacks.
 
