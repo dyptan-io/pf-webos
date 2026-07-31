@@ -1,7 +1,6 @@
 //! Diagnostics screen logic. Rendering lives in `app::view::diagnostics`.
 use crate::app::App;
 use crate::app::DropdownState;
-use crate::core::effect::Effect;
 use crate::core::screen::Screen;
 use crate::services::store;
 use crate::ui::{self, MenuEvent};
@@ -22,9 +21,7 @@ impl App {
     /// by `self.screen`, see `dropdown_overlay_tile`'s docs); the rest are plain
     /// Left/Right/Confirm toggles. Back saves and returns to Settings.
     ///
-    /// Returns effects the runtime should execute (currently just the log-overlay
-    /// toggle — see `core::effect` for scope/rationale).
-    pub(crate) fn handle_diagnostics_event(&mut self, ev: MenuEvent) -> Vec<Effect> {
+    pub(crate) fn handle_diagnostics_event(&mut self, ev: MenuEvent) {
         if let Some(dd) = self.dropdown.as_mut() {
             let len = ui::LOG_LEVEL_OPTIONS.len();
             match ev {
@@ -42,14 +39,13 @@ impl App {
                 }
                 MenuEvent::Left | MenuEvent::Right | MenuEvent::Secondary => {}
             }
-            return Vec::new();
+            return;
         }
         let len = self.diagnostics_rows().len();
         if ui::list_nav(&mut self.diagnostics_focused, len, ev) {
             self.modal_focus_anim = Some(Instant::now());
-            return Vec::new();
+            return;
         }
-        let mut effects = Vec::new();
         match (self.diagnostics_focused, ev) {
             (ui::DIAG_ROW_LOG_LEVEL, MenuEvent::Left | MenuEvent::Right) => self.cycle_log_level(),
             (ui::DIAG_ROW_LOG_LEVEL, MenuEvent::Confirm) => {
@@ -67,7 +63,7 @@ impl App {
             (ui::DIAG_ROW_SHOW_LOGS, MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
                 let from = self.settings.show_logs;
                 self.settings.show_logs = !from;
-                effects.push(Effect::SetLogOverlay(!from));
+                crate::real::set_log_overlay_enabled(!from);
                 self.switch_anim = Some((Instant::now(), from));
             }
             (ui::DIAG_ROW_SEND_LOGS, MenuEvent::Confirm) => {
@@ -83,7 +79,6 @@ impl App {
             }
             _ => {}
         }
-        effects
     }
 
     fn set_log_level(&mut self, level: store::LogLevelOverride) {

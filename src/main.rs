@@ -775,11 +775,7 @@ mod real {
             Screen::EditHost => app.handle_edit_host_event(menu_ev),
             Screen::About => app.handle_about_event(menu_ev, w, h, fonts),
             Screen::PinLimit => app.handle_pin_limit_event(menu_ev),
-            Screen::Diagnostics => {
-                for effect in app.handle_diagnostics_event(menu_ev) {
-                    crate::core::effect::execute(effect);
-                }
-            }
+            Screen::Diagnostics => app.handle_diagnostics_event(menu_ev),
             Screen::Experimental => app.handle_experimental_event(menu_ev),
             Screen::SendLogs => app.handle_send_logs_event(menu_ev),
         }
