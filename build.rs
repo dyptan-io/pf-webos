@@ -20,7 +20,7 @@ fn main() {
     let obj = format!("{out_dir}/glibc_compat_shim.o");
     let status = std::process::Command::new(&cc)
         // -fPIC: the final binary links -pie (position-independent executable).
-        .args(["-fPIC", "-c", "src/glibc_compat_shim.c", "-o"])
+        .args(["-fPIC", "-c", "src/platform/webos/glibc_compat_shim.c", "-o"])
         .arg(&obj)
         .status()
         .unwrap_or_else(|e| panic!("run {cc} to compile glibc_compat_shim.c: {e}"));
@@ -28,7 +28,7 @@ fn main() {
 
     // Object must come AFTER libstd in link order (so linker pulls glibc shim symbols).
     println!("cargo:rustc-link-arg={obj}");
-    println!("cargo:rerun-if-changed=src/glibc_compat_shim.c");
+    println!("cargo:rerun-if-changed=src/platform/webos/glibc_compat_shim.c");
 
     // Build C wrapper for libplayerAPIs.so (TV exposes C++ ABI only).
     let sysroot = format!(
@@ -36,7 +36,7 @@ fn main() {
          /arm-webos-linux-gnueabi/sysroot"
     );
     let include_dir = format!("{sysroot}/usr/include/starfish-media-pipeline");
-    let shim_src = format!("{manifest_dir}/src/starfish_c_shim.cpp");
+    let shim_src = format!("{manifest_dir}/src/platform/webos/starfish_c_shim.cpp");
     let release_dir = std::path::PathBuf::from(&out_dir)
         .ancestors()
         .nth(3)
@@ -54,7 +54,7 @@ fn main() {
         .status()
         .unwrap_or_else(|e| panic!("run {cxx} to compile starfish_c_shim.cpp: {e}"));
     assert!(status.success(), "{cxx} failed compiling starfish_c_shim.cpp");
-    println!("cargo:rerun-if-changed=src/starfish_c_shim.cpp");
+    println!("cargo:rerun-if-changed=src/platform/webos/starfish_c_shim.cpp");
 
     // On-device libSDL2 is too old; bundle newer version in ipk/lib/ and use $ORIGIN-relative rpath.
     println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
