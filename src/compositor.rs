@@ -167,10 +167,11 @@ impl Compositor {
                 if a == 0 || a == 255 {
                     self.staging.extend_from_slice(px);
                 } else {
-                    // premultiplied -> straight: c * 255 / a
-                    self.staging.push(((u16::from(px[0]) * 255) / a).min(255) as u8);
-                    self.staging.push(((u16::from(px[1]) * 255) / a).min(255) as u8);
-                    self.staging.push(((u16::from(px[2]) * 255) / a).min(255) as u8);
+                    // premultiplied -> straight: c * 255 / a, rounded (not floored) so the
+                    // round-trip doesn't bias colours down — see `fill_vertical_fade`.
+                    self.staging.push((((u16::from(px[0]) * 255) + a / 2) / a).min(255) as u8);
+                    self.staging.push((((u16::from(px[1]) * 255) + a / 2) / a).min(255) as u8);
+                    self.staging.push((((u16::from(px[2]) * 255) + a / 2) / a).min(255) as u8);
                     self.staging.push(px[3]);
                 }
             }

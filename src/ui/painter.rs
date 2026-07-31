@@ -147,7 +147,10 @@ impl Painter {
             // Premultiplied, because that is what a tile's buffer holds — `Compositor::upload`
             // un-premultiplies on the way to the GPU (docs/NOTES.md). Writing straight alpha
             // here would show up as a fade that washes toward white at its dense end.
-            let premul = |c: u8| ((u16::from(c) * u16::from(alpha)) / 255) as u8;
+            // Rounded, not truncated: flooring biases every channel down by a
+            // fraction of a level, and over the card the fade must reconstruct
+            // SIDEBAR_BG exactly or it bands as a dark rectangle on OLED near-black.
+            let premul = |c: u8| (((u16::from(c) * u16::from(alpha)) + 127) / 255) as u8;
             let px = [premul(color.r), premul(color.g), premul(color.b), alpha];
             for pixel in row.chunks_exact_mut(4) {
                 pixel.copy_from_slice(&px);
