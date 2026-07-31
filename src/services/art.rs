@@ -6,7 +6,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 use tiny_skia::{FilterQuality, IntSize, Pixmap, PixmapPaint, Transform};
 
-use crate::library::GameEntry;
+use crate::services::library::GameEntry;
 use crate::ui::premultiply_rgba;
 
 /// One decoded cover, ready to composite straight into the UI's frame `Painter`.
@@ -256,7 +256,7 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
             Ok(b) if !b.is_empty() => b,
             _ => {
                 if agent.is_none() {
-                    match crate::library::agent(identity, fingerprint) {
+                    match crate::services::library::agent(identity, fingerprint) {
                         Ok(a) => agent = Some(a),
                         Err(e) => {
                             tracing::warn!("art: {} building mTLS agent failed: {e}", req.game_id);
@@ -267,7 +267,7 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
                 let Some(a) = agent.as_ref() else { continue };
                 let mut fetched = None;
                 for path in &req.paths {
-                    match crate::library::fetch_art(a, host, mgmt_port, path) {
+                    match crate::services::library::fetch_art(a, host, mgmt_port, path) {
                         Ok(b) => {
                             fetched = Some(b);
                             break;

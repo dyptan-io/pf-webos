@@ -62,7 +62,7 @@ impl App {
     /// Spawn the background upload of the on-disk log file. Sets an immediate
     /// "sending…" status; the outcome replaces it via `drain_send_logs`.
     fn start_log_upload(&mut self) {
-        let Some(path) = crate::logger::latest_log_file(&crate::store::app_dir()) else {
+        let Some(path) = crate::logger::latest_log_file(&crate::services::store::app_dir()) else {
             self.home_status = Some("No logs to send yet.".into());
             return;
         };

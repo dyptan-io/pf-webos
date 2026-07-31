@@ -1,5 +1,5 @@
 use super::*;
-use crate::store::{CodecPref, ColorRangeOverride, GamepadType, LogLevelOverride, Settings, VideoBackend};
+use crate::services::store::{CodecPref, ColorRangeOverride, GamepadType, LogLevelOverride, Settings, VideoBackend};
 
 /// User-requested presets: 1080p, 1440p, 4K.
 pub const RESOLUTIONS: [(u32, u32, &str); 3] = [
@@ -449,7 +449,7 @@ pub fn codec_options(settings: &Settings) -> Vec<CodecPref> {
     // Four conditions, and AV1 has never satisfied the last one on real hardware — see
     // `store::dev_override_enable_av1`. The other three stay because each rules out a
     // distinct way of handing a decoder something it can't present.
-    if crate::store::dev_override_enable_av1()
+    if crate::services::store::dev_override_enable_av1()
         && settings.video_backend == VideoBackend::Starfish
         && crate::device::supports_av1()
         && !crate::starfish::proven_unavailable()

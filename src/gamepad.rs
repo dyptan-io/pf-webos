@@ -44,7 +44,7 @@ fn button_bit(button: Button) -> u32 {
 /// unrecognized, stays `None`: the host's default is already right for the former, and for
 /// the latter naming a specific backend the host may not be able to build is worse than
 /// letting it choose.
-pub fn detect_type(subsystem: &sdl2::GameControllerSubsystem) -> Option<crate::store::GamepadType> {
+pub fn detect_type(subsystem: &sdl2::GameControllerSubsystem) -> Option<crate::services::store::GamepadType> {
     let count = subsystem.num_joysticks().ok()?;
     (0..count)
         .filter(|&i| subsystem.is_game_controller(i))
@@ -55,8 +55,8 @@ pub fn detect_type(subsystem: &sdl2::GameControllerSubsystem) -> Option<crate::s
 /// Maps an SDL controller name to the kind to present. Names come from SDL's controller
 /// database (`SDL_GameControllerNameForIndex`), so they are stable strings like
 /// "`DualSense` Wireless Controller" rather than raw USB product strings.
-fn type_for_name(name: &str) -> Option<crate::store::GamepadType> {
-    use crate::store::GamepadType;
+fn type_for_name(name: &str) -> Option<crate::services::store::GamepadType> {
+    use crate::services::store::GamepadType;
     let name = name.to_ascii_lowercase();
     // Edge before plain: the Edge's SDL name contains "dualsense" too, so testing the
     // broader pattern first would silently downgrade every Edge to a plain DualSense.
@@ -124,7 +124,7 @@ pub fn axis_event(axis: Axis, value: i16, pad: u8) -> InputEvent {
 #[cfg(test)]
 mod tests {
     use super::type_for_name;
-    use crate::store::GamepadType;
+    use crate::services::store::GamepadType;
 
     /// The Edge's SDL name contains "dualsense", so pattern order is load-bearing — a
     /// regression here silently costs the Edge its two back buttons and Fn buttons.

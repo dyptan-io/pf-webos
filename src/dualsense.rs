@@ -131,7 +131,7 @@ pub fn find_address() -> Option<String> {
 ///
 /// The thread exists because a send is a fork/exec of `luna-send-pub` (see [`crate::luna`]),
 /// which must never land on the render/input loop. Queue depth is one with latest-wins
-/// replacement — the same discipline as [`crate::store::SettingsWriter`] — because the state
+/// replacement — the same discipline as [`crate::services::store::SettingsWriter`] — because the state
 /// is absolute: a superseded update carries no information the newer one lacks.
 pub struct Feedback {
     state: State,

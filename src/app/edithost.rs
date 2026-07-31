@@ -3,7 +3,7 @@
 use super::*;
 use sdl2::rect::Rect;
 
-use crate::store;
+use crate::services::store;
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};
 
 impl App {

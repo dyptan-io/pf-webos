@@ -22,7 +22,7 @@ use punktfunk_core::quic;
 use crate::ndl::{NdlCodec, NdlVideo};
 use crate::pacing::{HostPtsAnchor, PtsPacer};
 use crate::starfish::StarfishVideo;
-use crate::store::{CodecPref, ColorRangeOverride, VideoBackend};
+use crate::services::store::{CodecPref, ColorRangeOverride, VideoBackend};
 
 impl ColorRangeOverride {
     /// Force the VUI `full_range` flag per the user override before it's handed to
@@ -208,7 +208,7 @@ impl Connected {
 /// Whether NDL should decode audio (stereo only). NDL struct has no multistream mapping field,
 /// so 5.1/7.1 layouts would produce noise; anything >stereo stays on software decoder.
 fn ndl_audio_config(resolved_channels: u8) -> Option<crate::ndl::NdlAudioConfig> {
-    if !crate::store::dev_override_enable_ndl_audio_offload() {
+    if !crate::services::store::dev_override_enable_ndl_audio_offload() {
         return None;
     }
     tracing::warn!("NDL audio offload opted in via ndl-audio-offload.conf — known to freeze video on webOS 10.3");
@@ -283,7 +283,7 @@ pub fn connect(
     codec_pref: CodecPref,
     color_range_override: ColorRangeOverride,
     video_pacing: bool,
-    gamepad_type: crate::store::GamepadType,
+    gamepad_type: crate::services::store::GamepadType,
     cursor_capture: bool,
 ) -> Result<Connected> {
     // HDR only ever applies to HEVC. An explicit H.264 pick disables it end to end
@@ -311,7 +311,7 @@ pub fn connect(
     // Opt-in-only advertisement also means the host's own precedence ladder can never
     // auto-pick a codec path this client has not verified on its own panel.
     let starfish_selected = matches!(video_backend, VideoBackend::Starfish);
-    let av1_usable = crate::store::dev_override_enable_av1()
+    let av1_usable = crate::services::store::dev_override_enable_av1()
         && starfish_selected
         && crate::device::supports_av1()
         && !crate::starfish::proven_unavailable();
@@ -319,7 +319,7 @@ pub fn connect(
         tracing::warn!(
             "AV1 preference dropped: opted_in={} starfish_selected={starfish_selected} \
              decoder_declares_av1={} starfish_proven_unavailable={}",
-            crate::store::dev_override_enable_av1(),
+            crate::services::store::dev_override_enable_av1(),
             crate::device::supports_av1(),
             crate::starfish::proven_unavailable(),
         );
@@ -466,7 +466,7 @@ pub fn connect(
     // default — the units aren't documented and a guessed pacing change to this decoder
     // is exactly what `docs/NOTES.md` warns against shipping unverified.
     if matches!(video_backend, VideoBackend::Ndl) {
-        if let Some(threshold) = crate::store::dev_override_ndl_drop_threshold() {
+        if let Some(threshold) = crate::services::store::dev_override_ndl_drop_threshold() {
             match crate::ndl::NdlVideo::set_frame_drop_threshold(threshold) {
                 Ok(()) => tracing::info!("NDL frame-drop threshold override: {threshold}"),
                 Err(e) => tracing::warn!("NDL frame-drop threshold override failed: {e:#}"),

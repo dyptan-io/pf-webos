@@ -4,7 +4,7 @@
 //!
 //! Split out of the former single-file `app.rs`; see `super`'s module docs.
 use super::*;
-use crate::store::KnownHost;
+use crate::services::store::KnownHost;
 use crate::ui::{self, MenuEvent, Painter};
 use anyhow::Result;
 use sdl2::rect::Rect;
@@ -52,7 +52,7 @@ impl App {
     pub(crate) fn send_wake(wake: &mut WakeState) {
         // WHY: only mark sent=true if packet actually went out; wake_and_log fails on
         // unparseable MAC or no interface. Avoid showing "Waiting…" for no packet.
-        let sent = crate::wol::wake_and_log(&wake.mac, wake.host.parse().ok(), &wake.name);
+        let sent = crate::services::wol::wake_and_log(&wake.mac, wake.host.parse().ok(), &wake.name);
         let now = Instant::now();
         if sent {
             wake.sent = true;
@@ -134,13 +134,13 @@ impl App {
         identity: &(String, String),
         host: &str,
         port: u16,
-    ) -> std::sync::mpsc::Receiver<crate::library::GamesLoaded> {
+    ) -> std::sync::mpsc::Receiver<crate::services::library::GamesLoaded> {
         let known = known_hosts.iter().find(|h| h.host == host && h.port == port);
         let mgmt_port = known
             .and_then(|h| h.mgmt_port)
-            .unwrap_or(crate::library::DEFAULT_MGMT_PORT);
+            .unwrap_or(crate::services::library::DEFAULT_MGMT_PORT);
         let fingerprint = known.and_then(|h| h.fingerprint);
-        crate::library::load_games_async(host.to_string(), port, mgmt_port, identity.clone(), fingerprint)
+        crate::services::library::load_games_async(host.to_string(), port, mgmt_port, identity.clone(), fingerprint)
     }
 
     /// Handles Wake modal events: direction moves between "Wake"/"Cancel" buttons.

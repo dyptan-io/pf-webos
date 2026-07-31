@@ -14,7 +14,7 @@ use tracing_subscriber::layer::{Filter, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{reload, Layer, Registry};
 
-use crate::store::LogLevelOverride;
+use crate::services::store::LogLevelOverride;
 
 /// `PKG_VERSION` from Docker/Taskfile; falls back to `CARGO_PKG_VERSION`.
 const VERSION: &str = match option_env!("PKG_VERSION") {
@@ -188,7 +188,7 @@ pub fn latest_log_file(app_dir: &Path) -> Option<std::path::PathBuf> {
 
 /// Startup filter level, mapped from persisted/launch-override settings.
 pub fn resolved_level() -> tracing::Level {
-    override_to_level(crate::store::load_settings().log_level_override)
+    override_to_level(crate::services::store::load_settings().log_level_override)
 }
 
 fn override_to_level(o: LogLevelOverride) -> tracing::Level {

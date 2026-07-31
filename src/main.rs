@@ -3,15 +3,11 @@
 #[cfg(target_os = "linux")]
 mod app;
 #[cfg(target_os = "linux")]
-mod art;
-#[cfg(target_os = "linux")]
 mod audio;
 #[cfg(target_os = "linux")]
 mod compositor;
 #[cfg(target_os = "linux")]
 mod device;
-#[cfg(target_os = "linux")]
-mod discovery;
 #[cfg(target_os = "linux")]
 mod dualsense;
 #[cfg(target_os = "linux")]
@@ -20,8 +16,6 @@ mod errors;
 mod gamepad;
 #[cfg(target_os = "linux")]
 mod keyboard;
-#[cfg(target_os = "linux")]
-mod library;
 #[cfg(target_os = "linux")]
 mod logger;
 #[cfg(target_os = "linux")]
@@ -33,15 +27,13 @@ mod ndl;
 #[cfg(target_os = "linux")]
 mod pacing;
 #[cfg(target_os = "linux")]
+mod services;
+#[cfg(target_os = "linux")]
 mod session;
 #[cfg(target_os = "linux")]
 mod starfish;
 #[cfg(target_os = "linux")]
-mod store;
-#[cfg(target_os = "linux")]
 mod ui;
-#[cfg(target_os = "linux")]
-mod wol;
 
 #[cfg(target_os = "linux")]
 mod real {
@@ -59,7 +51,7 @@ mod real {
     use crate::keyboard;
     use crate::mouse;
     use crate::session;
-    use crate::store;
+    use crate::services::store;
     use crate::ui::MenuEvent;
 
     /// `ConnectOutcome`: connect thread (started early to overlap animation) + settings.

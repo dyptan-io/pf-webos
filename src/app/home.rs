@@ -1,6 +1,6 @@
 //! Home screen: sidebar/grid navigation, host selection, game library fetch, launching.
 use super::*;
-use crate::store::{self};
+use crate::services::store::{self};
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent};
 use std::time::Instant;
 
@@ -460,9 +460,9 @@ impl App {
             .iter()
             .find(|h| h.host == host && h.port == port)
             .and_then(|h| h.fingerprint);
-        let mgmt_port = mgmt_port.unwrap_or(crate::library::DEFAULT_MGMT_PORT);
+        let mgmt_port = mgmt_port.unwrap_or(crate::services::library::DEFAULT_MGMT_PORT);
         tracing::debug!("library: fetching from {host}:{mgmt_port}…");
-        self.games_rx = Some(crate::library::load_games_async(
+        self.games_rx = Some(crate::services::library::load_games_async(
             host,
             port,
             mgmt_port,
@@ -476,7 +476,7 @@ impl App {
         let Some(rx) = &self.games_rx else { return false };
         let Ok(loaded) = rx.try_recv() else { return false };
         self.games_rx = None;
-        let crate::library::GamesLoaded {
+        let crate::services::library::GamesLoaded {
             host,
             port,
             mgmt_port,
@@ -500,7 +500,7 @@ impl App {
                 // Covers are requested per card as the grid window reaches them (see
                 // `App::prepare_tiles`), not fetched for the whole library up front.
                 let (card_w, card_h) = self.card_size;
-                self.art_loader = Some(crate::art::ArtLoader::spawn(
+                self.art_loader = Some(crate::services::art::ArtLoader::spawn(
                     host,
                     port,
                     mgmt_port,
@@ -528,9 +528,9 @@ impl App {
     /// (even with no MAC on record — `start_wake`/`render_wake` just hide the send
     /// controls then); `NotPaired`/`PinMismatch`/`Http` mean the host answered, so
     /// Wake-on-LAN wouldn't help — those stay a plain status line.
-    pub(crate) fn handle_library_error(&mut self, host: String, port: u16, e: crate::library::LibraryError) {
+    pub(crate) fn handle_library_error(&mut self, host: String, port: u16, e: crate::services::library::LibraryError) {
         let reason = e.to_string();
-        if matches!(e, crate::library::LibraryError::Unreachable(_)) {
+        if matches!(e, crate::services::library::LibraryError::Unreachable(_)) {
             let mac = self
                 .known_hosts
                 .iter()
@@ -562,11 +562,11 @@ impl App {
             Some(GridCard::Game(game)) => (Some(game.id.clone()), game.title.clone()),
             None => return,
         };
-        let mgmt_port = known.mgmt_port.unwrap_or(crate::library::DEFAULT_MGMT_PORT);
+        let mgmt_port = known.mgmt_port.unwrap_or(crate::services::library::DEFAULT_MGMT_PORT);
         let identity = (self.identity.0.clone(), self.identity.1.clone());
         tracing::debug!("launch: checking {host}:{port} is still reachable before connecting…");
         self.home_status = Some(format!("Checking the host is still reachable before starting {title}…"));
-        let rx = crate::library::load_games_async(host.clone(), port, mgmt_port, identity, Some(fingerprint));
+        let rx = crate::services::library::load_games_async(host.clone(), port, mgmt_port, identity, Some(fingerprint));
         self.pending_launch = Some(PendingLaunch {
             host,
             port,
@@ -641,7 +641,7 @@ impl App {
             return;
         };
         let (host, port) = (h.host.clone(), h.port);
-        crate::art::clear_host_cache(&host, port);
+        crate::services::art::clear_host_cache(&host, port);
         self.known_hosts.retain(|k| !(k.host == host && k.port == port));
         let _ = store::save_known_hosts(&self.known_hosts);
         self.entries = self.known_hosts.iter().cloned().map(HostEntry::Known).collect();

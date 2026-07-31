@@ -2,8 +2,8 @@
 //!
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 use super::*;
-use crate::discovery::DiscoveredHost;
-use crate::store::KnownHost;
+use crate::services::discovery::DiscoveredHost;
+use crate::services::store::KnownHost;
 use anyhow::Result;
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;

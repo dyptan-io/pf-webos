@@ -7,8 +7,8 @@ use sdl2::rect::Rect;
 use tiny_skia::Pixmap;
 
 use crate::compositor::{DrawCmd, Tile};
-use crate::library::GameEntry;
-use crate::store::{self, KnownHost, Settings};
+use crate::services::library::GameEntry;
+use crate::services::store::{self, KnownHost, Settings};
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};
 
 mod about;
@@ -117,7 +117,7 @@ pub struct WakeState {
     /// `true` while running silently (auto-send before prompt shown).
     pub(crate) silent: bool,
     pub(crate) last_probe: Option<Instant>,
-    pub(crate) probe_rx: Option<std::sync::mpsc::Receiver<crate::library::GamesLoaded>>,
+    pub(crate) probe_rx: Option<std::sync::mpsc::Receiver<crate::services::library::GamesLoaded>>,
 }
 
 /// Home screen focus location.
@@ -228,7 +228,7 @@ pub(crate) struct PendingLaunch {
     pub(crate) fingerprint: [u8; 32],
     pub(crate) launch: Option<String>,
     pub(crate) title: String,
-    pub(crate) rx: std::sync::mpsc::Receiver<crate::library::GamesLoaded>,
+    pub(crate) rx: std::sync::mpsc::Receiver<crate::services::library::GamesLoaded>,
     /// Card index for `launch_anim`.
     pub(crate) idx: usize,
 }
@@ -334,7 +334,7 @@ pub(crate) enum ScrollContentKey {
 pub struct App {
     pub screen: Screen,
     pub known_hosts: Vec<KnownHost>,
-    pub discovered: std::sync::mpsc::Receiver<crate::discovery::DiscoveredHost>,
+    pub discovered: std::sync::mpsc::Receiver<crate::services::discovery::DiscoveredHost>,
     /// `None` if mDNS daemon didn't start. `Some` lets Drop shut it down explicitly.
     pub(crate) discovery_daemon: Option<mdns_sd::ServiceDaemon>,
     pub entries: Vec<HostEntry>,
@@ -345,11 +345,11 @@ pub struct App {
     pub(crate) pinned_count: usize,
     /// Host answered library fetch (gates Desktop card).
     pub(crate) games_loaded: bool,
-    pub(crate) games_rx: Option<std::sync::mpsc::Receiver<crate::library::GamesLoaded>>,
+    pub(crate) games_rx: Option<std::sync::mpsc::Receiver<crate::services::library::GamesLoaded>>,
     pub home_status: Option<String>,
     /// Cover art pixmaps by game id.
     pub art: std::collections::HashMap<String, Pixmap>,
-    pub(crate) art_loader: Option<crate::art::ArtLoader>,
+    pub(crate) art_loader: Option<crate::services::art::ArtLoader>,
     /// Current grid card size (updated in `prepare_tiles`).
     pub(crate) card_size: (u32, u32),
     pub(crate) pending_launch: Option<PendingLaunch>,
@@ -610,7 +610,7 @@ impl App {
     pub fn new(identity: (String, String)) -> Self {
         let known_hosts = store::load_known_hosts();
         let entries = known_hosts.iter().cloned().map(HostEntry::Known).collect();
-        let (discovered, discovery_daemon) = match crate::discovery::browse() {
+        let (discovered, discovery_daemon) = match crate::services::discovery::browse() {
             Some((rx, daemon)) => (rx, Some(daemon)),
             None => (std::sync::mpsc::channel().1, None),
         };
