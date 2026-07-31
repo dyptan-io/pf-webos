@@ -22,6 +22,7 @@ mod text;
 mod text_raster;
 mod theme;
 mod tiles;
+pub mod view;
 
 pub use crate::core::event::MenuEvent;
 pub use about::*;

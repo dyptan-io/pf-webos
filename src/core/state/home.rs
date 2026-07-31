@@ -1,5 +1,8 @@
-//! Home screen: sidebar/grid navigation, host selection, game library fetch, launching.
-use super::*;
+//! Home screen logic: sidebar/grid navigation, host selection, game library fetch,
+//! launching. Grid pixel geometry (rect helpers) lives in `ui::view::home`.
+use crate::app::App;
+use crate::app::{ConnectTarget, GridCard, GridLayout, PendingLaunch};
+use crate::core::screen::{HomeFocus, Screen};
 use crate::services::store::{self};
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent};
 use std::time::Instant;
@@ -300,64 +303,18 @@ impl App {
         }
     }
 
-    /// Extra vertical offset for grid index `idx`'s row — `ui::PINNED_SECTION_GAP`
-    /// once, for every row from the "rest" section on, `0` for a row still inside
-    /// the pinned front block (see `pinned_rows`).
-    fn extra_row_gap(&self, idx: usize, columns: usize) -> i32 {
-        let pinned_rows = self.pinned_rows(columns);
-        if pinned_rows > 0 && idx / columns.max(1) >= pinned_rows {
-            ui::PINNED_SECTION_GAP
-        } else {
-            0
-        }
-    }
-
-    /// `grid_card_rect`, translated by `extra_row_gap` — everything except the
-    /// current scroll offset; `scrolled_card_rect` applies that on top.
-    pub(crate) fn unscrolled_card_rect(&self, idx: usize, columns: usize, grid_x: i32, available_w: u32) -> Rect {
-        let r = ui::grid_card_rect(idx, columns, grid_x, available_w);
-        let extra = self.extra_row_gap(idx, columns);
-        Rect::new(r.x(), r.y() + extra, r.width(), r.height())
-    }
-
     /// Eased 0..=1 progress of pin id `id`'s zoom-in (see `CardTile::pop_since`)
     /// — 1.0, full size, for anything not animating.
     pub(crate) fn card_pop_frac(&self, id: &str) -> f32 {
-        ui::anim_frac(self.card_tiles.get(id).and_then(|c| c.pop_since), CARD_POP)
-    }
-
-    /// `unscrolled_card_rect`, translated by the current scroll offset — every
-    /// draw-list card position starts from this.
-    pub(crate) fn scrolled_card_rect(&self, idx: usize, columns: usize, grid_x: i32, available_w: u32) -> Rect {
-        let r = self.unscrolled_card_rect(idx, columns, grid_x, available_w);
-        Rect::new(r.x(), r.y() - self.grid_scroll, r.width(), r.height())
+        ui::anim_frac(self.card_tiles.get(id).and_then(|c| c.pop_since), crate::app::CARD_POP)
     }
 
     /// Whether the pinned front block is followed by anything — false when
     /// nothing's pinned, and when *everything* is, which would otherwise leave
     /// the divider and its gap hanging under the last row.
-    fn has_pinned_divider(&self, columns: usize) -> bool {
+    pub(crate) fn has_pinned_divider(&self, columns: usize) -> bool {
         let layout = self.grid_layout(columns);
         layout.pinned_rows > 0 && layout.len(self.games.len()) > layout.unpinned_start
-    }
-
-    /// The divider between the pinned front block and the rest, centered in the
-    /// gap `extra_row_gap` adds there, scrolled like any other grid content.
-    pub(crate) fn pinned_separator_rect(&self, columns: usize, grid_x: i32, available_w: u32) -> Option<Rect> {
-        if !self.has_pinned_divider(columns) {
-            return None;
-        }
-        let rows = self.pinned_rows(columns);
-        let (_, card_h) = ui::grid_card_size(available_w, columns);
-        let y = ui::GRID_TOP_Y + rows as i32 * (card_h as i32 + ui::GRID_GAP) - ui::GRID_GAP / 2
-            + ui::PINNED_SECTION_GAP / 2
-            - self.grid_scroll;
-        Some(Rect::new(
-            grid_x + ui::GRID_PAD,
-            y,
-            available_w.saturating_sub(2 * ui::GRID_PAD as u32),
-            1,
-        ))
     }
 
     /// The largest useful `grid_scroll` for the current library/layout — 0 when

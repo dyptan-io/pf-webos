@@ -1,9 +1,7 @@
-//! The "you can only pin N games" alert — a single-OK-button dialog.
-//!
-//! Split out of the former single-file `app.rs`; see `super`'s module docs.
-use super::*;
+//! The "you can only pin N games" alert — rendering. Logic lives in `core::state::pinlimit`.
+use crate::app::App;
 use crate::ui::render::Rect;
-use crate::ui::{self, MenuEvent, Painter};
+use crate::ui::{self, Painter};
 use anyhow::Result;
 
 /// The single OK button's fixed size.
@@ -11,22 +9,6 @@ const PIN_LIMIT_BUTTON_W: u32 = 200;
 const PIN_LIMIT_BUTTON_H: u32 = 72;
 
 impl App {
-    /// Shown when hold-to-pin would exceed `MAX_PINNED_GAMES` (5 items).
-    pub(crate) const PIN_LIMIT_MESSAGE: &'static str =
-        "You can only pin up to 5 items. Unpin something before pinning this one.";
-
-    /// Enter `PinLimit` alert when pinning exceeds `MAX_PINNED_GAMES`.
-    pub(crate) fn open_pin_limit(&mut self) {
-        self.screen = Screen::PinLimit;
-    }
-
-    /// Handle `PinLimit`: OK and Back both dismiss the alert.
-    pub fn handle_pin_limit_event(&mut self, ev: MenuEvent) {
-        if matches!(ev, MenuEvent::Confirm | MenuEvent::Back) {
-            self.screen = Screen::Home;
-        }
-    }
-
     pub(crate) fn pin_limit_card_rect(screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Rect {
         Self::simple_modal_card(screen_w, screen_h, |probe| {
             let header_end =

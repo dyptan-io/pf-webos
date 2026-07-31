@@ -1,8 +1,9 @@
-use super::*;
-use crate::ui::render::Rect;
+//! Per-host Wake-on-LAN settings — logic. Rendering lives in `ui::view::wakesettings`.
+use crate::app::App;
+use crate::core::screen::Screen;
+use crate::services::store;
+use crate::ui::MenuEvent;
 use std::time::Instant;
-
-use crate::ui::{self, FocusRow, MenuEvent, Painter};
 
 impl App {
     /// Open Wake settings for host menu's current host.
@@ -18,30 +19,10 @@ impl App {
         self.known_hosts.iter().find(|h| h.host == host && h.port == port)
     }
 
-    pub(crate) fn wake_settings_rows(&self) -> Vec<FocusRow> {
-        ui::wake_settings_rows(self.wake_settings_host().is_some_and(|h| h.wol_auto))
-    }
-
-    pub(crate) fn wake_settings_title(&self) -> String {
-        format!("Wake · {}", self.host_menu_title())
-    }
-
-    pub(crate) fn wake_settings_subtitle(&self) -> String {
-        // Spells out both halves of the behaviour, because the alternative to "On" is
-        // not "never wake" — it's "ask first", which the switch alone can't say.
-        "On: an unreachable host is sent a wake signal straight away, retried every \
-         minute until it answers. Off: it asks first."
-            .to_string()
-    }
-
-    pub(crate) fn wake_settings_card_rect(screen_w: u32, screen_h: u32, fonts: &ui::Fonts, subtitle: &str) -> Rect {
-        ui::list_modal_card_rect(screen_w, screen_h, fonts, subtitle, 1)
-    }
-
     /// Left/Right/Confirm flip toggle; Back returns to host menu.
     pub(crate) fn handle_wake_settings_event(&mut self, ev: MenuEvent) {
         let len = self.wake_settings_rows().len();
-        if ui::list_nav(&mut self.wake_settings_focused, len, ev) {
+        if crate::ui::list_nav(&mut self.wake_settings_focused, len, ev) {
             self.modal_focus_anim = Some(Instant::now());
             return;
         }
@@ -67,27 +48,5 @@ impl App {
         // Captures the value it's flipping *from*, so the knob slides rather than
         // snapping — same contract as the Settings modal's switch rows.
         self.switch_anim = Some((Instant::now(), from));
-    }
-
-    pub(crate) fn render_wake_settings(
-        &self,
-        painter: &mut Painter,
-        text_cache: &mut crate::ui::TextCache,
-        fonts: &ui::Fonts,
-        screen_w: u32,
-        screen_h: u32,
-    ) -> Result<()> {
-        let subtitle = self.wake_settings_subtitle();
-        let card = Self::wake_settings_card_rect(screen_w, screen_h, fonts, &subtitle);
-        self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
-        ui::render_list_modal(
-            painter,
-            text_cache,
-            fonts,
-            card,
-            &self.wake_settings_title(),
-            &subtitle,
-            &self.wake_settings_rows(),
-        )
     }
 }

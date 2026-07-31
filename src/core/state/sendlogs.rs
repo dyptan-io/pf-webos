@@ -1,14 +1,16 @@
-//! The "Send logs to developer" confirmation modal and its background upload.
+//! The "Send logs to developer" confirmation modal's logic and background upload.
 //!
 //! Reached from the Diagnostics screen's last row. A warning dialog explains that
 //! the current session's log file will be uploaded to the developer; both buttons
 //! (Cancel / Send) close the modal and return to Home. "Send" kicks off a
 //! background multipart upload — the same worker-thread + channel shape as the
-//! speed test and pairing ceremonies (see `app::speedtest`) — whose result lands
-//! in the Home status bar. Nothing here blocks the UI thread.
-use super::*;
-use crate::ui::{self, MenuEvent, Painter};
-use anyhow::Result;
+//! speed test and pairing ceremonies (see `core::state::speedtest`/`pairing`) — whose
+//! result lands in the Home status bar. Nothing here blocks the UI thread.
+//!
+//! Rendering lives in `ui::view::sendlogs`.
+use crate::app::App;
+use crate::core::screen::Screen;
+use crate::ui::MenuEvent;
 use std::path::Path;
 use std::time::Instant;
 
@@ -23,11 +25,6 @@ pub(crate) enum SendLogsMsg {
 }
 
 impl App {
-    pub(crate) const SEND_LOGS_SUBTITLE: &'static str =
-        "This uploads this session's log file to the app developer to help diagnose problems. \
-         Logs can include host names, IP addresses, and game titles. Only send them if you're \
-         comfortable sharing that.";
-
     /// Open the confirmation modal, defaulting focus to Cancel.
     pub(crate) fn open_send_logs(&mut self) {
         self.send_logs_focused = 1;
@@ -100,49 +97,6 @@ impl App {
                 false
             }
         }
-    }
-
-    /// The Send/Cancel button pair — shared by the shell render and the focused-button
-    /// tile so their `ConfirmButton` data can't drift apart. Order matches
-    /// `send_logs_focused` (0 = Send, 1 = Cancel); Send is drawn in the same red as
-    /// the Forget action, since both are consequential.
-    pub(crate) fn send_logs_buttons() -> [ui::ConfirmButton<'static>; 2] {
-        ui::confirm_buttons(Some(ui::ICON_SEND), "Send", ui::ERROR_RED)
-    }
-
-    pub(crate) fn render_send_logs(
-        &self,
-        painter: &mut Painter,
-        text_cache: &mut crate::ui::TextCache,
-        fonts: &ui::Fonts,
-        screen_w: u32,
-        screen_h: u32,
-    ) -> Result<()> {
-        let (card, content) = ui::confirm_dialog_layout(screen_w, screen_h, fonts, Self::SEND_LOGS_SUBTITLE);
-        self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
-        ui::draw_modal_header(
-            painter,
-            text_cache,
-            fonts.raster,
-            fonts.label,
-            fonts.value,
-            card,
-            "Send logs to developer?",
-            ui::WHITE,
-            Self::SEND_LOGS_SUBTITLE,
-            ui::MUTED,
-        )?;
-        // `usize::MAX` = nothing focused here; the focused button is a separate
-        // `Tile::ModalFocusElement` (see `prepare_tiles`).
-        ui::draw_confirm_buttons(
-            painter,
-            text_cache,
-            fonts,
-            content,
-            &Self::send_logs_buttons(),
-            usize::MAX,
-        )?;
-        Ok(())
     }
 }
 

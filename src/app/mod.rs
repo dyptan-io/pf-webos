@@ -13,23 +13,6 @@ use crate::services::store::{self, KnownHost, Settings};
 use crate::ui::render::{DrawCmd, TileId as Tile};
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};
 
-mod about;
-mod addhost;
-mod diagnostics;
-mod edithost;
-mod experimental;
-mod forget;
-mod home;
-mod hostmenu;
-mod pairing;
-mod pinlimit;
-mod reach;
-mod sendlogs;
-mod settings;
-mod speedtest;
-mod wake;
-mod wakesettings;
-
 /// Rows beyond viewport kept rasterized (prevents scroll stalls).
 const CARD_PREFETCH_ROWS: i32 = 2;
 /// Rows beyond which tiles are dropped. Hysteresis prevents eviction oscillation.
@@ -109,10 +92,10 @@ pub(crate) struct CardTile {
 /// Grid layout shape: pinned block (owns whole rows) + rest section (padding-aware).
 #[derive(Clone, Copy)]
 pub(crate) struct GridLayout {
-    pinned_count: usize,
+    pub(crate) pinned_count: usize,
     pub(crate) desktop_pinned: bool,
-    desktop_in_rest: bool,
-    front_count: usize,
+    pub(crate) desktop_in_rest: bool,
+    pub(crate) front_count: usize,
     pub(crate) pinned_rows: usize,
     pub(crate) unpinned_start: usize,
 }
@@ -360,20 +343,20 @@ pub struct App {
     pub send_logs_focused: usize,
     /// Delivers the background log upload's result; `None` when no upload is in
     /// flight. Drained each tick by `drain_send_logs`.
-    pub(crate) send_logs_rx: Option<std::sync::mpsc::Receiver<sendlogs::SendLogsMsg>>,
+    pub(crate) send_logs_rx: Option<std::sync::mpsc::Receiver<crate::core::state::sendlogs::SendLogsMsg>>,
     /// The sidebar row `Screen::EditHost` is editing, `None` otherwise.
     pub edit_host_index: Option<usize>,
     /// The in-flight/finished speed test, `None` when that screen isn't open.
-    pub(crate) speed_test: Option<speedtest::SpeedTestState>,
+    pub(crate) speed_test: Option<crate::core::state::speedtest::SpeedTestState>,
     /// Delivers the background probe's progress/result — dropping it cancels.
-    pub(crate) speed_test_rx: Option<std::sync::mpsc::Receiver<speedtest::SpeedTestMsg>>,
+    pub(crate) speed_test_rx: Option<std::sync::mpsc::Receiver<crate::core::state::speedtest::SpeedTestMsg>>,
     /// Which of the finished test's two buttons has focus.
     pub speed_test_focused: usize,
     /// The host being measured, for the status line.
     pub speed_test_name: String,
     /// Last known reachability per `(host, port)` — see `app::reach`.
     pub(crate) reachable: std::collections::HashMap<(String, u16), bool>,
-    pub(crate) reach_rx: Option<std::sync::mpsc::Receiver<reach::Reachability>>,
+    pub(crate) reach_rx: Option<std::sync::mpsc::Receiver<crate::core::state::reach::Reachability>>,
     pub(crate) reach_last: Option<Instant>,
     /// Whether webOS's on-screen keyboard is currently up, polled from
     /// `SDL_IsScreenKeyboardShown` each tick by `main.rs` — it moves the address form out
@@ -1950,11 +1933,14 @@ impl App {
             // on the card but text.
             Screen::SpeedTest => matches!(
                 self.speed_test,
-                Some(speedtest::SpeedTestState::Done { .. }) | Some(speedtest::SpeedTestState::Failed(_))
+                Some(crate::core::state::speedtest::SpeedTestState::Done { .. })
+                    | Some(crate::core::state::speedtest::SpeedTestState::Failed(_))
             )
             .then(|| {
                 let recommended = match &self.speed_test {
-                    Some(speedtest::SpeedTestState::Done { outcome, .. }) => Self::recommended_kbps(outcome),
+                    Some(crate::core::state::speedtest::SpeedTestState::Done { outcome, .. }) => {
+                        Self::recommended_kbps(outcome)
+                    }
                     _ => None,
                 };
                 ModalFocusKey::SpeedTestButton(self.speed_test_focused, Self::speed_test_apply_label(recommended))
@@ -2100,7 +2086,9 @@ impl App {
                         let rect =
                             ui::confirm_button_rect(self.speed_test_buttons_rect(card, fonts), self.speed_test_focused);
                         let recommended = match &self.speed_test {
-                            Some(speedtest::SpeedTestState::Done { outcome, .. }) => Self::recommended_kbps(outcome),
+                            Some(crate::core::state::speedtest::SpeedTestState::Done { outcome, .. }) => {
+                                Self::recommended_kbps(outcome)
+                            }
                             _ => None,
                         };
                         let apply_label = Self::speed_test_apply_label(recommended);
@@ -2807,7 +2795,8 @@ impl App {
                 }
                 Screen::SpeedTest => matches!(
                     self.speed_test,
-                    Some(speedtest::SpeedTestState::Done { .. }) | Some(speedtest::SpeedTestState::Failed(_))
+                    Some(crate::core::state::speedtest::SpeedTestState::Done { .. })
+                        | Some(crate::core::state::speedtest::SpeedTestState::Failed(_))
                 )
                 .then(|| {
                     let card = self.speed_test_card_rect(screen_w, screen_h, fonts);

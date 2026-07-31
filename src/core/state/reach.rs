@@ -1,4 +1,5 @@
-use super::*;
+//! Ambient reachability polling for sidebar host rows. Pure logic — no view counterpart.
+use crate::app::App;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 

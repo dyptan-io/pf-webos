@@ -1,10 +1,10 @@
-//! Editing a saved host's address (reuses add-host widget). Fingerprint survives address
-//! changes unchanged since it identifies the certificate, not the network location.
-use super::*;
-use crate::ui::render::Rect;
-
+//! Editing a saved host's address (reuses add-host widget) — logic. Fingerprint survives
+//! address changes unchanged since it identifies the certificate, not the network
+//! location. Rendering lives in `ui::view::edithost`.
+use crate::app::App;
+use crate::core::screen::{HomeFocus, Screen};
 use crate::services::store;
-use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};
+use crate::ui::{AddHostState, HostEntry, MenuEvent};
 
 impl App {
     /// Open `EditHost` for sidebar row; pre-filled with current address. No-op for unsaved entries.
@@ -80,20 +80,5 @@ impl App {
         self.sidebar_dirty = true;
         self.grid_dirty = true;
         self.screen = Screen::Home;
-    }
-
-    pub(crate) fn edit_host_card_rect(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Rect {
-        self.address_card_rect(screen_w, screen_h, fonts)
-    }
-
-    pub(crate) fn render_edit_host(
-        &self,
-        painter: &mut Painter,
-        text_cache: &mut crate::ui::TextCache,
-        fonts: &ui::Fonts,
-        screen_w: u32,
-        screen_h: u32,
-    ) -> Result<()> {
-        self.render_host_address_form(painter, text_cache, fonts, screen_w, screen_h, "Edit address")
     }
 }
