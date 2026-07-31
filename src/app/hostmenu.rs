@@ -195,7 +195,7 @@ impl App {
         let rows = self.host_menu_rows();
         let subtitle = self.host_menu_subtitle();
         let card = Self::host_menu_card_rect(screen_w, screen_h, fonts, &subtitle, rows.len());
-        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
+        self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
         ui::render_list_modal(
             painter,
             text_cache,

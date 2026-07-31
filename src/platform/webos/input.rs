@@ -1,8 +1,6 @@
 //! Raw SDL2 keyboard/gamepad input mapped to debounced `MenuEvent`s.
-//!
-//! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 
-pub use crate::core::event::MenuEvent;
+use crate::core::event::MenuEvent;
 
 /// Magic Remote Back button keycode (not Escape/Backspace/AcBack; identified via logs).
 /// Only usable hardware Back; Home button SIGTERMs the app.

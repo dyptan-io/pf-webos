@@ -5,8 +5,8 @@
 use super::*;
 use crate::ui::render::Color;
 use crate::ui::render::Rect;
+use crate::ui::text_raster::{FontId, TextRaster};
 use anyhow::Result;
-use sdl2::ttf::Font;
 
 /// How a focus row's right-hand control behaves — shared by the settings
 /// modal's row list and the Wake modal's two rows (`draw_focus_rows`'s single
@@ -206,15 +206,16 @@ pub fn draw_focus_row(
     } else {
         MUTED
     };
-    draw_icon(painter, text_cache, fonts.icon, icon_rect, row.icon, fg)?;
+    draw_icon(painter, text_cache, fonts.raster, fonts.icon, icon_rect, row.icon, fg)?;
     let label_x = icon_rect.x() + SETTINGS_ICON_SIZE as i32 + 20;
     draw_text(
         painter,
         text_cache,
+        fonts.raster,
         fonts.label,
         &row.label,
         label_x,
-        row_rect.y() + (row_rect.height() as i32 - fonts.label.height()) / 2,
+        row_rect.y() + (row_rect.height() as i32 - fonts.raster.height(fonts.label)) / 2,
         fg,
     )?;
 
@@ -233,15 +234,16 @@ pub fn draw_focus_row(
             )?;
         }
         RowKind::Slider => {
-            let value_w = fonts.value.size_of(&row.value).map_or(0, |(w, _)| w);
+            let value_w = fonts.raster.measure(fonts.value, &row.value).0;
             let slot_right = row_rect.x() + row_rect.width() as i32 - control_pad;
             draw_text(
                 painter,
                 text_cache,
+                fonts.raster,
                 fonts.value,
                 &row.value,
                 slot_right - value_w as i32,
-                row_rect.y() + (row_rect.height() as i32 - fonts.value.height()) / 2,
+                row_rect.y() + (row_rect.height() as i32 - fonts.raster.height(fonts.value)) / 2,
                 if focused { WHITE } else { MUTED },
             )?;
             let track_w = 220u32.min(row_rect.width() / 3);
@@ -266,14 +268,15 @@ pub fn draw_focus_row(
         RowKind::Action => {
             if !row.value.is_empty() {
                 let menu_w = row.menu.map_or(0, |_| SIDEBAR_MENU_BTN as i32 + 10);
-                let value_w = fonts.value.size_of(&row.value).map_or(0, |(w, _)| w);
+                let value_w = fonts.raster.measure(fonts.value, &row.value).0;
                 draw_text(
                     painter,
                     text_cache,
+                    fonts.raster,
                     fonts.value,
                     &row.value,
                     row_rect.x() + row_rect.width() as i32 - control_pad - menu_w - value_w as i32,
-                    row_rect.y() + (row_rect.height() as i32 - fonts.value.height()) / 2,
+                    row_rect.y() + (row_rect.height() as i32 - fonts.raster.height(fonts.value)) / 2,
                     MUTED,
                 )?;
             }
@@ -306,15 +309,24 @@ pub fn draw_dropdown_value(
         chevron_size,
         chevron_size,
     );
-    draw_icon(painter, text_cache, fonts.icon, chevron_rect, ICON_CHEVRON_DOWN, fg)?;
-    let text_w = fonts.value.size_of(label).map_or(0, |(w, _)| w);
+    draw_icon(
+        painter,
+        text_cache,
+        fonts.raster,
+        fonts.icon,
+        chevron_rect,
+        ICON_CHEVRON_DOWN,
+        fg,
+    )?;
+    let text_w = fonts.raster.measure(fonts.value, label).0;
     draw_text(
         painter,
         text_cache,
+        fonts.raster,
         fonts.value,
         label,
         right_edge - chevron_size as i32 - 10 - text_w as i32,
-        row_rect.y() + (row_rect.height() as i32 - fonts.value.height()) / 2,
+        row_rect.y() + (row_rect.height() as i32 - fonts.raster.height(fonts.value)) / 2,
         fg,
     )?;
     Ok(())
@@ -443,10 +455,12 @@ pub fn render_scroll_fade_tile(edge: FadeEdge) -> Painter {
 
 /// Renders dropdown options as an overlay list anchored below the opener row.
 /// One panel background+shadow instead of per-row cards to avoid shadow smearing.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_dropdown_overlay(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    font_value: &Font,
+    raster: &dyn TextRaster,
+    font_value: FontId,
     options: &[String],
     focused_index: usize,
     rect: Rect,
@@ -460,7 +474,15 @@ pub fn draw_dropdown_overlay(
     draw_popup_panel(painter, bg_rect, Color::RGBA(0xff, 0xff, 0xff, 0x20));
     for (i, opt) in options.iter().enumerate() {
         let row_rect = dropdown_option_rect(rect, i);
-        draw_dropdown_option(painter, text_cache, font_value, opt, i == focused_index, row_rect)?;
+        draw_dropdown_option(
+            painter,
+            text_cache,
+            raster,
+            font_value,
+            opt,
+            i == focused_index,
+            row_rect,
+        )?;
     }
     Ok(())
 }
@@ -479,21 +501,24 @@ pub fn dropdown_option_rect(rect: Rect, index: usize) -> Rect {
 /// Moving focus recomposites just this tile instead of re-rasterizing.
 pub fn render_dropdown_option_tile(
     text_cache: &mut TextCache,
-    font_value: &Font,
+    raster: &dyn TextRaster,
+    font_value: FontId,
     option: &str,
     width: u32,
 ) -> Result<Painter> {
     let mut p = Painter::new(width, DROPDOWN_OPTION_H);
     let rect = Rect::new(0, 0, width, DROPDOWN_OPTION_H);
-    draw_dropdown_option(&mut p, text_cache, font_value, option, true, rect)?;
+    draw_dropdown_option(&mut p, text_cache, raster, font_value, option, true, rect)?;
     Ok(p)
 }
 
 /// Draws one dropdown option (highlighted if focused) at normal size.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_dropdown_option(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    font_value: &Font,
+    raster: &dyn TextRaster,
+    font_value: FontId,
     option: &str,
     focused: bool,
     row_rect: Rect,
@@ -510,10 +535,11 @@ pub fn draw_dropdown_option(
     draw_text(
         painter,
         text_cache,
+        raster,
         font_value,
         option,
         row_rect.x() + 20,
-        row_rect.y() + (row_rect.height() as i32 - font_value.height()) / 2,
+        row_rect.y() + (row_rect.height() as i32 - raster.height(font_value)) / 2,
         if focused { WHITE } else { MUTED },
     )?;
     Ok(())
@@ -553,8 +579,8 @@ const CONFIRM_BUTTON_GAP: i32 = 20;
 
 /// Confirm button metrics derived from label font height — keeps sizing consistent
 /// between drawing and measurement.
-fn confirm_button_metrics(font: &Font) -> (u32, i32, i32) {
-    let line_h = font.height().max(1);
+fn confirm_button_metrics(raster: &dyn TextRaster, font: FontId) -> (u32, i32, i32) {
+    let line_h = raster.height(font).max(1);
     ((line_h * 2 / 3).max(1) as u32, (line_h / 3).max(1), (line_h / 2).max(1))
 }
 
@@ -620,8 +646,8 @@ pub fn draw_confirm_button(
     // It used to be a fixed `20 + 26 + 12`, which left "Stop streaming" more label than
     // button below 4K (~117px of room for ~154px of text at 720p) and ran it past the
     // right edge, because nothing clamped the label either.
-    let line_h = fonts.label.height().max(1);
-    let (icon_size, icon_gap, side_pad) = confirm_button_metrics(fonts.label);
+    let line_h = fonts.raster.height(fonts.label).max(1);
+    let (icon_size, icon_gap, side_pad) = confirm_button_metrics(fonts.raster, fonts.label);
 
     // Icon and label are centred as one group, the same way a label without an icon
     // was already centred on its own — and the label is ellipsized to whatever the icon
@@ -631,8 +657,8 @@ pub fn draw_confirm_button(
         None => 0,
     };
     let budget = rect.width().saturating_sub(2 * side_pad as u32).saturating_sub(leading);
-    let label = ellipsize(fonts.label, button.label, budget);
-    let label_w = fonts.label.size_of(&label).map_or(0, |(w, _)| w);
+    let label = ellipsize(fonts.raster, fonts.label, button.label, budget);
+    let label_w = fonts.raster.measure(fonts.label, &label).0;
     let start_x = rect.x() + (rect.width() as i32 - (leading + label_w) as i32) / 2;
 
     if let Some(icon) = button.icon {
@@ -642,11 +668,12 @@ pub fn draw_confirm_button(
             icon_size,
             icon_size,
         );
-        draw_icon(painter, text_cache, fonts.icon, icon_rect, icon, color)?;
+        draw_icon(painter, text_cache, fonts.raster, fonts.icon, icon_rect, icon, color)?;
     }
     draw_text(
         painter,
         text_cache,
+        fonts.raster,
         fonts.label,
         &label,
         start_x + leading as i32,

@@ -7,8 +7,8 @@
 use super::{anim_frac, draw_text, Painter, TextCache, OVERLAY_FADE, WHITE};
 use crate::ui::render::Color;
 use crate::ui::render::Rect;
+use crate::ui::text_raster::{FontId, TextRaster};
 use anyhow::Result;
-use sdl2::ttf::Font;
 use std::time::{Duration, Instant};
 
 /// Fully opaque for this long before the fade begins.
@@ -50,14 +50,14 @@ impl Notification {
 }
 
 /// Single-line notification panel, styled like the stats overlay's glass background.
-pub fn render_notification_tile(font: &Font, text: &str) -> Result<Painter> {
+pub fn render_notification_tile(raster: &dyn TextRaster, font: FontId, text: &str) -> Result<Painter> {
     let pad = 18i32;
-    let (tw, _) = font.size_of(text).unwrap_or((0, 0));
+    let (tw, _) = raster.measure(font, text);
     let w = tw + 2 * pad as u32;
-    let h = (font.height() + 2 * pad) as u32;
+    let h = (raster.height(font) + 2 * pad) as u32;
     let mut p = Painter::new(w.max(1), h.max(1));
     let mut tc = TextCache::new();
     p.fill_rounded_rect(Rect::new(0, 0, w, h), 14, Color::RGBA(0x14, 0x10, 0x1f, 0x90));
-    draw_text(&mut p, &mut tc, font, text, pad, pad, WHITE)?;
+    draw_text(&mut p, &mut tc, raster, font, text, pad, pad, WHITE)?;
     Ok(p)
 }

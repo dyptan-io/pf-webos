@@ -16,6 +16,7 @@
 //! document this size — see `draw_text_uncached`'s docs). Scrolling within that
 //! slice is then a pure `DrawCmd::TexCropped`, never a re-rasterize.
 use crate::ui::render::Rect;
+use crate::ui::text_raster::{FontId, TextRaster};
 use anyhow::Result;
 
 use super::*;
@@ -81,7 +82,7 @@ pub fn about_card_rect(screen_w: u32, screen_h: u32) -> Rect {
 
 /// The scrolling viewport inside `card`, below the header.
 pub fn about_body_rect(card: Rect, fonts: &Fonts) -> Rect {
-    let header_end = modal_header_end_y(fonts.label, fonts.value, card, ABOUT_SUBTITLE_PROBE);
+    let header_end = modal_header_end_y(fonts.raster, fonts.label, fonts.value, card, ABOUT_SUBTITLE_PROBE);
     let top = header_end + 20;
     let bottom = card.y() + card.height() as i32 - 28;
     Rect::new(
@@ -99,14 +100,14 @@ const ABOUT_SUBTITLE_PROBE: &str = "Version 0.0.0+git.00000000";
 
 /// Stride (px) between two consecutive wrapped visual lines at `font`'s size —
 /// the uniform unit `ui::ScrollWindow`/`ui::ContentWindow` scroll over.
-pub fn about_line_stride(font: &sdl2::ttf::Font) -> i32 {
-    font.height() + LINE_GAP
+pub fn about_line_stride(raster: &dyn TextRaster, font: FontId) -> i32 {
+    raster.height(font) + LINE_GAP
 }
 
 /// How many wrapped visual lines fit in `body` — used to clamp scrolling so the
 /// page can't be scrolled past its own end.
-pub fn about_visible_lines(body: Rect, font: &sdl2::ttf::Font) -> usize {
-    (body.height() as i32 / about_line_stride(font).max(1)).max(1) as usize
+pub fn about_visible_lines(body: Rect, raster: &dyn TextRaster, font: FontId) -> usize {
+    (body.height() as i32 / about_line_stride(raster, font).max(1)).max(1) as usize
 }
 
 /// Wraps every source `line` to `width`, flattening into one list of visual
@@ -115,7 +116,7 @@ pub fn about_visible_lines(body: Rect, font: &sdl2::ttf::Font) -> usize {
 /// This is the one-time cost (text measurement, not rasterization) that gives
 /// the whole document a uniform per-line stride, so it can scroll exactly like
 /// Settings' fixed-height rows instead of needing per-source-line bookkeeping.
-pub fn wrap_document(font: &sdl2::ttf::Font, lines: &[&str], width: u32) -> Vec<String> {
+pub fn wrap_document(raster: &dyn TextRaster, font: FontId, lines: &[&str], width: u32) -> Vec<String> {
     let mut out = Vec::new();
     for line in lines {
         if line.trim().is_empty() {
@@ -123,7 +124,7 @@ pub fn wrap_document(font: &sdl2::ttf::Font, lines: &[&str], width: u32) -> Vec<
         } else {
             // Wrapped, not clipped: this is licence text, and silently truncating it
             // would hide terms the screen exists to display.
-            out.extend(wrap_text(font, line, width));
+            out.extend(wrap_text(raster, font, line, width));
         }
     }
     out
@@ -135,17 +136,18 @@ pub fn wrap_document(font: &sdl2::ttf::Font, lines: &[&str], width: u32) -> Vec<
 /// Only called when `ui::ContentWindow` (re)bakes a window, not per frame.
 pub fn draw_about_window(
     painter: &mut Painter,
-    font: &sdl2::ttf::Font,
+    raster: &dyn TextRaster,
+    font: FontId,
     lines: &[String],
     start: usize,
     len: usize,
 ) -> Result<()> {
-    let step = about_line_stride(font);
+    let step = about_line_stride(raster, font);
     for (i, line) in lines.iter().skip(start).take(len).enumerate() {
         if line.is_empty() {
             continue;
         }
-        draw_text_uncached(painter, font, line, 0, i as i32 * step, MUTED)?;
+        draw_text_uncached(painter, raster, font, line, 0, i as i32 * step, MUTED)?;
     }
     Ok(())
 }

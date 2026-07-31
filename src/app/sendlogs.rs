@@ -119,10 +119,11 @@ impl App {
         screen_h: u32,
     ) -> Result<()> {
         let (card, content) = ui::confirm_dialog_layout(screen_w, screen_h, fonts, Self::SEND_LOGS_SUBTITLE);
-        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
+        self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
         ui::draw_modal_header(
             painter,
             text_cache,
+            fonts.raster,
             fonts.label,
             fonts.value,
             card,

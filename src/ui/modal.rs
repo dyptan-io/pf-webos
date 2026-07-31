@@ -1,8 +1,8 @@
 use super::*;
 use crate::ui::render::Color;
 use crate::ui::render::Rect;
+use crate::ui::text_raster::{FontId, TextRaster};
 use anyhow::Result;
-use sdl2::ttf::Font;
 
 /// A centered glass card of `(width_frac * screen_w, height)`.
 /// Centered glass card.
@@ -92,17 +92,19 @@ pub fn modal_close_rect(card_rect: Rect) -> Rect {
 /// then press the button". The rule makes the exclusivity structural rather than something
 /// the user has to read and remember.
 /// Horizontal rule with centered word (e.g., "or" between two exclusive options).
+#[allow(clippy::too_many_arguments)]
 pub fn draw_or_divider(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    font: &Font,
+    raster: &dyn TextRaster,
+    font: FontId,
     content: Rect,
     y: i32,
     word: &str,
 ) -> Result<()> {
-    let word_w = font.size_of(word).map_or(0, |(w, _)| w) as i32;
+    let word_w = raster.measure(font, word).0 as i32;
     let gap = 18i32;
-    let line_y = y + font.height() / 2;
+    let line_y = y + raster.height(font) / 2;
     let rule = Color::RGBA(0xff, 0xff, 0xff, 0x1e);
     let half = (content.width() as i32 - word_w - 2 * gap) / 2;
     if half > 0 {
@@ -115,6 +117,7 @@ pub fn draw_or_divider(
     draw_text(
         painter,
         text_cache,
+        raster,
         font,
         word,
         content.x() + (content.width() as i32 - word_w) / 2,
@@ -127,20 +130,22 @@ pub fn draw_or_divider(
 pub fn draw_primary_button(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    font: &Font,
+    raster: &dyn TextRaster,
+    font: FontId,
     rect: Rect,
     label: &str,
 ) -> Result<()> {
     draw_card_shadow(painter, rect, CARD_RADIUS);
     painter.fill_rounded_rect(rect, CARD_RADIUS, ACCENT);
-    let tw = font.size_of(label).map_or(0, |(w, _)| w) as i32;
+    let tw = raster.measure(font, label).0 as i32;
     draw_text(
         painter,
         text_cache,
+        raster,
         font,
         label,
         rect.x() + (rect.width() as i32 - tw) / 2,
-        rect.y() + (rect.height() as i32 - font.height()) / 2,
+        rect.y() + (rect.height() as i32 - raster.height(font)) / 2,
         WHITE,
     )?;
     Ok(())

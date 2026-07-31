@@ -4,8 +4,8 @@
 use super::*;
 use crate::ui::render::Color;
 use crate::ui::render::Rect;
+use crate::ui::text_raster::{FontId, TextRaster};
 use anyhow::Result;
-use sdl2::ttf::Font;
 use tiny_skia::Pixmap;
 
 // ---------------------------------GPU tiles-----------------------------------
@@ -146,14 +146,18 @@ pub fn render_card_outline_tile(w: u32, h: u32) -> Painter {
 pub const PIN_BADGE_SIZE: u32 = 28;
 
 /// Pinned badge: dark disc with PIN icon. Single shared tile.
-pub fn render_pin_badge_tile(text_cache: &mut TextCache, icon_font: &Font) -> Result<Painter> {
+pub fn render_pin_badge_tile(
+    text_cache: &mut TextCache,
+    raster: &dyn TextRaster,
+    icon_font: FontId,
+) -> Result<Painter> {
     let d = PIN_BADGE_SIZE;
     let mut p = Painter::new(d, d);
     let c = d as f32 / 2.0;
     p.fill_circle(c, c, c, Color::RGBA(0x00, 0x00, 0x00, 0x70));
     let icon = (d as f32 * 0.6) as u32;
     let icon_rect = Rect::new(((d - icon) / 2) as i32, ((d - icon) / 2) as i32, icon, icon);
-    draw_icon(&mut p, text_cache, icon_font, icon_rect, ICON_PIN, MUTED)?;
+    draw_icon(&mut p, text_cache, raster, icon_font, icon_rect, ICON_PIN, MUTED)?;
     Ok(p)
 }
 
@@ -196,27 +200,35 @@ pub fn render_focused_row_tile(
 }
 
 /// A single line of text as its own tight transparent tile.
-pub fn render_text_tile(text_cache: &mut TextCache, font: &Font, text: &str, color: Color) -> Result<Painter> {
-    let (w, h) = font.size_of(text).unwrap_or((1, 1));
+pub fn render_text_tile(
+    text_cache: &mut TextCache,
+    raster: &dyn TextRaster,
+    font: FontId,
+    text: &str,
+    color: Color,
+) -> Result<Painter> {
+    let (w, h) = raster.measure(font, text);
     let mut p = Painter::new(w.max(1), h.max(1));
-    draw_text(&mut p, text_cache, font, text, 0, 0, color)?;
+    draw_text(&mut p, text_cache, raster, font, text, 0, 0, color)?;
     Ok(p)
 }
 
 /// A wrapped text block as its own transparent tile (`max_w` wide, as tall as
 /// its wrapped line count).
+#[allow(clippy::too_many_arguments)]
 pub fn render_wrapped_text_tile(
     text_cache: &mut TextCache,
-    font: &Font,
+    raster: &dyn TextRaster,
+    font: FontId,
     text: &str,
     max_w: u32,
     color: Color,
     line_gap: i32,
 ) -> Result<Painter> {
-    let line_h = font.height() + line_gap;
-    let lines = wrap_text(font, text, max_w).len().max(1) as u32;
+    let line_h = raster.height(font) + line_gap;
+    let lines = wrap_text(raster, font, text, max_w).len().max(1) as u32;
     let mut p = Painter::new(max_w.max(1), lines * line_h.max(1) as u32);
-    draw_text_wrapped(&mut p, text_cache, font, text, 0, 0, max_w, color, line_gap)?;
+    draw_text_wrapped(&mut p, text_cache, raster, font, text, 0, 0, max_w, color, line_gap)?;
     Ok(p)
 }
 
@@ -225,16 +237,21 @@ pub const STATS_OVERLAY_REF_LINE: &str = "3840x2160@120 HEVC HDR Starfish";
 
 /// In-stream stats overlay with fixed width and centered hint.
 /// `lines[0]` is highlighted; remaining lines are muted.
-pub fn render_stats_overlay_tile(font: &Font, caption_font: &Font, lines: &[String], hint: &str) -> Result<Painter> {
+pub fn render_stats_overlay_tile(
+    raster: &dyn TextRaster,
+    font: FontId,
+    caption_font: FontId,
+    lines: &[String],
+    hint: &str,
+) -> Result<Painter> {
     let pad = 18i32;
     let content_safety = 16u32;
-    let line_font = font;
-    let line_h = line_font.height() + 6;
-    let caption_h = caption_font.height();
+    let line_h = raster.height(font) + 6;
+    let caption_h = raster.height(caption_font);
     let hint_h = caption_h + 8;
     let line_count = lines.len() as i32;
 
-    let inner_w = line_font.size_of(STATS_OVERLAY_REF_LINE).map_or(0, |(w, _)| w) + content_safety;
+    let inner_w = raster.measure(font, STATS_OVERLAY_REF_LINE).0 + content_safety;
     let w = inner_w + 2 * pad as u32;
     let h = (line_count * line_h + hint_h + 2 * pad) as u32;
     let content_w_i32 = w as i32 - 2 * pad;
@@ -246,13 +263,13 @@ pub fn render_stats_overlay_tile(font: &Font, caption_font: &Font, lines: &[Stri
     for (i, line) in lines.iter().enumerate() {
         let color = if i == 0 { WHITE } else { MUTED };
         let y = pad + i as i32 * line_h;
-        draw_text(&mut p, &mut tc, line_font, line, pad, y, color)?;
+        draw_text(&mut p, &mut tc, raster, font, line, pad, y, color)?;
     }
 
     let hint_y = pad + line_count * line_h + (hint_h - caption_h);
-    let hint_w = caption_font.size_of(hint).map_or(0, |(w, _)| w) as i32;
+    let hint_w = raster.measure(caption_font, hint).0 as i32;
     let hint_x = pad + (content_w_i32 - hint_w) / 2;
-    draw_text(&mut p, &mut tc, caption_font, hint, hint_x, hint_y, MUTED)?;
+    draw_text(&mut p, &mut tc, raster, caption_font, hint, hint_x, hint_y, MUTED)?;
     Ok(p)
 }
 
@@ -275,15 +292,20 @@ const LOG_OVERLAY_WRAP_INDENT: i32 = 20;
 /// Full-width log-tail at screen bottom (all screens, unlike stats overlay) — a
 /// constant left-to-right size regardless of content. Long lines word-wrap
 /// instead of clipping, only once they'd actually reach the screen edge.
-pub fn render_log_overlay_tile(font: &Font, screen_w: u32, lines: &[String]) -> Result<Painter> {
+pub fn render_log_overlay_tile(
+    raster: &dyn TextRaster,
+    font: FontId,
+    screen_w: u32,
+    lines: &[String],
+) -> Result<Painter> {
     let pad = 14i32;
-    let line_h = font.height() + 4;
+    let line_h = raster.height(font) + 4;
     let inner_w = screen_w.saturating_sub(2 * pad as u32);
     // Narrowed by the indent so continuation rows fit too; first row just has slack.
     let wrap_w = inner_w.saturating_sub(LOG_OVERLAY_WRAP_INDENT as u32).max(1);
     let wrapped: Vec<(Vec<String>, Color)> = lines
         .iter()
-        .map(|line| (wrap_text(font, line, wrap_w), log_line_color(line)))
+        .map(|line| (wrap_text(raster, font, line, wrap_w), log_line_color(line)))
         .collect();
     let total_rows: usize = wrapped.iter().map(|(rows, _)| rows.len().max(1)).sum();
     let h = (total_rows.max(1) as i32 * line_h + 2 * pad).max(1) as u32;
@@ -303,7 +325,7 @@ pub fn render_log_overlay_tile(font: &Font, screen_w: u32, lines: &[String]) -> 
         }
         for (i, text) in wrapped_rows.iter().enumerate() {
             let x = if i == 0 { pad } else { pad + LOG_OVERLAY_WRAP_INDENT };
-            draw_text(&mut p, &mut tc, font, text, x, pad + row * line_h, *color)?;
+            draw_text(&mut p, &mut tc, raster, font, text, x, pad + row * line_h, *color)?;
             row += 1;
         }
     }
@@ -316,7 +338,7 @@ pub fn render_log_overlay_tile(font: &Font, screen_w: u32, lines: &[String]) -> 
 /// shell) skip the second subtitle wrap the button-row rect would cost.
 pub fn confirm_dialog_card(screen_w: u32, screen_h: u32, fonts: &Fonts, subtitle: &str) -> Rect {
     simple_modal_card(screen_w, screen_h, |probe| {
-        let header_end = modal_header_end_y(fonts.label, fonts.value, probe, subtitle);
+        let header_end = modal_header_end_y(fonts.raster, fonts.label, fonts.value, probe, subtitle);
         (header_end + 32 + 72 + 32) as u32
     })
 }
@@ -326,7 +348,7 @@ pub fn confirm_dialog_card(screen_w: u32, screen_h: u32, fonts: &Fonts, subtitle
 /// subtitle. Shared with `main.rs`'s in-stream/quit dialog so all four modals match.
 pub fn confirm_dialog_layout(screen_w: u32, screen_h: u32, fonts: &Fonts, subtitle: &str) -> (Rect, Rect) {
     let card = confirm_dialog_card(screen_w, screen_h, fonts, subtitle);
-    let after_subtitle_y = modal_header_end_y(fonts.label, fonts.value, card, subtitle);
+    let after_subtitle_y = modal_header_end_y(fonts.raster, fonts.label, fonts.value, card, subtitle);
     let content = Rect::new(
         card.x() + 32,
         after_subtitle_y + 32,
@@ -361,10 +383,19 @@ pub fn render_confirm_dialog_shell(
     draw_modal_card(&mut p, card);
     // These dialogs are remote/controller-driven (no local pointer over the overlay), so the
     // X is a visual affordance only — always in the unhovered color.
-    draw_icon(&mut p, &mut tc, fonts.icon, modal_close_rect(card), ICON_CLOSE, MUTED)?;
+    draw_icon(
+        &mut p,
+        &mut tc,
+        fonts.raster,
+        fonts.icon,
+        modal_close_rect(card),
+        ICON_CLOSE,
+        MUTED,
+    )?;
     draw_modal_header(
         &mut p,
         &mut tc,
+        fonts.raster,
         fonts.label,
         fonts.value,
         card,

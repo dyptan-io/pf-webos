@@ -78,7 +78,7 @@ impl App {
     pub(crate) fn address_field_rect(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Rect {
         let subtitle = self.address_subtitle();
         let card = self.address_card_rect(screen_w, screen_h, fonts);
-        let after_subtitle_y = ui::modal_header_end_y(fonts.label, fonts.value, card, &subtitle);
+        let after_subtitle_y = ui::modal_header_end_y(fonts.raster, fonts.label, fonts.value, card, &subtitle);
         Rect::new(
             card.x() + 32,
             after_subtitle_y + 20,
@@ -91,7 +91,7 @@ impl App {
     pub(crate) fn address_card_rect(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Rect {
         let subtitle = self.address_subtitle();
         self.keyboard_modal_card(screen_w, screen_h, |probe| {
-            let header_end = ui::modal_header_end_y(fonts.label, fonts.value, probe, &subtitle);
+            let header_end = ui::modal_header_end_y(fonts.raster, fonts.label, fonts.value, probe, &subtitle);
             (header_end + 20 + 80 + 32) as u32 // field + bottom margin
         })
     }
@@ -119,11 +119,12 @@ impl App {
     ) -> Result<()> {
         let subtitle = self.address_subtitle();
         let card = self.address_card_rect(screen_w, screen_h, fonts);
-        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
+        self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
 
         let after_subtitle_y = ui::draw_modal_header(
             painter,
             text_cache,
+            fonts.raster,
             fonts.label,
             fonts.value,
             card,
@@ -142,14 +143,15 @@ impl App {
         let drawn = ui::draw_card(painter, field, true);
         let text_x = drawn.x() + 24;
         let typed = self.add_host.display_text();
-        let text_w = fonts.title.size_of(&typed).map_or(0, |(w, _)| w);
+        let text_w = fonts.raster.measure(fonts.title, &typed).0;
         ui::draw_text(
             painter,
             text_cache,
+            fonts.raster,
             fonts.title,
             &typed,
             text_x,
-            drawn.y() + (drawn.height() as i32 - fonts.title.height()) / 2,
+            drawn.y() + (drawn.height() as i32 - fonts.raster.height(fonts.title)) / 2,
             ui::WHITE,
         )?;
         // A blinkless text-cursor bar right after what's typed so far — there's

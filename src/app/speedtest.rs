@@ -287,7 +287,7 @@ impl App {
             Some(SpeedTestState::Done { .. }) | Some(SpeedTestState::Failed(_))
         );
         Self::simple_modal_card(screen_w, screen_h, |probe| {
-            let header_end = ui::modal_header_end_y(fonts.label, fonts.value, probe, &status);
+            let header_end = ui::modal_header_end_y(fonts.raster, fonts.label, fonts.value, probe, &status);
             if done {
                 (header_end + 32 + 72 + 32) as u32
             } else {
@@ -298,7 +298,7 @@ impl App {
 
     /// The button row's rect, below the status text.
     pub(crate) fn speed_test_buttons_rect(&self, card: Rect, fonts: &ui::Fonts) -> Rect {
-        let after = ui::modal_header_end_y(fonts.label, fonts.value, card, &self.speed_test_status());
+        let after = ui::modal_header_end_y(fonts.raster, fonts.label, fonts.value, card, &self.speed_test_status());
         Rect::new(card.x() + 32, after + 32, card.width().saturating_sub(64), 72)
     }
 
@@ -311,11 +311,12 @@ impl App {
         screen_h: u32,
     ) -> Result<()> {
         let card = self.speed_test_card_rect(screen_w, screen_h, fonts);
-        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
+        self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
         let failed = matches!(self.speed_test, Some(SpeedTestState::Failed(_)));
         ui::draw_modal_header(
             painter,
             text_cache,
+            fonts.raster,
             fonts.label,
             fonts.value,
             card,

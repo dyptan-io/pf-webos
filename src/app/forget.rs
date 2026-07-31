@@ -63,11 +63,12 @@ impl App {
             return Ok(());
         };
         let (card, content) = ui::confirm_dialog_layout(screen_w, screen_h, fonts, &Self::forget_host_subtitle(name));
-        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
+        self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
 
         ui::draw_modal_header(
             painter,
             text_cache,
+            fonts.raster,
             fonts.label,
             fonts.value,
             card,

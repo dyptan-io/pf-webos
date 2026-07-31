@@ -1,9 +1,10 @@
-//! Font loading, text/icon cache and drawing (Geist + icon font).
+//! Text/icon cache and drawing (Geist + icon font). Rasterization itself goes
+//! through `TextRaster` — this module never touches `sdl2::ttf`.
 use super::*;
 use crate::ui::render::Color;
 use crate::ui::render::Rect;
-use anyhow::{Context, Result};
-use sdl2::ttf::Font;
+use crate::ui::text_raster::{FontId, TextRaster};
+use anyhow::Result;
 use std::collections::HashMap;
 use tiny_skia::{IntSize, Pixmap};
 
@@ -20,32 +21,15 @@ pub enum FontWeight {
     SemiBold,
 }
 
-/// App UI fonts bundled for convenience (borrow-only, owned in `main.rs::run_inner`).
-pub struct Fonts<'a, 'ttf> {
-    pub label: &'a Font<'ttf, 'static>,
-    pub value: &'a Font<'ttf, 'static>,
-    pub title: &'a Font<'ttf, 'static>,
-    pub icon: &'a Font<'ttf, 'static>,
+/// App UI fonts: a `TextRaster` plus which loaded font each logical role maps to.
+pub struct Fonts<'a> {
+    pub raster: &'a dyn TextRaster,
+    pub label: FontId,
+    pub value: FontId,
+    pub title: FontId,
+    pub icon: FontId,
     /// Smallest weight (stats overlay Green-button hint).
-    pub caption: &'a Font<'ttf, 'static>,
-}
-
-/// Load Geist weight at size proportional to display height (720px reference).
-pub fn load_font(
-    ttf: &sdl2::ttf::Sdl2TtfContext,
-    height_px: u32,
-    design_size: u16,
-    weight: FontWeight,
-) -> Result<Font<'_, 'static>> {
-    let bytes: &'static [u8] = match weight {
-        FontWeight::Regular => GEIST_REGULAR,
-        FontWeight::Medium => GEIST_MEDIUM,
-        FontWeight::SemiBold => GEIST_SEMIBOLD,
-    };
-    let scaled = (u32::from(design_size) * height_px / 720).max(10) as u16;
-    let rwops = sdl2::rwops::RWops::from_bytes(bytes).map_err(|e| anyhow::anyhow!("geist rwops: {e}"))?;
-    ttf.load_font_from_rwops(rwops, scaled)
-        .map_err(|e| anyhow::anyhow!("load_font (Geist): {e}"))
+    pub caption: FontId,
 }
 
 /// Icon font bytes, embedded at compile time (no asset staging or runtime path needed).
@@ -68,56 +52,17 @@ pub fn logo_pixmap() -> Option<&'static Pixmap> {
     .as_ref()
 }
 
-/// Loads the bundled icon font at a fixed, generously large size — icon glyphs are
-/// always drawn through `draw_icon`, which composites (and, via `Painter`'s
-/// bilinear `draw_pixmap_scaled`, downscales) the rasterized glyph to fit whatever
-/// rect the caller actually wants, so a single oversized rasterization (rather than
-/// one `load_icon_font` call per distinct icon size, the way the three text fonts
-/// each get their own) is enough to stay crisp at every icon size this UI uses.
-pub fn load_icon_font(ttf: &sdl2::ttf::Sdl2TtfContext) -> Result<Font<'_, 'static>> {
-    let rwops = sdl2::rwops::RWops::from_bytes(ICON_FONT_BYTES).map_err(|e| anyhow::anyhow!("icon font rwops: {e}"))?;
-    ttf.load_font_from_rwops(rwops, 128)
-        .map_err(|e| anyhow::anyhow!("load_icon_font: {e}"))
-}
-
-/// Converts an `SDL2_ttf`-rendered glyph-run surface into an owned, premultiplied
-/// `tiny_skia::Pixmap`. Goes through `convert_format(RGBA32)` first so the byte
-/// order in memory is always R,G,B,A regardless of `SDL2_ttf`'s actual output format
-/// or host endianness — the same `RGBA32` convention `main.rs`/`art.rs` already rely
-/// on for raw RGBA buffers.
-pub fn pixmap_from_ttf_surface(surface: &sdl2::surface::Surface) -> Result<Pixmap> {
-    let surface = surface
-        .convert_format(sdl2::pixels::PixelFormatEnum::RGBA32)
-        .map_err(|e| anyhow::anyhow!("convert glyph surface: {e}"))?;
-    let (w, h) = (surface.width(), surface.height());
-    let pitch = surface.pitch() as usize;
-    let row_bytes = w as usize * 4;
-    let mut rgba = vec![0u8; row_bytes * h as usize];
-    surface.with_lock(|src| {
-        for y in 0..h as usize {
-            let start = y * pitch;
-            rgba[y * row_bytes..(y + 1) * row_bytes].copy_from_slice(&src[start..start + row_bytes]);
-        }
-    });
-    premultiply_rgba(&mut rgba);
-    Pixmap::from_vec(rgba, IntSize::from_wh(w, h).context("zero-sized glyph surface")?).context("build glyph pixmap")
-}
-
 /// Caches rasterized-text `Pixmap`s across frames, keyed by the exact
 /// `(text, color, font)` that produced them. Without this, `draw_text` re-rasterized
 /// (freetype glyph lookup + blend + premultiply) on *every* call — and every draw
 /// function in this module is called on every render tick (the pre-stream UI loop
 /// runs at ~60fps), so a static label like "Settings" paid that cost 60 times a
-/// second for pixels that never changed. `font` is identified by its address rather
-/// than any content: this client only ever loads three fonts once at startup
-/// (`font_label`/`font_value`/`font_title` in `main.rs`) and holds them for the
-/// whole UI-flow's lifetime, so a stable address is a safe, cheap stand-in for
-/// identity — `Font` itself exposes nothing hashable to key on instead. Entry count
-/// is naturally bounded by this app's own content (a handful of static labels, a
-/// bounded set of settings values, one row per known host/game) — no eviction
-/// needed; see module docs if that assumption ever stops holding.
+/// second for pixels that never changed. Entry count is naturally bounded by this
+/// app's own content (a handful of static labels, a bounded set of settings values,
+/// one row per known host/game) — no eviction needed; see module docs if that
+/// assumption ever stops holding.
 pub struct TextCache {
-    entries: HashMap<(String, u32, usize), Pixmap>,
+    entries: HashMap<(String, u32, FontId), Pixmap>,
 }
 
 impl TextCache {
@@ -127,22 +72,18 @@ impl TextCache {
         }
     }
 
-    fn key(font: &Font, text: &str, color: Color) -> (String, u32, usize) {
+    fn key(font: FontId, text: &str, color: Color) -> (String, u32, FontId) {
         let packed_color = u32::from_be_bytes([color.r, color.g, color.b, color.a]);
-        (text.to_string(), packed_color, std::ptr::from_ref(font) as usize)
+        (text.to_string(), packed_color, font)
     }
 
     /// Returns the cached `Pixmap` for `(font, text, color)`, rasterizing (and
     /// caching) it first if this is the first time this exact combination has
     /// been drawn.
-    fn get_or_create(&mut self, font: &Font, text: &str, color: Color) -> Result<&Pixmap> {
+    fn get_or_create(&mut self, raster: &dyn TextRaster, font: FontId, text: &str, color: Color) -> Result<&Pixmap> {
         let key = Self::key(font, text, color);
         if !self.entries.contains_key(&key) {
-            let surface = font
-                .render(text)
-                .blended(sdl2::pixels::Color::RGBA(color.r, color.g, color.b, color.a))
-                .map_err(|e| anyhow::anyhow!("render text: {e}"))?;
-            let pixmap = pixmap_from_ttf_surface(&surface)?;
+            let pixmap = raster.rasterize(font, text, color)?;
             self.entries.insert(key.clone(), pixmap);
         }
         Ok(self.entries.get(&key).expect("just inserted"))
@@ -159,10 +100,12 @@ impl Default for TextCache {
 /// width. `text_cache` (see [`TextCache`]) makes repeat calls with the same
 /// `(font, text, color)` — the common case, since most on-screen text is static
 /// from one frame to the next — cheap: no re-rasterization, no re-premultiplying.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_text(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    font: &Font,
+    raster: &dyn TextRaster,
+    font: FontId,
     text: &str,
     x: i32,
     y: i32,
@@ -171,7 +114,7 @@ pub fn draw_text(
     if text.is_empty() {
         return Ok(0);
     }
-    let pixmap = text_cache.get_or_create(font, text, color)?;
+    let pixmap = text_cache.get_or_create(raster, font, text, color)?;
     let width = pixmap.width();
     painter.draw_pixmap(x, y, pixmap);
     Ok(width)
@@ -188,15 +131,19 @@ pub fn draw_text(
 /// process — on a TV with no eviction path. These lines are drawn at most a couple of
 /// times each (once per scroll position that shows them), so rasterizing fresh is both
 /// cheaper overall and bounded in memory.
-pub fn draw_text_uncached(painter: &mut Painter, font: &Font, text: &str, x: i32, y: i32, color: Color) -> Result<u32> {
+pub fn draw_text_uncached(
+    painter: &mut Painter,
+    raster: &dyn TextRaster,
+    font: FontId,
+    text: &str,
+    x: i32,
+    y: i32,
+    color: Color,
+) -> Result<u32> {
     if text.is_empty() {
         return Ok(0);
     }
-    let surface = font
-        .render(text)
-        .blended(sdl2::pixels::Color::RGBA(color.r, color.g, color.b, color.a))
-        .map_err(|e| anyhow::anyhow!("render text: {e}"))?;
-    let pixmap = pixmap_from_ttf_surface(&surface)?;
+    let pixmap = raster.rasterize(font, text, color)?;
     let width = pixmap.width();
     painter.draw_pixmap(x, y, &pixmap);
     Ok(width)
@@ -204,18 +151,19 @@ pub fn draw_text_uncached(painter: &mut Painter, font: &Font, text: &str, x: i32
 
 /// Draws one icon glyph (one of the `ICON_*` constants above) from the bundled icon
 /// font, scaled to fill `rect` — the same `TextCache` that caches on-screen text
-/// caches these too (a `Font`'s address plus the glyph string is already a unique,
-/// stable cache key — see [`TextCache`] — so a second cache wasn't needed just
-/// because this one holds icons instead of words).
+/// caches these too (a font id plus the glyph string is already a unique, stable
+/// cache key — see [`TextCache`] — so a second cache wasn't needed just because this
+/// one holds icons instead of words).
 pub fn draw_icon(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    icon_font: &Font,
+    raster: &dyn TextRaster,
+    icon_font: FontId,
     rect: Rect,
     glyph: &str,
     color: Color,
 ) -> Result<()> {
-    let pixmap = text_cache.get_or_create(icon_font, glyph, color)?;
+    let pixmap = text_cache.get_or_create(raster, icon_font, glyph, color)?;
     painter.draw_pixmap_scaled(rect, pixmap);
     Ok(())
 }
@@ -223,15 +171,15 @@ pub fn draw_icon(
 /// Truncates `text` with a trailing "…" so it fits within `max_w` pixels in `font`
 /// (moonlight-tv scroll-marquees long titles on focus instead — see the module docs
 /// on why this client keeps it simple).
-pub fn ellipsize(font: &Font, text: &str, max_w: u32) -> String {
-    if font.size_of(text).map_or(0, |(w, _)| w) <= max_w {
+pub fn ellipsize(raster: &dyn TextRaster, font: FontId, text: &str, max_w: u32) -> String {
+    if raster.measure(font, text).0 <= max_w {
         return text.to_string();
     }
     let mut s: Vec<char> = text.chars().collect();
     while !s.is_empty() {
         s.pop();
         let candidate: String = s.iter().collect::<String>() + "…";
-        if font.size_of(&candidate).map_or(0, |(w, _)| w) <= max_w {
+        if raster.measure(font, &candidate).0 <= max_w {
             return candidate;
         }
     }
@@ -243,18 +191,18 @@ pub fn ellipsize(font: &Font, text: &str, max_w: u32) -> String {
 /// single-line truncation for card titles.
 ///
 /// Tracks the running line width instead of re-measuring the whole (growing) line on
-/// every word — the original did `font.size_of(&candidate)` on the full prefix each
-/// time, which is O(line length) per word and so O(n²) over a line, cheap for a
-/// sentence but the dominant cost of wrapping About's ~10,000-line document on open
-/// (see `ui::wrap_document`). Assumes negligible word-to-word kerning at the space
-/// boundary, same as every other width-budget calculation in this UI already does.
-pub fn wrap_text(font: &Font, text: &str, max_w: u32) -> Vec<String> {
-    let space_w = font.size_of(" ").map_or(0, |(w, _)| w);
+/// every word — the original did a full-prefix measure each time, which is O(line
+/// length) per word and so O(n²) over a line, cheap for a sentence but the dominant
+/// cost of wrapping About's ~10,000-line document on open (see `ui::wrap_document`).
+/// Assumes negligible word-to-word kerning at the space boundary, same as every other
+/// width-budget calculation in this UI already does.
+pub fn wrap_text(raster: &dyn TextRaster, font: FontId, text: &str, max_w: u32) -> Vec<String> {
+    let space_w = raster.measure(font, " ").0;
     let mut lines = Vec::new();
     let mut current = String::new();
     let mut current_w = 0u32;
     for word in text.split_whitespace() {
-        let word_w = font.size_of(word).map_or(0, |(w, _)| w);
+        let word_w = raster.measure(font, word).0;
         let candidate_w = if current.is_empty() {
             word_w
         } else {
@@ -279,14 +227,15 @@ pub fn wrap_text(font: &Font, text: &str, max_w: u32) -> Vec<String> {
 }
 
 /// Draws `text` word-wrapped to `max_w` (see [`wrap_text`]), one line per
-/// `font.height() + line_gap`, starting at `(x, y)`. Returns the y position just past
-/// the last line, so callers can stack more content beneath it without having to guess
-/// how many lines it wrapped to.
+/// `raster.height(font) + line_gap`, starting at `(x, y)`. Returns the y position just
+/// past the last line, so callers can stack more content beneath it without having to
+/// guess how many lines it wrapped to.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_text_wrapped(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    font: &Font,
+    raster: &dyn TextRaster,
+    font: FontId,
     text: &str,
     x: i32,
     y: i32,
@@ -295,9 +244,9 @@ pub fn draw_text_wrapped(
     line_gap: i32,
 ) -> Result<i32> {
     let mut cursor_y = y;
-    for line in wrap_text(font, text, max_w) {
-        draw_text(painter, text_cache, font, &line, x, cursor_y, color)?;
-        cursor_y += font.height() + line_gap;
+    for line in wrap_text(raster, font, text, max_w) {
+        draw_text(painter, text_cache, raster, font, &line, x, cursor_y, color)?;
+        cursor_y += raster.height(font) + line_gap;
     }
     Ok(cursor_y)
 }
@@ -305,10 +254,10 @@ pub fn draw_text_wrapped(
 /// The pure geometry `draw_modal_header` and `modal_header_end_y` share:
 /// `(text_x, subtitle_y, max_w)` — the one place it's computed, so the two
 /// can never drift apart.
-pub fn modal_header_geometry(title_font: &Font, card: Rect) -> (i32, i32, u32) {
+pub fn modal_header_geometry(raster: &dyn TextRaster, title_font: FontId, card: Rect) -> (i32, i32, u32) {
     let text_x = card.x() + 32;
     let title_y = card.y() + 28;
-    let subtitle_y = title_y + title_font.height() + 18;
+    let subtitle_y = title_y + raster.height(title_font) + 18;
     let max_w = card.width().saturating_sub(64);
     (text_x, subtitle_y, max_w)
 }
@@ -324,18 +273,20 @@ pub fn modal_header_geometry(title_font: &Font, card: Rect) -> (i32, i32, u32) {
 pub fn draw_modal_header(
     painter: &mut Painter,
     text_cache: &mut TextCache,
-    title_font: &Font,
-    subtitle_font: &Font,
+    raster: &dyn TextRaster,
+    title_font: FontId,
+    subtitle_font: FontId,
     card: Rect,
     title: &str,
     title_color: Color,
     subtitle: &str,
     subtitle_color: Color,
 ) -> Result<i32> {
-    let (text_x, subtitle_y, max_w) = modal_header_geometry(title_font, card);
+    let (text_x, subtitle_y, max_w) = modal_header_geometry(raster, title_font, card);
     draw_text(
         painter,
         text_cache,
+        raster,
         title_font,
         title,
         text_x,
@@ -345,6 +296,7 @@ pub fn draw_modal_header(
     draw_text_wrapped(
         painter,
         text_cache,
+        raster,
         subtitle_font,
         subtitle,
         text_x,
@@ -359,8 +311,14 @@ pub fn draw_modal_header(
 /// for positioning content below it (e.g. Pairing's PIN row) from `app.rs`'s
 /// `prepare_tiles`/`draw_list`, which need that position but must not
 /// re-render the header just to get it.
-pub fn modal_header_end_y(title_font: &Font, subtitle_font: &Font, card: Rect, subtitle: &str) -> i32 {
-    let (_, subtitle_y, max_w) = modal_header_geometry(title_font, card);
-    let lines = wrap_text(subtitle_font, subtitle, max_w).len() as i32;
-    subtitle_y + lines * (subtitle_font.height() + 6)
+pub fn modal_header_end_y(
+    raster: &dyn TextRaster,
+    title_font: FontId,
+    subtitle_font: FontId,
+    card: Rect,
+    subtitle: &str,
+) -> i32 {
+    let (_, subtitle_y, max_w) = modal_header_geometry(raster, title_font, card);
+    let lines = wrap_text(raster, subtitle_font, subtitle, max_w).len() as i32;
+    subtitle_y + lines * (raster.height(subtitle_font) + 6)
 }

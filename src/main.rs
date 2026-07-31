@@ -482,8 +482,10 @@ mod real {
                     keycode: Some(k),
                     repeat: false,
                     ..
-                } => crate::ui::menu_event_for_key(*k),
-                Event::ControllerButtonDown { button, .. } => crate::ui::menu_event_for_button(*button),
+                } => crate::platform::webos::input::menu_event_for_key(*k),
+                Event::ControllerButtonDown { button, .. } => {
+                    crate::platform::webos::input::menu_event_for_button(*button)
+                }
                 _ => None,
             };
             match nav {
@@ -506,7 +508,7 @@ mod real {
             &mut self,
             compositor: &mut Compositor,
             texture_creator: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
-            fonts: &crate::ui::Fonts<'_, '_>,
+            fonts: &crate::ui::Fonts<'_>,
             w: u32,
             h: u32,
             cmds: &mut Vec<DrawCmd>,
@@ -573,7 +575,8 @@ mod real {
     /// `WEBOS_EXIT_SCANCODE` — polled since it's outside rust-sdl2's `Scancode` enum).
     /// `prev` carries the last-frame state across calls.
     fn exit_gesture_fired(prev: &mut bool) -> bool {
-        let down = crate::ui::webos_scancode_down(crate::ui::WEBOS_EXIT_SCANCODE);
+        let down =
+            crate::platform::webos::input::webos_scancode_down(crate::platform::webos::input::WEBOS_EXIT_SCANCODE);
         let fired = down && !*prev;
         *prev = down;
         fired
@@ -622,7 +625,7 @@ mod real {
         menu_back_down: bool,
         /// Hold-to-pin on Home (see `PIN_HOLD`), while OK is held on a pinnable card.
         pin_held: Option<PinHold>,
-        stick_nav: crate::ui::StickMenuNav,
+        stick_nav: crate::platform::webos::input::StickMenuNav,
     }
 
     /// What the UI loop should do with the event `handle_ui_event` just consumed.
@@ -707,11 +710,11 @@ mod real {
         let confirm_down = matches!(
             *event,
             Event::KeyDown { keycode: Some(k), .. }
-                if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Confirm)
+                if crate::platform::webos::input::menu_event_for_key(k) == Some(MenuEvent::Confirm)
         ) || matches!(
             *event,
             Event::ControllerButtonDown { button, .. }
-                if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Confirm)
+                if crate::platform::webos::input::menu_event_for_button(button) == Some(MenuEvent::Confirm)
         );
         if confirm_down {
             // OK stays the gesture's until released, whatever the toggle put on
@@ -735,11 +738,11 @@ mod real {
         let ends_hold = matches!(
             *event,
             Event::KeyUp { keycode: Some(k), .. }
-                if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Confirm)
+                if crate::platform::webos::input::menu_event_for_key(k) == Some(MenuEvent::Confirm)
         ) || matches!(
             *event,
             Event::ControllerButtonUp { button, .. }
-                if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Confirm)
+                if crate::platform::webos::input::menu_event_for_button(button) == Some(MenuEvent::Confirm)
         );
         // This press was ours (tap or hold) — swallow the release.
         let hold = ends_hold.then(|| input.pin_held.take()).flatten()?;
@@ -885,7 +888,7 @@ mod real {
             Event::KeyDown { keycode: Some(k), .. }
                 if matches!(app.screen, Screen::Pairing | Screen::AddHost | Screen::EditHost) =>
             {
-                if let Some(digit) = crate::ui::digit_key_value(k) {
+                if let Some(digit) = crate::platform::webos::input::digit_key_value(k) {
                     match app.screen {
                         Screen::Pairing => app.enter_pin_digit(digit),
                         Screen::AddHost | Screen::EditHost => app.enter_add_host_digit(digit),
@@ -919,20 +922,22 @@ mod real {
             _ => {}
         }
         let menu_ev = match event {
-            Event::KeyDown { keycode: Some(k), .. } => {
-                edge_trigger_back(crate::ui::menu_event_for_key(k), &mut input.menu_back_down)
-            }
+            Event::KeyDown { keycode: Some(k), .. } => edge_trigger_back(
+                crate::platform::webos::input::menu_event_for_key(k),
+                &mut input.menu_back_down,
+            ),
             Event::KeyUp { keycode: Some(k), .. } => {
-                if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) {
+                if crate::platform::webos::input::menu_event_for_key(k) == Some(MenuEvent::Back) {
                     input.menu_back_down = false;
                 }
                 None
             }
-            Event::ControllerButtonDown { button, .. } => {
-                edge_trigger_back(crate::ui::menu_event_for_button(button), &mut input.menu_back_down)
-            }
+            Event::ControllerButtonDown { button, .. } => edge_trigger_back(
+                crate::platform::webos::input::menu_event_for_button(button),
+                &mut input.menu_back_down,
+            ),
             Event::ControllerButtonUp { button, .. } => {
-                if crate::ui::menu_event_for_button(button) == Some(MenuEvent::Back) {
+                if crate::platform::webos::input::menu_event_for_button(button) == Some(MenuEvent::Back) {
                     input.menu_back_down = false;
                 }
                 None
@@ -1073,7 +1078,9 @@ mod real {
                 return Ok(None);
             }
             // Raw scancode poll (not SDL2 event); edge-detected like streaming loop.
-            let yellow_down = crate::ui::webos_scancode_down(crate::ui::WEBOS_YELLOW_SCANCODE);
+            let yellow_down = crate::platform::webos::input::webos_scancode_down(
+                crate::platform::webos::input::WEBOS_YELLOW_SCANCODE,
+            );
             if yellow_down && !yellow_held {
                 cycle_log_overlay();
                 dirty = true; // force an immediate redraw with the new state
@@ -1282,7 +1289,8 @@ mod real {
             if let Some(lines) = log_overlay_lines() {
                 if log_overlay_due {
                     log_overlay_last = Some(Instant::now());
-                    match crate::ui::render_log_overlay_tile(fonts.caption, display_mode.w as u32, &lines) {
+                    match crate::ui::render_log_overlay_tile(fonts.raster, fonts.caption, display_mode.w as u32, &lines)
+                    {
                         Ok(tile) => {
                             log_overlay_dims = Some((tile.width(), tile.height()));
                             compositor.upload(texture_creator, Tile::LogOverlay, &tile)?;
@@ -1396,17 +1404,14 @@ mod real {
         let identity = store::load_or_create_identity().context("load_or_create_identity")?;
 
         // Sized for a 10-foot TV viewing distance — see ui.rs's ROW_H/ROW_MAX_W docs.
-        let font_label = crate::ui::load_font(&ttf, display_mode.h as u32, 22, crate::ui::FontWeight::Medium)?;
-        let font_value = crate::ui::load_font(&ttf, display_mode.h as u32, 20, crate::ui::FontWeight::Regular)?;
-        let font_title = crate::ui::load_font(&ttf, display_mode.h as u32, 40, crate::ui::FontWeight::SemiBold)?;
-        let font_caption = crate::ui::load_font(&ttf, display_mode.h as u32, 14, crate::ui::FontWeight::Regular)?;
-        let icon_font = crate::ui::load_icon_font(&ttf)?;
+        let text_raster = crate::platform::webos::text_sdl::SdlTextRaster::new(&ttf, display_mode.h as u32)?;
         let fonts = crate::ui::Fonts {
-            label: &font_label,
-            value: &font_value,
-            title: &font_title,
-            icon: &icon_font,
-            caption: &font_caption,
+            raster: &text_raster,
+            label: crate::ui::FontId::Label,
+            value: crate::ui::FontId::Value,
+            title: crate::ui::FontId::Title,
+            icon: crate::ui::FontId::Icon,
+            caption: crate::ui::FontId::Caption,
         };
 
         // Owned here, at the top of the menu/stream cycle, rather than re-declared in
@@ -1639,7 +1644,7 @@ mod real {
                             scancode: None,
                             repeat: false,
                             ..
-                        } if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) => {
+                        } if crate::platform::webos::input::menu_event_for_key(k) == Some(MenuEvent::Back) => {
                             if let Some(ev) = keyboard::key_event(sdl2::keyboard::Scancode::Escape, true) {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
@@ -1648,7 +1653,7 @@ mod real {
                             keycode: Some(k),
                             scancode: None,
                             ..
-                        } if crate::ui::menu_event_for_key(k) == Some(MenuEvent::Back) => {
+                        } if crate::platform::webos::input::menu_event_for_key(k) == Some(MenuEvent::Back) => {
                             if let Some(ev) = keyboard::key_event(sdl2::keyboard::Scancode::Escape, false) {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
@@ -1723,8 +1728,10 @@ mod real {
                 // Green button: local-only stats-overlay toggle, edge-detected here (raw
                 // scancode poll — the safe SDL2 event API can't see this key at all).
                 // Skipped while the disconnect dialog owns input, same as scancode forwarding.
-                let green_down =
-                    !disconnect.is_open() && crate::ui::webos_scancode_down(crate::ui::WEBOS_GREEN_SCANCODE);
+                let green_down = !disconnect.is_open()
+                    && crate::platform::webos::input::webos_scancode_down(
+                        crate::platform::webos::input::WEBOS_GREEN_SCANCODE,
+                    );
                 if green_down && !green_held {
                     stats_enabled = !stats_enabled;
                     overlay_last = None; // force an immediate redraw
@@ -1738,8 +1745,10 @@ mod real {
                 // Yellow button: log-tail overlay Off -> Live -> Frozen -> Off, same
                 // edge-detect technique as Green above. Works on every screen, not just
                 // while streaming — see the matching handling in `run_ui_flow`.
-                let yellow_down =
-                    !disconnect.is_open() && crate::ui::webos_scancode_down(crate::ui::WEBOS_YELLOW_SCANCODE);
+                let yellow_down = !disconnect.is_open()
+                    && crate::platform::webos::input::webos_scancode_down(
+                        crate::platform::webos::input::WEBOS_YELLOW_SCANCODE,
+                    );
                 if yellow_down && !yellow_held {
                     let was_on = log_overlay_state() != LogOverlayState::Off;
                     cycle_log_overlay();
@@ -1754,7 +1763,10 @@ mod real {
                 yellow_held = yellow_down;
                 // Blue button: live frame-pacing toggle, same edge-detect as Green/Yellow above
                 // (Red is OS-intercepted on-device). Force a redraw so Pace reflects the new state.
-                let blue_down = !disconnect.is_open() && crate::ui::webos_scancode_down(crate::ui::WEBOS_BLUE_SCANCODE);
+                let blue_down = !disconnect.is_open()
+                    && crate::platform::webos::input::webos_scancode_down(
+                        crate::platform::webos::input::WEBOS_BLUE_SCANCODE,
+                    );
                 if blue_down && !blue_held {
                     let now_on = !connected.stats.pacing_enabled.load(Ordering::Relaxed);
                     connected.stats.pacing_enabled.store(now_on, Ordering::Relaxed);
@@ -1933,6 +1945,7 @@ mod real {
                             lines.push(format!("Pace {delta_ms:+.1} ms"));
                         }
                         match crate::ui::render_stats_overlay_tile(
+                            fonts.raster,
                             fonts.value,
                             fonts.caption,
                             &lines,
@@ -1964,7 +1977,12 @@ mod real {
                     // the toggle has already flipped the state to Off) — the fade keeps
                     // recompositing the last uploaded tile via `log_dst`.
                     if let Some(lines) = log_overlay_lines() {
-                        match crate::ui::render_log_overlay_tile(fonts.caption, display_mode.w as u32, &lines) {
+                        match crate::ui::render_log_overlay_tile(
+                            fonts.raster,
+                            fonts.caption,
+                            display_mode.w as u32,
+                            &lines,
+                        ) {
                             Ok(tile) => {
                                 let (tw, th) = (tile.width(), tile.height());
                                 compositor.upload(&texture_creator, Tile::LogOverlay, &tile)?;
@@ -1983,7 +2001,7 @@ mod real {
                         }
                     }
                     if let Some((text, alpha)) = &notif_frame {
-                        match crate::ui::render_notification_tile(fonts.value, text) {
+                        match crate::ui::render_notification_tile(fonts.raster, fonts.value, text) {
                             Ok(tile) => {
                                 let (tw, th) = (tile.width(), tile.height());
                                 compositor.upload(&texture_creator, Tile::Notification, &tile)?;

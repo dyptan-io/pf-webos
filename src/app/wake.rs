@@ -185,7 +185,7 @@ impl App {
     /// button row (nothing to send), so it's a plain message card, not a confirm dialog.
     pub(crate) fn wake_message_card(screen_w: u32, screen_h: u32, fonts: &ui::Fonts, status: &str) -> Rect {
         Self::simple_modal_card(screen_w, screen_h, |probe| {
-            (ui::modal_header_end_y(fonts.label, fonts.value, probe, status) + 32) as u32
+            (ui::modal_header_end_y(fonts.raster, fonts.label, fonts.value, probe, status) + 32) as u32
         })
     }
 
@@ -221,10 +221,11 @@ impl App {
             (card, Some(content))
         };
 
-        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
+        self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
         ui::draw_modal_header(
             painter,
             text_cache,
+            fonts.raster,
             fonts.label,
             fonts.value,
             card,

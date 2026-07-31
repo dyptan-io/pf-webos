@@ -245,12 +245,12 @@ impl App {
             card.width().saturating_sub(PAIRING_MARGIN as u32 * 2),
             0,
         );
-        let header_end = ui::modal_header_end_y(fonts.label, fonts.value, card, PAIRING_SUBTITLE);
+        let header_end = ui::modal_header_end_y(fonts.raster, fonts.label, fonts.value, card, PAIRING_SUBTITLE);
         let button = Rect::new(content.x(), header_end + 26, content.width(), PAIRING_BUTTON_H);
         let button_caption_y = button.y() + button.height() as i32 + 12;
-        let or_y = button_caption_y + fonts.value.height() + 20;
-        let pin_caption_y = or_y + fonts.value.height() + 20;
-        let pin_y = pin_caption_y + fonts.value.height() + 14;
+        let or_y = button_caption_y + fonts.raster.height(fonts.value) + 20;
+        let pin_caption_y = or_y + fonts.raster.height(fonts.value) + 20;
+        let pin_y = pin_caption_y + fonts.raster.height(fonts.value) + 14;
         let status_y = pin_y + ui::PAIRING_DIGIT_H as i32 + 22;
         PairingLayout {
             button,
@@ -267,7 +267,7 @@ impl App {
     pub(crate) fn pairing_card_rect(screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Rect {
         Self::simple_modal_card(screen_w, screen_h, |probe| {
             let l = Self::pairing_layout(probe, fonts);
-            let status_room = 2 * (fonts.value.height() + 6);
+            let status_room = 2 * (fonts.raster.height(fonts.value) + 6);
             (l.status_y + status_room + 26) as u32
         })
     }
@@ -292,11 +292,12 @@ impl App {
     ) -> Result<()> {
         let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
         let l = Self::pairing_layout(card, fonts);
-        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
+        self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
 
         ui::draw_modal_header(
             painter,
             text_cache,
+            fonts.raster,
             fonts.label,
             fonts.value,
             card,
@@ -310,21 +311,30 @@ impl App {
         // always works, whereas the PIN needs the host's pairing page open and armed.
         // The shell draws it unfocused-but-filled; the focused copy is a separate
         // `Tile::ModalFocusElement` (see `prepare_tiles`).
-        ui::draw_primary_button(painter, text_cache, fonts.label, l.button, ui::PAIRING_REQUEST_LABEL)?;
+        ui::draw_primary_button(
+            painter,
+            text_cache,
+            fonts.raster,
+            fonts.label,
+            l.button,
+            ui::PAIRING_REQUEST_LABEL,
+        )?;
         Self::draw_centred_caption(
             painter,
             text_cache,
+            fonts.raster,
             fonts.value,
             l.content,
             l.button_caption_y,
             "Then approve this TV on the host.",
         )?;
 
-        ui::draw_or_divider(painter, text_cache, fonts.value, l.content, l.or_y, "or")?;
+        ui::draw_or_divider(painter, text_cache, fonts.raster, fonts.value, l.content, l.or_y, "or")?;
 
         Self::draw_centred_caption(
             painter,
             text_cache,
+            fonts.raster,
             fonts.value,
             l.content,
             l.pin_caption_y,
@@ -334,14 +344,15 @@ impl App {
             let rect = ui::pairing_digit_rect(card, l.pin_y, i);
             let drawn = ui::draw_card(painter, rect, false);
             let text = digit.to_string();
-            let tw = fonts.title.size_of(&text).map_or(0, |(w, _)| w);
+            let tw = fonts.raster.measure(fonts.title, &text).0;
             ui::draw_text(
                 painter,
                 text_cache,
+                fonts.raster,
                 fonts.title,
                 &text,
                 drawn.x() + (drawn.width() as i32 - tw as i32) / 2,
-                drawn.y() + (drawn.height() as i32 - fonts.title.height()) / 2,
+                drawn.y() + (drawn.height() as i32 - fonts.raster.height(fonts.title)) / 2,
                 ui::WHITE,
             )?;
         }
@@ -351,6 +362,7 @@ impl App {
             ui::draw_text_wrapped(
                 painter,
                 text_cache,
+                fonts.raster,
                 fonts.value,
                 status,
                 l.content.x(),
@@ -367,15 +379,17 @@ impl App {
     fn draw_centred_caption(
         painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
-        font: &sdl2::ttf::Font,
+        raster: &dyn ui::TextRaster,
+        font: ui::FontId,
         content: Rect,
         y: i32,
         text: &str,
     ) -> Result<()> {
-        let w = font.size_of(text).map_or(0, |(w, _)| w) as i32;
+        let w = raster.measure(font, text).0 as i32;
         ui::draw_text(
             painter,
             text_cache,
+            raster,
             font,
             text,
             content.x() + (content.width() as i32 - w) / 2,

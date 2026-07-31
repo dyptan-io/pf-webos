@@ -46,7 +46,7 @@ impl App {
     /// Scroll by pixels (Magic Remote wheel).
     pub(crate) fn scroll_about_by(&mut self, dy_px: i32, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> bool {
         let (total, visible) = self.about_scroll_geometry(screen_w, screen_h, fonts);
-        let step = ui::about_line_stride(fonts.value).max(1);
+        let step = ui::about_line_stride(fonts.raster, fonts.value).max(1);
         let lines = dy_px / step;
         if lines == 0 {
             return false;
@@ -60,7 +60,7 @@ impl App {
         let body = ui::about_body_rect(card, fonts);
         self.ensure_about_wrapped(fonts, body.width());
         let total = self.about_wrapped.as_ref().map_or(0, |(_, v)| v.len());
-        let visible = ui::about_visible_lines(body, fonts.value);
+        let visible = ui::about_visible_lines(body, fonts.raster, fonts.value);
         (total, visible)
     }
 
@@ -68,7 +68,10 @@ impl App {
     pub(crate) fn ensure_about_wrapped(&mut self, fonts: &ui::Fonts, width: u32) {
         let stale = !matches!(&self.about_wrapped, Some((w, _)) if *w == width);
         if stale {
-            self.about_wrapped = Some((width, ui::wrap_document(fonts.value, &self.about_lines, width)));
+            self.about_wrapped = Some((
+                width,
+                ui::wrap_document(fonts.raster, fonts.value, &self.about_lines, width),
+            ));
         }
     }
 
@@ -88,10 +91,11 @@ impl App {
         screen_h: u32,
     ) -> Result<()> {
         let card = ui::about_card_rect(screen_w, screen_h);
-        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
+        self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
         ui::draw_modal_header(
             painter,
             text_cache,
+            fonts.raster,
             fonts.label,
             fonts.value,
             card,

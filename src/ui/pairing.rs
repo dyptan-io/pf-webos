@@ -3,8 +3,8 @@
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 use super::*;
 use crate::ui::render::Rect;
+use crate::ui::text_raster::{FontId, TextRaster};
 use anyhow::Result;
-use sdl2::ttf::Font;
 
 /// PIN digit box size/gap — shared by `pairing_digit_rect` and the digit
 /// tiles so they can never disagree.
@@ -32,18 +32,26 @@ pub const PAIRING_REQUEST_LABEL: &str = "Request access";
 /// one `draw_card(.., false)` box (no CPU inflate; the zoom is a GPU animation
 /// in `app.rs`'s `draw_list`) with `text` centered in it. Backs both pairing
 /// focus tiles below.
-pub fn render_card_text_tile(text_cache: &mut TextCache, font: &Font, text: &str, w: u32, h: u32) -> Result<Painter> {
+pub fn render_card_text_tile(
+    text_cache: &mut TextCache,
+    raster: &dyn TextRaster,
+    font: FontId,
+    text: &str,
+    w: u32,
+    h: u32,
+) -> Result<Painter> {
     let pad = ROW_TILE_PAD;
     let mut p = Painter::new(w + 2 * pad as u32, h + 2 * pad as u32);
     let drawn = draw_card(&mut p, Rect::new(pad, pad, w, h), false);
-    let tw = font.size_of(text).map_or(0, |(w, _)| w);
+    let tw = raster.measure(font, text).0;
     draw_text(
         &mut p,
         text_cache,
+        raster,
         font,
         text,
         drawn.x() + (drawn.width() as i32 - tw as i32) / 2,
-        drawn.y() + (drawn.height() as i32 - font.height()) / 2,
+        drawn.y() + (drawn.height() as i32 - raster.height(font)) / 2,
         WHITE,
     )?;
     Ok(p)
@@ -52,9 +60,15 @@ pub fn render_card_text_tile(text_cache: &mut TextCache, font: &Font, text: &str
 /// One PIN digit, focused, as its own zoom-animated tile — composited by the
 /// GPU over the shell's unfocused digit boxes, same pattern as
 /// `render_focus_row_tile`.
-pub fn render_pairing_digit_tile(text_cache: &mut TextCache, font_title: &Font, digit: u8) -> Result<Painter> {
+pub fn render_pairing_digit_tile(
+    text_cache: &mut TextCache,
+    raster: &dyn TextRaster,
+    font_title: FontId,
+    digit: u8,
+) -> Result<Painter> {
     render_card_text_tile(
         text_cache,
+        raster,
         font_title,
         &digit.to_string(),
         PAIRING_DIGIT_W,
@@ -65,12 +79,19 @@ pub fn render_pairing_digit_tile(text_cache: &mut TextCache, font_title: &Font, 
 /// The "Request access" button, focused, as its own zoom-animated tile — accent-filled
 /// like the shell's copy (see `ui::draw_primary_button`), not the surface-card treatment
 /// the digit tiles use, so the primary action keeps its emphasis while focused.
-pub fn render_pairing_button_tile(text_cache: &mut TextCache, font_label: &Font, w: u32, h: u32) -> Result<Painter> {
+pub fn render_pairing_button_tile(
+    text_cache: &mut TextCache,
+    raster: &dyn TextRaster,
+    font_label: FontId,
+    w: u32,
+    h: u32,
+) -> Result<Painter> {
     let pad = ROW_TILE_PAD;
     let mut p = Painter::new(w + 2 * pad as u32, h + 2 * pad as u32);
     draw_primary_button(
         &mut p,
         text_cache,
+        raster,
         font_label,
         Rect::new(pad, pad, w, h),
         PAIRING_REQUEST_LABEL,

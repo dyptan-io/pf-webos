@@ -122,7 +122,7 @@ pub fn draw_poster_card(
     let r = inflate(rect, focused);
     draw_card_shadow(painter, r, CARD_RADIUS);
 
-    let strip_h = (fonts.value.height() + 16).min(r.height() as i32 / 3);
+    let strip_h = (fonts.raster.height(fonts.value) + 16).min(r.height() as i32 / 3);
     match art {
         // Already stretched to this card size by `art::ArtLoader` (see
         // `art::resize_pixmap`) — a plain blit, not `draw_pixmap_scaled`. Falls back
@@ -141,11 +141,12 @@ pub fn draw_poster_card(
                 .unwrap_or('?')
                 .to_uppercase()
                 .to_string();
-            let (iw, ih) = fonts.title.size_of(&initial).unwrap_or((0, 0));
+            let (iw, ih) = fonts.raster.measure(fonts.title, &initial);
             let art_h = r.height() as i32 - strip_h;
             draw_text(
                 painter,
                 text_cache,
+                fonts.raster,
                 fonts.title,
                 &initial,
                 r.x() + (r.width() as i32 - iw as i32) / 2,
@@ -162,14 +163,15 @@ pub fn draw_poster_card(
         strip_h.max(0) as u32,
     );
     painter.fill_frosted_rect(strip, 0, Color::RGBA(0x00, 0x00, 0x00, 0x68), 6);
-    let label = ellipsize(fonts.value, title, strip.width().saturating_sub(16));
+    let label = ellipsize(fonts.raster, fonts.value, title, strip.width().saturating_sub(16));
     draw_text(
         painter,
         text_cache,
+        fonts.raster,
         fonts.value,
         &label,
         strip.x() + 8,
-        strip.y() + (strip.height() as i32 - fonts.value.height()) / 2,
+        strip.y() + (strip.height() as i32 - fonts.raster.height(fonts.value)) / 2,
         WHITE,
     )?;
 

@@ -1722,7 +1722,7 @@ impl App {
             // The pinned badge tile — built once, composited over the focused
             // card in `draw_list` rather than baked into individual card tiles.
             if self.pin_badge_tile.is_none() {
-                self.pin_badge_tile = Some(ui::render_pin_badge_tile(text_cache, fonts.icon)?);
+                self.pin_badge_tile = Some(ui::render_pin_badge_tile(text_cache, fonts.raster, fonts.icon)?);
                 updated.push(Tile::PinBadge);
             }
 
@@ -1776,6 +1776,7 @@ impl App {
             if self.nohost_tile.is_none() {
                 self.nohost_tile = Some(ui::render_text_tile(
                     text_cache,
+                    fonts.raster,
                     fonts.label,
                     "No host selected — pick one from the list, or add one.",
                     ui::MUTED,
@@ -1792,7 +1793,8 @@ impl App {
                 if stale {
                     let avail = screen_w.saturating_sub(ui::SIDEBAR_W);
                     let max_w = avail.saturating_sub(2 * ui::GRID_PAD as u32);
-                    let tile = ui::render_wrapped_text_tile(text_cache, fonts.label, s, max_w, ui::MUTED, 6)?;
+                    let tile =
+                        ui::render_wrapped_text_tile(text_cache, fonts.raster, fonts.label, s, max_w, ui::MUTED, 6)?;
                     self.status_tile = Some((s.clone(), tile));
                     updated.push(Tile::Status);
                 }
@@ -2020,13 +2022,20 @@ impl App {
                     Screen::Pairing => match self.pairing_focus {
                         PairingFocus::Pin => ui::render_pairing_digit_tile(
                             text_cache,
+                            fonts.raster,
                             fonts.title,
                             self.pin_digits[self.pin_digit_index],
                         )?,
                         PairingFocus::RequestAccess => {
                             let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
                             let btn = Self::pairing_request_button_rect(card, fonts);
-                            ui::render_pairing_button_tile(text_cache, fonts.label, btn.width(), btn.height())?
+                            ui::render_pairing_button_tile(
+                                text_cache,
+                                fonts.raster,
+                                fonts.label,
+                                btn.width(),
+                                btn.height(),
+                            )?
                         }
                     },
                     Screen::ForgetHost => {
@@ -2189,7 +2198,15 @@ impl App {
                 let overlay_h = options.len() as u32 * ui::DROPDOWN_OPTION_H;
                 let mut p = Painter::new(content_w, overlay_h.max(1));
                 let rect = Rect::new(0, 0, content_w, overlay_h);
-                ui::draw_dropdown_overlay(&mut p, text_cache, fonts.value, &options, usize::MAX, rect)?;
+                ui::draw_dropdown_overlay(
+                    &mut p,
+                    text_cache,
+                    fonts.raster,
+                    fonts.value,
+                    &options,
+                    usize::MAX,
+                    rect,
+                )?;
                 self.dropdown_overlay_tile = Some((overlay_key, p));
                 updated.push(Tile::DropdownOverlay);
             }
@@ -2198,7 +2215,7 @@ impl App {
             let stale = !matches!(&self.dropdown_focus_tile, Some((k, _)) if *k == key);
             if stale {
                 let option = options.get(dd.focused).map_or("", String::as_str);
-                let tile = ui::render_dropdown_option_tile(text_cache, fonts.value, option, content_w)?;
+                let tile = ui::render_dropdown_option_tile(text_cache, fonts.raster, fonts.value, option, content_w)?;
                 self.dropdown_focus_tile = Some((key, tile));
                 updated.push(Tile::DropdownFocusOption);
             }
@@ -2275,7 +2292,7 @@ impl App {
                         if let Some((_, wrapped)) = &self.about_wrapped {
                             let stride = self.scroll_stride(fonts) as u32;
                             let mut p = Painter::new(content.width().max(1), (len as u32 * stride).max(1));
-                            ui::draw_about_window(&mut p, fonts.value, wrapped, new_start, len)?;
+                            ui::draw_about_window(&mut p, fonts.raster, fonts.value, wrapped, new_start, len)?;
                             self.content_window = ui::ContentWindow { start: new_start, len };
                             self.scroll_content_tile = Some(((Screen::About, ScrollContentKey::About(new_start)), p));
                             updated.push(Tile::ScrollContent(Screen::About));
@@ -2324,7 +2341,7 @@ impl App {
                 let card = ui::about_card_rect(screen_w, screen_h);
                 let body = ui::about_body_rect(card, fonts);
                 let total = self.about_wrapped.as_ref().map_or(0, |(_, v)| v.len());
-                let visible = ui::about_visible_lines(body, fonts.value);
+                let visible = ui::about_visible_lines(body, fonts.raster, fonts.value);
                 Some((total, visible, card, body))
             }
             _ => None,
@@ -2404,7 +2421,7 @@ impl App {
     fn scroll_stride_for(&self, screen: Screen, fonts: &ui::Fonts) -> i32 {
         match screen {
             Screen::Settings => ui::SETTINGS_ROW_H as i32 + ui::SETTINGS_ROW_GAP,
-            Screen::About => ui::about_line_stride(fonts.value),
+            Screen::About => ui::about_line_stride(fonts.raster, fonts.value),
             _ => 1,
         }
     }
@@ -2596,7 +2613,7 @@ impl App {
         }
         if self.home_status.is_some() {
             if let Some((_, p)) = &self.status_tile {
-                let line_h = fonts.label.height() + 6;
+                let line_h = fonts.raster.height(fonts.label) + 6;
                 let box_h = 2 * line_h as u32 + 2 * STATUS_BG_PAD as u32;
                 let box_y = screen_h as i32 - box_h as i32;
                 cmds.push(DrawCmd::Fill {
@@ -2947,7 +2964,8 @@ impl App {
         &self,
         painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
-        icon_font: &sdl2::ttf::Font,
+        raster: &dyn ui::TextRaster,
+        icon_font: ui::FontId,
         card: Rect,
     ) -> Result<()> {
         // No backdrop here: the scrim behind the modal is a GPU fill in
@@ -2957,6 +2975,7 @@ impl App {
         ui::draw_icon(
             painter,
             text_cache,
+            raster,
             icon_font,
             ui::modal_close_rect(card),
             ui::ICON_CLOSE,

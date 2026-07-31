@@ -209,10 +209,11 @@ impl App {
         screen_h: u32,
     ) -> Result<()> {
         let (card, content) = self.settings_layout(screen_w, screen_h);
-        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
+        self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
         ui::draw_text(
             painter,
             text_cache,
+            fonts.raster,
             fonts.label,
             "Settings",
             card.x() + 40,
@@ -233,6 +234,7 @@ impl App {
             ui::draw_text(
                 painter,
                 text_cache,
+                fonts.raster,
                 fonts.value,
                 "May be unstable on Wi-Fi — try Ethernet if streaming drops.",
                 content.x(),
