@@ -94,6 +94,14 @@ pub const WEBOS_GREEN_SCANCODE: i32 = 487;
 pub const WEBOS_YELLOW_SCANCODE: i32 = 488;
 pub const WEBOS_BLUE_SCANCODE: i32 = 489;
 
+/// webOS EXIT key (`SDL_SCANCODE_WEBOS_EXIT`). A held/root-level Back is turned
+/// by the OS into its own EXIT gesture and delivered as this discrete keypress —
+/// *not* as a held [`WEBOS_BACK_KEYCODE`] — so it's the reliable signal for
+/// "open the disconnect/quit dialog" (a short Back tap still arrives as Back).
+/// Needs `SDL_WEBOS_ACCESS_POLICY_KEYS_EXIT` set before window creation to reach
+/// the app instead of `SIGTERM`ing it. See `docs/NOTES.md`.
+pub const WEBOS_EXIT_SCANCODE: i32 = 505;
+
 /// Check a Magic Remote button via raw SDL keyboard state (safe after `sdl2::init`).
 pub fn webos_scancode_down(scancode: i32) -> bool {
     unsafe {

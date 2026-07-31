@@ -94,7 +94,11 @@ fn crc32_le(bytes: &[u8]) -> u32 {
         crc ^= u32::from(b);
         for _ in 0..8 {
             // 0xEDB88320 = reflected 0x04C11DB7.
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -418,7 +422,10 @@ mod tests {
         let payload = payload_for("aa:bb", &build_report(0, &State::default()));
         assert!(!payload.contains("reportId"), "an extra key fails the service schema");
         // 49 = 0x31, the Bluetooth output report id, as the first array element.
-        assert!(payload.starts_with("{\"address\":\"aa:bb\",\"reportData\":[49,"), "{payload}");
+        assert!(
+            payload.starts_with("{\"address\":\"aa:bb\",\"reportData\":[49,"),
+            "{payload}"
+        );
         assert!(payload.ends_with("]}"));
     }
 }

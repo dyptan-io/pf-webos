@@ -147,9 +147,8 @@ impl App {
     pub(crate) fn settings_visible_rows(&self, screen_h: u32) -> usize {
         let stride = ui::settings_row_stride();
         let total = ui::settings_row_count(&self.settings);
-        let budget = screen_h.saturating_sub(
-            ui::SETTINGS_CHROME_TOP + self.settings_chrome_bottom() + ui::SETTINGS_EDGE_MARGIN,
-        );
+        let budget =
+            screen_h.saturating_sub(ui::SETTINGS_CHROME_TOP + self.settings_chrome_bottom() + ui::SETTINGS_EDGE_MARGIN);
         if (budget / stride) as usize >= total {
             return total.max(1);
         }
