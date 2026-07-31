@@ -15,8 +15,8 @@
 //! (not through [`TextCache`], which would be a non-starter on this `SoC` for a
 //! document this size — see `draw_text_uncached`'s docs). Scrolling within that
 //! slice is then a pure `DrawCmd::TexCropped`, never a re-rasterize.
+use crate::ui::render::Rect;
 use anyhow::Result;
-use sdl2::rect::Rect;
 
 use super::*;
 

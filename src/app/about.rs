@@ -1,5 +1,5 @@
 use super::*;
-use sdl2::rect::Rect;
+use crate::ui::render::Rect;
 
 use crate::ui::{self, MenuEvent, Painter};
 

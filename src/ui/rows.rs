@@ -3,9 +3,9 @@
 //!
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 use super::*;
+use crate::ui::render::Color;
+use crate::ui::render::Rect;
 use anyhow::Result;
-use sdl2::pixels::Color;
-use sdl2::rect::Rect;
 use sdl2::ttf::Font;
 
 /// How a focus row's right-hand control behaves — shared by the settings

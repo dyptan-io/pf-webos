@@ -1,5 +1,5 @@
 //! Game-grid geometry: columns, rects, hit testing, scroll extent.
-use sdl2::rect::Rect;
+use crate::ui::render::Rect;
 
 pub const GRID_PAD: i32 = 32;
 pub const GRID_GAP: i32 = 24;

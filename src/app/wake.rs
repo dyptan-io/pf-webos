@@ -5,9 +5,9 @@
 //! Split out of the former single-file `app.rs`; see `super`'s module docs.
 use super::*;
 use crate::services::store::KnownHost;
+use crate::ui::render::Rect;
 use crate::ui::{self, MenuEvent, Painter};
 use anyhow::Result;
-use sdl2::rect::Rect;
 use std::time::Instant;
 
 impl App {
@@ -223,7 +223,15 @@ impl App {
 
         self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
         ui::draw_modal_header(
-            painter, text_cache, fonts.label, fonts.value, card, Self::wake_title(wake), ui::WHITE, &status, ui::MUTED,
+            painter,
+            text_cache,
+            fonts.label,
+            fonts.value,
+            card,
+            Self::wake_title(wake),
+            ui::WHITE,
+            &status,
+            ui::MUTED,
         )?;
         if let Some(content) = buttons {
             // usize::MAX = no focus; focused button is a separate ModalFocusElement.

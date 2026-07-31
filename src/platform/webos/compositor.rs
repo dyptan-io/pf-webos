@@ -10,94 +10,22 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use sdl2::pixels::PixelFormatEnum;
-use sdl2::rect::Rect;
 use sdl2::render::{BlendMode, Canvas, Texture, TextureCreator};
 use sdl2::video::{Window, WindowContext};
 
-use crate::app::Screen;
+use crate::ui::render::{Color, DrawCmd, Rect, TileId};
 use crate::ui::Painter;
 
-/// Identity of one cached tile/texture. `Card` is keyed by pin id (a
-/// `GameEntry::id`, or `store::DESKTOP_PIN_ID`) rather than grid index, so a
-/// pin/unpin reorder — which only shuffles positions, not which games exist —
-/// never needs to re-upload a card's texture.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum Tile {
-    /// The focus-free sidebar strip (opaque, screen-height).
-    Sidebar,
-    /// The currently focused sidebar row (transparent padding + shadow).
-    FocusRow,
-    /// One grid card, shadow included (transparent padding), keyed by pin id.
-    Card(String),
-    /// The shared focus-ring glow (all cards are the same size).
-    Ring,
-    /// The focused card's crisp edge outline, composited on top of the card
-    /// art (unlike `Ring`, which sits behind it). Shared, like `Ring`.
-    CardOutline,
-    /// The pinned badge composited over the focused grid card's top-right
-    /// corner, only when that card is pinned. Shared by every card, like `Ring`.
-    PinBadge,
-    /// The active modal, full-screen with transparent surroundings.
-    Modal,
-    /// One modal's focused, zoom-animated widget (row, PIN digit, button, etc).
-    /// Composited over Modal's shell; one tile covers all modals.
-    ModalFocusElement,
-    /// Open dropdown panel + option list. Own tile so it composites after `ScrollContent`.
-    DropdownOverlay,
-    /// Open dropdown's focused option. Composited over `DropdownOverlay`.
-    DropdownFocusOption,
-    /// The Home status line block (bottom of the grid panel).
-    Status,
-    /// The "No host selected" hint line.
-    NoHost,
-    /// Modal scrollbar tile, keyed by Screen (covers all scrollable modals).
-    ScrollIndicator(Screen),
-    /// Modal scrollable content at unscrolled position. GPU crops/repositions via
-    /// `TexCropped`; rebuilds only when content changes, not on scroll.
-    ScrollContent(Screen),
-    /// Bottom-edge fade over a scrollable modal's content, composited between
-    /// `ScrollContent` and the focused row so it hints at more rows without dimming
-    /// whatever is focused. Static (a fixed alpha ramp), stretched to the list width —
-    /// not keyed by Screen, since one texture serves every scrollable modal.
-    ScrollFade,
-    /// The same fade mirrored for the top edge, shown while content is scrolled off above.
-    /// A second tile rather than a flipped blit: `DrawCmd` has no flip, and the ramp is
-    /// 8x44 px.
-    ScrollFadeTop,
-    /// Spinner frame texture, keyed by frame index. Held in VRAM until stream starts.
-    SpinnerFrame(usize),
-    /// The in-stream stats overlay panel (`ui::render_stats_overlay_tile`).
-    StatsOverlay,
-    /// Transient toast notification (`ui::render_notification_tile`), e.g. the
-    /// frame-pacing on/off confirmation after a mid-stream Blue-button toggle.
-    Notification,
-    /// The log-tail overlay (`ui::render_log_overlay_tile`) — Yellow-button debug
-    /// aid, shown on every screen (menu UI and stream), not just while streaming.
-    LogOverlay,
-    /// Disconnect dialog shell (card + title + unfocused buttons).
-    DisconnectDialog,
-    /// Disconnect dialog focused button. Composited over `DisconnectDialog` shell.
-    DisconnectFocusButton,
+fn to_sdl_rect(r: Rect) -> sdl2::rect::Rect {
+    sdl2::rect::Rect::new(r.x(), r.y(), r.width(), r.height())
 }
 
-/// One step of a frame's composition, in paint order.
-pub enum DrawCmd {
-    /// Copy `tile`'s texture to `dst` (scaled by the GPU if sizes differ),
-    /// modulated by `alpha`.
-    Tex { tile: Tile, dst: Rect, alpha: u8 },
-    /// Copy with source crop — how scrolling works: GPU crops fixed texture.
-    TexCropped {
-        tile: Tile,
-        src: Rect,
-        dst: Rect,
-        alpha: u8,
-    },
-    /// A blended solid fill — the modal scrim.
-    Fill { rect: Rect, color: sdl2::pixels::Color },
+fn to_sdl_color(c: Color) -> sdl2::pixels::Color {
+    sdl2::pixels::Color::RGBA(c.r, c.g, c.b, c.a)
 }
 
 pub struct Compositor {
-    textures: HashMap<Tile, Texture>,
+    textures: HashMap<TileId, Texture>,
     /// Reused staging buffer for the premultiplied → straight-alpha conversion
     /// performed once per `upload` call (never per frame).
     staging: Vec<u8>,
@@ -115,7 +43,7 @@ impl Compositor {
     pub fn upload_raw(
         &mut self,
         creator: &TextureCreator<WindowContext>,
-        tile: Tile,
+        tile: TileId,
         w: u32,
         h: u32,
         rgba_straight: &[u8],
@@ -136,7 +64,7 @@ impl Compositor {
 
     /// Creates/updates tile's texture from a rasterized painter. Opaque tiles
     /// upload directly; others un-premultiply and alpha-blend.
-    pub fn upload(&mut self, creator: &TextureCreator<WindowContext>, tile: Tile, pm: &Painter) -> Result<()> {
+    pub fn upload(&mut self, creator: &TextureCreator<WindowContext>, tile: TileId, pm: &Painter) -> Result<()> {
         let (w, h) = (pm.width(), pm.height());
         let recreate = match self.textures.get(&tile) {
             Some(t) => {
@@ -153,7 +81,7 @@ impl Compositor {
         }
         let tex = self.textures.get_mut(&tile).expect("just inserted");
         let pitch = w as usize * 4;
-        let opaque = matches!(tile, Tile::Sidebar);
+        let opaque = matches!(tile, TileId::Sidebar);
         if opaque {
             tex.update(None, pm.data(), pitch)
                 .map_err(|e| anyhow::anyhow!("upload {tile:?}: {e}"))?;
@@ -198,7 +126,7 @@ impl Compositor {
 
     /// Drops tile's GPU texture. Needed for windowed card tiles to free VRAM
     /// when scrolled out of view (SDL object must be explicitly destroyed).
-    pub fn drop_tile(&mut self, tile: Tile) {
+    pub fn drop_tile(&mut self, tile: TileId) {
         if let Some(tex) = self.textures.remove(&tile) {
             // SAFETY: see `clear_all`.
             unsafe { tex.destroy() };
@@ -207,7 +135,7 @@ impl Compositor {
 
     /// Executes one frame's draw list. The caller has already cleared the canvas
     /// to the background color.
-    pub fn execute(&mut self, canvas: &mut Canvas<Window>, cmds: &[DrawCmd]) -> Result<()> {
+    pub fn present(&mut self, canvas: &mut Canvas<Window>, cmds: &[DrawCmd]) -> Result<()> {
         for cmd in cmds {
             match cmd {
                 DrawCmd::Tex { tile, dst, alpha } => {
@@ -216,7 +144,7 @@ impl Compositor {
                     };
                     tex.set_alpha_mod(*alpha);
                     canvas
-                        .copy(tex, None, Some(*dst))
+                        .copy(tex, None, Some(to_sdl_rect(*dst)))
                         .map_err(|e| anyhow::anyhow!("copy {tile:?}: {e}"))?;
                 }
                 DrawCmd::TexCropped { tile, src, dst, alpha } => {
@@ -225,14 +153,14 @@ impl Compositor {
                     };
                     tex.set_alpha_mod(*alpha);
                     canvas
-                        .copy(tex, Some(*src), Some(*dst))
+                        .copy(tex, Some(to_sdl_rect(*src)), Some(to_sdl_rect(*dst)))
                         .map_err(|e| anyhow::anyhow!("copy cropped {tile:?}: {e}"))?;
                 }
                 DrawCmd::Fill { rect, color } => {
                     canvas.set_blend_mode(BlendMode::Blend);
-                    canvas.set_draw_color(*color);
+                    canvas.set_draw_color(to_sdl_color(*color));
                     canvas
-                        .fill_rect(Some(*rect))
+                        .fill_rect(Some(to_sdl_rect(*rect)))
                         .map_err(|e| anyhow::anyhow!("fill: {e}"))?;
                 }
             }

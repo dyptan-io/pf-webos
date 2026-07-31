@@ -5,8 +5,6 @@ mod app;
 #[cfg(target_os = "linux")]
 mod audio;
 #[cfg(target_os = "linux")]
-mod compositor;
-#[cfg(target_os = "linux")]
 mod core;
 #[cfg(target_os = "linux")]
 mod device;
@@ -29,6 +27,8 @@ mod ndl;
 #[cfg(target_os = "linux")]
 mod pacing;
 #[cfg(target_os = "linux")]
+mod platform;
+#[cfg(target_os = "linux")]
 mod services;
 #[cfg(target_os = "linux")]
 mod session;
@@ -48,12 +48,13 @@ mod real {
     use sdl2::controller::GameController;
 
     use crate::app::{App, HomeFocus, Screen, MODAL_FADE, MODAL_POP_SHRINK};
-    use crate::compositor::{Compositor, DrawCmd, Tile};
     use crate::gamepad;
     use crate::keyboard;
     use crate::mouse;
-    use crate::session;
+    use crate::platform::webos::compositor::Compositor;
     use crate::services::store;
+    use crate::session;
+    use crate::ui::render::{DrawCmd, TileId as Tile};
     use crate::ui::MenuEvent;
 
     /// `ConnectOutcome`: connect thread (started early to overlap animation) + settings.
@@ -215,9 +216,12 @@ mod real {
         match log_overlay_state() {
             LogOverlayState::Off => None,
             LogOverlayState::Live => Some(crate::logger::recent_lines(crate::ui::LOG_OVERLAY_LINES)),
-            LogOverlayState::Frozen => {
-                Some(frozen_log_lines().lock().unwrap_or_else(PoisonError::into_inner).clone())
-            }
+            LogOverlayState::Frozen => Some(
+                frozen_log_lines()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            ),
         }
     }
 
@@ -510,7 +514,7 @@ mod real {
             let Some((focus, m, closing)) = self.frame(MODAL_FADE) else {
                 return Ok(());
             };
-            let full = sdl2::rect::Rect::new(0, 0, w, h);
+            let full = crate::ui::render::Rect::new(0, 0, w, h);
             if self.shell_dirty {
                 self.shell_dirty = false;
                 let shell =
@@ -534,14 +538,14 @@ mod real {
             // in from ~26px below while fading, and the shell scales up on open.
             let dy = ((1.0 - m) * 26.0) as i32;
             let pad = crate::ui::ROW_TILE_PAD;
-            let base = sdl2::rect::Rect::new(
+            let base = crate::ui::render::Rect::new(
                 btn_rect.x() - pad,
                 btn_rect.y() - pad + dy,
                 btn_rect.width() + 2 * pad as u32,
                 btn_rect.height() + 2 * pad as u32,
             );
             let f = crate::ui::anim_frac(self.focus_anim, crate::ui::FOCUS_POP);
-            let modal_base = sdl2::rect::Rect::new(0, dy, w, h);
+            let modal_base = crate::ui::render::Rect::new(0, dy, w, h);
             let shell_dst = if closing {
                 modal_base
             } else {
@@ -549,7 +553,7 @@ mod real {
             };
             cmds.push(DrawCmd::Fill {
                 rect: full,
-                color: sdl2::pixels::Color::RGBA(0, 0, 0, (f32::from(crate::ui::MODAL_SCRIM.a) * m) as u8),
+                color: crate::ui::render::Color::RGBA(0, 0, 0, (f32::from(crate::ui::MODAL_SCRIM.a) * m) as u8),
             });
             cmds.push(DrawCmd::Tex {
                 tile: Tile::DisconnectDialog,
@@ -1204,7 +1208,8 @@ mod real {
             if wants_text != text_input_active {
                 text_input_active = wants_text;
                 if wants_text {
-                    text_input.set_rect(app.address_field_rect(display_mode.w as u32, display_mode.h as u32, fonts));
+                    let r = app.address_field_rect(display_mode.w as u32, display_mode.h as u32, fonts);
+                    text_input.set_rect(sdl2::rect::Rect::new(r.x(), r.y(), r.width(), r.height()));
                     text_input.start();
                 } else {
                     text_input.stop();
@@ -1288,7 +1293,7 @@ mod real {
                 if let Some((tw, th)) = log_overlay_dims {
                     cmds.push(DrawCmd::Tex {
                         tile: Tile::LogOverlay,
-                        dst: sdl2::rect::Rect::new(0, display_mode.h - th as i32, tw, th),
+                        dst: crate::ui::render::Rect::new(0, display_mode.h - th as i32, tw, th),
                         alpha: 0xff,
                     });
                 }
@@ -1304,9 +1309,10 @@ mod real {
                 &mut cmds,
             )?;
             canvas.set_blend_mode(sdl2::render::BlendMode::None);
-            canvas.set_draw_color(crate::ui::BG);
+            let bg = crate::ui::BG;
+            canvas.set_draw_color(sdl2::pixels::Color::RGBA(bg.r, bg.g, bg.b, bg.a));
             canvas.clear();
-            compositor.execute(canvas, &cmds)?;
+            compositor.present(canvas, &cmds)?;
             canvas.present();
             let elapsed = tick_start.elapsed();
             if elapsed < TICK_BUDGET {
@@ -1555,8 +1561,8 @@ mod real {
             // content stays on a slower cadence (`stats_built_at`, and the log tail's own poll).
             let mut notif = crate::ui::Notification::new();
             let mut overlay_was_active = false;
-            let mut stats_dst: Option<sdl2::rect::Rect> = None;
-            let mut log_dst: Option<sdl2::rect::Rect> = None;
+            let mut stats_dst: Option<crate::ui::render::Rect> = None;
+            let mut log_dst: Option<crate::ui::render::Rect> = None;
             let mut stats_built_at: Option<Instant> = None;
             let mut overlay_last: Option<Instant> = None;
             let mut overlay_prev_frames: u64 = 0;
@@ -1781,7 +1787,7 @@ mod real {
                     canvas.set_blend_mode(sdl2::render::BlendMode::None);
                     canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
                     canvas.clear();
-                    compositor.execute(&mut canvas, &cmds)?;
+                    compositor.present(&mut canvas, &cmds)?;
                     canvas.present();
                 } else if disconnect.fade.tick(MODAL_FADE) {
                     // The close-fade (Cancel/Back, or a confirmed Disconnect) just
@@ -1935,7 +1941,12 @@ mod real {
                             Ok(tile) => {
                                 let (tw, th) = (tile.width(), tile.height());
                                 compositor.upload(&texture_creator, Tile::StatsOverlay, &tile)?;
-                                stats_dst = Some(sdl2::rect::Rect::new(display_mode.w - tw as i32 - 24, 24, tw, th));
+                                stats_dst = Some(crate::ui::render::Rect::new(
+                                    display_mode.w - tw as i32 - 24,
+                                    24,
+                                    tw,
+                                    th,
+                                ));
                             }
                             Err(e) => tracing::warn!("stats overlay render failed: {e:#}"),
                         }
@@ -1957,7 +1968,7 @@ mod real {
                             Ok(tile) => {
                                 let (tw, th) = (tile.width(), tile.height());
                                 compositor.upload(&texture_creator, Tile::LogOverlay, &tile)?;
-                                log_dst = Some(sdl2::rect::Rect::new(0, display_mode.h - th as i32, tw, th));
+                                log_dst = Some(crate::ui::render::Rect::new(0, display_mode.h - th as i32, tw, th));
                             }
                             Err(e) => tracing::warn!("log overlay render failed: {e:#}"),
                         }
@@ -1980,7 +1991,7 @@ mod real {
                                 // bottom log overlay, so it never overlaps either.
                                 cmds.push(DrawCmd::Tex {
                                     tile: Tile::Notification,
-                                    dst: sdl2::rect::Rect::new((display_mode.w - tw as i32) / 2, 24, tw, th),
+                                    dst: crate::ui::render::Rect::new((display_mode.w - tw as i32) / 2, 24, tw, th),
                                     alpha: (alpha * 255.0) as u8,
                                 });
                             }
@@ -1991,7 +2002,7 @@ mod real {
                         canvas.set_blend_mode(sdl2::render::BlendMode::None);
                         canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
                         canvas.clear();
-                        compositor.execute(&mut canvas, &cmds)?;
+                        compositor.present(&mut canvas, &cmds)?;
                         canvas.present();
                     }
                 }

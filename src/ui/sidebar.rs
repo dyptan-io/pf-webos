@@ -4,9 +4,9 @@
 use super::*;
 use crate::services::discovery::DiscoveredHost;
 use crate::services::store::KnownHost;
+use crate::ui::render::Color;
+use crate::ui::render::Rect;
 use anyhow::Result;
-use sdl2::pixels::Color;
-use sdl2::rect::Rect;
 
 // Sized for a 10-foot TV viewing distance, not a desktop/phone screen.
 pub const SIDEBAR_W: u32 = 460;

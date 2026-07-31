@@ -2,9 +2,9 @@
 //!
 //! Split out of the former single-file `app.rs`; see `super`'s module docs.
 use super::*;
+use crate::ui::render::Rect;
 use crate::ui::{self, MenuEvent, Painter};
 use anyhow::Result;
-use sdl2::rect::Rect;
 use std::time::Instant;
 
 impl App {
@@ -221,7 +221,7 @@ impl App {
         )?;
         painter.fill_rect(
             Rect::new(card.x() + 40, card.y() + 88, card.width().saturating_sub(80), 1),
-            sdl2::pixels::Color::RGBA(0xff, 0xff, 0xff, 0x1e),
+            crate::ui::render::Color::RGBA(0xff, 0xff, 0xff, 0x1e),
         );
 
         // The row list itself is drawn separately — see `Tile::ScrollContent` — so

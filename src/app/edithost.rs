@@ -1,7 +1,7 @@
 //! Editing a saved host's address (reuses add-host widget). Fingerprint survives address
 //! changes unchanged since it identifies the certificate, not the network location.
 use super::*;
-use sdl2::rect::Rect;
+use crate::ui::render::Rect;
 
 use crate::services::store;
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};

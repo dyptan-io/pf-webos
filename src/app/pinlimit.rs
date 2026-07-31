@@ -2,9 +2,9 @@
 //!
 //! Split out of the former single-file `app.rs`; see `super`'s module docs.
 use super::*;
+use crate::ui::render::Rect;
 use crate::ui::{self, MenuEvent, Painter};
 use anyhow::Result;
-use sdl2::rect::Rect;
 
 /// The single OK button's fixed size.
 const PIN_LIMIT_BUTTON_W: u32 = 200;

@@ -1,8 +1,8 @@
 //! Focus rings, selectable cards, game-grid poster card.
 use super::*;
+use crate::ui::render::Color;
+use crate::ui::render::Rect;
 use anyhow::Result;
-use sdl2::pixels::Color;
-use sdl2::rect::Rect;
 use tiny_skia::Pixmap;
 
 /// Card corner radius (softened from moonlight-tv's ~2px).

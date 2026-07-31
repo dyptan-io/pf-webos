@@ -14,6 +14,7 @@ mod modal;
 mod notification;
 mod painter;
 mod pairing;
+pub mod render;
 mod rows;
 mod scroll;
 mod settings;

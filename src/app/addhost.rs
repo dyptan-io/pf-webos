@@ -1,8 +1,8 @@
 use super::*;
 use crate::services::store::{self, KnownHost};
+use crate::ui::render::Rect;
 use crate::ui::{self, HostEntry, MenuEvent, Painter};
 use anyhow::Result;
-use sdl2::rect::Rect;
 
 const ADD_HOST_SUBTITLE: &str = "Enter the host's IP address.";
 

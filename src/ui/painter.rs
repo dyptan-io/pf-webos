@@ -1,6 +1,6 @@
 //! Anti-aliased software rendering backend (`tiny_skia` Pixmap framebuffer).
-use sdl2::pixels::Color;
-use sdl2::rect::Rect;
+use crate::ui::render::Color;
+use crate::ui::render::Rect;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use tiny_skia::{

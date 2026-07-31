@@ -1,5 +1,5 @@
 use super::*;
-use sdl2::rect::Rect;
+use crate::ui::render::Rect;
 use std::time::Instant;
 
 use crate::ui::{self, FocusRow, MenuEvent, Painter};

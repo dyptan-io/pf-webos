@@ -21,8 +21,8 @@ use punktfunk_core::quic;
 
 use crate::ndl::{NdlCodec, NdlVideo};
 use crate::pacing::{HostPtsAnchor, PtsPacer};
-use crate::starfish::StarfishVideo;
 use crate::services::store::{CodecPref, ColorRangeOverride, VideoBackend};
+use crate::starfish::StarfishVideo;
 
 impl ColorRangeOverride {
     /// Force the VUI `full_range` flag per the user override before it's handed to

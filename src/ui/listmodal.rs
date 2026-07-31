@@ -1,5 +1,5 @@
+use crate::ui::render::Rect;
 use anyhow::Result;
-use sdl2::rect::Rect;
 
 use super::*;
 

@@ -2,8 +2,8 @@
 //!
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 use super::*;
+use crate::ui::render::Rect;
 use anyhow::Result;
-use sdl2::rect::Rect;
 use sdl2::ttf::Font;
 
 /// PIN digit box size/gap — shared by `pairing_digit_rect` and the digit

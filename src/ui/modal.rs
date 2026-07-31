@@ -1,7 +1,7 @@
 use super::*;
+use crate::ui::render::Color;
+use crate::ui::render::Rect;
 use anyhow::Result;
-use sdl2::pixels::Color;
-use sdl2::rect::Rect;
 use sdl2::ttf::Font;
 
 /// A centered glass card of `(width_frac * screen_w, height)`.

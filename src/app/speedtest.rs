@@ -10,7 +10,7 @@
 //! Measured throughput is end-to-end deliverable goodput (after AEAD decrypt),
 //! not pure link speed. Bounds useful for bitrate picking on this TV.
 use super::*;
-use sdl2::rect::Rect;
+use crate::ui::render::Rect;
 use std::time::Instant;
 
 use punktfunk_core::client::ProbeOutcome;

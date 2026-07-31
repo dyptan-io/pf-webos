@@ -1,8 +1,8 @@
 //! Font loading, text/icon cache and drawing (Geist + icon font).
 use super::*;
+use crate::ui::render::Color;
+use crate::ui::render::Rect;
 use anyhow::{Context, Result};
-use sdl2::pixels::Color;
-use sdl2::rect::Rect;
 use sdl2::ttf::Font;
 use std::collections::HashMap;
 use tiny_skia::{IntSize, Pixmap};
@@ -140,7 +140,7 @@ impl TextCache {
         if !self.entries.contains_key(&key) {
             let surface = font
                 .render(text)
-                .blended(color)
+                .blended(sdl2::pixels::Color::RGBA(color.r, color.g, color.b, color.a))
                 .map_err(|e| anyhow::anyhow!("render text: {e}"))?;
             let pixmap = pixmap_from_ttf_surface(&surface)?;
             self.entries.insert(key.clone(), pixmap);
@@ -194,7 +194,7 @@ pub fn draw_text_uncached(painter: &mut Painter, font: &Font, text: &str, x: i32
     }
     let surface = font
         .render(text)
-        .blended(color)
+        .blended(sdl2::pixels::Color::RGBA(color.r, color.g, color.b, color.a))
         .map_err(|e| anyhow::anyhow!("render text: {e}"))?;
     let pixmap = pixmap_from_ttf_surface(&surface)?;
     let width = pixmap.width();

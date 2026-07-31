@@ -2,15 +2,15 @@
 //! `ui.rs` owns drawing/input-mapping, `store.rs` owns persistence, `discovery.rs` owns mDNS.
 use std::time::{Duration, Instant};
 
+use crate::ui::render::Rect;
 use anyhow::Result;
-use sdl2::rect::Rect;
 use tiny_skia::Pixmap;
 
-use crate::compositor::{DrawCmd, Tile};
 pub use crate::core::model::ConnectTarget;
 use crate::core::model::GameEntry;
 pub use crate::core::screen::{HomeFocus, PairingFocus, Screen};
 use crate::services::store::{self, KnownHost, Settings};
+use crate::ui::render::{DrawCmd, TileId as Tile};
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};
 
 mod about;
@@ -987,7 +987,14 @@ impl App {
     /// Button index under `(x, y)` for a two-button confirm modal with `subtitle`, or
     /// `None` off both buttons — every confirm modal's hover arm shares this, against the
     /// same `confirm_dialog_layout` geometry the modal is drawn with.
-    fn confirm_button_at(screen_w: u32, screen_h: u32, fonts: &ui::Fonts, subtitle: &str, x: i32, y: i32) -> Option<usize> {
+    fn confirm_button_at(
+        screen_w: u32,
+        screen_h: u32,
+        fonts: &ui::Fonts,
+        subtitle: &str,
+        x: i32,
+        y: i32,
+    ) -> Option<usize> {
         let (_, content) = ui::confirm_dialog_layout(screen_w, screen_h, fonts, subtitle);
         ui::confirm_button_at(content, x, y)
     }
@@ -2439,7 +2446,7 @@ impl App {
     /// params are only for pure geometry — `ui::modal_header_end_y` and
     /// friends — needed to position a modal's focused-widget tile without
     /// re-rendering its header). The GPU executes it (`Compositor::execute`).
-    pub fn draw_list(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Vec<DrawCmd> {
+    pub fn draw_list(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> ui::render::DrawList {
         let mut cmds = Vec::new();
         let grid_x = ui::SIDEBAR_W as i32;
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
@@ -2512,7 +2519,7 @@ impl App {
                 if sep.y() >= 0 && sep.y() <= screen_h as i32 {
                     cmds.push(DrawCmd::Fill {
                         rect: sep,
-                        color: sdl2::pixels::Color::RGBA(0xff, 0xff, 0xff, 0x20),
+                        color: crate::ui::render::Color::RGBA(0xff, 0xff, 0xff, 0x20),
                     });
                 }
             }
@@ -2639,7 +2646,7 @@ impl App {
         if !matches!(screen, Screen::Home) {
             cmds.push(DrawCmd::Fill {
                 rect: Rect::new(0, 0, screen_w, screen_h),
-                color: sdl2::pixels::Color::RGBA(0, 0, 0, (f32::from(ui::MODAL_SCRIM.a) * m) as u8),
+                color: crate::ui::render::Color::RGBA(0, 0, 0, (f32::from(ui::MODAL_SCRIM.a) * m) as u8),
             });
             let dy = ((1.0 - m) * 26.0) as i32;
             let modal_base = Rect::new(0, dy, screen_w, screen_h);
@@ -2927,7 +2934,7 @@ impl App {
             }
             cmds.push(DrawCmd::Fill {
                 rect: Rect::new(0, 0, screen_w, screen_h),
-                color: sdl2::pixels::Color::RGBA(0, 0, 0, (255.0 * f) as u8),
+                color: crate::ui::render::Color::RGBA(0, 0, 0, (255.0 * f) as u8),
             });
         }
         cmds

@@ -5,9 +5,9 @@
 //! replaces whatever is on screen.
 
 use super::{anim_frac, draw_text, Painter, TextCache, OVERLAY_FADE, WHITE};
+use crate::ui::render::Color;
+use crate::ui::render::Rect;
 use anyhow::Result;
-use sdl2::pixels::Color;
-use sdl2::rect::Rect;
 use sdl2::ttf::Font;
 use std::time::{Duration, Instant};
 

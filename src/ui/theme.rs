@@ -1,4 +1,4 @@
-use sdl2::pixels::Color;
+use crate::ui::render::Color;
 
 pub const BG: Color = Color::RGB(0x14, 0x10, 0x1f);
 pub const SIDEBAR_BG: Color = Color::RGB(0x1c, 0x15, 0x30);

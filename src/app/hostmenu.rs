@@ -7,7 +7,7 @@
 //! else — card geometry, the unfocused shell, the focused-row tile, the focus pop — is
 //! `ui::ListModal`'s, shared with any future list screen.
 use super::*;
-use sdl2::rect::Rect;
+use crate::ui::render::Rect;
 use std::time::Instant;
 
 use crate::ui::{self, FocusRow, HostEntry, MenuEvent, Painter};
