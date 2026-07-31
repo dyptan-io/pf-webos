@@ -7,7 +7,7 @@ pub enum Effect {
     SetLogOverlay(bool),
 }
 
-/// Runs one effect. Lives outside `core::state` deliberately — this is the one place
+/// Runs one effect. Lives outside `app::state` deliberately — this is the one place
 /// allowed to reach into `crate::real`/`crate::services`/`crate::session` on the app
 /// logic's behalf.
 pub fn execute(effect: Effect) {
