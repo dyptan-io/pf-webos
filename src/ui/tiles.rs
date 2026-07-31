@@ -309,74 +309,54 @@ pub fn render_log_overlay_tile(font: &Font, screen_w: u32, lines: &[String]) -> 
     Ok(p)
 }
 
-/// Stop/Cancel button pair for the in-stream disconnect dialog.
-pub fn disconnect_dialog_buttons() -> [ConfirmButton<'static>; 2] {
-    [
-        ConfirmButton {
-            icon: Some(ICON_CLOSE),
-            label: "Stop streaming",
-            color: ERROR_RED,
-        },
-        ConfirmButton {
-            icon: None,
-            label: "Cancel",
-            color: WHITE,
-        },
-    ]
-}
-
-/// Quit/Cancel button pair for the menu quit dialog.
-pub fn quit_dialog_buttons() -> [ConfirmButton<'static>; 2] {
-    [
-        ConfirmButton {
-            icon: Some(ICON_CLOSE),
-            label: "Quit app",
-            color: ERROR_RED,
-        },
-        ConfirmButton {
-            icon: None,
-            label: "Cancel",
-            color: WHITE,
-        },
-    ]
-}
-
-/// Confirm dialog card + button row rects (shared with main.rs for layout).
-pub fn confirm_dialog_layout(
-    screen_w: u32,
-    screen_h: u32,
-    font_label: &Font,
-    buttons: &[ConfirmButton; 2],
-) -> (Rect, Rect) {
-    // Width: at least 34%, enough for button labels, capped at 90% for margin.
-    let needed = confirm_row_min_width(font_label, buttons) + 64;
-    let frac = (needed as f32 / screen_w.max(1) as f32).clamp(0.34, 0.90);
-    let card = modal_card_rect(screen_w, screen_h, frac, 200);
+/// Confirm dialog card + button-row rects, sized exactly like the `App`'s simple modals
+/// (forget host, send logs): [`SIMPLE_MODAL_WIDTH_FRAC`] wide, height driven by the wrapped
+/// subtitle. Shared with `main.rs`'s in-stream/quit dialog so all four modals match.
+pub fn confirm_dialog_layout(screen_w: u32, screen_h: u32, fonts: &Fonts, subtitle: &str) -> (Rect, Rect) {
+    let card = simple_modal_card(screen_w, screen_h, |probe| {
+        let header_end = modal_header_end_y(fonts.label, fonts.value, probe, subtitle);
+        (header_end + 32 + 72 + 32) as u32
+    });
+    let after_subtitle_y = modal_header_end_y(fonts.label, fonts.value, card, subtitle);
     let content = Rect::new(
         card.x() + 32,
-        card.y() + 36 + font_label.height() + 28,
+        after_subtitle_y + 32,
         card.width().saturating_sub(64),
         72,
     );
     (card, content)
 }
 
-/// Confirm dialog shell (full-screen): card + title + unfocused buttons.
-/// Focused button composites on top as own small tile (shell/focus-tile split).
+/// Confirm dialog shell (full-screen tile): the same card + close (X) + header + unfocused
+/// buttons that `App::draw_modal_shell`/`ui::draw_modal_header` paint for the forget-host and
+/// send-logs modals — replicated here because the streaming/quit loops have no `App`. The
+/// focused button composites on top as its own small tile (shell/focus-tile split).
 pub fn render_confirm_dialog_shell(
     screen_w: u32,
     screen_h: u32,
     fonts: &Fonts,
     title: &str,
+    subtitle: &str,
     buttons: &[ConfirmButton; 2],
 ) -> Result<Painter> {
     let mut p = Painter::new(screen_w, screen_h);
     let mut tc = TextCache::new();
-    let (card, content) = confirm_dialog_layout(screen_w, screen_h, fonts.label, buttons);
+    let (card, content) = confirm_dialog_layout(screen_w, screen_h, fonts, subtitle);
     draw_modal_card(&mut p, card);
-    let (title_w, _) = fonts.label.size_of(title).unwrap_or((0, 0));
-    let title_x = card.x() + (card.width() as i32 - title_w as i32) / 2;
-    draw_text(&mut p, &mut tc, fonts.label, title, title_x, card.y() + 36, WHITE)?;
+    // These dialogs are remote/controller-driven (no local pointer over the overlay), so the
+    // X is a visual affordance only — always in the unhovered color.
+    draw_icon(&mut p, &mut tc, fonts.icon, modal_close_rect(card), ICON_CLOSE, MUTED)?;
+    draw_modal_header(
+        &mut p,
+        &mut tc,
+        fonts.label,
+        fonts.value,
+        card,
+        title,
+        WHITE,
+        subtitle,
+        MUTED,
+    )?;
     draw_confirm_buttons(&mut p, &mut tc, fonts, content, buttons, usize::MAX)?;
     Ok(p)
 }

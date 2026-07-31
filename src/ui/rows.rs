@@ -533,6 +533,21 @@ pub struct ConfirmButton<'a> {
     pub color: Color,
 }
 
+/// A primary action button plus a Cancel — the pair every confirm modal shares
+/// (forget host, send logs, stop streaming, quit app), so their `ConfirmButton`
+/// data can't drift apart. Index 0 is the action, index 1 is Cancel (the safe
+/// default focus).
+pub fn confirm_buttons(icon: Option<&'static str>, label: &'static str, color: Color) -> [ConfirmButton<'static>; 2] {
+    [
+        ConfirmButton { icon, label, color },
+        ConfirmButton {
+            icon: None,
+            label: "Cancel",
+            color: WHITE,
+        },
+    ]
+}
+
 /// Gap between the two buttons in a [`draw_confirm_buttons`] row.
 const CONFIRM_BUTTON_GAP: i32 = 20;
 
@@ -541,25 +556,6 @@ const CONFIRM_BUTTON_GAP: i32 = 20;
 fn confirm_button_metrics(font: &Font) -> (u32, i32, i32) {
     let line_h = font.height().max(1);
     ((line_h * 2 / 3).max(1) as u32, (line_h / 3).max(1), (line_h / 2).max(1))
-}
-
-/// Minimum content width to show both button labels in full without ellipsis.
-pub fn confirm_row_min_width(font: &Font, buttons: &[ConfirmButton; 2]) -> u32 {
-    let (icon_size, icon_gap, side_pad) = confirm_button_metrics(font);
-    let widest = buttons
-        .iter()
-        .map(|b| {
-            let label_w = font.size_of(b.label).map_or(0, |(w, _)| w);
-            let leading = if b.icon.is_some() {
-                icon_size + icon_gap as u32
-            } else {
-                0
-            };
-            label_w + leading + 2 * side_pad as u32
-        })
-        .max()
-        .unwrap_or(0);
-    widest * 2 + CONFIRM_BUTTON_GAP as u32
 }
 
 /// Button `index`'s rect within a confirm button row.

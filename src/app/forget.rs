@@ -94,18 +94,7 @@ impl App {
     /// and the focused-button tile (`prepare_tiles`), so their `ConfirmButton`
     /// data can't drift apart.
     pub(crate) fn forget_buttons() -> [ui::ConfirmButton<'static>; 2] {
-        [
-            ui::ConfirmButton {
-                icon: Some(ui::ICON_DELETE),
-                label: "Forget",
-                color: ui::ERROR_RED,
-            },
-            ui::ConfirmButton {
-                icon: None,
-                label: "Cancel",
-                color: ui::WHITE,
-            },
-        ]
+        ui::confirm_buttons(Some(ui::ICON_DELETE), "Forget", ui::ERROR_RED)
     }
 
     pub(crate) fn forget_host_subtitle(name: &str) -> String {

@@ -92,9 +92,6 @@ const ABOUT_WINDOW_MARGIN: usize = 16;
 /// Pairing modal subtitle (also used for height measurement).
 pub(crate) const PAIRING_SUBTITLE: &str = "Two ways to pair with this host — either one works.";
 
-/// Shared width for Pairing/AddHost/Wake/ForgetHost (consistent window sizing).
-pub(crate) const SIMPLE_MODAL_WIDTH_FRAC: f32 = 0.40;
-
 /// Home status bar's vertical padding; box height is fixed at two text rows.
 const STATUS_BG_PAD: i32 = 12;
 
@@ -993,15 +990,9 @@ impl App {
     }
     // ---------------------------------------------------------------- mouse --
 
-    /// Shared width, per-modal height: the four simple modals all size to
-    /// `SIMPLE_MODAL_WIDTH_FRAC` but fit their own content (a shared *height*
-    /// once clipped Wake's buttons — see the constant's docs). `content_height`
-    /// receives a zero-y/height probe card at the final width and returns the
-    /// card's total height.
+    /// Thin wrapper over [`ui::simple_modal_card`] kept for the `Self::` call sites.
     pub(crate) fn simple_modal_card(screen_w: u32, screen_h: u32, content_height: impl FnOnce(Rect) -> u32) -> Rect {
-        let w = (screen_w as f32 * SIMPLE_MODAL_WIDTH_FRAC).round() as u32;
-        let height = content_height(Rect::new(0, 0, w, 0));
-        ui::modal_card_rect(screen_w, screen_h, SIMPLE_MODAL_WIDTH_FRAC, height)
+        ui::simple_modal_card(screen_w, screen_h, content_height)
     }
 
     /// Same, but for screens that raise the on-screen keyboard: the card sits where any
@@ -1017,9 +1008,15 @@ impl App {
         screen_h: u32,
         content_height: impl FnOnce(Rect) -> u32,
     ) -> Rect {
-        let w = (screen_w as f32 * SIMPLE_MODAL_WIDTH_FRAC).round() as u32;
+        let w = (screen_w as f32 * ui::SIMPLE_MODAL_WIDTH_FRAC).round() as u32;
         let height = content_height(Rect::new(0, 0, w, 0));
-        ui::modal_card_rect_above_keyboard(screen_w, screen_h, SIMPLE_MODAL_WIDTH_FRAC, height, self.keyboard_shown)
+        ui::modal_card_rect_above_keyboard(
+            screen_w,
+            screen_h,
+            ui::SIMPLE_MODAL_WIDTH_FRAC,
+            height,
+            self.keyboard_shown,
+        )
     }
     /// Updates focus/hover to whatever the Magic Remote's pointer is over.
     /// Returns whether that actually changed anything visible — Magic Remote

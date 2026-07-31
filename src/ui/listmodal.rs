@@ -3,7 +3,7 @@ use sdl2::rect::Rect;
 
 use super::*;
 
-/// Wider than the confirm-style modals (`SIMPLE_MODAL_WIDTH_FRAC` in `app`) — these
+/// Wider than the confirm-style modals ([`SIMPLE_MODAL_WIDTH_FRAC`]) — these
 /// hold full rows with icons and hint text, not a sentence and two buttons.
 pub const LIST_MODAL_WIDTH_FRAC: f32 = 0.46;
 /// Gap between the header's last line and the first row.

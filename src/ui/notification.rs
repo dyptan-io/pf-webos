@@ -4,7 +4,7 @@
 //! [`anim_frac`] easing so it matches the modals' curve. One slot — a new [`Notification::show`]
 //! replaces whatever is on screen.
 
-use super::{anim_frac, draw_text, Painter, TextCache, WHITE};
+use super::{anim_frac, draw_text, Painter, TextCache, OVERLAY_FADE, WHITE};
 use anyhow::Result;
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
@@ -13,8 +13,6 @@ use std::time::{Duration, Instant};
 
 /// Fully opaque for this long before the fade begins.
 const HOLD: Duration = Duration::from_secs(2);
-/// Fade-out duration once [`HOLD`] expires.
-const FADE_OUT: Duration = Duration::from_millis(400);
 
 /// A single-slot transient toast. The message is owned so callers don't have to keep it
 /// alive across ticks; [`Notification::frame`] drives both the fade alpha and expiry.
@@ -28,7 +26,7 @@ impl Notification {
         Self { active: None }
     }
 
-    /// Show `text` from now: full opacity for [`HOLD`], then a [`FADE_OUT`] fade.
+    /// Show `text` from now: full opacity for [`HOLD`], then an [`OVERLAY_FADE`] fade.
     pub fn show(&mut self, text: impl Into<String>) {
         self.active = Some((text.into(), Instant::now()));
     }
@@ -38,14 +36,14 @@ impl Notification {
     pub fn frame(&mut self) -> Option<(String, f32)> {
         let shown = self.active.as_ref()?.1;
         let elapsed = shown.elapsed();
-        if elapsed >= HOLD + FADE_OUT {
+        if elapsed >= HOLD + OVERLAY_FADE {
             self.active = None;
             return None;
         }
         let alpha = if elapsed < HOLD {
             1.0
         } else {
-            (1.0 - anim_frac(Some(shown + HOLD), FADE_OUT)).clamp(0.0, 1.0)
+            (1.0 - anim_frac(Some(shown + HOLD), OVERLAY_FADE)).clamp(0.0, 1.0)
         };
         Some((self.active.as_ref()?.0.clone(), alpha))
     }

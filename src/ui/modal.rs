@@ -58,6 +58,21 @@ pub fn draw_modal_card(painter: &mut Painter, rect: Rect) {
     painter.stroke_rounded_rect(rect, MODAL_RADIUS, Color::RGBA(0xff, 0xff, 0xff, 0x18), 1.5);
 }
 
+/// Width fraction shared by the confirm-style modals (forget host, send logs, stop
+/// streaming, quit app) — narrower than the scrollable `ListModal` screens.
+pub const SIMPLE_MODAL_WIDTH_FRAC: f32 = 0.40;
+
+/// A centered [`SIMPLE_MODAL_WIDTH_FRAC`]-wide card whose *height* is derived from its
+/// own content: `content_height` receives a zero-y/height probe card at the final width
+/// and returns the card's total height. Shared by every confirm modal so they size
+/// identically whether they render through `App` (forget/send-logs) or `main.rs`'s
+/// in-stream/quit dialog.
+pub fn simple_modal_card(screen_w: u32, screen_h: u32, content_height: impl FnOnce(Rect) -> u32) -> Rect {
+    let w = (screen_w as f32 * SIMPLE_MODAL_WIDTH_FRAC).round() as u32;
+    let height = content_height(Rect::new(0, 0, w, 0));
+    modal_card_rect(screen_w, screen_h, SIMPLE_MODAL_WIDTH_FRAC, height)
+}
+
 pub fn modal_close_rect(card_rect: Rect) -> Rect {
     const SIZE: u32 = 44;
     const MARGIN: i32 = 20;

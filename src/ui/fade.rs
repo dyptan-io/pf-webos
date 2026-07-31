@@ -7,6 +7,11 @@
 use super::anim_frac;
 use std::time::{Duration, Instant};
 
+/// Shared fade-in/out duration for transient in-stream overlays (toast notifications,
+/// the stats overlay, the log-tail overlay) — one curve so toggling any of them feels
+/// the same.
+pub const OVERLAY_FADE: Duration = Duration::from_millis(400);
+
 /// `T` is whatever the caller needs preserved while closing (e.g. which screen was
 /// open) so the fade-out can keep rendering it after the live state has already moved
 /// on — use `()` if there's only ever one thing this could be.
@@ -61,6 +66,23 @@ impl<T: Copy + PartialEq> ModalFade<T> {
     /// Open-fade alpha: eases 0.0 -> 1.0, `1.0` once finished or if never opened.
     pub fn open_alpha(&self, dur: Duration) -> f32 {
         anim_frac(self.open_since, dur)
+    }
+
+    /// Alpha for a simple show/hide overlay driven by `shown`: `Some` through the close
+    /// fade even after `shown` has already flipped to `false` (so the last frame doesn't
+    /// cut instantly), and `None` once fully faded and hidden.
+    pub fn visibility_alpha(&self, dur: Duration, shown: bool) -> Option<f32> {
+        if let Some((alpha, _)) = self.closing_frame(dur) {
+            return Some(alpha);
+        }
+        shown.then(|| self.open_alpha(dur))
+    }
+
+    /// Whether an open or close fade is still mid-flight (i.e. hasn't yet reached its
+    /// steady state). Pure and non-mutating, unlike `tick` — safe to call just to pick a
+    /// redraw cadence.
+    pub fn is_animating(&self, dur: Duration) -> bool {
+        self.open_since.is_some_and(|t| t.elapsed() < dur) || self.closing.is_some_and(|(t, _)| t.elapsed() < dur)
     }
 
     /// Advances the clock; returns whether either fade is still in flight.

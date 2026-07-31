@@ -108,18 +108,7 @@ impl App {
     /// `send_logs_focused` (0 = Send, 1 = Cancel); Send is drawn in the same red as
     /// the Forget action, since both are consequential.
     pub(crate) fn send_logs_buttons() -> [ui::ConfirmButton<'static>; 2] {
-        [
-            ui::ConfirmButton {
-                icon: Some(ui::ICON_SEND),
-                label: "Send",
-                color: ui::ERROR_RED,
-            },
-            ui::ConfirmButton {
-                icon: None,
-                label: "Cancel",
-                color: ui::WHITE,
-            },
-        ]
+        ui::confirm_buttons(Some(ui::ICON_SEND), "Send", ui::ERROR_RED)
     }
 
     pub(crate) fn send_logs_card_rect(screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Rect {

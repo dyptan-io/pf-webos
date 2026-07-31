@@ -273,11 +273,14 @@ mod real {
         }
     }
 
-    /// How long a disconnect shortcut ([`DisconnectChord`]) must be held during a stream
-    /// before the dialog opens. Every button in these shortcuts is also real game input,
-    /// so a hold — not a press — is the only safe trigger (L1+R1 in particular is a common
-    /// in-game bind); the hold window is the margin against a stream dying mid-play.
-    const DISCONNECT_HOLD: Duration = Duration::from_millis(500);
+    /// How long a controller shortcut ([`DisconnectChord`]) must be held before its dialog
+    /// opens — the in-stream disconnect dialog while streaming, the quit dialog in the menu.
+    /// Every button in these shortcuts is also real game input, so a hold — not a press — is
+    /// the only safe trigger (L1+R1 in particular is a common in-game bind); the hold window
+    /// is the margin against a stream dying mid-play. Shared by both loops so the remote's
+    /// held-Back EXIT gesture and the controller chord feel the same in either context —
+    /// 1s to match webOS's own long-press threshold on the EXIT gesture.
+    const EXIT_HOLD: Duration = Duration::from_millis(1000);
 
     /// How long OK must be held on a focused Home game card to pin/unpin it instead
     /// of launching it — see `pin_hold_gate`.
@@ -293,8 +296,8 @@ mod real {
         fired: bool,
     }
 
-    /// The gamepad routes to the in-stream disconnect dialog: Guide, both shoulders, or
-    /// Start+Back, each held for [`DISCONNECT_HOLD`].
+    /// The gamepad routes to the disconnect dialog (streaming) or quit dialog (menu): Guide,
+    /// both shoulders, or Start+Back, each held for [`EXIT_HOLD`].
     ///
     /// Tracked as button state rather than read back from SDL because SDL only reports
     /// transitions here — and a chord needs to know what is down *now*, not what changed
@@ -370,6 +373,7 @@ mod real {
     /// never show one at the same time, so they share those two tile slots.
     struct ConfirmDialog {
         title: &'static str,
+        subtitle: &'static str,
         buttons: [crate::ui::ConfirmButton<'static>; 2],
         focus: Option<usize>,
         fade: crate::ui::ModalFade<usize>,
@@ -381,9 +385,10 @@ mod real {
     }
 
     impl ConfirmDialog {
-        fn new(title: &'static str, buttons: [crate::ui::ConfirmButton<'static>; 2]) -> Self {
+        fn new(title: &'static str, subtitle: &'static str, buttons: [crate::ui::ConfirmButton<'static>; 2]) -> Self {
             Self {
                 title,
+                subtitle,
                 buttons,
                 focus: None,
                 fade: crate::ui::ModalFade::new(),
@@ -475,10 +480,11 @@ mod real {
             let full = sdl2::rect::Rect::new(0, 0, w, h);
             if self.shell_dirty {
                 self.shell_dirty = false;
-                let shell = crate::ui::render_confirm_dialog_shell(w, h, fonts, self.title, &self.buttons)?;
+                let shell =
+                    crate::ui::render_confirm_dialog_shell(w, h, fonts, self.title, self.subtitle, &self.buttons)?;
                 compositor.upload(texture_creator, Tile::DisconnectDialog, &shell)?;
             }
-            let (_, content) = crate::ui::confirm_dialog_layout(w, h, fonts.label, &self.buttons);
+            let (_, content) = crate::ui::confirm_dialog_layout(w, h, fonts, self.subtitle);
             let btn_rect = crate::ui::confirm_button_rect(content, focus);
             if self.focus_dirty {
                 self.focus_dirty = false;
@@ -491,19 +497,22 @@ mod real {
                 )?;
                 compositor.upload(texture_creator, Tile::DisconnectFocusButton, &tile)?;
             }
+            // Same open/close motion as the `App`'s `Screen` modals (see `draw_list`): slide
+            // in from ~26px below while fading, and the shell scales up on open.
+            let dy = ((1.0 - m) * 26.0) as i32;
             let pad = crate::ui::ROW_TILE_PAD;
             let base = sdl2::rect::Rect::new(
                 btn_rect.x() - pad,
-                btn_rect.y() - pad,
+                btn_rect.y() - pad + dy,
                 btn_rect.width() + 2 * pad as u32,
                 btn_rect.height() + 2 * pad as u32,
             );
             let f = crate::ui::anim_frac(self.focus_anim, crate::ui::FOCUS_POP);
-            // Open grows in like every other modal; close is a plain fade, no scale.
+            let modal_base = sdl2::rect::Rect::new(0, dy, w, h);
             let shell_dst = if closing {
-                full
+                modal_base
             } else {
-                crate::ui::pop_in_rect(full, m, MODAL_POP_SHRINK)
+                crate::ui::pop_in_rect(modal_base, m, MODAL_POP_SHRINK)
             };
             cmds.push(DrawCmd::Fill {
                 rect: full,
@@ -954,8 +963,15 @@ mod real {
         let mut log_overlay_dims: Option<(u32, u32)> = None;
         // `quit_dialog_was_active` catches the close-fade's final frame so it gets one last
         // redraw-on-change tick to wipe the dialog off the menu.
-        let mut quit_dialog = ConfirmDialog::new("Quit app?", crate::ui::quit_dialog_buttons());
+        let mut quit_dialog = ConfirmDialog::new(
+            "Quit app?",
+            "punktfunk will close and you'll return to the webOS home screen.",
+            crate::ui::confirm_buttons(Some(crate::ui::ICON_CLOSE), "Quit app", crate::ui::ERROR_RED),
+        );
         let mut exit_held = false;
+        // Controller routes to the quit dialog the same way it routes to the disconnect
+        // dialog while streaming — see `DisconnectChord`.
+        let mut chord = DisconnectChord::default();
         let mut quit_dialog_was_active = false;
         'ui: loop {
             let tick_start = Instant::now();
@@ -975,6 +991,14 @@ mod real {
             // through `handle_ui_event` as normal back-navigation (a no-op on Home).
             if exit_gesture_fired(&mut exit_held) && !quit_dialog.is_open() && matches!(app.screen, Screen::Home) {
                 tracing::info!("EXIT gesture — opening quit dialog");
+                quit_dialog.open(1);
+                dirty = true;
+            }
+            // Controller quit shortcut, mirroring the EXIT gesture: held long enough on Home,
+            // then forgotten so it fires once per hold rather than repeatedly while held.
+            if !quit_dialog.is_open() && matches!(app.screen, Screen::Home) && chord.held_for(EXIT_HOLD) {
+                tracing::info!("quit shortcut held — opening quit dialog");
+                chord.clear();
                 quit_dialog.open(1);
                 dirty = true;
             }
@@ -1048,8 +1072,17 @@ mod real {
                     }
                     Event::ControllerDeviceRemoved { .. } => {
                         *controller = None;
+                        // An unplugged pad sends no releases — drop any armed chord.
+                        chord.clear();
                         continue;
                     }
+                    _ => {}
+                }
+                // Track chord state for the quit shortcut without consuming the event — the
+                // buttons still flow through `handle_ui_event` for normal menu navigation.
+                match event {
+                    Event::ControllerButtonDown { button, .. } => chord.set(button, true),
+                    Event::ControllerButtonUp { button, .. } => chord.set(button, false),
                     _ => {}
                 }
                 // The quit dialog owns input while open — navigate it only, don't let the
@@ -1414,18 +1447,26 @@ mod real {
             // Settings-screen default; the Green button below flips it live for the rest
             // of this stream only, without writing back to `settings`.
             let mut stats_enabled = settings.stats_overlay;
+            // Fades stats/log in on their toggle and out the same way, on the same curve
+            // (`OVERLAY_FADE`) as the toast below — see `ModalFade::visibility_alpha`.
+            let mut stats_fade = crate::ui::ModalFade::<()>::new();
+            if stats_enabled {
+                stats_fade.open();
+            }
+            let mut log_fade = crate::ui::ModalFade::<()>::new();
             let mut green_held = false;
             let mut yellow_held = false;
             // Blue button flips pacing live via `stats.pacing_enabled` (`video_pump` reads it
             // per frame). Pure PTS math, no decoder state — safe to toggle mid-stream.
             let mut blue_held = false;
-            // Transient toasts (frame-pacing on/off, etc). `notif_was_active` catches the
-            // fade-out edge so the canvas gets wiped once (nothing else clears it). `stats_dst`
-            // lets the tile recomposite every frame while its content stays on a 500ms cadence
-            // (`stats_built_at`).
+            // Transient toasts (frame-pacing on/off, etc). `overlay_was_active` catches the
+            // fade-out edge (toast, stats, or log) so the canvas gets wiped once (nothing else
+            // clears it). `stats_dst`/`log_dst` let the tile recomposite every frame while its
+            // content stays on a slower cadence (`stats_built_at`, and the log tail's own poll).
             let mut notif = crate::ui::Notification::new();
-            let mut notif_was_active = false;
+            let mut overlay_was_active = false;
             let mut stats_dst: Option<sdl2::rect::Rect> = None;
+            let mut log_dst: Option<sdl2::rect::Rect> = None;
             let mut stats_built_at: Option<Instant> = None;
             let mut overlay_last: Option<Instant> = None;
             let mut overlay_prev_frames: u64 = 0;
@@ -1433,7 +1474,11 @@ mod real {
             let mut overlay_prev_cpu_ticks: Option<u64> = None;
             let mut overlay_prev_at = Instant::now();
             // 0 = "Disconnect" focused, 1 = "Cancel" (default on open — safer).
-            let mut disconnect = ConfirmDialog::new("Stop streaming?", crate::ui::disconnect_dialog_buttons());
+            let mut disconnect = ConfirmDialog::new(
+                "Stop streaming?",
+                "The stream will end and you'll return to the menu.",
+                crate::ui::confirm_buttons(Some(crate::ui::ICON_CLOSE), "Stop streaming", crate::ui::ERROR_RED),
+            );
             // Gamepad routes to the disconnect dialog — see `DisconnectChord`.
             let mut chord = DisconnectChord::default();
             // A short Back tap forwards Esc to the host; a held Back becomes webOS's EXIT
@@ -1566,7 +1611,7 @@ mod real {
                 // A disconnect chord held long enough (and the dialog isn't already up) —
                 // open it, then forget the chord so it fires once per hold rather than
                 // repeatedly while the buttons stay down.
-                if !disconnect.is_open() && chord.held_for(DISCONNECT_HOLD) {
+                if !disconnect.is_open() && chord.held_for(EXIT_HOLD) {
                     tracing::info!("disconnect shortcut held — opening dialog");
                     chord.clear();
                     disconnect.open(1);
@@ -1583,17 +1628,11 @@ mod real {
                     !disconnect.is_open() && crate::ui::webos_scancode_down(crate::ui::WEBOS_GREEN_SCANCODE);
                 if green_down && !green_held {
                     stats_enabled = !stats_enabled;
+                    overlay_last = None; // force an immediate redraw
                     if stats_enabled {
-                        overlay_last = None; // force an immediate redraw
+                        stats_fade.reopen();
                     } else {
-                        // Nothing else clears the canvas once the overlay stops
-                        // drawing — wipe both buffers back to transparent so the
-                        // last frame doesn't stick over the video.
-                        canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
-                        canvas.clear();
-                        canvas.present();
-                        canvas.clear();
-                        canvas.present();
+                        stats_fade.close(());
                     }
                 }
                 green_held = green_down;
@@ -1603,16 +1642,14 @@ mod real {
                 let yellow_down =
                     !disconnect.is_open() && crate::ui::webos_scancode_down(crate::ui::WEBOS_YELLOW_SCANCODE);
                 if yellow_down && !yellow_held {
+                    let was_on = log_overlay_state() != LogOverlayState::Off;
                     cycle_log_overlay();
+                    let now_on = log_overlay_state() != LogOverlayState::Off;
                     overlay_last = None; // force an immediate redraw with the new state
-                    if log_overlay_state() == LogOverlayState::Off && !stats_enabled {
-                        // Same "nothing else clears this canvas" wipe as Green's
-                        // toggle-off above — otherwise the last overlay frame sticks.
-                        canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
-                        canvas.clear();
-                        canvas.present();
-                        canvas.clear();
-                        canvas.present();
+                    if now_on && !was_on {
+                        log_fade.reopen();
+                    } else if was_on && !now_on {
+                        log_fade.close(());
                     }
                 }
                 yellow_held = yellow_down;
@@ -1686,23 +1723,34 @@ mod real {
                 let log_lines = log_overlay_lines();
                 let notif_frame = if dialog_frame.is_none() { notif.frame() } else { None };
                 let notif_active = notif_frame.is_some();
-                if notif_was_active && !notif_active && !stats_enabled && log_lines.is_none() {
-                    // Same "nothing else clears this canvas" wipe as Green's toggle-off — the
-                    // faded-out toast's last frame would otherwise stick over the video.
+                // Stats/log fade in on their toggle and fade out the same way the toast does
+                // (same `OVERLAY_FADE` curve) instead of cutting instantly — `visibility_alpha`
+                // keeps returning `Some` through the close fade even once the toggle itself
+                // has already flipped off.
+                let stats_alpha = stats_fade.visibility_alpha(crate::ui::OVERLAY_FADE, stats_enabled);
+                let log_overlay_on = log_overlay_state() != LogOverlayState::Off;
+                let log_alpha = log_fade.visibility_alpha(crate::ui::OVERLAY_FADE, log_overlay_on);
+                let overlay_active = stats_alpha.is_some() || log_alpha.is_some() || notif_active;
+                if overlay_was_active && !overlay_active {
+                    // Same "nothing else clears this canvas" wipe as before — the last
+                    // faded-out tile would otherwise stick over the video.
                     canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
                     canvas.clear();
                     canvas.present();
                     canvas.clear();
                     canvas.present();
                 }
-                notif_was_active = notif_active;
-                // A fading toast needs frequent frames; stats/log alone are fine at ~2Hz.
-                let redraw_interval = if notif_active {
+                overlay_was_active = overlay_active;
+                // A fade in flight needs frequent frames; steady-state stats/log are fine at ~2Hz.
+                let fading = notif_active
+                    || stats_fade.is_animating(crate::ui::OVERLAY_FADE)
+                    || log_fade.is_animating(crate::ui::OVERLAY_FADE);
+                let redraw_interval = if fading {
                     Duration::from_millis(33)
                 } else {
                     Duration::from_millis(500)
                 };
-                if (stats_enabled || log_lines.is_some() || notif_active)
+                if overlay_active
                     && dialog_frame.is_none()
                     && overlay_last.is_none_or(|t| t.elapsed() >= redraw_interval)
                 {
@@ -1796,27 +1844,35 @@ mod real {
                             Err(e) => tracing::warn!("stats overlay render failed: {e:#}"),
                         }
                     }
-                    if stats_enabled {
+                    if let Some(alpha) = stats_alpha {
                         if let Some(dst) = stats_dst {
                             cmds.push(DrawCmd::Tex {
                                 tile: Tile::StatsOverlay,
                                 dst,
-                                alpha: 0xff,
+                                alpha: (alpha * 255.0) as u8,
                             });
                         }
                     }
-                    if let Some(lines) = log_lines {
-                        match crate::ui::render_log_overlay_tile(fonts.caption, display_mode.w as u32, &lines) {
+                    // Re-rendered only while actually on (`log_lines` is `None` during the
+                    // fade-out, once the toggle has already flipped the state to Off) — the
+                    // fade keeps recompositing the last uploaded tile via `log_dst`.
+                    if let Some(lines) = &log_lines {
+                        match crate::ui::render_log_overlay_tile(fonts.caption, display_mode.w as u32, lines) {
                             Ok(tile) => {
                                 let (tw, th) = (tile.width(), tile.height());
                                 compositor.upload(&texture_creator, Tile::LogOverlay, &tile)?;
-                                cmds.push(DrawCmd::Tex {
-                                    tile: Tile::LogOverlay,
-                                    dst: sdl2::rect::Rect::new(0, display_mode.h - th as i32, tw, th),
-                                    alpha: 0xff,
-                                });
+                                log_dst = Some(sdl2::rect::Rect::new(0, display_mode.h - th as i32, tw, th));
                             }
                             Err(e) => tracing::warn!("log overlay render failed: {e:#}"),
+                        }
+                    }
+                    if let Some(alpha) = log_alpha {
+                        if let Some(dst) = log_dst {
+                            cmds.push(DrawCmd::Tex {
+                                tile: Tile::LogOverlay,
+                                dst,
+                                alpha: (alpha * 255.0) as u8,
+                            });
                         }
                     }
                     if let Some((text, alpha)) = &notif_frame {
