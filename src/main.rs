@@ -7,6 +7,8 @@ mod audio;
 #[cfg(target_os = "linux")]
 mod compositor;
 #[cfg(target_os = "linux")]
+mod core;
+#[cfg(target_os = "linux")]
 mod device;
 #[cfg(target_os = "linux")]
 mod dualsense;

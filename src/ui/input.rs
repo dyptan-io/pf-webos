@@ -2,18 +2,7 @@
 //!
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 
-/// Menu event (debounced from raw SDL2 input: keyboard arrows, gamepad d-pad).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MenuEvent {
-    Up,
-    Down,
-    Left,
-    Right,
-    Confirm,
-    Back,
-    /// "Forget host" (separate from Back/Confirm to prevent accident).
-    Secondary,
-}
+pub use crate::core::event::MenuEvent;
 
 /// Magic Remote Back button keycode (not Escape/Backspace/AcBack; identified via logs).
 /// Only usable hardware Back; Home button SIGTERMs the app.

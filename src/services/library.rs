@@ -8,39 +8,18 @@ use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
 use ureq::unversioned::resolver::DefaultResolver;
 use ureq::unversioned::transport::{
     Buffers, ConnectionDetails, Connector, Either, LazyBuffers, NextTimeout, TcpConnector, Transport, TransportAdapter,
 };
+
+pub use crate::core::model::GameEntry;
 
 /// The management API's default port — matches the host's `mgmt::DEFAULT_PORT`. A
 /// discovered host may advertise a different one via its mDNS `mgmt` TXT record
 /// (`discovery::DiscoveredHost::mgmt_port`); saved-but-not-advertising hosts (or an
 /// older host with no mgmt TXT at all) fall back here.
 pub const DEFAULT_MGMT_PORT: u16 = 47990;
-
-/// Cover-art paths for a title (host-relative, fetched via mTLS).
-/// art.rs prefers `portrait`, falls back to `header`. `hero`/`logo` unused.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[allow(dead_code)]
-pub struct Artwork {
-    pub portrait: Option<String>,
-    pub hero: Option<String>,
-    pub logo: Option<String>,
-    pub header: Option<String>,
-}
-
-/// One title in the host's unified library. `id` is store-qualified (`steam:<appid>`,
-/// `custom:<id>`) and doubles as the launch handle `session::connect`'s `launch`
-/// parameter takes — the host resolves the actual launch spec itself from `id`.
-#[derive(Clone, Debug, Deserialize)]
-pub struct GameEntry {
-    pub id: String,
-    pub title: String,
-    #[serde(default)]
-    pub art: Artwork,
-}
 
 /// Errors surfaced to the UI so it can explain what to do next.
 #[derive(Debug)]

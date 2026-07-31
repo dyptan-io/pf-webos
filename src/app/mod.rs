@@ -7,7 +7,9 @@ use sdl2::rect::Rect;
 use tiny_skia::Pixmap;
 
 use crate::compositor::{DrawCmd, Tile};
-use crate::services::library::GameEntry;
+pub use crate::core::model::ConnectTarget;
+use crate::core::model::GameEntry;
+pub use crate::core::screen::{HomeFocus, PairingFocus, Screen};
 use crate::services::store::{self, KnownHost, Settings};
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};
 
@@ -27,35 +29,6 @@ mod settings;
 mod speedtest;
 mod wake;
 mod wakesettings;
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Screen {
-    Home,
-    Pairing,
-    Settings,
-    AddHost,
-    Wake,
-    ForgetHost,
-    HostMenu,
-    EditHost,
-    About,
-    SpeedTest,
-    WakeSettings,
-    PinLimit,
-    /// Log level debug aid (see `app/diagnostics.rs`).
-    Diagnostics,
-    /// Experimental/unstable toggles (see `app/experimental.rs`).
-    Experimental,
-    /// "Send logs to developer" confirmation (see `app/sendlogs.rs`).
-    SendLogs,
-}
-
-/// Pairing modal's focused input: PIN row or "Request access" button.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PairingFocus {
-    Pin,
-    RequestAccess,
-}
 
 /// Rows beyond viewport kept rasterized (prevents scroll stalls).
 const CARD_PREFETCH_ROWS: i32 = 2;
@@ -118,14 +91,6 @@ pub struct WakeState {
     pub(crate) silent: bool,
     pub(crate) last_probe: Option<Instant>,
     pub(crate) probe_rx: Option<std::sync::mpsc::Receiver<crate::services::library::GamesLoaded>>,
-}
-
-/// Home screen focus location.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum HomeFocus {
-    Sidebar(usize),
-    SidebarMenu(usize),
-    Grid(usize),
 }
 
 /// Grid card: Desktop or game (both pinnable).
@@ -210,15 +175,6 @@ impl GridLayout {
             self.unpinned_start + usize::from(self.desktop_in_rest) + (pos - self.pinned_count)
         })
     }
-}
-
-/// Stream connection target.
-pub struct ConnectTarget {
-    pub host: String,
-    pub port: u16,
-    pub fingerprint: [u8; 32],
-    /// Library entry id to launch, or `None` for desktop.
-    pub launch: Option<String>,
 }
 
 /// Pending launch awaiting pre-flight reachability check.
