@@ -1,6 +1,6 @@
 //! The per-host network speed test — rendering. Logic lives in `app::state::speedtest`.
-use crate::app::App;
 use crate::app::state::speedtest::SpeedTestState;
+use crate::app::App;
 use crate::ui::render::Rect;
 use crate::ui::{self, Painter};
 use anyhow::Result;

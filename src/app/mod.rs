@@ -675,7 +675,7 @@ impl App {
         // (never a race) if it finishes first.
         // Applies the persisted "Show logs" preference to the otherwise-ephemeral overlay.
         if app.settings.show_logs {
-            crate::real::set_log_overlay_enabled(true);
+            crate::runtime::set_log_overlay_enabled(true);
         }
         std::thread::spawn(ui::spinner_frames);
         std::thread::spawn(crate::platform::webos::device::supports_av1);

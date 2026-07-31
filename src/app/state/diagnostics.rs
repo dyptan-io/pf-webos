@@ -20,7 +20,6 @@ impl App {
     /// `Settings` dropdown uses (its row `0` is disambiguated from `Settings`' row 0
     /// by `self.screen`, see `dropdown_overlay_tile`'s docs); the rest are plain
     /// Left/Right/Confirm toggles. Back saves and returns to Settings.
-    ///
     pub(crate) fn handle_diagnostics_event(&mut self, ev: MenuEvent) {
         if let Some(dd) = self.dropdown.as_mut() {
             let len = ui::LOG_LEVEL_OPTIONS.len();
@@ -63,7 +62,7 @@ impl App {
             (ui::DIAG_ROW_SHOW_LOGS, MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
                 let from = self.settings.show_logs;
                 self.settings.show_logs = !from;
-                crate::real::set_log_overlay_enabled(!from);
+                crate::runtime::set_log_overlay_enabled(!from);
                 self.switch_anim = Some((Instant::now(), from));
             }
             (ui::DIAG_ROW_SEND_LOGS, MenuEvent::Confirm) => {
