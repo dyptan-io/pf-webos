@@ -2,7 +2,6 @@
 use super::*;
 use crate::ui::{self, HostEntry, MenuEvent, Painter};
 use anyhow::Result;
-use sdl2::rect::Rect;
 use std::time::Instant;
 
 impl App {
@@ -48,13 +47,6 @@ impl App {
             MenuEvent::Up | MenuEvent::Down | MenuEvent::Secondary => {}
         }
     }
-    /// Forget confirmation card rect (shared by render and hit-testing).
-    pub(crate) fn forget_host_card_rect(screen_w: u32, screen_h: u32, name: &str, fonts: &ui::Fonts) -> Rect {
-        Self::simple_modal_card(screen_w, screen_h, |probe| {
-            let header_end = ui::modal_header_end_y(fonts.label, fonts.value, probe, &Self::forget_host_subtitle(name));
-            (header_end + 32 + 72 + 32) as u32
-        })
-    }
     pub(crate) fn render_forget_host(
         &self,
         painter: &mut Painter,
@@ -70,7 +62,7 @@ impl App {
         else {
             return Ok(());
         };
-        let card = Self::forget_host_card_rect(screen_w, screen_h, name, fonts);
+        let (card, content) = ui::confirm_dialog_layout(screen_w, screen_h, fonts, &Self::forget_host_subtitle(name));
         self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
 
         ui::draw_modal_header(
@@ -85,7 +77,6 @@ impl App {
             ui::MUTED,
         )?;
 
-        let content = Self::forget_host_content_rect(card, name, fonts);
         ui::draw_confirm_buttons(painter, text_cache, fonts, content, &Self::forget_buttons(), usize::MAX)?;
         Ok(())
     }
@@ -99,20 +90,5 @@ impl App {
 
     pub(crate) fn forget_host_subtitle(name: &str) -> String {
         format!("{name} will be removed from this TV. You can pair with it again later.")
-    }
-
-    /// The Forget/Cancel button row's rect — depends on the host-name
-    /// subtitle's wrapped height, computed via `ui::modal_header_end_y`
-    /// without drawing so `prepare_tiles`/`draw_list` can position the
-    /// focused-button tile without re-rendering the header.
-    pub(crate) fn forget_host_content_rect(card: Rect, name: &str, fonts: &ui::Fonts) -> Rect {
-        let after_subtitle_y =
-            ui::modal_header_end_y(fonts.label, fonts.value, card, &Self::forget_host_subtitle(name));
-        Rect::new(
-            card.x() + 32,
-            after_subtitle_y + 32,
-            card.width().saturating_sub(64),
-            72,
-        )
     }
 }

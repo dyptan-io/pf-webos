@@ -1028,6 +1028,27 @@ impl App {
         focus_changed || close_changed
     }
 
+    /// Button index under `(x, y)` for a two-button confirm modal with `subtitle`, or
+    /// `None` off both buttons — every confirm modal's hover arm shares this, against the
+    /// same `confirm_dialog_layout` geometry the modal is drawn with.
+    fn confirm_button_at(screen_w: u32, screen_h: u32, fonts: &ui::Fonts, subtitle: &str, x: i32, y: i32) -> Option<usize> {
+        let (_, content) = ui::confirm_dialog_layout(screen_w, screen_h, fonts, subtitle);
+        ui::confirm_button_at(content, x, y)
+    }
+
+    /// Rect of confirm button `index` for a two-button modal with `subtitle` — the shared
+    /// geometry the focused-button tile and its hit-rect are positioned against.
+    fn confirm_focus_button_rect(
+        screen_w: u32,
+        screen_h: u32,
+        fonts: &ui::Fonts,
+        subtitle: &str,
+        index: usize,
+    ) -> Rect {
+        let (_, content) = ui::confirm_dialog_layout(screen_w, screen_h, fonts, subtitle);
+        ui::confirm_button_rect(content, index)
+    }
+
     /// Moves the positional focus/selection onto whatever interactive element sits
     /// under the pointer, so the Magic Remote's pointer highlights elements on hover
     /// exactly where a click would land. Returns whether the selection actually
@@ -1127,18 +1148,17 @@ impl App {
                     false
                 }
             }
-            // Two-button confirm modals: hovering a button focuses it so the pointer
-            // can pick Forget-vs-Cancel / Send-vs-Cancel, not just confirm whatever
-            // the D-pad last focused.
+            // Two-button confirm modals (Forget/SendLogs/Wake — the same modal type as the
+            // in-stream Disconnect dialog): hovering a button focuses it, so the pointer can
+            // pick action-vs-Cancel, not just confirm whatever the D-pad last focused. All
+            // three share `confirm_button_at`; only the focus field they set differs.
             Screen::ForgetHost => {
                 let name = self
                     .host_menu_index
                     .and_then(|i| self.entries.get(i))
                     .map(HostEntry::name)
                     .unwrap_or_default();
-                let card = Self::forget_host_card_rect(screen_w, screen_h, name, fonts);
-                let content = Self::forget_host_content_rect(card, name, fonts);
-                match (0..2).find(|&i| ui::confirm_button_rect(content, i).contains_point((x, y))) {
+                match Self::confirm_button_at(screen_w, screen_h, fonts, &Self::forget_host_subtitle(name), x, y) {
                     Some(i) => {
                         let changed = self.host_menu_focused != i;
                         self.host_menu_focused = i;
@@ -1148,9 +1168,7 @@ impl App {
                 }
             }
             Screen::SendLogs => {
-                let card = Self::send_logs_card_rect(screen_w, screen_h, fonts);
-                let content = Self::send_logs_content_rect(card, fonts);
-                match (0..2).find(|&i| ui::confirm_button_rect(content, i).contains_point((x, y))) {
+                match Self::confirm_button_at(screen_w, screen_h, fonts, Self::SEND_LOGS_SUBTITLE, x, y) {
                     Some(i) => {
                         let changed = self.send_logs_focused != i;
                         self.send_logs_focused = i;
@@ -1159,9 +1177,23 @@ impl App {
                     None => false,
                 }
             }
+            // Only with a MAC — the no-MAC wake variant is a button-less message.
+            Screen::Wake => {
+                let Some(wake) = self.wake.as_ref().filter(|w| !w.mac.is_empty()) else {
+                    return false;
+                };
+                let Some(i) = Self::confirm_button_at(screen_w, screen_h, fonts, &Self::wake_status_text(wake), x, y)
+                else {
+                    return false;
+                };
+                let wake = self.wake.as_mut().expect("filtered to Some above");
+                let changed = wake.focused != i;
+                wake.focused = i;
+                changed
+            }
             // No positional focus to move: single-card info/entry modals (AddHost,
-            // EditHost, About, Wake, WakeSettings, PinLimit, SpeedTest) and Settings
-            // with a dropdown open.
+            // EditHost, About, WakeSettings, PinLimit, SpeedTest) and Settings with a
+            // dropdown open.
             _ => false,
         }
     }
@@ -1270,7 +1302,7 @@ impl App {
                     .and_then(|i| self.entries.get(i))
                     .map(HostEntry::name)
                     .unwrap_or_default();
-                Self::forget_host_card_rect(screen_w, screen_h, name, fonts)
+                ui::confirm_dialog_card(screen_w, screen_h, fonts, &Self::forget_host_subtitle(name))
             }
             Screen::HostMenu => {
                 let subtitle = self.host_menu_subtitle();
@@ -1292,7 +1324,7 @@ impl App {
                 let subtitle = self.experimental_subtitle();
                 Self::experimental_card_rect(screen_w, screen_h, fonts, &subtitle)
             }
-            Screen::SendLogs => Self::send_logs_card_rect(screen_w, screen_h, fonts),
+            Screen::SendLogs => ui::confirm_dialog_card(screen_w, screen_h, fonts, Self::SEND_LOGS_SUBTITLE),
         })
     }
 
@@ -2005,8 +2037,14 @@ impl App {
                             .wake
                             .as_ref()
                             .expect("focus_key only Some for a Wake with a focusable widget");
-                        let card = Self::wake_card_rect(screen_w, screen_h, wake, fonts);
-                        let rect = ui::confirm_button_rect(Self::wake_buttons_rect(card, wake, fonts), wake.focused);
+                        // focus_key is only Some for a Wake with a MAC, so this is the confirm dialog.
+                        let rect = Self::confirm_focus_button_rect(
+                            screen_w,
+                            screen_h,
+                            fonts,
+                            &Self::wake_status_text(wake),
+                            wake.focused,
+                        );
                         let buttons = Self::wake_buttons();
                         ui::render_confirm_button_tile(
                             text_cache,
@@ -2034,9 +2072,13 @@ impl App {
                             .and_then(|i| self.entries.get(i))
                             .map(HostEntry::name)
                             .unwrap_or_default();
-                        let card = Self::forget_host_card_rect(screen_w, screen_h, name, fonts);
-                        let content = Self::forget_host_content_rect(card, name, fonts);
-                        let rect = ui::confirm_button_rect(content, self.host_menu_focused);
+                        let rect = Self::confirm_focus_button_rect(
+                            screen_w,
+                            screen_h,
+                            fonts,
+                            &Self::forget_host_subtitle(name),
+                            self.host_menu_focused,
+                        );
                         let buttons = Self::forget_buttons();
                         ui::render_confirm_button_tile(
                             text_cache,
@@ -2136,9 +2178,13 @@ impl App {
                         )?
                     }
                     Screen::SendLogs => {
-                        let card = Self::send_logs_card_rect(screen_w, screen_h, fonts);
-                        let content = Self::send_logs_content_rect(card, fonts);
-                        let rect = ui::confirm_button_rect(content, self.send_logs_focused);
+                        let rect = Self::confirm_focus_button_rect(
+                            screen_w,
+                            screen_h,
+                            fonts,
+                            Self::SEND_LOGS_SUBTITLE,
+                            self.send_logs_focused,
+                        );
                         let buttons = Self::send_logs_buttons();
                         ui::render_confirm_button_tile(
                             text_cache,
@@ -2740,8 +2786,7 @@ impl App {
                     Some(ui::focus_row_rect_at_px(content, self.settings_focused, px))
                 }
                 Screen::Wake => self.wake.as_ref().filter(|w| !w.mac.is_empty()).map(|w| {
-                    let card = Self::wake_card_rect(screen_w, screen_h, w, fonts);
-                    ui::confirm_button_rect(Self::wake_buttons_rect(card, w, fonts), w.focused)
+                    Self::confirm_focus_button_rect(screen_w, screen_h, fonts, &Self::wake_status_text(w), w.focused)
                 }),
                 Screen::Pairing => {
                     let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
@@ -2759,9 +2804,13 @@ impl App {
                         .and_then(|i| self.entries.get(i))
                         .map(HostEntry::name)
                         .unwrap_or_default();
-                    let card = Self::forget_host_card_rect(screen_w, screen_h, name, fonts);
-                    let content = Self::forget_host_content_rect(card, name, fonts);
-                    Some(ui::confirm_button_rect(content, self.host_menu_focused))
+                    Some(Self::confirm_focus_button_rect(
+                        screen_w,
+                        screen_h,
+                        fonts,
+                        &Self::forget_host_subtitle(name),
+                        self.host_menu_focused,
+                    ))
                 }
                 Screen::HostMenu => {
                     let subtitle = self.host_menu_subtitle();
@@ -2796,11 +2845,13 @@ impl App {
                     let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::EXPERIMENTAL_ROW_COUNT);
                     Some(ui::focus_row_rect(content, self.experimental_focused))
                 }
-                Screen::SendLogs => {
-                    let card = Self::send_logs_card_rect(screen_w, screen_h, fonts);
-                    let content = Self::send_logs_content_rect(card, fonts);
-                    Some(ui::confirm_button_rect(content, self.send_logs_focused))
-                }
+                Screen::SendLogs => Some(Self::confirm_focus_button_rect(
+                    screen_w,
+                    screen_h,
+                    fonts,
+                    Self::SEND_LOGS_SUBTITLE,
+                    self.send_logs_focused,
+                )),
                 Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About | Screen::PinLimit => None,
             };
             if let Some(rect) = focus_rect {

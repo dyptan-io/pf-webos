@@ -449,8 +449,7 @@ mod real {
             // with what's on screen. `content` is a plain Rect (captured by copy), so
             // the closure holds no borrow of `self` that `set_focus` would collide with.
             let (_, content) = crate::ui::confirm_dialog_layout(w, h, fonts, self.subtitle);
-            let button_at =
-                |x: i32, y: i32| (0..2).find(|&i| crate::ui::confirm_button_rect(content, i).contains_point((x, y)));
+            let button_at = |x: i32, y: i32| crate::ui::confirm_button_at(content, x, y);
             match *event {
                 Event::MouseMotion { x, y, .. } => {
                     return match button_at(x, y) {
@@ -1060,7 +1059,7 @@ mod real {
         // `quit_dialog_was_active` catches the close-fade's final frame so it gets one last
         // redraw-on-change tick to wipe the dialog off the menu.
         let mut quit_dialog = ConfirmDialog::new(
-            "Quit app?",
+            "Quit?",
             "punktfunk will close and you'll return to the webOS home screen.",
             crate::ui::confirm_buttons(Some(crate::ui::ICON_CLOSE), "Quit app", crate::ui::ERROR_RED),
         );

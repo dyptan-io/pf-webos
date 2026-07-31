@@ -181,17 +181,25 @@ impl App {
             _ => self.home_status = self.wake.take().map(|w| w.reason),
         }
     }
-    /// Wake modal card rect; height includes status + buttons (absent if no MAC).
-    pub(crate) fn wake_card_rect(screen_w: u32, screen_h: u32, wake: &WakeState, fonts: &ui::Fonts) -> Rect {
+    /// Card for the no-MAC modal: an informational "Host unreachable" message with no
+    /// button row (nothing to send), so it's a plain message card, not a confirm dialog.
+    pub(crate) fn wake_message_card(screen_w: u32, screen_h: u32, fonts: &ui::Fonts, status: &str) -> Rect {
         Self::simple_modal_card(screen_w, screen_h, |probe| {
-            let header_end = ui::modal_header_end_y(fonts.title, fonts.label, probe, &Self::wake_status_text(wake));
-            if wake.mac.is_empty() {
-                (header_end + 32) as u32
-            } else {
-                (header_end + 28 + 72 + 32) as u32
-            }
+            (ui::modal_header_end_y(fonts.label, fonts.value, probe, status) + 32) as u32
         })
     }
+
+    /// Wake modal card rect. With a MAC it's the shared confirmation dialog; without one
+    /// it's the button-less informational card.
+    pub(crate) fn wake_card_rect(screen_w: u32, screen_h: u32, wake: &WakeState, fonts: &ui::Fonts) -> Rect {
+        let status = Self::wake_status_text(wake);
+        if wake.mac.is_empty() {
+            Self::wake_message_card(screen_w, screen_h, fonts, &status)
+        } else {
+            ui::confirm_dialog_card(screen_w, screen_h, fonts, &status)
+        }
+    }
+
     pub(crate) fn render_wake(
         &self,
         painter: &mut Painter,
@@ -201,28 +209,25 @@ impl App {
         screen_h: u32,
     ) -> Result<()> {
         let Some(wake) = &self.wake else { return Ok(()) };
-        let card = Self::wake_card_rect(screen_w, screen_h, wake, fonts);
-        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
-
         let status = Self::wake_status_text(wake);
-        ui::draw_modal_header(
-            painter,
-            text_cache,
-            fonts.title,
-            fonts.label,
-            card,
-            Self::wake_title(wake),
-            ui::WHITE,
-            &status,
-            ui::MUTED,
-        )?;
 
-        // No MAC = nothing to draw (status text explains why). drain_discovery reconnects
-        // automatically when host reappears on mDNS.
-        if !wake.mac.is_empty() {
+        // With a MAC it's the shared confirmation dialog (card + Wake/Cancel row); without
+        // one it's a button-less informational card ("unreachable", status explains why —
+        // drain_discovery reconnects automatically once the host reappears on mDNS).
+        let (card, buttons) = if wake.mac.is_empty() {
+            (Self::wake_message_card(screen_w, screen_h, fonts, &status), None)
+        } else {
+            let (card, content) = ui::confirm_dialog_layout(screen_w, screen_h, fonts, &status);
+            (card, Some(content))
+        };
+
+        self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
+        ui::draw_modal_header(
+            painter, text_cache, fonts.label, fonts.value, card, Self::wake_title(wake), ui::WHITE, &status, ui::MUTED,
+        )?;
+        if let Some(content) = buttons {
             // usize::MAX = no focus; focused button is a separate ModalFocusElement.
-            let buttons = Self::wake_buttons_rect(card, wake, fonts);
-            ui::draw_confirm_buttons(painter, text_cache, fonts, buttons, &Self::wake_buttons(), usize::MAX)?;
+            ui::draw_confirm_buttons(painter, text_cache, fonts, content, &Self::wake_buttons(), usize::MAX)?;
         }
         Ok(())
     }
@@ -283,11 +288,5 @@ impl App {
         } else {
             format!("{} isn't responding. It may be powered off or asleep.", wake.name)
         }
-    }
-
-    /// Wake/Cancel button row rect, stacked under status text whose height it depends on.
-    pub(crate) fn wake_buttons_rect(card: Rect, wake: &WakeState, fonts: &ui::Fonts) -> Rect {
-        let after_status_y = ui::modal_header_end_y(fonts.title, fonts.label, card, &Self::wake_status_text(wake));
-        Rect::new(card.x() + 32, after_status_y + 28, card.width().saturating_sub(64), 72)
     }
 }

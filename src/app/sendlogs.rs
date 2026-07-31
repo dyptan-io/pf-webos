@@ -9,7 +9,6 @@
 use super::*;
 use crate::ui::{self, MenuEvent, Painter};
 use anyhow::Result;
-use sdl2::rect::Rect;
 use std::path::Path;
 use std::time::Instant;
 
@@ -111,24 +110,6 @@ impl App {
         ui::confirm_buttons(Some(ui::ICON_SEND), "Send", ui::ERROR_RED)
     }
 
-    pub(crate) fn send_logs_card_rect(screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Rect {
-        Self::simple_modal_card(screen_w, screen_h, |probe| {
-            let header_end = ui::modal_header_end_y(fonts.label, fonts.value, probe, Self::SEND_LOGS_SUBTITLE);
-            (header_end + 32 + 72 + 32) as u32
-        })
-    }
-
-    /// The Cancel/Send button row's rect, below the warning copy.
-    pub(crate) fn send_logs_content_rect(card: Rect, fonts: &ui::Fonts) -> Rect {
-        let after_subtitle_y = ui::modal_header_end_y(fonts.label, fonts.value, card, Self::SEND_LOGS_SUBTITLE);
-        Rect::new(
-            card.x() + 32,
-            after_subtitle_y + 32,
-            card.width().saturating_sub(64),
-            72,
-        )
-    }
-
     pub(crate) fn render_send_logs(
         &self,
         painter: &mut Painter,
@@ -137,7 +118,7 @@ impl App {
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
-        let card = Self::send_logs_card_rect(screen_w, screen_h, fonts);
+        let (card, content) = ui::confirm_dialog_layout(screen_w, screen_h, fonts, Self::SEND_LOGS_SUBTITLE);
         self.draw_modal_shell(painter, text_cache, fonts.icon, card)?;
         ui::draw_modal_header(
             painter,
@@ -150,7 +131,6 @@ impl App {
             Self::SEND_LOGS_SUBTITLE,
             ui::MUTED,
         )?;
-        let content = Self::send_logs_content_rect(card, fonts);
         // `usize::MAX` = nothing focused here; the focused button is a separate
         // `Tile::ModalFocusElement` (see `prepare_tiles`).
         ui::draw_confirm_buttons(

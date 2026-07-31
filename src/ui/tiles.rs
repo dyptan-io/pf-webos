@@ -310,14 +310,22 @@ pub fn render_log_overlay_tile(font: &Font, screen_w: u32, lines: &[String]) -> 
     Ok(p)
 }
 
+/// Confirm dialog card rect: [`SIMPLE_MODAL_WIDTH_FRAC`] wide, height driven by the
+/// wrapped subtitle plus room for the button row. Split from [`confirm_dialog_layout`]
+/// so callers that only need the card (hit-testing the close button, positioning the
+/// shell) skip the second subtitle wrap the button-row rect would cost.
+pub fn confirm_dialog_card(screen_w: u32, screen_h: u32, fonts: &Fonts, subtitle: &str) -> Rect {
+    simple_modal_card(screen_w, screen_h, |probe| {
+        let header_end = modal_header_end_y(fonts.label, fonts.value, probe, subtitle);
+        (header_end + 32 + 72 + 32) as u32
+    })
+}
+
 /// Confirm dialog card + button-row rects, sized exactly like the `App`'s simple modals
 /// (forget host, send logs): [`SIMPLE_MODAL_WIDTH_FRAC`] wide, height driven by the wrapped
 /// subtitle. Shared with `main.rs`'s in-stream/quit dialog so all four modals match.
 pub fn confirm_dialog_layout(screen_w: u32, screen_h: u32, fonts: &Fonts, subtitle: &str) -> (Rect, Rect) {
-    let card = simple_modal_card(screen_w, screen_h, |probe| {
-        let header_end = modal_header_end_y(fonts.label, fonts.value, probe, subtitle);
-        (header_end + 32 + 72 + 32) as u32
-    });
+    let card = confirm_dialog_card(screen_w, screen_h, fonts, subtitle);
     let after_subtitle_y = modal_header_end_y(fonts.label, fonts.value, card, subtitle);
     let content = Rect::new(
         card.x() + 32,
@@ -326,6 +334,13 @@ pub fn confirm_dialog_layout(screen_w: u32, screen_h: u32, fonts: &Fonts, subtit
         72,
     );
     (card, content)
+}
+
+/// Button index under `(x, y)` within a confirm dialog's button-row `content` rect, or
+/// `None` off both buttons — the shared hit-test the App confirm modals' hover arms and
+/// the in-stream Disconnect dialog use so pointer focus behaves identically.
+pub fn confirm_button_at(content: Rect, x: i32, y: i32) -> Option<usize> {
+    (0..2).find(|&i| confirm_button_rect(content, i).contains_point((x, y)))
 }
 
 /// Confirm dialog shell (full-screen tile): the same card + close (X) + header + unfocused
