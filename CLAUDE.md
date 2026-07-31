@@ -26,34 +26,59 @@ Set `TV_HOST` in `.env` (copy `.env.example`). `task -s` skips echo. No test sui
 
 ## Architecture
 
-Layered by module: `core/` (domain logic — `Screen`/`MenuEvent`/`Settings`,
-plus `core::state::<screen>` per-screen event handling and a not-yet-fully-wired
-`core::effect::Effect` for side effects) → `ui/` (presentation — `ui::render`'s
-`Rect`/`Color`/`DrawList` instead of raw `sdl2` types, `ui::view::<screen>` for
-per-screen geometry/draw calls, plus shared drawing primitives) → `platform/webos/`
-(the SDL2/hardware boundary — compositor, input mapping, `TextRaster`/SDL2_ttf,
-C build shims) → `services/` (portable I/O: `store`, `discovery`, `library`,
-`art`, `wol`). `app/mod.rs`'s `App` struct still fuses screen state with the
-GPU tile cache (`sidebar_layer`, `card_tiles`, `modal_tile`, etc. — rasterized-once
-`Painter`s that `prepare_tiles`/`draw_list` rebuild and compose per frame) rather
-than living purely in `core::state`, since those fields are `tiny_skia`-typed.
-Remaining webOS-only modules (`ndl.rs`, `starfish.rs`, `luna.rs`, `device.rs`,
-`audio.rs`, `gamepad.rs`, `keyboard.rs`, `mouse.rs`, `dualsense.rs`) still sit at
-crate root, not yet under `platform/`. Add a screen: build on `ui::ListModal`
-(see `core/state/hostmenu.rs` / `ui/view/hostmenu.rs`); `Screen` enum has eight
-dispatch sites across `app/mod.rs` and `main.rs` (compiler finds all at once,
-mechanical but safe). Rendering: `tiny_skia` software framebuffer, redraw-on-change
-(`dirty` flag, no time-based animation).
+Layered by module, dependencies point inward (acyclic). Leaves first:
 
-**Platform gating**: nearly whole crate `#[cfg(target_os = "linux")]` in
-`main.rs`. webOS target reports Linux same as dev box; macOS/Windows get stub
-`anyhow::bail!` in `main()` — builds stay green without SDL2.
+- **`core/`** — pure domain, no `sdl2`/`tiny_skia`/I/O. `model` (`Settings`, `KnownHost`,
+  `GameEntry`, `ConnectTarget`), `screen` (`Screen` + focus enums), `event` (`MenuEvent`/
+  `InputEvent`). Depends on nothing in-crate.
+- **`ui/`** — presentation, `tiny_skia` only, **no `sdl2`**. `render` (`Rect`/`Color`/
+  `TileId`/`DrawList` — the platform-neutral draw types), `painter`, `text` +
+  `text_raster` (`TextRaster` trait/`FontId`; glyph rasterization is a platform seam),
+  and shared primitives (`sidebar`/`rows`/`cards`/`modal`/`tiles`/…). Depends on `core` only.
+- **`services/`** — portable I/O: `store` (JSON persistence), `discovery` (mDNS),
+  `library` (mTLS REST), `art`, `wol`. Depends on `core`.
+- **`session/`** — streaming orchestration on `punktfunk-core`: `session::connect` spawns
+  the video pump thread; `session/pacing.rs` is the PTS pacer.
+- **`platform/webos/`** — the SDL2/hardware boundary (all `#[cfg(target_os = "linux")]`):
+  `compositor` (translates `ui::DrawList` → SDL textures, owns the texture cache),
+  `input` (SDL events → `InputEvent`), `text_sdl` (SDL2_ttf impl of `TextRaster`),
+  video (`ndl`/`starfish`/`luna`), `audio`, `device`, `gamepad`/`keyboard`/`mouse`/
+  `dualsense`, and the C build shims.
+- **`app/`** — the `App` state machine. Per-screen `impl App` blocks are split by concern:
+  `app::state::<screen>` (event handling/transitions) and `app::view::<screen>` (geometry +
+  draw-list building). Kept under `app` — not `core`/`ui` — so those stay dependency leaves.
+  `App` also owns the GPU tile cache (`sidebar_layer`, `card_tiles`, `modal_tile`, … —
+  rasterized-once `Painter`s that `prepare_tiles`/`draw_list` rebuild and compose per frame),
+  since those fields are `tiny_skia`-typed.
+- **`runtime/`** — the top-level loop (was `main.rs`'s `mod real`): `mod.rs` (`run()`, connect
+  spawn, signal handlers, log-overlay state, shared input/dialog helpers), `ui_flow.rs`
+  (`run_ui_flow`, the menu loop), `stream.rs` (`run_inner`, the streaming loop). `main.rs` is
+  thin (~50 lines): module declarations + the non-linux stub + `main()`.
 
-**Two decode paths**: video via NDL DirectMedia (`ndl.rs`, opaque decode+present), audio client-side Opus (`audio.rs`). Loss recovery: `session.rs`'s `video_pump` reimplements freeze-until-reanchor directly — upstream `ReanchorGate` assumes decode/present split NDL lacks.
+Add a screen: build on `ui::ListModal` (see `app/state/hostmenu.rs` / `app/view/hostmenu.rs`);
+the `Screen` enum has eight dispatch sites across `app/mod.rs` and `runtime/` (compiler finds
+all at once, mechanical but safe). Rendering: `tiny_skia` software framebuffer,
+redraw-on-change (`dirty` flag, no time-based animation).
 
-**Two runtime phases** in `main.rs`: pre-stream UI (`run_ui_flow`), streaming (`run_inner`), alternating on `StreamOutcome::ReturnToMenu` vs `Quit`.
+**Platform gating**: only the SDL2/webOS-linked layers are `#[cfg(target_os = "linux")]` in
+`main.rs` — `app`, `platform`, `session`, `runtime`. The platform-independent layers (`core`,
+`ui`, `services`, `errors`, `logger`) are ungated and build on any host (their deps —
+`tiny-skia`, `image`, `ureq`, `rustls` — are base; only `sdl2`/`opus`/`libc` stay Linux-gated
+in `Cargo.toml`). webOS target reports Linux same as dev box; macOS/Windows get a stub
+`anyhow::bail!` in `main()` — builds stay green without SDL2, and now typecheck `ui`/`core`/
+`services` too. Keep new modules ungated unless they link SDL2/webOS libs.
 
-**Streaming** (`session.rs` + `ndl.rs` + `audio.rs` + input modules): `session::connect` spawns video pump thread; audio pumped from main thread each tick; input modules map SDL2 events to `InputEvent`s (`platform::webos::input` for the SDL2 mapping itself).
+**Two decode paths**: video via NDL DirectMedia (`platform/webos/ndl.rs`, opaque
+decode+present), audio client-side Opus (`platform/webos/audio.rs`). Loss recovery:
+`session`'s `video_pump` reimplements freeze-until-reanchor directly — upstream `ReanchorGate`
+assumes decode/present split NDL lacks.
+
+**Two runtime phases** in `runtime/`: pre-stream UI (`run_ui_flow`), streaming (`run_inner`),
+alternating on `StreamOutcome::ReturnToMenu` vs `Quit`.
+
+**Streaming** (`session` + `platform/webos/{ndl,audio}` + input modules): `session::connect`
+spawns video pump thread; audio pumped from main thread each tick; `platform::webos::input`
+maps SDL2 events to `InputEvent`s.
 
 **Networking**: `services::discovery` (mDNS), `services::library` (mTLS game-library REST) standalone impls (not via `pf-client-core`) — avoids its dep tree. `services::art` background-fetches/decodes cover art.
 

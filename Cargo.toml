@@ -38,20 +38,23 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # mDNS LAN discovery; direct dep (not via pf-client-core — see session.rs docs).
 mdns-sd = "0.20"
-
-# Linux-only (webOS cross target + dev boxes); macOS/Windows build with stub in main.rs.
-[target.'cfg(target_os = "linux")'.dependencies]
-# ttf: SDL2_ttf + freetype on-device; text renders in Geist font. unsafe_textures
-# lets GPU compositor cache textures without TextureCreator lifetime.
-sdl2 = { version = "0.38", default-features = false, features = ["ttf", "unsafe_textures"] }
-# Opus decode (audio.rs); explicit dep despite being transitive via punktfunk-core.
-opus = "0.3"
-# mTLS game library fetch (library.rs) + cover art decode (art.rs); pure Rust codecs.
+# Pure-Rust crates used by the platform-independent layers (`ui`, `services`), so they build
+# on every host — only the SDL2/webOS-linked crates below stay Linux-gated.
+# mTLS game library fetch (services::library) + cover art decode (services::art).
 ureq = { version = "3", features = ["rustls"], default-features = false }
 rustls = { version = "0.23", features = ["ring"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 # Pre-stream UI rendering (software rasterizer); png-format off (already-decoded buffers only).
 tiny-skia = { version = "0.12", default-features = false, features = ["std"] }
+
+# Linux-only (webOS cross target + dev boxes); macOS/Windows build with stub in main.rs.
+# Only genuinely platform-linked crates live here (SDL2, opus C lib, libc).
+[target.'cfg(target_os = "linux")'.dependencies]
+# ttf: SDL2_ttf + freetype on-device; text renders in Geist font. unsafe_textures
+# lets GPU compositor cache textures without TextureCreator lifetime.
+sdl2 = { version = "0.38", default-features = false, features = ["ttf", "unsafe_textures"] }
+# Opus decode (platform::webos::audio); explicit dep despite being transitive via punktfunk-core.
+opus = "0.3"
 # setpriority for video pump scheduling; explicit dep for libc::gettid calls.
 libc = "0.2"
 

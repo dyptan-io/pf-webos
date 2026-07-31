@@ -45,6 +45,13 @@ pub(super) fn run_ui_flow(
         return Ok(Some((handle, settings)));
     }
 
+    // Re-evaluate AV1 decoder availability each menu entry and hand it to `ui`, so the codec
+    // picker stays platform-free. Starfish can prove itself unavailable during a failed
+    // stream attempt, so this is refreshed on every return to the menu, not just at boot.
+    crate::ui::set_av1_capable(
+        crate::platform::webos::device::supports_av1() && !crate::platform::webos::starfish::proven_unavailable(),
+    );
+
     canvas.window_mut().show();
     let mut app = App::new(identity.clone());
     // Upload every spinner frame's GPU texture now, once, rather than letting each

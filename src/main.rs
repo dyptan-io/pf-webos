@@ -2,19 +2,14 @@
 //! Platform-gated to `target_os` = "linux" (both webOS and Linux dev boxes).
 #[cfg(target_os = "linux")]
 mod app;
-#[cfg(target_os = "linux")]
 mod core;
-#[cfg(target_os = "linux")]
 mod errors;
-#[cfg(target_os = "linux")]
 mod logger;
 #[cfg(target_os = "linux")]
 mod platform;
-#[cfg(target_os = "linux")]
 mod services;
 #[cfg(target_os = "linux")]
 mod session;
-#[cfg(target_os = "linux")]
 mod ui;
 
 #[cfg(target_os = "linux")]

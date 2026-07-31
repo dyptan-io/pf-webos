@@ -448,15 +448,27 @@ pub fn codec_options(settings: &Settings) -> Vec<CodecPref> {
     let mut options = vec![CodecPref::Auto, CodecPref::H264, CodecPref::Hevc];
     // Four conditions, and AV1 has never satisfied the last one on real hardware — see
     // `store::dev_override_enable_av1`. The other three stay because each rules out a
-    // distinct way of handing a decoder something it can't present.
+    // distinct way of handing a decoder something it can't present. The platform decoder
+    // capability (`AV1_CAPABLE`) is pushed in by the runtime rather than probed here, so
+    // this stays free of `platform::webos` — see `set_av1_capable`.
     if crate::services::store::dev_override_enable_av1()
         && settings.video_backend == VideoBackend::Starfish
-        && crate::platform::webos::device::supports_av1()
-        && !crate::platform::webos::starfish::proven_unavailable()
+        && AV1_CAPABLE.load(std::sync::atomic::Ordering::Relaxed)
     {
         options.push(CodecPref::Av1);
     }
     options
+}
+
+/// Whether this TV's platform decoder can present AV1 *and* the Starfish backend is still
+/// viable. The runtime re-evaluates and sets this on each menu entry (its two inputs live in
+/// `platform::webos`), keeping `codec_options` — and all of `ui` — free of any `platform`
+/// dependency. Defaults `false` until the first probe.
+static AV1_CAPABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Sets the AV1-capability flag `codec_options` reads. Called from `runtime`.
+pub fn set_av1_capable(capable: bool) {
+    AV1_CAPABLE.store(capable, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn codec_label(pref: CodecPref) -> &'static str {
