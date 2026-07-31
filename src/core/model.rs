@@ -106,7 +106,7 @@ pub enum ColorRangeOverride {
 ///
 /// This is the *virtual* pad the host builds, not what the user is holding — the host
 /// translates. It matters beyond glyphs: a game only emits adaptive-trigger effects when it
-/// sees a `DualSense`, so [`GamepadType::DualSense`] is what makes `crate::dualsense` have
+/// sees a `DualSense`, so [`GamepadType::DualSense`] is what makes `crate::platform::webos::dualsense` have
 /// anything to replay. The host resolves the choice against what its platform can actually
 /// build (the `PlayStation` and Switch backends need Linux UHID) and falls back on its own if
 /// not, so an unbuildable pick degrades to a working session rather than none.
@@ -125,7 +125,7 @@ pub enum GamepadType {
     Xbox360,
     XboxOne,
     DualShock4,
-    /// Adaptive triggers, lightbar, touchpad, motion — see [`crate::dualsense`].
+    /// Adaptive triggers, lightbar, touchpad, motion — see [`crate::platform::webos::dualsense`].
     DualSense,
     /// `DualSense` plus the two back buttons and two Fn buttons.
     DualSenseEdge,

@@ -129,7 +129,7 @@ pub fn find_address() -> Option<String> {
 
 /// Owns the pad's feedback state and the thread that ships it.
 ///
-/// The thread exists because a send is a fork/exec of `luna-send-pub` (see [`crate::luna`]),
+/// The thread exists because a send is a fork/exec of `luna-send-pub` (see [`crate::platform::webos::luna`]),
 /// which must never land on the render/input loop. Queue depth is one with latest-wins
 /// replacement — the same discipline as [`crate::services::store::SettingsWriter`] — because the state
 /// is absolute: a superseded update carries no information the newer one lacks.
@@ -145,7 +145,7 @@ impl Feedback {
     /// Starts a feedback sender for the pad at Bluetooth `address`, or `None` when the
     /// platform can't support it (no `luna-send-pub`). Resolve `address` via [`find_address`].
     pub fn new(address: String) -> Option<Self> {
-        if !crate::luna::available() {
+        if !crate::platform::webos::luna::available() {
             return None;
         }
         // Depth 1 + `try_send`: at most one pending state, and a full queue means the sender
@@ -204,7 +204,7 @@ impl Feedback {
     /// [`Drop`] joins the sender right after so it is actually delivered.
     ///
     /// Called on the way out of a stream, so it delays return-to-menu by one send — tens of
-    /// milliseconds normally, and at worst two [`crate::luna::CALL_TIMEOUT`] windows if the
+    /// milliseconds normally, and at worst two [`crate::platform::webos::luna::CALL_TIMEOUT`] windows if the
     /// Bluetooth service has stopped answering.
     pub fn release(&mut self) {
         self.state = State {
@@ -287,12 +287,12 @@ fn payload_for(address: &str, report: &[u8; REPORT_LEN]) -> String {
 }
 
 fn send_report(address: &str, report: &[u8; REPORT_LEN]) -> anyhow::Result<()> {
-    crate::luna::call(SEND_DATA_URI, &payload_for(address, report))
+    crate::platform::webos::luna::call(SEND_DATA_URI, &payload_for(address, report))
 }
 
 /// Minimum wall time between two sends.
 ///
-/// A send is a fork/exec of `luna-send-pub` (see [`crate::luna`]), which copies the page
+/// A send is a fork/exec of `luna-send-pub` (see [`crate::platform::webos::luna`]), which copies the page
 /// tables of a process holding SDL, the decoder and its frame buffers. **Unthrottled, this
 /// blacked out the video plane on a real stream**: a Steam/Gamescope host animates the
 /// `DualSense` lightbar continuously, which turned every animation step into a process spawn —

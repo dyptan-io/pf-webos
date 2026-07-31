@@ -1,3 +1,12 @@
+pub mod audio;
 pub mod compositor;
+pub mod device;
+pub mod dualsense;
+pub mod gamepad;
 pub mod input;
+pub mod keyboard;
+pub mod luna;
+pub mod mouse;
+pub mod ndl;
+pub mod starfish;
 pub mod text_sdl;

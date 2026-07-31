@@ -38,7 +38,7 @@ fn button_bit(button: Button) -> u32 {
 /// host picks an Xbox 360 pad. So a `DualSense` owner who never opened Settings held a
 /// `DualSense` while the game saw an Xbox pad: wrong glyphs, and — the reason this matters —
 /// no adaptive-trigger effects at all, since a game only emits those for a `DualSense`
-/// ([`crate::dualsense`]).
+/// ([`crate::platform::webos::dualsense`]).
 ///
 /// Only pads the Xbox default actually misrepresents are mapped. An Xbox pad, or anything
 /// unrecognized, stays `None`: the host's default is already right for the former, and for

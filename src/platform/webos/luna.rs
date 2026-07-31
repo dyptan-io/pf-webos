@@ -1,4 +1,4 @@
-//! Minimal one-shot Luna (webOS service bus) caller, used by [`crate::dualsense`].
+//! Minimal one-shot Luna (webOS service bus) caller, used by [`crate::platform::webos::dualsense`].
 //!
 //! **Why a subprocess and not `libluna-service2` directly.** In-process `LSCall` needs a
 //! registered `LSHandle` attached to a running `GMainLoop`, and — the deciding factor — LS2
@@ -11,7 +11,7 @@
 //!
 //! Cost is one fork/exec per call, which is why nothing here is on a hot path: the only
 //! caller coalesces to the latest state and sends from its own thread (see
-//! [`crate::dualsense::Feedback`]). Never call this from the render/input loop.
+//! [`crate::platform::webos::dualsense::Feedback`]). Never call this from the render/input loop.
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -25,7 +25,7 @@ const LUNA_SEND_PUB: &str = "/usr/bin/luna-send-pub";
 /// and a kill rather than an unbounded wait.
 ///
 /// Kept short deliberately: this bounds how long session teardown can wait for the pad to be
-/// handed back (see `crate::dualsense::Feedback::release`), and a send that hasn't answered in
+/// handed back (see `crate::platform::webos::dualsense::Feedback::release`), and a send that hasn't answered in
 /// this long means the Bluetooth service is wedged or the pad is gone — in which case there is
 /// nothing left to hand back. A healthy send answers in tens of milliseconds.
 pub(crate) const CALL_TIMEOUT: Duration = Duration::from_millis(800);

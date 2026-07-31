@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 
-use crate::ndl::NdlCodec;
+use crate::platform::webos::ndl::NdlCodec;
 
 const EVENT_LOADCOMPLETED: c_int = 0x16;
 

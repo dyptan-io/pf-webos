@@ -7,6 +7,8 @@
 //! thread ([`pump_audio_once`]) because `sdl2::audio::AudioQueue` is `!Send`; the
 //! NDL-offloaded path has its own drain thread ([`ndl_audio_pump`]), decoupled from
 //! both the main loop and the video pump.
+pub mod pacing;
+
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,10 +21,10 @@ use punktfunk_core::input::InputEvent;
 use punktfunk_core::packet::{FLAG_SOF, USER_FLAG_RECOVERY_ANCHOR};
 use punktfunk_core::quic;
 
-use crate::ndl::{NdlCodec, NdlVideo};
-use crate::pacing::{HostPtsAnchor, PtsPacer};
+use crate::platform::webos::ndl::{NdlCodec, NdlVideo};
+use crate::session::pacing::{HostPtsAnchor, PtsPacer};
 use crate::services::store::{CodecPref, ColorRangeOverride, VideoBackend};
-use crate::starfish::StarfishVideo;
+use crate::platform::webos::starfish::StarfishVideo;
 
 impl ColorRangeOverride {
     /// Force the VUI `full_range` flag per the user override before it's handed to
@@ -207,12 +209,12 @@ impl Connected {
 
 /// Whether NDL should decode audio (stereo only). NDL struct has no multistream mapping field,
 /// so 5.1/7.1 layouts would produce noise; anything >stereo stays on software decoder.
-fn ndl_audio_config(resolved_channels: u8) -> Option<crate::ndl::NdlAudioConfig> {
+fn ndl_audio_config(resolved_channels: u8) -> Option<crate::platform::webos::ndl::NdlAudioConfig> {
     if !crate::services::store::dev_override_enable_ndl_audio_offload() {
         return None;
     }
     tracing::warn!("NDL audio offload opted in via ndl-audio-offload.conf — known to freeze video on webOS 10.3");
-    (resolved_channels == 2).then_some(crate::ndl::NdlAudioConfig {
+    (resolved_channels == 2).then_some(crate::platform::webos::ndl::NdlAudioConfig {
         channels: 2,
         // punktfunk's audio plane is fixed at 48 kHz (see `audio.rs`'s SAMPLE_RATE).
         sample_rate: 48_000.0,
@@ -264,7 +266,7 @@ fn cx_display_hdr() -> quic::HdrMeta {
 /// host fingerprint from a prior pairing (`None` = trust-on-first-use). `display_w`
 /// / `display_h` is the physical panel size for the Starfish punch-through window —
 /// independent of `mode` (the negotiated stream resolution). NDL manages its own
-/// punch-through area natively (see [`crate::ndl`]'s module docs).
+/// punch-through area natively (see [`crate::platform::webos::ndl`]'s module docs).
 #[allow(clippy::too_many_arguments)]
 pub fn connect(
     host: &str,
@@ -313,15 +315,15 @@ pub fn connect(
     let starfish_selected = matches!(video_backend, VideoBackend::Starfish);
     let av1_usable = crate::services::store::dev_override_enable_av1()
         && starfish_selected
-        && crate::device::supports_av1()
-        && !crate::starfish::proven_unavailable();
+        && crate::platform::webos::device::supports_av1()
+        && !crate::platform::webos::starfish::proven_unavailable();
     let codec_pref = if codec_pref == CodecPref::Av1 && !av1_usable {
         tracing::warn!(
             "AV1 preference dropped: opted_in={} starfish_selected={starfish_selected} \
              decoder_declares_av1={} starfish_proven_unavailable={}",
             crate::services::store::dev_override_enable_av1(),
-            crate::device::supports_av1(),
-            crate::starfish::proven_unavailable(),
+            crate::platform::webos::device::supports_av1(),
+            crate::platform::webos::starfish::proven_unavailable(),
         );
         CodecPref::Auto
     } else {
@@ -467,7 +469,7 @@ pub fn connect(
     // is exactly what `docs/NOTES.md` warns against shipping unverified.
     if matches!(video_backend, VideoBackend::Ndl) {
         if let Some(threshold) = crate::services::store::dev_override_ndl_drop_threshold() {
-            match crate::ndl::NdlVideo::set_frame_drop_threshold(threshold) {
+            match crate::platform::webos::ndl::NdlVideo::set_frame_drop_threshold(threshold) {
                 Ok(()) => tracing::info!("NDL frame-drop threshold override: {threshold}"),
                 Err(e) => tracing::warn!("NDL frame-drop threshold override failed: {e:#}"),
             }
@@ -976,7 +978,7 @@ fn video_pump(
     // refresh (`reconciled_pace_interval_ns`); ABR backlog folding above stays on the stream
     // rate (host's actual cadence). `host_anchor` is the NDL host-PTS→player-clock mapping,
     // reset in lockstep with the pacer (no-op on Starfish).
-    let mut pacer = PtsPacer::new(crate::pacing::reconciled_pace_interval_ns(stream_hz));
+    let mut pacer = PtsPacer::new(crate::session::pacing::reconciled_pace_interval_ns(stream_hz));
     let mut host_anchor = HostPtsAnchor::new();
     // Previous-frame pacing state, so an off→on flip can re-anchor cleanly.
     let mut pacing_was_on = stats.pacing_enabled.load(Ordering::Relaxed);
@@ -1210,8 +1212,8 @@ fn ndl_audio_pump(client: &NativeClient, ndl: &NdlVideo, stop: &AtomicBool) {
 
 /// Drains and plays all pending audio packets (non-blocking). Call once per main-loop
 /// tick; runs on the main thread because `sdl2::audio::AudioQueue` is `!Send`.
-pub fn pump_audio_once(client: &NativeClient, audio: &mut crate::audio::AudioPlayer) {
-    use crate::audio::AudioEvent;
+pub fn pump_audio_once(client: &NativeClient, audio: &mut crate::platform::webos::audio::AudioPlayer) {
+    use crate::platform::webos::audio::AudioEvent;
     // Logged roughly once/sec (200 packets @ 5ms/frame).
     static PACKET_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     while let Ok(packet) = client.next_audio(Duration::ZERO) {
@@ -1228,13 +1230,13 @@ pub fn pump_audio_once(client: &NativeClient, audio: &mut crate::audio::AudioPla
                     AudioEvent::Resnapped => {
                         tracing::debug!(
                             "audio resnapped (queue was >{}ms behind)",
-                            crate::audio::MAX_QUEUED_LAG_MS
+                            crate::platform::webos::audio::MAX_QUEUED_LAG_MS
                         );
                     }
                     AudioEvent::Dropped => {
                         tracing::debug!(
                             "audio packet dropped (queue >{}ms, draining)",
-                            crate::audio::SOFT_QUEUED_LAG_MS
+                            crate::platform::webos::audio::SOFT_QUEUED_LAG_MS
                         );
                     }
                     AudioEvent::Queued => {
@@ -1273,7 +1275,7 @@ const FEEDBACK_DRAIN_BUDGET: usize = 32;
 ///     any pad the TV has bound, `DualSense` included;
 ///   * **`DualSense` HID feedback** (adaptive triggers, lightbar, player LEDs) → the Bluetooth
 ///     service, since SDL's own `DualSense` path needs a hidraw node the app's jail doesn't have
-///     (see [`crate::dualsense`]).
+///     (see [`crate::platform::webos::dualsense`]).
 ///
 /// Both drains run even when their sink is absent: the planes are bounded queues, and leaving
 /// one unread would let it fill and then discard the *newest* events — including, for rumble,
@@ -1281,7 +1283,7 @@ const FEEDBACK_DRAIN_BUDGET: usize = 32;
 pub fn pump_feedback_once(
     client: &NativeClient,
     mut controller: Option<&mut sdl2::controller::GameController>,
-    mut feedback: Option<&mut crate::dualsense::Feedback>,
+    mut feedback: Option<&mut crate::platform::webos::dualsense::Feedback>,
 ) {
     // `next_rumble_command` is the policy-engine API: it already resolves lease expiry, stale
     // legacy hosts and close-drain zeros, so commands apply verbatim — `(0, 0)` stops now.

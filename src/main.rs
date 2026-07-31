@@ -3,37 +3,17 @@
 #[cfg(target_os = "linux")]
 mod app;
 #[cfg(target_os = "linux")]
-mod audio;
-#[cfg(target_os = "linux")]
 mod core;
-#[cfg(target_os = "linux")]
-mod device;
-#[cfg(target_os = "linux")]
-mod dualsense;
 #[cfg(target_os = "linux")]
 mod errors;
 #[cfg(target_os = "linux")]
-mod gamepad;
-#[cfg(target_os = "linux")]
-mod keyboard;
-#[cfg(target_os = "linux")]
 mod logger;
-#[cfg(target_os = "linux")]
-mod luna;
-#[cfg(target_os = "linux")]
-mod mouse;
-#[cfg(target_os = "linux")]
-mod ndl;
-#[cfg(target_os = "linux")]
-mod pacing;
 #[cfg(target_os = "linux")]
 mod platform;
 #[cfg(target_os = "linux")]
 mod services;
 #[cfg(target_os = "linux")]
 mod session;
-#[cfg(target_os = "linux")]
-mod starfish;
 #[cfg(target_os = "linux")]
 mod ui;
 
@@ -48,9 +28,9 @@ mod real {
     use sdl2::controller::GameController;
 
     use crate::app::{App, HomeFocus, Screen, MODAL_FADE, MODAL_POP_SHRINK};
-    use crate::gamepad;
-    use crate::keyboard;
-    use crate::mouse;
+    use crate::platform::webos::gamepad;
+    use crate::platform::webos::keyboard;
+    use crate::platform::webos::mouse;
     use crate::platform::webos::compositor::Compositor;
     use crate::services::store;
     use crate::session;
@@ -240,7 +220,7 @@ mod real {
         tracing::info!("punktfunk-webos starting");
         // Logged before anything else can fail: a report from a model neither developer
         // owns is only actionable if the log says what it was running on.
-        crate::device::DeviceInfo::detect().log();
+        crate::platform::webos::device::DeviceInfo::detect().log();
 
         // A panic on ANY thread otherwise goes only to stderr, which a SAM-launched
         // native app has no terminal for — the app simply vanishes back to the
@@ -1500,7 +1480,7 @@ mod real {
             let mut audio_player = if connected.audio_offloaded {
                 None
             } else {
-                match crate::audio::AudioPlayer::new(&sdl_audio, connected.client.audio_channels) {
+                match crate::platform::webos::audio::AudioPlayer::new(&sdl_audio, connected.client.audio_channels) {
                     Ok(p) => Some(p),
                     Err(e) => {
                         // Same no-crash policy as the connect above — including the
@@ -1509,7 +1489,7 @@ mod real {
                         tracing::error!("audio player init failed: {e:#}");
                         connected.client.disconnect_quit();
                         connected.shutdown();
-                        crate::ndl::quit();
+                        crate::platform::webos::ndl::quit();
                         sdl.mouse().show_cursor(true);
                         menu_status = Some(format!("Couldn't start audio: {e:#}"));
                         continue;
@@ -1530,8 +1510,8 @@ mod real {
             // (pad on USB rather than Bluetooth, no `luna-send-pub`) is not an error: the
             // stream is unaffected, so it's logged once and the feature is simply off.
             let mut ds_feedback = if settings.gamepad_type.is_dualsense() {
-                match crate::dualsense::find_address() {
-                    Some(addr) => crate::dualsense::Feedback::new(addr),
+                match crate::platform::webos::dualsense::find_address() {
+                    Some(addr) => crate::platform::webos::dualsense::Feedback::new(addr),
                     None => {
                         tracing::info!(
                             "no Bluetooth DualSense found in /proc/bus/input/devices — \
@@ -2057,7 +2037,7 @@ mod real {
             // `shutdown()` joins the video thread and drops `client` so the QUIC close
             // frame actually gets sent before this function returns (see its docs).
             connected.shutdown();
-            crate::ndl::quit();
+            crate::platform::webos::ndl::quit();
             sdl.mouse().show_cursor(true);
             match outcome {
                 StreamOutcome::Quit => {

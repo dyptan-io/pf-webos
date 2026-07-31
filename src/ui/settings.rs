@@ -87,7 +87,7 @@ pub const ROW_HDR: usize = 6;
 pub const ROW_AUDIO: usize = 7;
 /// Which controller the host presents to the game — see `store::GamepadType`. Last of the
 /// real settings: it's the only input-side one, and picking `DualSense` is what turns on
-/// adaptive triggers (`crate::dualsense`).
+/// adaptive triggers (`crate::platform::webos::dualsense`).
 pub const ROW_GAMEPAD: usize = 8;
 /// Directly below Controller — the other input-side setting. See
 /// `store::Settings::cursor_capture`.
@@ -451,8 +451,8 @@ pub fn codec_options(settings: &Settings) -> Vec<CodecPref> {
     // distinct way of handing a decoder something it can't present.
     if crate::services::store::dev_override_enable_av1()
         && settings.video_backend == VideoBackend::Starfish
-        && crate::device::supports_av1()
-        && !crate::starfish::proven_unavailable()
+        && crate::platform::webos::device::supports_av1()
+        && !crate::platform::webos::starfish::proven_unavailable()
     {
         options.push(CodecPref::Av1);
     }
