@@ -45,12 +45,12 @@ jobs:
           version: 3
 
       - name: Lint
-        run: task native:lint
+        run: task lint
         env:
           CARGO_TARGET_DIR: target-clippy
 
       - name: Build and package
-        run: task native:package
+        run: task package
 
       - name: Upload .ipk artifact
         if: github.event_name != 'release'

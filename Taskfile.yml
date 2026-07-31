@@ -1,6 +1,7 @@
-# `build`/`check`/`package` (local dev) always run inside Docker, since the
-# webOS cross-toolchain only ships a Linux aarch64 build. `native:*` is the
-# same logic without Docker, used by CI (already a Linux aarch64 runner).
+# `build`/`check`/`package`/`lint` run directly on the host — meaningful only on
+# a Linux aarch64 box with Rust installed (CI, already such a runner). The
+# `docker:*` variants wrap the same logic in Docker for local dev, since the
+# webOS cross-toolchain only ships a Linux aarch64 build.
 # webOS-specific plumbing lives in `taskfiles/toolchain.yml`, kept separate so
 # this file stays short.
 version: '3'
@@ -39,44 +40,11 @@ vars:
 
 tasks:
   build:
-    desc: Cross-compile the release binary, inside Docker with thin LTO (fast). Override with RELEASE_LTO=fat for optimized build.
-    cmds:
-      - task: toolchain:docker-run
-        vars:
-          TARGET_TASK: native:build
-          RELEASE_LTO: '{{.RELEASE_LTO | default "thin"}}'
-
-  check:
-    desc: Quick cross-target `cargo check`, inside Docker — the local dev entry point
-    cmds:
-      - task: toolchain:docker-run
-        vars: {TARGET_TASK: native:check}
-
-  package:
-    desc: Build and package dist/*.ipk, inside Docker with thin LTO (fast). Override with RELEASE_LTO=fat for optimized.
-    cmds:
-      - task: toolchain:docker-run
-        vars:
-          TARGET_TASK: native:package
-          RELEASE_LTO: '{{.RELEASE_LTO | default "thin"}}'
-
-  lint:
-    desc: Cross-target `cargo clippy` (the lint set in Cargo.toml's `[lints.clippy]`), inside Docker
-    cmds:
-      - task: toolchain:docker-run
-        vars: {TARGET_TASK: native:lint}
-
-  fmt:
-    desc: Format the whole crate with rustfmt (native — formatting doesn't need the cross toolchain)
-    cmds:
-      - cargo fmt
-
-
-  native:build:
     desc: >-
-      Cross-compile directly on the host, no Docker — only meaningful on a Linux
-      aarch64 box with Rust already installed (used by CI; `build` is the local
-      dev entry point).
+      Cross-compile the release binary directly on the host, no Docker — only
+      meaningful on a Linux aarch64 box with Rust already installed (used by CI;
+      `docker:build` is the local dev entry point). Thin LTO (fast); override
+      with RELEASE_LTO=fat for an optimized build.
     deps: [toolchain:all]
     env:
       # Modern CMake refuses vendored libopus's old cmake_minimum_required
@@ -84,13 +52,13 @@ tasks:
       CMAKE_POLICY_VERSION_MINIMUM: '3.5'
       # Thread the packaged version into the binary so the UI's build marker matches
       # the .ipk (Cargo.toml stays a fixed 0.0.1; recomputed inside Docker from the
-      # mounted repo's git, so both `build` and CI's `native:build` pick it up).
+      # mounted repo's git, so both `build` and CI's `build` pick it up).
       PKG_VERSION: '{{.PKG_VERSION}}'
     cmds:
       - rustup target add {{.TARGET}}
       - cargo build --release --target {{.TARGET}}
 
-  native:check:
+  check:
     desc: Quick cross-target `cargo check`, no Docker (used by CI)
     deps: [toolchain:all]
     env:
@@ -99,8 +67,8 @@ tasks:
       - rustup target add {{.TARGET}}
       - cargo check --target {{.TARGET}}
 
-  native:lint:
-    desc: Cross-target `cargo clippy`, no Docker (used by CI)
+  lint:
+    desc: Cross-target `cargo clippy` (the lint set in Cargo.toml's `[lints.clippy]`), no Docker (used by CI)
     deps: [toolchain:all]
     env:
       CMAKE_POLICY_VERSION_MINIMUM: '3.5'
@@ -109,14 +77,46 @@ tasks:
       - rustup component add clippy
       - cargo clippy --target {{.TARGET}} --all-targets -- -D warnings
 
-
-  native:package:
-    desc: Build and package dist/*.ipk, no Docker (used by CI)
-    deps: [native:build, toolchain:ares-package]
+  package:
+    desc: Build and package dist/*.ipk, no Docker (used by CI). Thin LTO (fast); override with RELEASE_LTO=fat for optimized.
+    deps: [build, toolchain:ares-package]
     cmds:
       - task: toolchain:stage-and-package
         vars:
           PKG_VERSION: '{{.PKG_VERSION}}'
+
+  fmt:
+    desc: Format the whole crate with rustfmt (native — formatting doesn't need the cross toolchain)
+    cmds:
+      - cargo fmt
+
+  docker:build:
+    desc: Cross-compile the release binary inside Docker with thin LTO (fast) — the local dev entry point. Override with RELEASE_LTO=fat for optimized build.
+    cmds:
+      - task: toolchain:docker-run
+        vars:
+          TARGET_TASK: build
+          RELEASE_LTO: '{{.RELEASE_LTO | default "thin"}}'
+
+  docker:check:
+    desc: Quick cross-target `cargo check`, inside Docker — the local dev entry point
+    cmds:
+      - task: toolchain:docker-run
+        vars: {TARGET_TASK: check}
+
+  docker:lint:
+    desc: Cross-target `cargo clippy` (the lint set in Cargo.toml's `[lints.clippy]`), inside Docker
+    cmds:
+      - task: toolchain:docker-run
+        vars: {TARGET_TASK: lint}
+
+  docker:package:
+    desc: Build and package dist/*.ipk, inside Docker with thin LTO (fast) — the local dev entry point. Override with RELEASE_LTO=fat for optimized.
+    cmds:
+      - task: toolchain:docker-run
+        vars:
+          TARGET_TASK: package
+          RELEASE_LTO: '{{.RELEASE_LTO | default "thin"}}'
 
   deploy:
     desc: >-
@@ -129,7 +129,7 @@ tasks:
       use this machine's own LAN IP on a random port (printed once the listener is
       up, in case you need to connect to it manually). TELEMETRY_LEVEL
       (debug/info/warn/error, default debug) sets the minimum level sent.
-    deps: [package]
+    deps: [docker:package]
     requires:
       vars: [TV_HOST]
     vars:

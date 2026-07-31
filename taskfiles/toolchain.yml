@@ -21,8 +21,6 @@ vars:
     -e PATH=/opt/punktfunk-webos-tools/bin:/opt/punktfunk-webos-cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 tasks:
-  # ---------------------------------------------------------------- toolchain --
-
   ndk:
     desc: Fetch the webosbrew/native-toolchain cross-compiler
     status:
@@ -81,8 +79,6 @@ tasks:
     cmds:
       - cargo install --git https://github.com/webosbrew/ares-cli-rs ares-package
 
-  # ------------------------------------------------------------------ package --
-
   stage-and-package:
     internal: true
     requires:
@@ -133,8 +129,6 @@ tasks:
           mv "dist/io.dyptan.punktfunk.webos_${APP_VERSION}_arm.ipk" \
              "dist/io.dyptan.punktfunk.webos_${PKG_VERSION}_arm.ipk"
         fi
-
-  # ------------------------------------------------------------------- docker --
 
   docker-run:
     internal: true

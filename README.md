@@ -74,21 +74,24 @@ dev/CI builds don't.
 
 ## Development
 
-Everything is a [go-task](https://taskfile.dev) target — the same tasks run locally and in CI.
-**Only Docker is required; no local Rust/NDK install needed** (the webOS cross-toolchain ships
-Linux-aarch64-only, so builds run in an ephemeral `docker run`, working on amd64 hosts too via
-QEMU). Run `task --list` for everything.
+Everything is a [go-task](https://taskfile.dev) target. The bare `build`/`check`/`lint`/`package`
+targets run natively and need a Linux-aarch64 host with Rust installed (that's how CI runs). For
+**local dev, use the `docker:*` variants** — they run the same logic in an ephemeral `docker run`,
+so **only Docker is required, no local Rust/NDK install** (the webOS cross-toolchain ships
+Linux-aarch64-only; works on amd64 hosts too via QEMU). Run `task --list` for everything.
 
 | Task | What it does |
 | --- | --- |
-| `task package` | Build + package `dist/*.ipk` — the one you usually want |
-| `task build` / `task check` | Faster inner loop: compile only, or `cargo check` only |
-| `task lint` / `task fmt` | `cargo clippy` / `cargo fmt` |
+| `task docker:package` | Build + package `dist/*.ipk` — the one you usually want |
+| `task docker:build` / `task docker:check` | Faster inner loop: compile only, or `cargo check` only |
+| `task docker:lint` / `task fmt` | `cargo clippy` / `cargo fmt` |
 | `task deploy TV_HOST=root@<tv-ip>` | Build, package, install, and launch on a real TV over SSH |
 | `task deploy TV_HOST=... TELEMETRY=auto` | Same, but streams the app's logs live to this machine instead of a file on-device |
 | `task clean` | Remove build output and caches |
 
-**Build optimization**: Dev builds use thin LTO for speed (~2-3x faster iteration). For final release builds optimized for weak TV hardware, append `RELEASE_LTO=fat` to any build task: `task package RELEASE_LTO=fat` or `task deploy TV_HOST=... RELEASE_LTO=fat`.
+Drop the `docker:` prefix (`task package`, `task lint`, …) to run natively on a Linux-aarch64 box.
+
+**Build optimization**: Dev builds use thin LTO for speed (~2-3x faster iteration). For final release builds optimized for weak TV hardware, append `RELEASE_LTO=fat` to any build task: `task docker:package RELEASE_LTO=fat` or `task deploy TV_HOST=... RELEASE_LTO=fat`.
 
 Set `TV_HOST` once in a local `.env` (copy `.env.example`) to skip typing it each time. Architecture
 and on-device gotchas live in [`docs/NOTES.md`](docs/NOTES.md) and `CLAUDE.md`.
