@@ -220,12 +220,9 @@ mod real {
         match log_overlay_state() {
             LogOverlayState::Off => None,
             LogOverlayState::Live => Some(crate::logger::recent_lines(crate::ui::LOG_OVERLAY_LINES)),
-            LogOverlayState::Frozen => Some(
-                frozen_log_lines()
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone(),
-            ),
+            LogOverlayState::Frozen => {
+                Some(frozen_log_lines().lock().unwrap_or_else(PoisonError::into_inner).clone())
+            }
         }
     }
 
@@ -1715,12 +1712,15 @@ mod real {
                 // trigger/lightbar effects via the Bluetooth service. Called unconditionally
                 // so both planes keep draining even with no pad attached — see the fn's docs.
                 session::pump_feedback_once(&connected.client, controller.as_mut(), ds_feedback.as_mut());
-                // Skipped whenever the dialog block drew this tick (open or still
-                // fading out) — its own redraw above already owns the canvas. Stats
-                // and the log overlay share one clear/execute/present: each does its
-                // own `canvas.clear()` otherwise, which would erase whichever tile the
-                // other just drew.
-                let log_lines = log_overlay_lines();
+                // Skipped whenever the dialog block drew this tick (open or still fading
+                // out) — its own redraw above already owns the canvas. Stats and the log
+                // overlay share one clear/execute/present so neither erases the other's
+                // tile with its own `canvas.clear()`.
+                //
+                // `log_overlay_lines()` is deferred to the throttled block below rather
+                // than called every ~2ms tick — it locks the same ring-buffer mutex every
+                // log call writes to, which was contending with log writes ~500x/s and
+                // stuttering this thread's input polling.
                 let notif_frame = if dialog_frame.is_none() { notif.frame() } else { None };
                 let notif_active = notif_frame.is_some();
                 // Stats/log fade in on their toggle and fade out the same way the toast does
@@ -1853,11 +1853,11 @@ mod real {
                             });
                         }
                     }
-                    // Re-rendered only while actually on (`log_lines` is `None` during the
-                    // fade-out, once the toggle has already flipped the state to Off) — the
-                    // fade keeps recompositing the last uploaded tile via `log_dst`.
-                    if let Some(lines) = &log_lines {
-                        match crate::ui::render_log_overlay_tile(fonts.caption, display_mode.w as u32, lines) {
+                    // Re-rendered only while actually on (`None` during the fade-out, once
+                    // the toggle has already flipped the state to Off) — the fade keeps
+                    // recompositing the last uploaded tile via `log_dst`.
+                    if let Some(lines) = log_overlay_lines() {
+                        match crate::ui::render_log_overlay_tile(fonts.caption, display_mode.w as u32, &lines) {
                             Ok(tile) => {
                                 let (tw, th) = (tile.width(), tile.height());
                                 compositor.upload(&texture_creator, Tile::LogOverlay, &tile)?;

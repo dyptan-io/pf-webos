@@ -241,7 +241,7 @@ pub fn render_stats_overlay_tile(font: &Font, caption_font: &Font, lines: &[Stri
 
     let mut p = Painter::new(w.max(1), h.max(1));
     let mut tc = TextCache::new();
-    p.fill_rounded_rect(Rect::new(0, 0, w, h), 14, Color::RGBA(0x14, 0x10, 0x1f, 0x90));
+    p.fill_rounded_rect(Rect::new(0, 0, w, h), 14, Color::RGBA(0x14, 0x10, 0x1f, 0x70));
 
     for (i, line) in lines.iter().enumerate() {
         let color = if i == 0 { WHITE } else { MUTED };
@@ -257,7 +257,7 @@ pub fn render_stats_overlay_tile(font: &Font, caption_font: &Font, lines: &[Stri
 }
 
 /// Number of lines shown in the log-tail overlay.
-pub const LOG_OVERLAY_LINES: usize = 12;
+pub const LOG_OVERLAY_LINES: usize = 9;
 
 /// Color for log line by level prefix; errors/warnings highlighted to stand out.
 fn log_line_color(line: &str) -> Color {
@@ -272,8 +272,9 @@ fn log_line_color(line: &str) -> Color {
 /// Left indent for a wrapped log line's 2nd+ row, so it reads as a continuation.
 const LOG_OVERLAY_WRAP_INDENT: i32 = 20;
 
-/// Full-width log-tail at screen bottom (all screens, unlike stats overlay).
-/// Long lines word-wrap instead of clipping.
+/// Full-width log-tail at screen bottom (all screens, unlike stats overlay) — a
+/// constant left-to-right size regardless of content. Long lines word-wrap
+/// instead of clipping, only once they'd actually reach the screen edge.
 pub fn render_log_overlay_tile(font: &Font, screen_w: u32, lines: &[String]) -> Result<Painter> {
     let pad = 14i32;
     let line_h = font.height() + 4;
@@ -291,7 +292,7 @@ pub fn render_log_overlay_tile(font: &Font, screen_w: u32, lines: &[String]) -> 
     p.fill_rounded_rect(
         Rect::new(0, 0, screen_w.max(1), h),
         14,
-        Color::RGBA(0x14, 0x10, 0x1f, 0x90),
+        Color::RGBA(0x14, 0x10, 0x1f, 0xb8),
     );
     let mut row = 0i32;
     for (wrapped_rows, color) in &wrapped {

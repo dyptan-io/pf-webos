@@ -165,16 +165,22 @@ pub fn log_file_path(app_dir: &Path) -> std::path::PathBuf {
     app_dir.join(format!("punktfunk-webos-{VERSION}.log"))
 }
 
-/// The newest log file to upload — the active file, or the most recently modified
-/// rotation if there's no active file (e.g. a TCP-telemetry session wrote none).
-/// `None` if nothing has been logged to disk at all.
+/// The newest log file to upload, by mtime, across all rotations and app versions —
+/// a version bump changes `VERSION` in `log_file_path`, so scanning only the current
+/// name would orphan older logs. `None` if nothing has been logged yet.
 pub fn latest_log_file(app_dir: &Path) -> Option<std::path::PathBuf> {
-    let base = log_file_path(app_dir);
-    (0..=MAX_LOG_ROTATIONS)
-        .map(|n| if n == 0 { base.clone() } else { numbered_log(&base, n) })
-        .filter_map(|p| {
-            let meta = p.metadata().ok()?;
-            (meta.len() > 0).then(|| (p, meta.modified().ok()))
+    std::fs::read_dir(app_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("punktfunk-webos-") && name.contains(".log"))
+        })
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            (meta.len() > 0).then(|| (entry.path(), meta.modified().ok()))
         })
         .max_by_key(|(_, mtime)| *mtime)
         .map(|(p, _)| p)
