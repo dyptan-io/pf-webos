@@ -12,8 +12,6 @@ use super::*;
 /// upload; `draw_list` composes each frame from their textures. Focus movement, scrolling,
 /// and animations never re-rasterize anything.
 pub(crate) struct TileCache {
-    /// Current grid card size (derived from width in `App::advance_frame`).
-    pub(crate) card_size: (u32, u32),
     /// Focus-free sidebar strip (`SIDEBAR_W` × screen height): panel, brand mark +
     /// wordmark, every row unfocused. Stale when row content changes (`sidebar_dirty`),
     /// never on focus movement.
@@ -68,7 +66,6 @@ pub(crate) struct TileCache {
 impl TileCache {
     pub(crate) fn new() -> Self {
         Self {
-            card_size: (0, 0),
             sidebar_layer: None,
             card_tiles: std::collections::HashMap::new(),
             ring_tile: None,

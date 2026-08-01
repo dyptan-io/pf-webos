@@ -459,7 +459,7 @@ impl App {
                     .and_then(|h| h.fingerprint);
                 // Covers are requested per card as the grid window reaches them (see
                 // `App::prepare_tiles`), not fetched for the whole library up front.
-                let (card_w, card_h) = self.tiles.card_size;
+                let (card_w, card_h) = self.card_size;
                 self.art_loader = Some(crate::services::art::ArtLoader::spawn(
                     host,
                     port,

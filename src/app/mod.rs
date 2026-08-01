@@ -402,6 +402,10 @@ pub struct App {
     /// scrolling, and animations never re-rasterize anything. Grouped into its own
     /// struct so screen state and the render cache stay separable.
     pub(crate) tiles: TileCache,
+    /// Current grid card size, derived from screen width in `advance_frame`. Screen
+    /// geometry (the event side reads it to size cover-art requests), not a rasterized
+    /// tile — hence on `App`, not in the `Painter` cache.
+    pub(crate) card_size: (u32, u32),
     /// Sidebar row content changed — `tiles.sidebar_layer` must re-rasterize
     /// (never set on focus movement).
     pub(crate) sidebar_dirty: bool,
@@ -569,6 +573,7 @@ impl App {
             hover_close: false,
             identity,
             tiles: TileCache::new(),
+            card_size: (0, 0),
             sidebar_dirty: true,
             grid_dirty: true,
             tiles_pending: false,
@@ -1457,7 +1462,7 @@ impl App {
     pub fn advance_frame(&mut self, screen_w: u32) -> bool {
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
         let columns = ui::grid_columns(available_w);
-        self.tiles.card_size = ui::grid_card_size(available_w, columns);
+        self.card_size = ui::grid_card_size(available_w, columns);
 
         // Every screen transition triggers close-fade for the left screen and
         // open-fade for the entered screen, centralized here rather than at each
@@ -2298,7 +2303,7 @@ impl App {
         let mut updated = Vec::new();
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
         let columns = ui::grid_columns(available_w);
-        // `self.tiles.card_size` is set by `advance_frame` (same formula) before this runs; the
+        // `self.card_size` is set by `advance_frame` (same formula) before this runs; the
         // local copy is what the tile-build loop below reads.
         let (card_w, card_h) = ui::grid_card_size(available_w, columns);
 
