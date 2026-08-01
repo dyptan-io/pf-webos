@@ -2131,59 +2131,15 @@ impl App {
         Ok(())
     }
 
-    /// Rasterizes every stale tile (tiny-skia, CPU — the only place rasterization
-    /// happens) and returns which tiles need their GPU texture re-uploaded.
-    /// `content_dirty` is the main loop's "an event/drain changed something this
-    /// tick" flag — it forces the open modal's tile to re-rasterize, since modal
-    /// content has no finer dirty tracking of its own. Pure animation frames pass
-    /// `false` and rasterize nothing at all. Call `advance_frame` first.
-    pub fn prepare_tiles(
+    /// Dropdown family: the overlay panel + focused-option tile for an open Settings/Diagnostics dropdown; cleared when closed (unless a close-fade still needs them). Extracted from `prepare_tiles`.
+    fn prepare_dropdown(
         &mut self,
         text_cache: &mut crate::ui::TextCache,
         fonts: &ui::Fonts,
         screen_w: u32,
         screen_h: u32,
-        content_dirty: bool,
-        screen_changed: bool,
-    ) -> Result<Vec<Tile>> {
-        let mut updated = Vec::new();
-        let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
-        let columns = ui::grid_columns(available_w);
-        // `self.tiles.card_size` is set by `advance_frame` (same formula) before this runs; the
-        // local copy is what the tile-build loop below reads.
-        let (card_w, card_h) = ui::grid_card_size(available_w, columns);
-
-        self.prepare_sidebar(text_cache, fonts, screen_h, &mut updated)?;
-
-        self.prepare_grid(text_cache, fonts, columns, card_w, card_h, screen_h, &mut updated)?;
-
-        // Status line block — built whenever `home_status` is set, independent of
-        // whether a host is selected (the "Send logs" result shows here too).
-        match &self.home_status {
-            Some(s) => {
-                let stale = !matches!(&self.tiles.status_tile, Some((t, _)) if t == s);
-                if stale {
-                    let avail = screen_w.saturating_sub(ui::SIDEBAR_W);
-                    let max_w = avail.saturating_sub(2 * ui::GRID_PAD as u32);
-                    let tile =
-                        ui::render_wrapped_text_tile(text_cache, fonts.raster, fonts.label, s, max_w, ui::MUTED, 6)?;
-                    self.tiles.status_tile = Some((s.clone(), tile));
-                    updated.push(Tile::Status);
-                }
-            }
-            None => self.tiles.status_tile = None,
-        }
-
-        self.prepare_modal(
-            text_cache,
-            fonts,
-            screen_w,
-            screen_h,
-            content_dirty,
-            screen_changed,
-            &mut updated,
-        )?;
-
+        updated: &mut Vec<Tile>,
+    ) -> Result<()> {
         if let Some(dd) = &self.dropdown {
             let (options, content_w) = match self.screen {
                 Screen::Diagnostics => {
@@ -2232,7 +2188,18 @@ impl App {
             self.tiles.dropdown_overlay_tile = None;
             self.tiles.dropdown_focus_tile = None;
         }
+        Ok(())
+    }
 
+    /// Scroll family: the indicator, edge-fade ramps, and windowed content tile for whichever modal overflows (Settings rows / About document). Extracted from `prepare_tiles`.
+    fn prepare_scroll(
+        &mut self,
+        text_cache: &mut crate::ui::TextCache,
+        fonts: &ui::Fonts,
+        screen_w: u32,
+        screen_h: u32,
+        updated: &mut Vec<Tile>,
+    ) -> Result<()> {
         // Whichever modal's content overflows its viewport (Settings' rows, About's
         // document) gets its scroll indicator and content tile refreshed here — see
         // `scroll_geometry`'s docs for why this one block covers every such modal
@@ -2310,6 +2277,65 @@ impl App {
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    /// Rasterizes every stale tile (tiny-skia, CPU — the only place rasterization
+    /// happens) and returns which tiles need their GPU texture re-uploaded.
+    /// `content_dirty` is the main loop's "an event/drain changed something this
+    /// tick" flag — it forces the open modal's tile to re-rasterize, since modal
+    /// content has no finer dirty tracking of its own. Pure animation frames pass
+    /// `false` and rasterize nothing at all. Call `advance_frame` first.
+    pub fn prepare_tiles(
+        &mut self,
+        text_cache: &mut crate::ui::TextCache,
+        fonts: &ui::Fonts,
+        screen_w: u32,
+        screen_h: u32,
+        content_dirty: bool,
+        screen_changed: bool,
+    ) -> Result<Vec<Tile>> {
+        let mut updated = Vec::new();
+        let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
+        let columns = ui::grid_columns(available_w);
+        // `self.tiles.card_size` is set by `advance_frame` (same formula) before this runs; the
+        // local copy is what the tile-build loop below reads.
+        let (card_w, card_h) = ui::grid_card_size(available_w, columns);
+
+        self.prepare_sidebar(text_cache, fonts, screen_h, &mut updated)?;
+
+        self.prepare_grid(text_cache, fonts, columns, card_w, card_h, screen_h, &mut updated)?;
+
+        // Status line block — built whenever `home_status` is set, independent of
+        // whether a host is selected (the "Send logs" result shows here too).
+        match &self.home_status {
+            Some(s) => {
+                let stale = !matches!(&self.tiles.status_tile, Some((t, _)) if t == s);
+                if stale {
+                    let avail = screen_w.saturating_sub(ui::SIDEBAR_W);
+                    let max_w = avail.saturating_sub(2 * ui::GRID_PAD as u32);
+                    let tile =
+                        ui::render_wrapped_text_tile(text_cache, fonts.raster, fonts.label, s, max_w, ui::MUTED, 6)?;
+                    self.tiles.status_tile = Some((s.clone(), tile));
+                    updated.push(Tile::Status);
+                }
+            }
+            None => self.tiles.status_tile = None,
+        }
+
+        self.prepare_modal(
+            text_cache,
+            fonts,
+            screen_w,
+            screen_h,
+            content_dirty,
+            screen_changed,
+            &mut updated,
+        )?;
+
+        self.prepare_dropdown(text_cache, fonts, screen_w, screen_h, &mut updated)?;
+
+        self.prepare_scroll(text_cache, fonts, screen_w, screen_h, &mut updated)?;
         Ok(updated)
     }
 
