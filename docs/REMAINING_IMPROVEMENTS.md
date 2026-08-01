@@ -50,12 +50,26 @@ the structural relocation** — pull `TileCache` out of `App` and flip the famil
   - **Needs one on-device smoke pass** (every screen: focus glow / card pop-in / modal fades /
     scrolling pixel-identical) before phase 2 — verbatim so expected identical, but the plan
     mandates it.
-- **A2 phase 2 — TODO (the structural, higher-risk cut):** move `tiles: TileCache` ownership
-  out of `App` into the `ui_flow`/`stream` loop; thread `&mut TileCache`/`&TileCache` through
-  the family methods + `advance_frame`/`tile_pixmap` and the event-handlers that touch
-  `card_tiles`/`card_size`; convert `render_input()` to feed `TileCache` methods; relocate the
-  key enums (`ModalFocusKey`/`ScrollContentKey`/`CardTile`) to `ui` and lift `TileCache` into
-  `ui`. Unblocks D. Device-verify after.
+- **A2 phase 2 — DONE (ownership lifted; compile-verified clean on Linux + macOS; the pop-clock
+  split in 2b is behavior-sensitive — device-verify card pop-in on reveal/scroll/reorder):**
+  - 2a: `card_size` moved from `TileCache` onto `App` (it's screen geometry the event side
+    reads to size cover-art requests, not a rasterized tile).
+  - 2b: card pop-in clocks moved out of `CardTile` into `App.card_pop`
+    (`HashMap<pin_id, Instant>`); `card_tiles` is now `HashMap<String, Painter>`. This was the
+    last event-side reach into the cache (`replay_reorder_pop`), so the `Painter` cache is now
+    touched only by the render loop.
+  - 2c: `TileCache` lifted out of `App` — owned by `runtime::ui_flow`, threaded as a parameter
+    (`&mut` into `prepare_tiles` + family methods, `&` into `draw_list`/`compose_modal`/
+    `tile_pixmap`). **`App` no longer owns the render cache** — the core A2 goal ("App holds
+    only screen state") is met. Recreated per menu entry exactly as `App` already was.
+- **A2 — remaining (optional, mostly D-gated, NOT done):** move the render methods off `impl App`
+  onto `impl ui::TileCache` taking a `RenderInput`, and relocate `ModalFocusKey`/
+  `ScrollContentKey` + the `TileCache` struct into `ui`. Blocked by real coupling: the
+  `prepare_*` methods call App-side view/rasterization helpers (`render_settings`,
+  `host_menu_actions`, `settings_layout`, …) that live in `app::view`/`app::state` and read broad
+  state — they can't move to `ui` without dragging the whole view layer along. So this last step
+  has limited standalone value; revisit only as part of D (which also needs `app` to build on the
+  host + a host `TextRaster`). The ownership decoupling above is the shippable endpoint.
 
 Remaining after A2: **D** (emulator). Needs on-device screenshot verification.
 
