@@ -54,6 +54,9 @@ pub(super) fn run_ui_flow(
 
     canvas.window_mut().show();
     let mut app = App::new(identity.clone());
+    // The GPU tile cache is the render loop's, not App's — App holds only screen state
+    // (see docs/REMAINING_IMPROVEMENTS.md A2). Recreated per menu entry, same as `app`.
+    let mut tiles = crate::app::TileCache::new();
     // Upload every spinner frame's GPU texture now, once, rather than letting each
     // frame's first appearance create it lazily inside the render loop. `upload_raw`
     // creates a *new* static texture (allocation, not just a pixel copy) the first
@@ -300,6 +303,7 @@ pub(super) fn run_ui_flow(
         // Advance per-tick app state (card size, modal fades) exactly once before compose.
         let screen_changed = app.advance_frame(display_mode.w as u32);
         let updated = app.prepare_tiles(
+            &mut tiles,
             &mut text_cache,
             fonts,
             display_mode.w as u32,
@@ -319,13 +323,13 @@ pub(super) fn run_ui_flow(
                     }
                 }
                 _ => {
-                    if let Some(pm) = app.tile_pixmap(&tile) {
+                    if let Some(pm) = app.tile_pixmap(&tiles, &tile) {
                         compositor.upload(texture_creator, tile, pm)?;
                     }
                 }
             }
         }
-        let mut cmds = app.draw_list(display_mode.w as u32, display_mode.h as u32, fonts);
+        let mut cmds = app.draw_list(&tiles, display_mode.w as u32, display_mode.h as u32, fonts);
         // Appended into the same single draw list/present as the rest of the
         // screen — this loop has no separate overlay pass (see the streaming
         // loop's `Tile::LogOverlay` handling for why that one differs).

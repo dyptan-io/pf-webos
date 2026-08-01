@@ -20,7 +20,7 @@ pub use crate::core::screen::{HomeFocus, PairingFocus, Screen};
 use crate::services::store::{self, KnownHost, Settings};
 use crate::ui::render::{DrawCmd, TileId as Tile};
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};
-use tiles::TileCache;
+pub(crate) use tiles::TileCache;
 
 /// Rows beyond viewport kept rasterized (prevents scroll stalls).
 const CARD_PREFETCH_ROWS: i32 = 2;
@@ -388,13 +388,10 @@ pub struct App {
     /// close (X) button.
     pub hover_close: bool,
     pub(crate) identity: (String, String),
-    // ------------------------------------------------------------- GPU tiles --
-    /// Rasterized-once tile sources for the GPU compositor (`compositor.rs`):
-    /// `prepare_tiles` rebuilds whichever are stale and reports them for upload,
-    /// `draw_list` composes each frame from their textures. Focus movement,
-    /// scrolling, and animations never re-rasterize anything. Grouped into its own
-    /// struct so screen state and the render cache stay separable.
-    pub(crate) tiles: TileCache,
+    // -------------------------------------------------------- render clocks --
+    // The `Painter` tile cache (`ui::TileCache`) is owned by the render loop
+    // (`runtime::ui_flow`), not `App` — App keeps only screen state plus these
+    // render-facing derived values that the event side also needs.
     /// Per-card zoom-in start clock, keyed by pin id — set when a card first
     /// appears/reveals, read by `card_pop_frac`. Animation state (the event side
     /// re-arms it on reorder), kept off the `Painter` cache so that cache is
@@ -570,7 +567,6 @@ impl App {
             pairing_entry: 0,
             hover_close: false,
             identity,
-            tiles: TileCache::new(),
             card_pop: std::collections::HashMap::new(),
             card_size: (0, 0),
             sidebar_dirty: true,
@@ -1486,13 +1482,14 @@ impl App {
     /// Extracted from `prepare_tiles` as a self-contained family (A2 staging).
     fn prepare_sidebar(
         &mut self,
+        tiles: &mut TileCache,
         text_cache: &mut crate::ui::TextCache,
         fonts: &ui::Fonts,
         screen_h: u32,
         updated: &mut Vec<Tile>,
     ) -> Result<()> {
-        if self.sidebar_dirty || self.tiles.sidebar_layer.is_none() {
-            let mut layer = match self.tiles.sidebar_layer.take() {
+        if self.sidebar_dirty || tiles.sidebar_layer.is_none() {
+            let mut layer = match tiles.sidebar_layer.take() {
                 Some(l) => l,
                 None => Painter::new(ui::SIDEBAR_W, screen_h),
             };
@@ -1507,9 +1504,9 @@ impl App {
                 &self.reachability_list(),
                 screen_h,
             )?;
-            self.tiles.sidebar_layer = Some(layer);
+            tiles.sidebar_layer = Some(layer);
             self.sidebar_dirty = false;
-            self.tiles.focused_row_tile = None; // row content may have changed under it
+            tiles.focused_row_tile = None; // row content may have changed under it
             updated.push(Tile::Sidebar);
         }
         // One tile serves both sidebar focus states (see `render_focused_row_tile`).
@@ -1519,11 +1516,11 @@ impl App {
             HomeFocus::Grid(_) => None,
         };
         if let Some(key) = sidebar_focus {
-            let stale = !matches!(&self.tiles.focused_row_tile, Some((k, _)) if *k == key);
+            let stale = !matches!(&tiles.focused_row_tile, Some((k, _)) if *k == key);
             if stale {
                 let online = self.entries.get(key.0).and_then(|e| self.entry_online(e));
                 let tile = ui::render_focused_row_tile(text_cache, fonts, &self.entries, key.0, key.1, online)?;
-                self.tiles.focused_row_tile = Some((key, tile));
+                tiles.focused_row_tile = Some((key, tile));
                 updated.push(Tile::FocusRow);
             }
         }
@@ -1536,6 +1533,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     fn prepare_grid(
         &mut self,
+        tiles: &mut TileCache,
         text_cache: &mut crate::ui::TextCache,
         fonts: &ui::Fonts,
         columns: usize,
@@ -1557,7 +1555,7 @@ impl App {
                 // Every existing texture is stale (different games, different host) —
                 // drop them rather than leaving them to be overwritten one by one,
                 // which would strand the tail of a longer previous library.
-                for (id, _) in self.tiles.card_tiles.drain() {
+                for (id, _) in tiles.card_tiles.drain() {
                     self.evicted_tiles.push(Tile::Card(id));
                 }
                 self.card_pop.clear();
@@ -1570,7 +1568,7 @@ impl App {
                 self.spinner_frame = None;
             } else {
                 for id in std::mem::take(&mut self.grid_cards_dirty) {
-                    self.tiles.card_tiles.remove(&id);
+                    tiles.card_tiles.remove(&id);
                     self.card_pop.remove(&id);
                 }
             }
@@ -1598,7 +1596,7 @@ impl App {
                     let Some(id) = layout.pin_id_at(&self.games, idx) else {
                         continue;
                     };
-                    if self.tiles.card_tiles.remove(id).is_some() {
+                    if tiles.card_tiles.remove(id).is_some() {
                         self.evicted_tiles.push(Tile::Card(id.to_string()));
                     }
                     self.card_pop.remove(id);
@@ -1640,7 +1638,7 @@ impl App {
                 if let (Some(loader), Some(game)) = (&mut self.art_loader, layout.game_at(&self.games, idx)) {
                     loader.request(game);
                 }
-                if self.tiles.card_tiles.contains_key(id) {
+                if tiles.card_tiles.contains_key(id) {
                     continue;
                 }
                 to_build.push((idx, id.to_string(), art_ready(idx)));
@@ -1657,7 +1655,7 @@ impl App {
                     let (title, art) = self.grid_card_content(idx, columns);
                     ui::render_card_tile(text_cache, fonts, card_w, card_h, title, art)?
                 };
-                self.tiles.card_tiles.insert(id.clone(), tile);
+                tiles.card_tiles.insert(id.clone(), tile);
                 if self.grid_reveal_ready {
                     self.card_pop.insert(id.clone(), Instant::now());
                 }
@@ -1667,8 +1665,8 @@ impl App {
 
             // The pinned badge tile — built once, composited over the focused
             // card in `draw_list` rather than baked into individual card tiles.
-            if self.tiles.pin_badge_tile.is_none() {
-                self.tiles.pin_badge_tile = Some(ui::render_pin_badge_tile(text_cache, fonts.raster, fonts.icon)?);
+            if tiles.pin_badge_tile.is_none() {
+                tiles.pin_badge_tile = Some(ui::render_pin_badge_tile(text_cache, fonts.raster, fonts.icon)?);
                 updated.push(Tile::PinBadge);
             }
 
@@ -1684,7 +1682,7 @@ impl App {
                     .all(|idx| {
                         layout
                             .pin_id_at(&self.games, idx)
-                            .is_none_or(|id| self.tiles.card_tiles.contains_key(id) && art_ready(idx))
+                            .is_none_or(|id| tiles.card_tiles.contains_key(id) && art_ready(idx))
                     });
                 let since = *self.spinner_since.get_or_insert_with(Instant::now);
                 self.grid_reveal_ready = window_ready || since.elapsed() >= SPINNER_MAX_WAIT;
@@ -1694,7 +1692,7 @@ impl App {
                     // Everything built behind the spinner becomes visible in this
                     // one frame, so it all zooms in off a single clock.
                     let now = Instant::now();
-                    for id in self.tiles.card_tiles.keys() {
+                    for id in tiles.card_tiles.keys() {
                         self.card_pop.entry(id.clone()).or_insert(now);
                     }
                 } else {
@@ -1707,20 +1705,20 @@ impl App {
             }
 
             let ring_w = card_w + 2 * ui::FOCUS_RING_PAD as u32;
-            if !matches!(&self.tiles.ring_tile, Some(p) if p.width() == ring_w) {
-                self.tiles.ring_tile = Some(ui::render_focus_ring_tile(card_w, card_h));
+            if !matches!(&tiles.ring_tile, Some(p) if p.width() == ring_w) {
+                tiles.ring_tile = Some(ui::render_focus_ring_tile(card_w, card_h));
                 updated.push(Tile::Ring);
             }
             let outline_w = card_w + 2 * ui::CARD_OUTLINE_PAD as u32;
-            if !matches!(&self.tiles.outline_tile, Some(p) if p.width() == outline_w) {
-                self.tiles.outline_tile = Some(ui::render_card_outline_tile(card_w, card_h));
+            if !matches!(&tiles.outline_tile, Some(p) if p.width() == outline_w) {
+                tiles.outline_tile = Some(ui::render_card_outline_tile(card_w, card_h));
                 updated.push(Tile::CardOutline);
             }
         } else {
             self.grid_reveal_ready = true;
             self.spinner_since = None;
-            if self.tiles.nohost_tile.is_none() {
-                self.tiles.nohost_tile = Some(ui::render_text_tile(
+            if tiles.nohost_tile.is_none() {
+                tiles.nohost_tile = Some(ui::render_text_tile(
                     text_cache,
                     fonts.raster,
                     fonts.label,
@@ -1739,6 +1737,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     fn prepare_modal(
         &mut self,
+        tiles: &mut TileCache,
         text_cache: &mut crate::ui::TextCache,
         fonts: &ui::Fonts,
         screen_w: u32,
@@ -1817,13 +1816,13 @@ impl App {
             Screen::Home | Screen::AddHost | Screen::EditHost | Screen::PinLimit => None,
         };
         let modal_stale = if modal_shell_key.is_some() {
-            self.tiles.modal_tile.is_none() || self.modal_shell_key != modal_shell_key
+            tiles.modal_tile.is_none() || self.modal_shell_key != modal_shell_key
         } else {
-            content_dirty || self.tiles.modal_tile.is_none()
+            content_dirty || tiles.modal_tile.is_none()
         };
         self.modal_shell_key = modal_shell_key;
         if modal_open && (screen_changed || modal_stale) {
-            let mut p = match self.tiles.modal_tile.take() {
+            let mut p = match tiles.modal_tile.take() {
                 Some(p) => p,
                 None => Painter::new(screen_w, screen_h),
             };
@@ -1863,7 +1862,7 @@ impl App {
                     self.render_send_logs(&mut p, text_cache, fonts, screen_w, screen_h)?;
                 }
             }
-            self.tiles.modal_tile = Some(p);
+            tiles.modal_tile = Some(p);
             updated.push(Tile::Modal);
         }
         // Whichever modal is open has at most one focused, zoom-animated widget
@@ -1927,8 +1926,7 @@ impl App {
             // Also stale on every tick of an in-flight `switch_anim`: the knob's
             // position depends on elapsed time, not on `key`, which doesn't
             // change mid-flip.
-            let stale =
-                self.switch_anim.is_some() || !matches!(&self.tiles.modal_focus_tile, Some((k, _)) if *k == key);
+            let stale = self.switch_anim.is_some() || !matches!(&tiles.modal_focus_tile, Some((k, _)) if *k == key);
             if stale {
                 let tile = match self.screen {
                     Screen::Settings => {
@@ -2121,11 +2119,11 @@ impl App {
                         unreachable!("focus_key checked above")
                     }
                 };
-                self.tiles.modal_focus_tile = Some((key, tile));
+                tiles.modal_focus_tile = Some((key, tile));
                 updated.push(Tile::ModalFocusElement);
             }
         } else {
-            self.tiles.modal_focus_tile = None;
+            tiles.modal_focus_tile = None;
         }
         Ok(())
     }
@@ -2133,6 +2131,7 @@ impl App {
     /// Dropdown family: the overlay panel + focused-option tile for an open Settings/Diagnostics dropdown; cleared when closed (unless a close-fade still needs them). Extracted from `prepare_tiles`.
     fn prepare_dropdown(
         &mut self,
+        tiles: &mut TileCache,
         text_cache: &mut crate::ui::TextCache,
         fonts: &ui::Fonts,
         screen_w: u32,
@@ -2155,7 +2154,7 @@ impl App {
             };
 
             let overlay_key = (self.screen, dd.row);
-            let overlay_stale = !matches!(&self.tiles.dropdown_overlay_tile, Some((k, _)) if *k == overlay_key);
+            let overlay_stale = !matches!(&tiles.dropdown_overlay_tile, Some((k, _)) if *k == overlay_key);
             if overlay_stale {
                 let overlay_h = options.len() as u32 * ui::DROPDOWN_OPTION_H;
                 let mut p = Painter::new(content_w, overlay_h.max(1));
@@ -2169,23 +2168,23 @@ impl App {
                     usize::MAX,
                     rect,
                 )?;
-                self.tiles.dropdown_overlay_tile = Some((overlay_key, p));
+                tiles.dropdown_overlay_tile = Some((overlay_key, p));
                 updated.push(Tile::DropdownOverlay);
             }
 
             let key = (self.screen, dd.row, dd.focused);
-            let stale = !matches!(&self.tiles.dropdown_focus_tile, Some((k, _)) if *k == key);
+            let stale = !matches!(&tiles.dropdown_focus_tile, Some((k, _)) if *k == key);
             if stale {
                 let option = options.get(dd.focused).map_or("", String::as_str);
                 let tile = ui::render_dropdown_option_tile(text_cache, fonts.raster, fonts.value, option, content_w)?;
-                self.tiles.dropdown_focus_tile = Some((key, tile));
+                tiles.dropdown_focus_tile = Some((key, tile));
                 updated.push(Tile::DropdownFocusOption);
             }
         } else if self.dropdown_fade.closing_frame(DROPDOWN_FADE).is_none() {
             // Keep the tiles cached while a close-fade is in flight — `draw_list`
             // still composites them at falling alpha.
-            self.tiles.dropdown_overlay_tile = None;
-            self.tiles.dropdown_focus_tile = None;
+            tiles.dropdown_overlay_tile = None;
+            tiles.dropdown_focus_tile = None;
         }
         Ok(())
     }
@@ -2193,6 +2192,7 @@ impl App {
     /// Scroll family: the indicator, edge-fade ramps, and windowed content tile for whichever modal overflows (Settings rows / About document). Extracted from `prepare_tiles`.
     fn prepare_scroll(
         &mut self,
+        tiles: &mut TileCache,
         text_cache: &mut crate::ui::TextCache,
         fonts: &ui::Fonts,
         screen_w: u32,
@@ -2213,21 +2213,21 @@ impl App {
         if let Some((total, visible, _, content)) = self.scroll_geometry(screen_w, screen_h, fonts) {
             let scroll = self.scroll.clamped(total, visible);
             let ind_key = (total, visible, scroll);
-            let ind_stale = !matches!(&self.tiles.scroll_indicator_tile, Some((k, _)) if *k == ind_key);
+            let ind_stale = !matches!(&tiles.scroll_indicator_tile, Some((k, _)) if *k == ind_key);
             if ind_stale {
                 let tile =
                     ui::render_list_scrollbar_tile(SCROLL_INDICATOR_TILE_W, content.height(), total, visible, scroll);
-                self.tiles.scroll_indicator_tile = Some((ind_key, tile));
+                tiles.scroll_indicator_tile = Some((ind_key, tile));
                 updated.push(Tile::ScrollIndicator(self.screen));
             }
             // Static ramp, so this is a once-per-run bake rather than a keyed rebuild —
             // scrolling and resizing both leave it valid (the GPU restretches it).
-            if self.tiles.scroll_fade_tile.is_none() {
-                self.tiles.scroll_fade_tile = Some(ui::render_scroll_fade_tile(ui::FadeEdge::Bottom));
+            if tiles.scroll_fade_tile.is_none() {
+                tiles.scroll_fade_tile = Some(ui::render_scroll_fade_tile(ui::FadeEdge::Bottom));
                 updated.push(Tile::ScrollFade);
             }
-            if self.tiles.scroll_fade_top_tile.is_none() {
-                self.tiles.scroll_fade_top_tile = Some(ui::render_scroll_fade_tile(ui::FadeEdge::Top));
+            if tiles.scroll_fade_top_tile.is_none() {
+                tiles.scroll_fade_top_tile = Some(ui::render_scroll_fade_tile(ui::FadeEdge::Top));
                 updated.push(Tile::ScrollFadeTop);
             }
             let stride = self.scroll_stride(fonts);
@@ -2240,11 +2240,11 @@ impl App {
                         Screen::Settings,
                         ScrollContentKey::Settings(self.settings, dropdown_row),
                     );
-                    let stale = !matches!(&self.tiles.scroll_content_tile, Some((k, _)) if *k == key);
+                    let stale = !matches!(&tiles.scroll_content_tile, Some((k, _)) if *k == key);
                     if stale {
                         let rows = ui::settings_rows(&self.settings);
                         let tile = ui::render_focus_rows_tile(text_cache, fonts, &rows, content.width(), dropdown_row)?;
-                        self.tiles.scroll_content_tile = Some((key, tile));
+                        tiles.scroll_content_tile = Some((key, tile));
                         // Settings' whole row list always fits one tile — no windowing.
                         self.content_window = ui::ContentWindow {
                             start: 0,
@@ -2267,8 +2267,7 @@ impl App {
                             let mut p = Painter::new(content.width().max(1), (len as u32 * stride).max(1));
                             ui::draw_about_window(&mut p, fonts.raster, fonts.value, wrapped, new_start, len)?;
                             self.content_window = ui::ContentWindow { start: new_start, len };
-                            self.tiles.scroll_content_tile =
-                                Some(((Screen::About, ScrollContentKey::About(new_start)), p));
+                            tiles.scroll_content_tile = Some(((Screen::About, ScrollContentKey::About(new_start)), p));
                             updated.push(Tile::ScrollContent(Screen::About));
                         }
                     }
@@ -2285,8 +2284,10 @@ impl App {
     /// tick" flag — it forces the open modal's tile to re-rasterize, since modal
     /// content has no finer dirty tracking of its own. Pure animation frames pass
     /// `false` and rasterize nothing at all. Call `advance_frame` first.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_tiles(
         &mut self,
+        tiles: &mut TileCache,
         text_cache: &mut crate::ui::TextCache,
         fonts: &ui::Fonts,
         screen_w: u32,
@@ -2301,28 +2302,38 @@ impl App {
         // local copy is what the tile-build loop below reads.
         let (card_w, card_h) = ui::grid_card_size(available_w, columns);
 
-        self.prepare_sidebar(text_cache, fonts, screen_h, &mut updated)?;
+        self.prepare_sidebar(tiles, text_cache, fonts, screen_h, &mut updated)?;
 
-        self.prepare_grid(text_cache, fonts, columns, card_w, card_h, screen_h, &mut updated)?;
+        self.prepare_grid(
+            tiles,
+            text_cache,
+            fonts,
+            columns,
+            card_w,
+            card_h,
+            screen_h,
+            &mut updated,
+        )?;
 
         // Status line block — built whenever `home_status` is set, independent of
         // whether a host is selected (the "Send logs" result shows here too).
         match &self.home_status {
             Some(s) => {
-                let stale = !matches!(&self.tiles.status_tile, Some((t, _)) if t == s);
+                let stale = !matches!(&tiles.status_tile, Some((t, _)) if t == s);
                 if stale {
                     let avail = screen_w.saturating_sub(ui::SIDEBAR_W);
                     let max_w = avail.saturating_sub(2 * ui::GRID_PAD as u32);
                     let tile =
                         ui::render_wrapped_text_tile(text_cache, fonts.raster, fonts.label, s, max_w, ui::MUTED, 6)?;
-                    self.tiles.status_tile = Some((s.clone(), tile));
+                    tiles.status_tile = Some((s.clone(), tile));
                     updated.push(Tile::Status);
                 }
             }
-            None => self.tiles.status_tile = None,
+            None => tiles.status_tile = None,
         }
 
         self.prepare_modal(
+            tiles,
             text_cache,
             fonts,
             screen_w,
@@ -2332,9 +2343,9 @@ impl App {
             &mut updated,
         )?;
 
-        self.prepare_dropdown(text_cache, fonts, screen_w, screen_h, &mut updated)?;
+        self.prepare_dropdown(tiles, text_cache, fonts, screen_w, screen_h, &mut updated)?;
 
-        self.prepare_scroll(text_cache, fonts, screen_w, screen_h, &mut updated)?;
+        self.prepare_scroll(tiles, text_cache, fonts, screen_w, screen_h, &mut updated)?;
         Ok(updated)
     }
 
@@ -2460,24 +2471,24 @@ impl App {
     }
 
     /// The pixmap behind `tile`, for the compositor to upload.
-    pub fn tile_pixmap(&self, tile: &Tile) -> Option<&Painter> {
+    pub fn tile_pixmap<'a>(&self, tiles: &'a TileCache, tile: &Tile) -> Option<&'a Painter> {
         match tile {
-            Tile::Sidebar => self.tiles.sidebar_layer.as_ref(),
-            Tile::FocusRow => self.tiles.focused_row_tile.as_ref().map(|(_, p)| p),
-            Tile::Card(id) => self.tiles.card_tiles.get(id),
-            Tile::Ring => self.tiles.ring_tile.as_ref(),
-            Tile::CardOutline => self.tiles.outline_tile.as_ref(),
-            Tile::PinBadge => self.tiles.pin_badge_tile.as_ref(),
-            Tile::Modal => self.tiles.modal_tile.as_ref(),
-            Tile::ModalFocusElement => self.tiles.modal_focus_tile.as_ref().map(|(_, p)| p),
-            Tile::DropdownOverlay => self.tiles.dropdown_overlay_tile.as_ref().map(|(_, p)| p),
-            Tile::DropdownFocusOption => self.tiles.dropdown_focus_tile.as_ref().map(|(_, p)| p),
-            Tile::ScrollIndicator(_) => self.tiles.scroll_indicator_tile.as_ref().map(|(_, p)| p),
-            Tile::ScrollContent(_) => self.tiles.scroll_content_tile.as_ref().map(|(_, p)| p),
-            Tile::ScrollFade => self.tiles.scroll_fade_tile.as_ref(),
-            Tile::ScrollFadeTop => self.tiles.scroll_fade_top_tile.as_ref(),
-            Tile::Status => self.tiles.status_tile.as_ref().map(|(_, p)| p),
-            Tile::NoHost => self.tiles.nohost_tile.as_ref(),
+            Tile::Sidebar => tiles.sidebar_layer.as_ref(),
+            Tile::FocusRow => tiles.focused_row_tile.as_ref().map(|(_, p)| p),
+            Tile::Card(id) => tiles.card_tiles.get(id),
+            Tile::Ring => tiles.ring_tile.as_ref(),
+            Tile::CardOutline => tiles.outline_tile.as_ref(),
+            Tile::PinBadge => tiles.pin_badge_tile.as_ref(),
+            Tile::Modal => tiles.modal_tile.as_ref(),
+            Tile::ModalFocusElement => tiles.modal_focus_tile.as_ref().map(|(_, p)| p),
+            Tile::DropdownOverlay => tiles.dropdown_overlay_tile.as_ref().map(|(_, p)| p),
+            Tile::DropdownFocusOption => tiles.dropdown_focus_tile.as_ref().map(|(_, p)| p),
+            Tile::ScrollIndicator(_) => tiles.scroll_indicator_tile.as_ref().map(|(_, p)| p),
+            Tile::ScrollContent(_) => tiles.scroll_content_tile.as_ref().map(|(_, p)| p),
+            Tile::ScrollFade => tiles.scroll_fade_tile.as_ref(),
+            Tile::ScrollFadeTop => tiles.scroll_fade_top_tile.as_ref(),
+            Tile::Status => tiles.status_tile.as_ref().map(|(_, p)| p),
+            Tile::NoHost => tiles.nohost_tile.as_ref(),
             // `SpinnerFrame` is uploaded directly from its raw decoded pixels (see
             // `main.rs`), never rasterized as a `Painter`; the rest are stream-side only
             // (uploaded directly by `run_inner`'s overlay refresh) — never one of App's
@@ -2511,7 +2522,14 @@ impl App {
     /// Modal family compose: the fade-in scrim + shell, scrollable content crop with
     /// its edge fades, the dropdown overlay, the focused-widget zoom, and the scroll
     /// indicator — all driven by the modal fade clock. Extracted from `draw_list`.
-    fn compose_modal(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts, cmds: &mut Vec<DrawCmd>) {
+    fn compose_modal(
+        &self,
+        tiles: &TileCache,
+        screen_w: u32,
+        screen_h: u32,
+        fonts: &ui::Fonts,
+        cmds: &mut Vec<DrawCmd>,
+    ) {
         // While closing, `self.screen` has already moved on — render the fade's
         // captured screen instead, so the still-uploaded tiles keep drawing for one
         // more `MODAL_FADE` with alpha running in reverse (see `ui::ModalFade`).
@@ -2715,11 +2733,7 @@ impl App {
                 // edge mid-glide (the crop lags the row offset by up to one stride), so it is
                 // clipped rather than left to paint over the card's chrome. Every other modal
                 // keeps the plain unclipped path — none of them scrolls.
-                let tile_size = self
-                    .tiles
-                    .modal_focus_tile
-                    .as_ref()
-                    .map(|(_, p)| (p.width(), p.height()));
+                let tile_size = tiles.modal_focus_tile.as_ref().map(|(_, p)| (p.width(), p.height()));
                 match (scroll_geom, tile_size) {
                     (Some((_, _, _, content)), Some((tw, th))) => {
                         let viewport = Rect::new(
@@ -2951,7 +2965,13 @@ impl App {
         }
     }
 
-    pub fn draw_list(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> ui::render::DrawList {
+    pub fn draw_list(
+        &self,
+        tiles: &TileCache,
+        screen_w: u32,
+        screen_h: u32,
+        fonts: &ui::Fonts,
+    ) -> ui::render::DrawList {
         let input = self.render_input();
         let mut cmds = Vec::new();
         let grid_x = ui::SIDEBAR_W as i32;
@@ -2965,7 +2985,7 @@ impl App {
         });
 
         if !input.host_selected {
-            if let Some(p) = &self.tiles.nohost_tile {
+            if let Some(p) = &tiles.nohost_tile {
                 cmds.push(DrawCmd::Tex {
                     tile: Tile::NoHost,
                     dst: Rect::new(grid_x + ui::GRID_PAD, ui::GRID_TOP_Y, p.width(), p.height()),
@@ -2988,7 +3008,7 @@ impl App {
             self.compose_grid(screen_h, grid_x, available_w, columns, &mut cmds);
         }
         if input.has_status {
-            if let Some((_, p)) = &self.tiles.status_tile {
+            if let Some((_, p)) = &tiles.status_tile {
                 let line_h = fonts.raster.height(fonts.label) + 6;
                 let box_h = 2 * line_h as u32 + 2 * STATUS_BG_PAD as u32;
                 let box_y = screen_h as i32 - box_h as i32;
@@ -3007,7 +3027,7 @@ impl App {
 
         Self::compose_sidebar_focus(&input, screen_h, &mut cmds);
 
-        self.compose_modal(screen_w, screen_h, fonts, &mut cmds);
+        self.compose_modal(tiles, screen_w, screen_h, fonts, &mut cmds);
         // The launch transition: the confirmed card zooms in around its own
         // center (same `zoom_rect` technique as the focus pop, so its aspect
         // ratio never changes) while a black scrim blends in over it, both driven
