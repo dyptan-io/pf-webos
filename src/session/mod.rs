@@ -199,15 +199,60 @@ pub fn clock_ticks_per_sec() -> u64 {
     (unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64).max(1) // SAFETY: no pointers
 }
 
+/// Ceiling on each teardown join below. The video/audio pumps re-check `stop` on a bounded
+/// cadence, but the FFI calls they make between checks (NDL `play`/`play_audio`, and the
+/// QUIC-close worker `NativeClient::drop` joins internally) have no timeout of their own — an
+/// intermittently wedged vendor call must not freeze the whole app on the caller's thread.
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Joins `handle` from a watcher thread so a hang inside it can't block the caller past
+/// `timeout`. Returns `false` (and leaks the watcher, still waiting on the real join) if it
+/// didn't finish in time.
+fn join_with_timeout<T: Send + 'static>(handle: std::thread::JoinHandle<T>, timeout: Duration, name: &str) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name(format!("punktfunk-webos-join-{name}"))
+        .spawn(move || {
+            let _ = handle.join();
+            let _ = tx.send(());
+        });
+    let Ok(watcher) = spawned else {
+        // Can't even start the watcher — fall back to a direct (unbounded) join rather
+        // than leaking `handle` outright.
+        return true;
+    };
+    if rx.recv_timeout(timeout).is_ok() {
+        let _ = watcher.join();
+        true
+    } else {
+        tracing::error!(
+            "{name} thread did not finish within {timeout:?} — leaking it \
+             (likely a wedged NDL/FFI or QUIC-close call)"
+        );
+        false
+    }
+}
+
 impl Connected {
-    /// Stop and join threads, then drop `NativeClient`. Call `disconnect_quit()` first for graceful shutdown.
-    pub fn shutdown(self) {
+    /// Stop and join threads, then drop `NativeClient`. Call `disconnect_quit()` first for
+    /// graceful shutdown. Returns `false` if any step didn't finish within
+    /// [`SHUTDOWN_JOIN_TIMEOUT`] — the caller must then skip `ndl::quit()`, since the thread
+    /// still running may still be inside an NDL FFI call that a concurrent unload would race.
+    pub fn shutdown(self) -> bool {
         self.stop.store(true, Ordering::Relaxed);
-        let _ = self.video_thread.join();
+        let mut clean = join_with_timeout(self.video_thread, SHUTDOWN_JOIN_TIMEOUT, "video");
         if let Some(audio) = self.audio_thread {
-            let _ = audio.join();
+            clean &= join_with_timeout(audio, SHUTDOWN_JOIN_TIMEOUT, "audio");
         }
-        drop(self.client);
+        // `NativeClient::drop` joins its own QUIC-close worker thread internally — bound
+        // that the same way, on its own thread, rather than blocking here directly.
+        let client = self.client;
+        clean &= join_with_timeout(
+            std::thread::spawn(move || drop(client)),
+            SHUTDOWN_JOIN_TIMEOUT,
+            "client-drop",
+        );
+        clean
     }
 }
 

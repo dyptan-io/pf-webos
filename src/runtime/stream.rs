@@ -171,8 +171,11 @@ pub(super) fn run_inner() -> Result<()> {
                     // connect succeeded and loaded a decoder.
                     tracing::error!("audio player init failed: {e:#}");
                     connected.client.disconnect_quit();
-                    connected.shutdown();
-                    crate::platform::webos::ndl::quit();
+                    if connected.shutdown() {
+                        crate::platform::webos::ndl::quit();
+                    } else {
+                        tracing::warn!("session teardown timed out — skipping NDL unload for this run");
+                    }
                     sdl.mouse().show_cursor(true);
                     menu_status = Some(format!("Couldn't start audio: {e:#}"));
                     continue;
@@ -718,9 +721,14 @@ pub(super) fn run_inner() -> Result<()> {
         }
         // `disconnect_quit()` was already called above for every deliberate-stop path;
         // `shutdown()` joins the video thread and drops `client` so the QUIC close
-        // frame actually gets sent before this function returns (see its docs).
-        connected.shutdown();
-        crate::platform::webos::ndl::quit();
+        // frame actually gets sent before this function returns (see its docs). A `false`
+        // return means some teardown thread is still wedged inside an FFI call — unloading
+        // NDL from under it would race, so skip that call and accept the leak for this run.
+        if connected.shutdown() {
+            crate::platform::webos::ndl::quit();
+        } else {
+            tracing::warn!("session teardown timed out — skipping NDL unload for this run");
+        }
         // Put the TV's picture/sound modes back (no-op unless game mode switched them).
         crate::platform::webos::game_mode::restore(restore_tv_modes);
         sdl.mouse().show_cursor(true);
