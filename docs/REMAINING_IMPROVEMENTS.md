@@ -62,9 +62,17 @@ the structural relocation** — pull `TileCache` out of `App` and flip the famil
     (`&mut` into `prepare_tiles` + family methods, `&` into `draw_list`/`compose_modal`/
     `tile_pixmap`). **`App` no longer owns the render cache** — the core A2 goal ("App holds
     only screen state") is met. Recreated per menu entry exactly as `App` already was.
+- **A2 tail — type relocation DONE (compile-verified: `docker:check`+`docker:lint` clean, macOS
+  `cargo check` 0 warnings; verbatim struct/enum moves, NOT device-tested):** the `TileCache`
+  struct and its two staleness keys `ModalFocusKey`/`ScrollContentKey` now live in `ui::tiles`
+  (they name only `core` types — `Settings`/`LogLevelOverride`/`Screen` — so `ui` stays a leaf).
+  `app/tiles.rs` deleted; `app` imports `ui::{TileCache, ModalFocusKey, ScrollContentKey}`;
+  `ui_flow` builds `crate::ui::TileCache::new()`. **The cache is now `ui`-owned with no `App`
+  reference** — a `ui`-only harness (D) could hold it. The render *methods* still live on
+  `impl App` (each takes a `&/&mut TileCache` param).
+
 - **A2 — remaining (optional, mostly D-gated, NOT done):** move the render methods off `impl App`
-  onto `impl ui::TileCache` taking a `RenderInput`, and relocate `ModalFocusKey`/
-  `ScrollContentKey` + the `TileCache` struct into `ui`. Blocked by real coupling: the
+  onto `impl ui::TileCache` taking a `RenderInput`. Blocked by real coupling: the
   `prepare_*` methods call App-side view/rasterization helpers (`render_settings`,
   `host_menu_actions`, `settings_layout`, …) that live in `app::view`/`app::state` and read broad
   state — they can't move to `ui` without dragging the whole view layer along. So this last step
