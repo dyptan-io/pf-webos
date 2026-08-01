@@ -31,17 +31,31 @@ smoke-tested on device**):
   it references still live in `app`; relocating them (+ re-pathing `Settings`/`LogLevelOverride`
   to `core`) is A2's job. `TileCache` is already App-agnostic, so A2 can lift it into `ui`.
 
-In progress: **A2**, staged one tile family at a time (per the plan's "one family at a time,
-old method delegating" note):
-- **A2 stage 1 (done, compile-verified, behavior-identical — no device test needed yet):**
-  `ui::RenderInput` + `App::render_input()` added; `draw_list`'s home/sidebar-chrome reads
-  (`host_selected`, `has_status`, `grid_reveal_ready`, `home_focus`, `entries`) now go through
-  the input slice. Struct grows as each family migrates.
-- **A2 remaining stages:** move the tile *build* + *compose* logic per family (sidebar → grid
-  → modal/focus → dropdown → scroll) onto `TileCache` methods taking `&RenderInput`, old `App`
-  method delegating until the last moves; then relocate the key enums (`ModalFocusKey`/
-  `ScrollContentKey`/`CardTile`) to `ui` and lift `TileCache` into `ui`. **Each family move
-  needs on-device screenshot verification before the next.**
+In progress: **A2**, staged. Note on sequencing discovered mid-way: a clean
+`TileCache::method(&RenderInput)` can't be cut per-family *while `tiles` is still a field of
+`App`* — `render_input()` borrows `&self` and the tile build needs `&mut self.tiles`, a borrow
+conflict, and `tiles` is also reached by App event-handlers (`card_pop_frac`,
+`replay_reorder_pop`, `advance_frame`). So A2 is split into **(phase 1) decompose** the two
+mega-methods into per-family methods on `App` — done, behavior-identical — then **(phase 2)
+the structural relocation** — pull `TileCache` out of `App` and flip the family methods onto it.
+
+- **A2 phase 1 — DONE (compile-verified: `docker:check`+`docker:lint` clean, macOS `cargo check`
+  0 warnings; behavior-identical verbatim moves; NOT yet device-tested):**
+  - Stage 1: `ui::RenderInput` + `App::render_input()` scaffolding; `draw_list` home/sidebar
+    chrome reads go through the input slice.
+  - Stages 2–5: `prepare_tiles`/`draw_list` decomposed into per-family method pairs on `App`:
+    `prepare_sidebar`/`compose_sidebar_focus`, `prepare_grid`/`compose_grid`, `prepare_modal`/
+    `compose_modal`, `prepare_dropdown`, `prepare_scroll`. `prepare_tiles` is now a ~50-line
+    driver; `draw_list` composes from the family helpers.
+  - **Needs one on-device smoke pass** (every screen: focus glow / card pop-in / modal fades /
+    scrolling pixel-identical) before phase 2 — verbatim so expected identical, but the plan
+    mandates it.
+- **A2 phase 2 — TODO (the structural, higher-risk cut):** move `tiles: TileCache` ownership
+  out of `App` into the `ui_flow`/`stream` loop; thread `&mut TileCache`/`&TileCache` through
+  the family methods + `advance_frame`/`tile_pixmap` and the event-handlers that touch
+  `card_tiles`/`card_size`; convert `render_input()` to feed `TileCache` methods; relocate the
+  key enums (`ModalFocusKey`/`ScrollContentKey`/`CardTile`) to `ui` and lift `TileCache` into
+  `ui`. Unblocks D. Device-verify after.
 
 Remaining after A2: **D** (emulator). Needs on-device screenshot verification.
 
