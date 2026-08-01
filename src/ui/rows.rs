@@ -43,6 +43,38 @@ pub struct FocusRow {
     /// Confirm can mean, reached with Right, so the row's own action stays a single
     /// press. `None` (the default) draws no button at all.
     pub menu: Option<bool>,
+    /// A small secondary line drawn under the row's label (e.g. the high-bitrate
+    /// "may be unstable on Wi-Fi" caution on the Bitrate row). `None` draws nothing and
+    /// the label stays vertically centred; `Some` centres label + subtext as a block.
+    pub subtext: Option<RowSubtext>,
+}
+
+/// A small caption drawn under a row's label. The color is carried with the text so the
+/// drawing code stays generic — a neutral hint and a caution differ only by which
+/// constructor built them, not by any special-casing in `draw_focus_row`.
+pub struct RowSubtext {
+    pub text: String,
+    pub color: Color,
+}
+
+impl RowSubtext {
+    /// Neutral secondary line (muted grey) — the default for extra context. No caller
+    /// yet; provided alongside `caution` so a future row's plain sub-label reads the same.
+    #[allow(dead_code)]
+    pub fn hint(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            color: MUTED,
+        }
+    }
+
+    /// Dull-orange caution line — a soft warning that isn't a hard error.
+    pub fn caution(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            color: CAUTION,
+        }
+    }
 }
 
 impl FocusRow {
@@ -56,6 +88,7 @@ impl FocusRow {
             fraction: 0.0,
             danger: false,
             menu: None,
+            subtext: None,
         }
     }
 
@@ -208,6 +241,28 @@ pub fn draw_focus_row(
     };
     draw_icon(painter, text_cache, fonts.raster, fonts.icon, icon_rect, row.icon, fg)?;
     let label_x = icon_rect.x() + SETTINGS_ICON_SIZE as i32 + 20;
+    // With a caution caption the label + caption are centred as a block; without one the
+    // label alone stays centred (the common case).
+    let label_h = fonts.raster.height(fonts.label);
+    let label_y = if let Some(subtext) = &row.subtext {
+        let caption_h = fonts.raster.height(fonts.caption);
+        let gap = 4;
+        let block_h = label_h + gap + caption_h;
+        let top = row_rect.y() + (row_rect.height() as i32 - block_h) / 2;
+        draw_text(
+            painter,
+            text_cache,
+            fonts.raster,
+            fonts.caption,
+            &subtext.text,
+            label_x,
+            top + label_h + gap,
+            subtext.color,
+        )?;
+        top
+    } else {
+        row_rect.y() + (row_rect.height() as i32 - label_h) / 2
+    };
     draw_text(
         painter,
         text_cache,
@@ -215,7 +270,7 @@ pub fn draw_focus_row(
         fonts.label,
         &row.label,
         label_x,
-        row_rect.y() + (row_rect.height() as i32 - fonts.raster.height(fonts.label)) / 2,
+        label_y,
         fg,
     )?;
 

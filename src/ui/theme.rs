@@ -6,6 +6,9 @@ pub const SURFACE: Color = Color::RGB(0x2b, 0x21, 0x48);
 pub const ACCENT: Color = Color::RGB(0x6c, 0x5b, 0xf3);
 pub const ACCENT_BRIGHT: Color = Color::RGB(0xa7, 0x9f, 0xf8);
 pub const WARNING: Color = Color::RGB(0xff, 0xc1, 0x07);
+/// Muted, desaturated orange for an inline caution caption (e.g. the high-bitrate note on
+/// the Bitrate row) — dimmer than `WARNING` so it reads as a hint, not an alert.
+pub const CAUTION: Color = Color::RGB(0xd1, 0x84, 0x4a);
 pub const ERROR_RED: Color = Color::RGB(0xff, 0x6b, 0x6b);
 /// A desaturated mint rather than a signal green — it sits next to brand purple on every row,
 /// and a pure green fights it.

@@ -40,6 +40,11 @@ pub(crate) const MODAL_FADE: Duration = Duration::from_millis(200);
 pub(crate) const DROPDOWN_FADE: Duration = MODAL_FADE;
 /// Scale during open — subtle, since fade dominates for full-screen modal.
 pub(crate) const MODAL_POP_SHRINK: f32 = 0.05;
+/// Transparent margin the modal tile leaves around the card so its drop shadow
+/// (`draw_card_shadow`: blur `SHADOW_BLUR`=14, offset dy 5) fits inside the tile.
+/// The tile is sized to the card's bounding box plus this pad rather than the whole
+/// screen, so every open rasterizes and uploads a fraction of the pixels it used to.
+pub(crate) const MODAL_TILE_PAD: i32 = 24;
 pub(crate) const SCROLL_INDICATOR_HOLD: Duration = Duration::from_millis(700);
 pub(crate) const SCROLL_INDICATOR_FADE: Duration = Duration::from_millis(350);
 pub(crate) const SCROLL_INDICATOR_LIFETIME: Duration =
@@ -402,6 +407,12 @@ pub struct App {
     /// Which screen `modal_scroll_px` describes, so opening a different modal snaps instead of
     /// gliding from the previous one's offset.
     pub(crate) modal_scroll_screen: Option<Screen>,
+    /// Screen-space region the `Tile::Modal` painter currently covers (card bbox +
+    /// [`MODAL_TILE_PAD`]) — set by `prepare_modal` when it (re)builds the tile, read by
+    /// `compose_modal` to place it. Held across frames so the close-fade, which renders
+    /// the still-uploaded tile after `self.screen` has moved to Home, still knows where
+    /// to draw it.
+    pub(crate) modal_tile_region: Rect,
     /// Whether the grid's initial build for the current library has finished — while
     /// `false`, the grid shows the loading spinner (`Tile::SpinnerFrame`) instead of
     /// popping cards in one by one. One-shot per library: only `prepare_tiles`'s
@@ -545,6 +556,7 @@ impl App {
             modal_scroll_px: 0,
             modal_scroll_target_px: 0,
             modal_scroll_screen: None,
+            modal_tile_region: Rect::new(0, 0, 1, 1),
             grid_reveal_ready: true,
             spinner_frame: None,
             spinner_since: None,
@@ -1042,9 +1054,31 @@ impl App {
                 wake.focused = i;
                 changed
             }
+            // The finished/failed speed test shows the same two-button confirm row as
+            // ForgetHost et al., so hover picks apply-vs-Close there too. While the test
+            // is still running there are no buttons — `speed_test_buttons_rect` is only
+            // meaningful once `render_speed_test` draws them (Done/Failed).
+            Screen::SpeedTest
+                if matches!(
+                    self.speed_test,
+                    Some(crate::app::state::speedtest::SpeedTestState::Done { .. })
+                        | Some(crate::app::state::speedtest::SpeedTestState::Failed(_))
+                ) =>
+            {
+                let card = self.speed_test_card_rect(screen_w, screen_h, fonts);
+                let content = self.speed_test_buttons_rect(card, fonts);
+                match ui::confirm_button_at(content, x, y) {
+                    Some(i) => {
+                        let changed = self.speed_test_focused != i;
+                        self.speed_test_focused = i;
+                        changed
+                    }
+                    None => false,
+                }
+            }
             // No positional focus to move: single-card info/entry modals (AddHost,
-            // EditHost, About, WakeSettings, PinLimit, SpeedTest) and Settings with a
-            // dropdown open.
+            // EditHost, About, WakeSettings, PinLimit, running SpeedTest) and Settings
+            // with a dropdown open.
             _ => false,
         }
     }
@@ -1177,6 +1211,21 @@ impl App {
             }
             Screen::SendLogs => ui::confirm_dialog_card(screen_w, screen_h, fonts, Self::SEND_LOGS_SUBTITLE),
         })
+    }
+
+    /// The current screen's modal *tile* region: its card rect grown by
+    /// [`MODAL_TILE_PAD`] on every side for the shadow. The `Tile::Modal` painter is
+    /// sized and positioned to this instead of the whole screen — see `compose_modal`,
+    /// which composites the tile here. `None` on a screen with no modal card.
+    fn modal_tile_region(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Option<Rect> {
+        let c = self.modal_card_rect(screen_w, screen_h, fonts)?;
+        let pad = MODAL_TILE_PAD;
+        Some(Rect::new(
+            c.x() - pad,
+            c.y() - pad,
+            c.width() + 2 * pad as u32,
+            c.height() + 2 * pad as u32,
+        ))
     }
 
     /// The list-modal row index under the pointer, for the plain list modals whose
@@ -1789,11 +1838,17 @@ impl App {
         };
         self.modal_shell_key = modal_shell_key;
         if modal_open && (screen_changed || modal_stale) {
-            let mut p = match tiles.modal_tile.take() {
-                Some(p) => p,
-                None => Painter::new(screen_w, screen_h),
-            };
-            p.clear_transparent();
+            // Size the tile to the card's bounding box, not the whole screen: the
+            // render fns below draw at absolute, screen-centered coordinates, and the
+            // painter's origin shift (see `Painter::set_origin`) maps that geometry into
+            // this smaller buffer. Falls back to full-screen only for a screen with no
+            // card rect (shouldn't happen while `modal_open`).
+            let region = self
+                .modal_tile_region(screen_w, screen_h, fonts)
+                .unwrap_or_else(|| Rect::new(0, 0, screen_w, screen_h));
+            self.modal_tile_region = region;
+            let mut p = Painter::new(region.width(), region.height());
+            p.set_origin(region.x(), region.y());
             match self.screen {
                 Screen::Home => unreachable!("modal_open checked above"),
                 Screen::Pairing => {
@@ -2245,6 +2300,31 @@ impl App {
         Ok(())
     }
 
+    /// Warms the caches a modal's first open would otherwise fill cold, off the
+    /// open path — call once on an idle Home frame. The first real open pays a
+    /// burst of `SDL2_ttf` glyph renders plus the card's shadow blur; on the very
+    /// first open of a session nothing is cached, which is the hitch the user
+    /// sees. Rendering the Settings shell + rows into throwaway painters here has
+    /// three surviving side effects: `text_cache` (per-line pixmaps), the
+    /// thread-local shadow/glow caches, and `SDL2_ttf`'s own freetype glyph cache.
+    /// The last is font-wide, so it speeds up every modal's cold renders — not
+    /// just Settings — even where the exact strings differ (e.g. the host menu).
+    pub fn prewarm_modal_caches(
+        &self,
+        text_cache: &mut crate::ui::TextCache,
+        fonts: &ui::Fonts,
+        screen_w: u32,
+        screen_h: u32,
+    ) -> Result<()> {
+        let mut scratch = Painter::new(screen_w, screen_h);
+        self.render_settings(&mut scratch, text_cache, fonts, screen_w, screen_h)?;
+        let (_, content) = self.settings_layout(screen_w, screen_h);
+        let rows = ui::settings_rows(&self.settings);
+        let _ = ui::render_focus_rows_tile(text_cache, fonts, &rows, content.width(), None)?;
+        let _ = ui::render_focus_row_tile(text_cache, fonts, &rows, content.width(), 0, false, 0.0)?;
+        Ok(())
+    }
+
     /// Rasterizes every stale tile (tiny-skia, CPU — the only place rasterization
     /// happens) and returns which tiles need their GPU texture re-uploaded.
     /// `content_dirty` is the main loop's "an event/drain changed something this
@@ -2511,7 +2591,10 @@ impl App {
                 color: crate::ui::render::Color::RGBA(0, 0, 0, (f32::from(ui::MODAL_SCRIM.a) * m) as u8),
             });
             let dy = ((1.0 - m) * 26.0) as i32;
-            let modal_base = Rect::new(0, dy, screen_w, screen_h);
+            // The tile now covers only the card region (see `prepare_modal`), so it
+            // composites there rather than full-screen. `pop_in_rect` scaling around this
+            // rect's center is the card's own center — the same visual pop as before.
+            let modal_base = self.modal_tile_region.offset(0, dy);
             let modal_dst = if closing_frame.is_some() {
                 modal_base
             } else {
@@ -2597,88 +2680,105 @@ impl App {
             }
             // Focused widget of the active modal (setting row, button, etc.);
             // composites on shell at its on-screen position (no re-rasterize on move).
-            let focus_rect = match screen {
-                Screen::Settings => {
-                    let (total, _, _, content) = scroll_geom.expect("screen is Screen::Settings");
-                    // Positioned from the animated pixel offset, not the row index: the baked
-                    // list is cropped at that offset, and the focus tile *is* the focused row
-                    // re-rendered — so anchoring it to the quantized row would show that row's
-                    // content twice, in two places, for the length of every scroll.
-                    let stride = ui::settings_row_stride() as i32;
-                    let px = self
-                        .modal_scroll_px
-                        .clamp(0, Self::max_scroll_px(total, stride, content.height()));
-                    Some(ui::focus_row_rect_at_px(content, self.settings_focused, px))
-                }
-                Screen::Wake => self.wake.as_ref().filter(|w| !w.mac.is_empty()).map(|w| {
-                    Self::confirm_focus_button_rect(screen_w, screen_h, fonts, &Self::wake_status_text(w), w.focused)
-                }),
-                Screen::Pairing => {
-                    let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
-                    Some(match self.pairing_focus {
-                        PairingFocus::Pin => {
-                            let digit_y = Self::pairing_pin_row_y(card, fonts);
-                            ui::pairing_digit_rect(card, digit_y, self.pin_digit_index)
-                        }
-                        PairingFocus::RequestAccess => Self::pairing_request_button_rect(card, fonts),
-                    })
-                }
-                Screen::ForgetHost => {
-                    let name = self
-                        .host_menu_index
-                        .and_then(|i| self.entries.get(i))
-                        .map(HostEntry::name)
-                        .unwrap_or_default();
-                    Some(Self::confirm_focus_button_rect(
+            //
+            // Skipped entirely once the modal is closing: the position is recomputed
+            // from live per-screen state, which Back may have already torn down (e.g.
+            // `host_menu_index` cleared, collapsing the host-menu card to the screen
+            // centre and floating the highlight there). The shell and scroll-content
+            // tiles still render the focused row through the fade, so dropping just the
+            // zoom-highlight overlay is invisible — and correct.
+            let focus_rect = if closing_frame.is_some() {
+                None
+            } else {
+                match screen {
+                    Screen::Settings => {
+                        let (total, _, _, content) = scroll_geom.expect("screen is Screen::Settings");
+                        // Positioned from the animated pixel offset, not the row index: the baked
+                        // list is cropped at that offset, and the focus tile *is* the focused row
+                        // re-rendered — so anchoring it to the quantized row would show that row's
+                        // content twice, in two places, for the length of every scroll.
+                        let stride = ui::settings_row_stride() as i32;
+                        let px = self
+                            .modal_scroll_px
+                            .clamp(0, Self::max_scroll_px(total, stride, content.height()));
+                        Some(ui::focus_row_rect_at_px(content, self.settings_focused, px))
+                    }
+                    Screen::Wake => self.wake.as_ref().filter(|w| !w.mac.is_empty()).map(|w| {
+                        Self::confirm_focus_button_rect(
+                            screen_w,
+                            screen_h,
+                            fonts,
+                            &Self::wake_status_text(w),
+                            w.focused,
+                        )
+                    }),
+                    Screen::Pairing => {
+                        let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
+                        Some(match self.pairing_focus {
+                            PairingFocus::Pin => {
+                                let digit_y = Self::pairing_pin_row_y(card, fonts);
+                                ui::pairing_digit_rect(card, digit_y, self.pin_digit_index)
+                            }
+                            PairingFocus::RequestAccess => Self::pairing_request_button_rect(card, fonts),
+                        })
+                    }
+                    Screen::ForgetHost => {
+                        let name = self
+                            .host_menu_index
+                            .and_then(|i| self.entries.get(i))
+                            .map(HostEntry::name)
+                            .unwrap_or_default();
+                        Some(Self::confirm_focus_button_rect(
+                            screen_w,
+                            screen_h,
+                            fonts,
+                            &Self::forget_host_subtitle(name),
+                            self.host_menu_focused,
+                        ))
+                    }
+                    Screen::HostMenu => {
+                        let subtitle = self.host_menu_subtitle();
+                        let rows = self.host_menu_actions().len();
+                        let card = Self::host_menu_card_rect(screen_w, screen_h, fonts, &subtitle, rows);
+                        let content = ui::list_modal_content_rect(card, fonts, &subtitle, rows);
+                        Some(ui::focus_row_rect(content, self.menu_focused))
+                    }
+                    Screen::WakeSettings => {
+                        let subtitle = self.wake_settings_subtitle();
+                        let card = Self::wake_settings_card_rect(screen_w, screen_h, fonts, &subtitle);
+                        let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT);
+                        Some(ui::focus_row_rect(content, self.wake_settings_focused))
+                    }
+                    Screen::SpeedTest => matches!(
+                        self.speed_test,
+                        Some(crate::app::state::speedtest::SpeedTestState::Done { .. })
+                            | Some(crate::app::state::speedtest::SpeedTestState::Failed(_))
+                    )
+                    .then(|| {
+                        let card = self.speed_test_card_rect(screen_w, screen_h, fonts);
+                        ui::confirm_button_rect(self.speed_test_buttons_rect(card, fonts), self.speed_test_focused)
+                    }),
+                    Screen::Diagnostics => {
+                        let subtitle = self.diagnostics_subtitle();
+                        let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
+                        let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT);
+                        Some(ui::focus_row_rect(content, self.diagnostics_focused))
+                    }
+                    Screen::Experimental => {
+                        let subtitle = self.experimental_subtitle();
+                        let card = Self::experimental_card_rect(screen_w, screen_h, fonts, &subtitle);
+                        let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::EXPERIMENTAL_ROW_COUNT);
+                        Some(ui::focus_row_rect(content, self.experimental_focused))
+                    }
+                    Screen::SendLogs => Some(Self::confirm_focus_button_rect(
                         screen_w,
                         screen_h,
                         fonts,
-                        &Self::forget_host_subtitle(name),
-                        self.host_menu_focused,
-                    ))
+                        Self::SEND_LOGS_SUBTITLE,
+                        self.send_logs_focused,
+                    )),
+                    Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About | Screen::PinLimit => None,
                 }
-                Screen::HostMenu => {
-                    let subtitle = self.host_menu_subtitle();
-                    let rows = self.host_menu_actions().len();
-                    let card = Self::host_menu_card_rect(screen_w, screen_h, fonts, &subtitle, rows);
-                    let content = ui::list_modal_content_rect(card, fonts, &subtitle, rows);
-                    Some(ui::focus_row_rect(content, self.menu_focused))
-                }
-                Screen::WakeSettings => {
-                    let subtitle = self.wake_settings_subtitle();
-                    let card = Self::wake_settings_card_rect(screen_w, screen_h, fonts, &subtitle);
-                    let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT);
-                    Some(ui::focus_row_rect(content, self.wake_settings_focused))
-                }
-                Screen::SpeedTest => matches!(
-                    self.speed_test,
-                    Some(crate::app::state::speedtest::SpeedTestState::Done { .. })
-                        | Some(crate::app::state::speedtest::SpeedTestState::Failed(_))
-                )
-                .then(|| {
-                    let card = self.speed_test_card_rect(screen_w, screen_h, fonts);
-                    ui::confirm_button_rect(self.speed_test_buttons_rect(card, fonts), self.speed_test_focused)
-                }),
-                Screen::Diagnostics => {
-                    let subtitle = self.diagnostics_subtitle();
-                    let card = Self::diagnostics_card_rect(screen_w, screen_h, fonts, &subtitle);
-                    let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::DIAGNOSTICS_ROW_COUNT);
-                    Some(ui::focus_row_rect(content, self.diagnostics_focused))
-                }
-                Screen::Experimental => {
-                    let subtitle = self.experimental_subtitle();
-                    let card = Self::experimental_card_rect(screen_w, screen_h, fonts, &subtitle);
-                    let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::EXPERIMENTAL_ROW_COUNT);
-                    Some(ui::focus_row_rect(content, self.experimental_focused))
-                }
-                Screen::SendLogs => Some(Self::confirm_focus_button_rect(
-                    screen_w,
-                    screen_h,
-                    fonts,
-                    Self::SEND_LOGS_SUBTITLE,
-                    self.send_logs_focused,
-                )),
-                Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About | Screen::PinLimit => None,
             };
             if let Some(rect) = focus_rect {
                 let pad = ui::ROW_TILE_PAD;

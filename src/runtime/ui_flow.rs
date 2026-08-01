@@ -122,6 +122,10 @@ pub(super) fn run_ui_flow(
     // dialog while streaming — see `DisconnectChord`.
     let mut chord = DisconnectChord::default();
     let mut quit_dialog_was_active = false;
+    // One-shot: warm the modal text/shadow/freetype caches on the first idle tick
+    // (Home already painted by then) so the first Settings/host-menu open doesn't
+    // hitch on cold rasterization. Reset per menu entry — `text_cache` is too.
+    let mut prewarmed = false;
     'ui: loop {
         let tick_start = Instant::now();
         if QUIT_REQUESTED.load(Ordering::Relaxed) {
@@ -292,6 +296,10 @@ pub(super) fn run_ui_flow(
         let log_overlay_due = log_overlay_state() != LogOverlayState::Off
             && log_overlay_last.is_none_or(|t| t.elapsed() >= Duration::from_millis(500));
         if !dirty && !animating && !log_overlay_due {
+            if !prewarmed {
+                prewarmed = true;
+                app.prewarm_modal_caches(&mut text_cache, fonts, display_mode.w as u32, display_mode.h as u32)?;
+            }
             let elapsed = tick_start.elapsed();
             if elapsed < TICK_BUDGET {
                 std::thread::sleep(TICK_BUDGET - elapsed);

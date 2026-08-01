@@ -22,7 +22,7 @@ pub const BITRATE_STEP_KBPS: u32 = 5_000;
 /// or climbing every ~750ms. A fixed Mbps number, however carefully picked, never adapts to a link
 /// that degrades mid-session — this does.
 pub const BITRATE_AUTOMATIC: u32 = 0;
-/// Above this, shown as amber caution (not a hard cap).
+/// Above this, the Bitrate row shows a dull-orange caution caption (not a hard cap).
 pub const BITRATE_WARN_KBPS: u32 = 150_000;
 
 /// Card space above the row list: title, divider, and their padding.
@@ -34,11 +34,6 @@ pub const SETTINGS_CHROME_TOP: u32 = 120;
 /// Anything more shows as a band of flat card background under the fade — the fade already
 /// *is* the bottom edge, so padding beneath it reads as dead space rather than breathing room.
 pub const SETTINGS_CHROME_BOTTOM: u32 = 16;
-
-/// Extra bottom chrome while the high-bitrate caution line is showing, which is the only
-/// thing that ever needs room below the list. Conditional so the other 99% of the time the
-/// card isn't padded out for a line that isn't there.
-pub const SETTINGS_WARN_CHROME: u32 = 52;
 
 /// Minimum gap between the settings card and the screen edges, top and bottom combined.
 ///
@@ -215,6 +210,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
+            subtext: None,
         },
         FocusRow {
             icon: ICON_SCHEDULE,
@@ -224,6 +220,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
+            subtext: None,
         },
         FocusRow {
             icon: ICON_SIGNAL,
@@ -237,6 +234,8 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: bitrate_frac,
             danger: false,
             menu: None,
+            subtext: (settings.bitrate_kbps > BITRATE_WARN_KBPS)
+                .then(|| RowSubtext::caution("May be unstable on Wi-Fi — try Ethernet")),
         },
         FocusRow {
             icon: ICON_MEMORY,
@@ -249,6 +248,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
+            subtext: None,
         },
         FocusRow {
             icon: ICON_PALETTE,
@@ -258,6 +258,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
+            subtext: None,
         },
         FocusRow {
             icon: ICON_MOVIE,
@@ -274,6 +275,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
+            subtext: None,
         },
         FocusRow {
             icon: ICON_SUN,
@@ -287,6 +289,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
+            subtext: None,
         },
         FocusRow {
             icon: ICON_SIGNAL,
@@ -296,6 +299,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
+            subtext: None,
         },
         FocusRow {
             icon: ICON_GAMEPAD,
@@ -305,6 +309,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
+            subtext: None,
         },
         FocusRow {
             icon: ICON_MOUSE,
@@ -318,6 +323,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
+            subtext: None,
         },
         FocusRow::action(ICON_BUG, "Experimental"),
         FocusRow::action(ICON_WRENCH, "Diagnostics"),
@@ -379,6 +385,7 @@ pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
+            subtext: None,
         },
         FocusRow {
             icon: ICON_CHART,
@@ -392,6 +399,7 @@ pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
+            subtext: None,
         },
         FocusRow {
             icon: ICON_VISIBILITY,
@@ -401,6 +409,7 @@ pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
+            subtext: None,
         },
         FocusRow::action(ICON_SEND, "Send logs to developer"),
     ]
@@ -422,6 +431,7 @@ pub fn experimental_rows(settings: &Settings) -> Vec<FocusRow> {
         fraction: 0.0,
         danger: false,
         menu: None,
+        subtext: None,
     }]
 }
 
@@ -435,6 +445,7 @@ pub fn wake_settings_rows(auto_send: bool) -> Vec<FocusRow> {
         fraction: 0.0,
         danger: false,
         menu: None,
+        subtext: None,
     }]
 }
 

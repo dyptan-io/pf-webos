@@ -49,6 +49,14 @@ pub fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<
 /// version did.
 pub struct Painter {
     pixmap: Pixmap,
+    /// Drawing offset: every coordinate a caller passes is shifted by `-origin`
+    /// before it hits the buffer. Lets a painter whose buffer covers only a
+    /// sub-region of the screen still be fed absolute, screen-space geometry — the
+    /// modal tile uses this so it can be sized to just the card's bounding box
+    /// (a fraction of the full-screen raster + GPU upload it used to be) while the
+    /// per-screen render fns keep computing centered, absolute card rects. `(0, 0)`
+    /// for every full-screen painter, so their behaviour is unchanged.
+    origin: (i32, i32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,7 +99,19 @@ impl Painter {
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             pixmap: Pixmap::new(width.max(1), height.max(1)).expect("nonzero framebuffer size"),
+            origin: (0, 0),
         }
+    }
+
+    /// Shifts all subsequent drawing so `(x, y)` in caller (screen) space maps to
+    /// this buffer's top-left — see the `origin` field. Set once, right after
+    /// `new`, for a sub-region tile.
+    pub fn set_origin(&mut self, x: i32, y: i32) {
+        self.origin = (x, y);
+    }
+
+    fn off(&self, rect: Rect) -> Rect {
+        rect.offset(-self.origin.0, -self.origin.1)
     }
 
     /// Raw premultiplied RGBA8 bytes, row-major, `width() * height() * 4` long —
@@ -109,12 +129,6 @@ impl Painter {
 
     pub fn height(&self) -> u32 {
         self.pixmap.height()
-    }
-
-    /// Zeroes the buffer to fully transparent — tile painters start from this
-    /// (their surroundings must stay see-through for GPU alpha compositing).
-    pub fn clear_transparent(&mut self) {
-        self.pixmap.data_mut().fill(0);
     }
 
     pub fn fill_rect(&mut self, rect: Rect, color: Color) {
@@ -159,6 +173,7 @@ impl Painter {
     }
 
     pub fn fill_rounded_rect(&mut self, rect: Rect, radius: i32, color: Color) {
+        let rect = self.off(rect);
         let (w, h) = (rect.width() as f32, rect.height() as f32);
         if w <= 0.0 || h <= 0.0 {
             return;
@@ -170,6 +185,7 @@ impl Painter {
     }
 
     pub fn stroke_rounded_rect(&mut self, rect: Rect, radius: i32, color: Color, width: f32) {
+        let rect = self.off(rect);
         let (w, h) = (rect.width() as f32, rect.height() as f32);
         if w <= 0.0 || h <= 0.0 {
             return;
@@ -190,6 +206,7 @@ impl Painter {
         if r <= 0.0 {
             return;
         }
+        let (cx, cy) = (cx - self.origin.0 as f32, cy - self.origin.1 as f32);
         let Some(path) = PathBuilder::from_circle(cx, cy, r) else {
             return;
         };
@@ -215,6 +232,7 @@ impl Painter {
             return;
         }
         let pad = blur.ceil().max(0.0) as i32 + 1;
+        let (ox, oy) = self.origin;
         let key = ShadowKey {
             w: rect.width(),
             h: rect.height(),
@@ -235,8 +253,8 @@ impl Painter {
                 }
             };
             self.pixmap.draw_pixmap(
-                rect.x() - pad + dx.round() as i32,
-                rect.y() - pad + dy.round() as i32,
+                rect.x() - pad + dx.round() as i32 - ox,
+                rect.y() - pad + dy.round() as i32 - oy,
                 shape.as_ref(),
                 &PixmapPaint::default(),
                 Transform::identity(),
@@ -253,6 +271,7 @@ impl Painter {
             return;
         }
         let pad = blur.ceil().max(0.0) as i32 + 1;
+        let (ox, oy) = self.origin;
         let key = GlowKey {
             w: rect.width(),
             h: rect.height(),
@@ -272,8 +291,8 @@ impl Painter {
                 }
             };
             self.pixmap.draw_pixmap(
-                rect.x() - pad,
-                rect.y() - pad,
+                rect.x() - pad - ox,
+                rect.y() - pad - oy,
                 shape.as_ref(),
                 &PixmapPaint::default(),
                 Transform::identity(),
@@ -287,6 +306,7 @@ impl Painter {
         if radius == 0 {
             return;
         }
+        let rect = self.off(rect);
         let (pw, ph) = (self.pixmap.width() as i32, self.pixmap.height() as i32);
         let x0 = rect.x().max(0);
         let y0 = rect.y().max(0);
@@ -324,8 +344,14 @@ impl Painter {
     }
 
     pub fn draw_pixmap(&mut self, x: i32, y: i32, src: &Pixmap) {
-        self.pixmap
-            .draw_pixmap(x, y, src.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        self.pixmap.draw_pixmap(
+            x - self.origin.0,
+            y - self.origin.1,
+            src.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
     }
 
     /// Composites `src` scaled to exactly fill `dst` — the one caller is game-art
@@ -336,6 +362,7 @@ impl Painter {
     /// once per card build, not every frame — plain `Nearest` scaling left visible
     /// jaggies on art whose source resolution didn't cleanly divide into the card size.
     pub fn draw_pixmap_scaled(&mut self, dst: Rect, src: &Pixmap) {
+        let dst = self.off(dst);
         let (dw, dh) = (dst.width() as f32, dst.height() as f32);
         let (sw, sh) = (src.width() as f32, src.height() as f32);
         if dw <= 0.0 || dh <= 0.0 || sw <= 0.0 || sh <= 0.0 {

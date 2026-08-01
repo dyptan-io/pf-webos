@@ -26,13 +26,10 @@ impl App {
         ((budget.saturating_sub(2 * ui::SETTINGS_PEEK) / stride) as usize).clamp(1, total)
     }
 
-    /// Card space below the list: minimal, unless the high-bitrate caution line needs room.
+    /// Card space below the list. The high-bitrate caution now rides on the Bitrate row
+    /// itself (see `settings_rows`), so no extra chrome is reserved for it.
     pub(crate) fn settings_chrome_bottom(&self) -> u32 {
-        if self.settings.bitrate_kbps > ui::BITRATE_WARN_KBPS {
-            ui::SETTINGS_WARN_CHROME
-        } else {
-            ui::SETTINGS_CHROME_BOTTOM
-        }
+        ui::SETTINGS_CHROME_BOTTOM
     }
 
     /// Height of the scrolling viewport: the fully-visible rows plus a peek strip past each
@@ -77,7 +74,7 @@ impl App {
         screen_w: u32,
         screen_h: u32,
     ) -> Result<()> {
-        let (card, content) = self.settings_layout(screen_w, screen_h);
+        let (card, _content) = self.settings_layout(screen_w, screen_h);
         self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
         ui::draw_text(
             painter,
@@ -99,18 +96,6 @@ impl App {
         // The open dropdown's panel is drawn separately too — see `Tile::DropdownOverlay`
         // — so it composites *after* `Tile::ScrollContent` instead of being covered by it.
 
-        if self.settings.bitrate_kbps > ui::BITRATE_WARN_KBPS {
-            ui::draw_text(
-                painter,
-                text_cache,
-                fonts.raster,
-                fonts.value,
-                "May be unstable on Wi-Fi — try Ethernet if streaming drops.",
-                content.x(),
-                content.y() + content.height() as i32 + 16,
-                ui::WARNING,
-            )?;
-        }
         Ok(())
     }
 
