@@ -1531,30 +1531,20 @@ impl App {
         Ok(())
     }
 
-    /// Rasterizes every stale tile (tiny-skia, CPU — the only place rasterization
-    /// happens) and returns which tiles need their GPU texture re-uploaded.
-    /// `content_dirty` is the main loop's "an event/drain changed something this
-    /// tick" flag — it forces the open modal's tile to re-rasterize, since modal
-    /// content has no finer dirty tracking of its own. Pure animation frames pass
-    /// `false` and rasterize nothing at all. Call `advance_frame` first.
-    pub fn prepare_tiles(
+    /// Grid family: windowed/budgeted card-tile building, eviction, the reveal
+    /// spinner, and the shared ring/outline/pin-badge tiles — or the "no host"
+    /// hint when nothing is selected. Extracted from `prepare_tiles` (A2 staging).
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_grid(
         &mut self,
         text_cache: &mut crate::ui::TextCache,
         fonts: &ui::Fonts,
-        screen_w: u32,
+        columns: usize,
+        card_w: u32,
+        card_h: u32,
         screen_h: u32,
-        content_dirty: bool,
-        screen_changed: bool,
-    ) -> Result<Vec<Tile>> {
-        let mut updated = Vec::new();
-        let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
-        let columns = ui::grid_columns(available_w);
-        // `self.tiles.card_size` is set by `advance_frame` (same formula) before this runs; the
-        // local copy is what the tile-build loop below reads.
-        let (card_w, card_h) = ui::grid_card_size(available_w, columns);
-
-        self.prepare_sidebar(text_cache, fonts, screen_h, &mut updated)?;
-
+        updated: &mut Vec<Tile>,
+    ) -> Result<()> {
         // Reset before the branch: it is only ever set inside it, and a stale `true` left
         // behind by a host that has since been deselected would spin the render loop at
         // full rate forever.
@@ -1741,6 +1731,34 @@ impl App {
                 updated.push(Tile::NoHost);
             }
         }
+        Ok(())
+    }
+
+    /// Rasterizes every stale tile (tiny-skia, CPU — the only place rasterization
+    /// happens) and returns which tiles need their GPU texture re-uploaded.
+    /// `content_dirty` is the main loop's "an event/drain changed something this
+    /// tick" flag — it forces the open modal's tile to re-rasterize, since modal
+    /// content has no finer dirty tracking of its own. Pure animation frames pass
+    /// `false` and rasterize nothing at all. Call `advance_frame` first.
+    pub fn prepare_tiles(
+        &mut self,
+        text_cache: &mut crate::ui::TextCache,
+        fonts: &ui::Fonts,
+        screen_w: u32,
+        screen_h: u32,
+        content_dirty: bool,
+        screen_changed: bool,
+    ) -> Result<Vec<Tile>> {
+        let mut updated = Vec::new();
+        let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
+        let columns = ui::grid_columns(available_w);
+        // `self.tiles.card_size` is set by `advance_frame` (same formula) before this runs; the
+        // local copy is what the tile-build loop below reads.
+        let (card_w, card_h) = ui::grid_card_size(available_w, columns);
+
+        self.prepare_sidebar(text_cache, fonts, screen_h, &mut updated)?;
+
+        self.prepare_grid(text_cache, fonts, columns, card_w, card_h, screen_h, &mut updated)?;
 
         // Status line block — built whenever `home_status` is set, independent of
         // whether a host is selected (the "Send logs" result shows here too).
@@ -2467,6 +2485,127 @@ impl App {
         }
     }
 
+    /// Grid family compose: the card tiles at their scrolled positions, the pinned
+    /// divider, and the focused card with its ring/outline/pin-badge pop. Only reached
+    /// once the grid is revealed. Extracted from `draw_list` (A2 staging).
+    #[allow(clippy::too_many_arguments)]
+    fn compose_grid(&self, screen_h: u32, grid_x: i32, available_w: u32, columns: usize, cmds: &mut Vec<DrawCmd>) {
+        let count = self.grid_len(columns);
+        let focused = match self.home_focus {
+            HomeFocus::Grid(i) if i < count => Some(i),
+            HomeFocus::Grid(_) | HomeFocus::Sidebar(_) | HomeFocus::SidebarMenu(_) => None,
+        };
+        let pad = ui::CARD_TILE_PAD;
+        let layout = self.grid_layout(columns);
+        for idx in 0..count {
+            if Some(idx) == focused {
+                continue; // drawn last, on top of its neighbors
+            }
+            // padding after a partial pinned row — nothing to draw
+            let Some(pin_id) = layout.pin_id_at(&self.games, idx) else {
+                continue;
+            };
+            let r = self.scrolled_card_rect(idx, columns, grid_x, available_w);
+            if r.bottom() + pad < 0 || r.y() - pad > screen_h as i32 {
+                continue; // culled — fully off-screen at this scroll offset
+            }
+            // A card that just landed is still zooming up to full size.
+            let pop = self.card_pop_frac(pin_id);
+            let base = Rect::new(
+                r.x() - pad,
+                r.y() - pad,
+                r.width() + 2 * pad as u32,
+                r.height() + 2 * pad as u32,
+            );
+            cmds.push(DrawCmd::Tex {
+                tile: Tile::Card(pin_id.to_string()),
+                dst: ui::pop_in_rect(base, pop, CARD_POP_SHRINK),
+                alpha: (255.0 * pop) as u8,
+            });
+        }
+        // The divider between pinned games and the rest — scrolled with
+        // everything else (there's no separate fixed region), so it's just
+        // another rect at its own scrolled position, culled the same way.
+        if let Some(sep) = self.pinned_separator_rect(columns, grid_x, available_w) {
+            if sep.y() >= 0 && sep.y() <= screen_h as i32 {
+                cmds.push(DrawCmd::Fill {
+                    rect: sep,
+                    color: crate::ui::render::Color::RGBA(0xff, 0xff, 0xff, 0x20),
+                });
+            }
+        }
+        if let Some(idx) = focused {
+            if let Some(pin_id) = layout.pin_id_at(&self.games, idx) {
+                // The focus pop: the GPU scales the (unfocused) card tile up
+                // around its center as the pop progresses, with the shared glow
+                // tile fading in behind it at the same scale.
+                let f = ui::anim_frac(self.focus_anim, ui::FOCUS_POP);
+                let r = self.scrolled_card_rect(idx, columns, grid_x, available_w);
+                let card_base = Rect::new(
+                    r.x() - pad,
+                    r.y() - pad,
+                    r.width() + 2 * pad as u32,
+                    r.height() + 2 * pad as u32,
+                );
+                let pop = self.card_pop_frac(pin_id);
+                let popped = |base: Rect| ui::pop_in_rect(base, pop, CARD_POP_SHRINK);
+                // Glow drawn first — it's a halo behind the card, not an outline
+                // on top of it.
+                let rp = ui::FOCUS_RING_PAD;
+                let ring_base = Rect::new(
+                    r.x() - rp,
+                    r.y() - rp,
+                    r.width() + 2 * rp as u32,
+                    r.height() + 2 * rp as u32,
+                );
+                cmds.push(DrawCmd::Tex {
+                    tile: Tile::Ring,
+                    dst: popped(ui::zoom_rect(ring_base, f, CARD_GROWTH)),
+                    alpha: (255.0 * f * pop) as u8,
+                });
+                // The focused card zooms in on first appearance like any other,
+                // composed with its focus pop — both scale around the card's own
+                // center, so they can't fight over position.
+                cmds.push(DrawCmd::Tex {
+                    tile: Tile::Card(pin_id.to_string()),
+                    dst: popped(ui::zoom_rect(card_base, f, CARD_GROWTH)),
+                    alpha: (255.0 * pop) as u8,
+                });
+                // The crisp outline, on top of the card art — a clean edge
+                // between it and the glow behind, unlike the glow's own
+                // soft, blurred boundary.
+                let op = ui::CARD_OUTLINE_PAD;
+                let outline_base = Rect::new(
+                    r.x() - op,
+                    r.y() - op,
+                    r.width() + 2 * op as u32,
+                    r.height() + 2 * op as u32,
+                );
+                cmds.push(DrawCmd::Tex {
+                    tile: Tile::CardOutline,
+                    dst: popped(ui::zoom_rect(outline_base, f, CARD_GROWTH)),
+                    alpha: (255.0 * f * pop) as u8,
+                });
+                if self.selected_known_host().is_some_and(|h| h.is_pinned(pin_id)) {
+                    let badge = ui::PIN_BADGE_SIZE;
+                    let badge_base = Rect::new(
+                        r.right() - badge as i32 - PIN_BADGE_MARGIN,
+                        r.y() + PIN_BADGE_MARGIN,
+                        badge,
+                        badge,
+                    );
+                    // Corner-anchored, so it only fades — scaling it around its
+                    // own center would drift it off the shrunken card.
+                    cmds.push(DrawCmd::Tex {
+                        tile: Tile::PinBadge,
+                        dst: ui::zoom_rect(badge_base, f, CARD_GROWTH),
+                        alpha: (255.0 * pop) as u8,
+                    });
+                }
+            }
+        }
+    }
+
     pub fn draw_list(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> ui::render::DrawList {
         let input = self.render_input();
         let mut cmds = Vec::new();
@@ -2501,120 +2640,7 @@ impl App {
                 alpha: 0xff,
             });
         } else {
-            let count = self.grid_len(columns);
-            let focused = match self.home_focus {
-                HomeFocus::Grid(i) if i < count => Some(i),
-                HomeFocus::Grid(_) | HomeFocus::Sidebar(_) | HomeFocus::SidebarMenu(_) => None,
-            };
-            let pad = ui::CARD_TILE_PAD;
-            let layout = self.grid_layout(columns);
-            for idx in 0..count {
-                if Some(idx) == focused {
-                    continue; // drawn last, on top of its neighbors
-                }
-                // padding after a partial pinned row — nothing to draw
-                let Some(pin_id) = layout.pin_id_at(&self.games, idx) else {
-                    continue;
-                };
-                let r = self.scrolled_card_rect(idx, columns, grid_x, available_w);
-                if r.bottom() + pad < 0 || r.y() - pad > screen_h as i32 {
-                    continue; // culled — fully off-screen at this scroll offset
-                }
-                // A card that just landed is still zooming up to full size.
-                let pop = self.card_pop_frac(pin_id);
-                let base = Rect::new(
-                    r.x() - pad,
-                    r.y() - pad,
-                    r.width() + 2 * pad as u32,
-                    r.height() + 2 * pad as u32,
-                );
-                cmds.push(DrawCmd::Tex {
-                    tile: Tile::Card(pin_id.to_string()),
-                    dst: ui::pop_in_rect(base, pop, CARD_POP_SHRINK),
-                    alpha: (255.0 * pop) as u8,
-                });
-            }
-            // The divider between pinned games and the rest — scrolled with
-            // everything else (there's no separate fixed region), so it's just
-            // another rect at its own scrolled position, culled the same way.
-            if let Some(sep) = self.pinned_separator_rect(columns, grid_x, available_w) {
-                if sep.y() >= 0 && sep.y() <= screen_h as i32 {
-                    cmds.push(DrawCmd::Fill {
-                        rect: sep,
-                        color: crate::ui::render::Color::RGBA(0xff, 0xff, 0xff, 0x20),
-                    });
-                }
-            }
-            if let Some(idx) = focused {
-                if let Some(pin_id) = layout.pin_id_at(&self.games, idx) {
-                    // The focus pop: the GPU scales the (unfocused) card tile up
-                    // around its center as the pop progresses, with the shared glow
-                    // tile fading in behind it at the same scale.
-                    let f = ui::anim_frac(self.focus_anim, ui::FOCUS_POP);
-                    let r = self.scrolled_card_rect(idx, columns, grid_x, available_w);
-                    let card_base = Rect::new(
-                        r.x() - pad,
-                        r.y() - pad,
-                        r.width() + 2 * pad as u32,
-                        r.height() + 2 * pad as u32,
-                    );
-                    let pop = self.card_pop_frac(pin_id);
-                    let popped = |base: Rect| ui::pop_in_rect(base, pop, CARD_POP_SHRINK);
-                    // Glow drawn first — it's a halo behind the card, not an outline
-                    // on top of it.
-                    let rp = ui::FOCUS_RING_PAD;
-                    let ring_base = Rect::new(
-                        r.x() - rp,
-                        r.y() - rp,
-                        r.width() + 2 * rp as u32,
-                        r.height() + 2 * rp as u32,
-                    );
-                    cmds.push(DrawCmd::Tex {
-                        tile: Tile::Ring,
-                        dst: popped(ui::zoom_rect(ring_base, f, CARD_GROWTH)),
-                        alpha: (255.0 * f * pop) as u8,
-                    });
-                    // The focused card zooms in on first appearance like any other,
-                    // composed with its focus pop — both scale around the card's own
-                    // center, so they can't fight over position.
-                    cmds.push(DrawCmd::Tex {
-                        tile: Tile::Card(pin_id.to_string()),
-                        dst: popped(ui::zoom_rect(card_base, f, CARD_GROWTH)),
-                        alpha: (255.0 * pop) as u8,
-                    });
-                    // The crisp outline, on top of the card art — a clean edge
-                    // between it and the glow behind, unlike the glow's own
-                    // soft, blurred boundary.
-                    let op = ui::CARD_OUTLINE_PAD;
-                    let outline_base = Rect::new(
-                        r.x() - op,
-                        r.y() - op,
-                        r.width() + 2 * op as u32,
-                        r.height() + 2 * op as u32,
-                    );
-                    cmds.push(DrawCmd::Tex {
-                        tile: Tile::CardOutline,
-                        dst: popped(ui::zoom_rect(outline_base, f, CARD_GROWTH)),
-                        alpha: (255.0 * f * pop) as u8,
-                    });
-                    if self.selected_known_host().is_some_and(|h| h.is_pinned(pin_id)) {
-                        let badge = ui::PIN_BADGE_SIZE;
-                        let badge_base = Rect::new(
-                            r.right() - badge as i32 - PIN_BADGE_MARGIN,
-                            r.y() + PIN_BADGE_MARGIN,
-                            badge,
-                            badge,
-                        );
-                        // Corner-anchored, so it only fades — scaling it around its
-                        // own center would drift it off the shrunken card.
-                        cmds.push(DrawCmd::Tex {
-                            tile: Tile::PinBadge,
-                            dst: ui::zoom_rect(badge_base, f, CARD_GROWTH),
-                            alpha: (255.0 * pop) as u8,
-                        });
-                    }
-                }
-            }
+            self.compose_grid(screen_h, grid_x, available_w, columns, &mut cmds);
         }
         if input.has_status {
             if let Some((_, p)) = &self.tiles.status_tile {
