@@ -21,7 +21,7 @@ pub(crate) struct TileCache {
     /// a pin/unpin reorder only shuffles which index a game sits at, so keying
     /// by identity means the reorder never has to rebuild anything. Absent = not
     /// yet rasterized (or evicted).
-    pub(crate) card_tiles: std::collections::HashMap<String, CardTile>,
+    pub(crate) card_tiles: std::collections::HashMap<String, Painter>,
     /// The shared focus-ring glow tile (one per card size).
     pub(crate) ring_tile: Option<Painter>,
     /// The shared card-outline tile (one per card size) — composited on top of the

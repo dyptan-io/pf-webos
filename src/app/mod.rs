@@ -91,13 +91,6 @@ pub(crate) enum GridCard<'a> {
     Game(&'a GameEntry),
 }
 
-/// Rasterized grid card with its zoom-in clock.
-pub(crate) struct CardTile {
-    pub(crate) tile: Painter,
-    /// When card started zooming in. `None` while behind loading spinner.
-    pub(crate) pop_since: Option<Instant>,
-}
-
 /// Grid layout shape: pinned block (owns whole rows) + rest section (padding-aware).
 #[derive(Clone, Copy)]
 pub(crate) struct GridLayout {
@@ -402,6 +395,11 @@ pub struct App {
     /// scrolling, and animations never re-rasterize anything. Grouped into its own
     /// struct so screen state and the render cache stay separable.
     pub(crate) tiles: TileCache,
+    /// Per-card zoom-in start clock, keyed by pin id — set when a card first
+    /// appears/reveals, read by `card_pop_frac`. Animation state (the event side
+    /// re-arms it on reorder), kept off the `Painter` cache so that cache is
+    /// touched only by the render loop.
+    pub(crate) card_pop: std::collections::HashMap<String, Instant>,
     /// Current grid card size, derived from screen width in `advance_frame`. Screen
     /// geometry (the event side reads it to size cover-art requests), not a rasterized
     /// tile — hence on `App`, not in the `Painter` cache.
@@ -573,6 +571,7 @@ impl App {
             hover_close: false,
             identity,
             tiles: TileCache::new(),
+            card_pop: std::collections::HashMap::new(),
             card_size: (0, 0),
             sidebar_dirty: true,
             grid_dirty: true,
@@ -864,13 +863,8 @@ impl App {
             }
             animating = true;
         }
-        // A scan, not one clock: every card zooms on its own (`CardTile::pop_since`).
-        if self
-            .tiles
-            .card_tiles
-            .values()
-            .any(|c| c.pop_since.is_some_and(|t| t.elapsed() < CARD_POP))
-        {
+        // A scan, not one clock: every card zooms on its own (see `card_pop`).
+        if self.card_pop.values().any(|t| t.elapsed() < CARD_POP) {
             animating = true;
         }
         animating
@@ -1566,6 +1560,7 @@ impl App {
                 for (id, _) in self.tiles.card_tiles.drain() {
                     self.evicted_tiles.push(Tile::Card(id));
                 }
+                self.card_pop.clear();
                 self.grid_dirty = false;
                 self.grid_cards_dirty.clear();
                 // Scrolling or re-pinning a card must not hide the already-visible
@@ -1576,6 +1571,7 @@ impl App {
             } else {
                 for id in std::mem::take(&mut self.grid_cards_dirty) {
                     self.tiles.card_tiles.remove(&id);
+                    self.card_pop.remove(&id);
                 }
             }
 
@@ -1605,6 +1601,7 @@ impl App {
                     if self.tiles.card_tiles.remove(id).is_some() {
                         self.evicted_tiles.push(Tile::Card(id.to_string()));
                     }
+                    self.card_pop.remove(id);
                     if layout.game_at(&self.games, idx).is_some() {
                         // Drop the decoded cover too — it is several times the size of the
                         // tile it feeds. Re-requested from the disk cache on scroll back.
@@ -1660,13 +1657,10 @@ impl App {
                     let (title, art) = self.grid_card_content(idx, columns);
                     ui::render_card_tile(text_cache, fonts, card_w, card_h, title, art)?
                 };
-                self.tiles.card_tiles.insert(
-                    id.clone(),
-                    CardTile {
-                        tile,
-                        pop_since: self.grid_reveal_ready.then(Instant::now),
-                    },
-                );
+                self.tiles.card_tiles.insert(id.clone(), tile);
+                if self.grid_reveal_ready {
+                    self.card_pop.insert(id.clone(), Instant::now());
+                }
                 updated.push(Tile::Card(id));
             }
             self.tiles_pending = pending;
@@ -1700,8 +1694,8 @@ impl App {
                     // Everything built behind the spinner becomes visible in this
                     // one frame, so it all zooms in off a single clock.
                     let now = Instant::now();
-                    for card in self.tiles.card_tiles.values_mut() {
-                        card.pop_since.get_or_insert(now);
+                    for id in self.tiles.card_tiles.keys() {
+                        self.card_pop.entry(id.clone()).or_insert(now);
                     }
                 } else {
                     let (frame_idx, _) = ui::spinner_frame_at(since.elapsed().as_secs_f32());
@@ -2470,7 +2464,7 @@ impl App {
         match tile {
             Tile::Sidebar => self.tiles.sidebar_layer.as_ref(),
             Tile::FocusRow => self.tiles.focused_row_tile.as_ref().map(|(_, p)| p),
-            Tile::Card(id) => self.tiles.card_tiles.get(id).map(|c| &c.tile),
+            Tile::Card(id) => self.tiles.card_tiles.get(id),
             Tile::Ring => self.tiles.ring_tile.as_ref(),
             Tile::CardOutline => self.tiles.outline_tile.as_ref(),
             Tile::PinBadge => self.tiles.pin_badge_tile.as_ref(),
