@@ -1207,7 +1207,7 @@ impl App {
             }
             Screen::Experimental => {
                 let subtitle = self.experimental_subtitle();
-                Self::experimental_card_rect(screen_w, screen_h, fonts, &subtitle)
+                Self::experimental_card_rect(screen_w, screen_h, fonts, &subtitle, self.experimental_row_count())
             }
             Screen::SendLogs => ui::confirm_dialog_card(screen_w, screen_h, fonts, Self::SEND_LOGS_SUBTITLE),
         })
@@ -1237,7 +1237,7 @@ impl App {
         let (subtitle, rows) = match self.screen {
             Screen::HostMenu => (self.host_menu_subtitle(), self.host_menu_actions().len()),
             Screen::Diagnostics => (self.diagnostics_subtitle(), ui::DIAGNOSTICS_ROW_COUNT),
-            Screen::Experimental => (self.experimental_subtitle(), ui::EXPERIMENTAL_ROW_COUNT),
+            Screen::Experimental => (self.experimental_subtitle(), self.experimental_row_count()),
             _ => return None,
         };
         let content = ui::list_modal_content_rect(card, fonts, &subtitle, rows);
@@ -2107,7 +2107,7 @@ impl App {
                     Screen::Experimental => {
                         let subtitle = self.experimental_subtitle();
                         let rows = self.experimental_rows();
-                        let card = Self::experimental_card_rect(screen_w, screen_h, fonts, &subtitle);
+                        let card = Self::experimental_card_rect(screen_w, screen_h, fonts, &subtitle, rows.len());
                         let content = ui::list_modal_content_rect(card, fonts, &subtitle, rows.len());
                         let target_on = rows.get(self.experimental_focused).is_some_and(|r| r.value == "On");
                         ui::render_focus_row_tile(
@@ -2766,8 +2766,9 @@ impl App {
                     }
                     Screen::Experimental => {
                         let subtitle = self.experimental_subtitle();
-                        let card = Self::experimental_card_rect(screen_w, screen_h, fonts, &subtitle);
-                        let content = ui::list_modal_content_rect(card, fonts, &subtitle, ui::EXPERIMENTAL_ROW_COUNT);
+                        let rows = self.experimental_row_count();
+                        let card = Self::experimental_card_rect(screen_w, screen_h, fonts, &subtitle, rows);
+                        let content = ui::list_modal_content_rect(card, fonts, &subtitle, rows);
                         Some(ui::focus_row_rect(content, self.experimental_focused))
                     }
                     Screen::SendLogs => Some(Self::confirm_focus_button_rect(

@@ -235,6 +235,13 @@ pub struct Settings {
     /// existing settings.json without the key still loads as `true`.
     #[serde(default = "default_cursor_capture")]
     pub cursor_capture: bool,
+    /// Ask the TV to switch to its Game picture mode for the duration of a stream (the
+    /// app-plane stand-in for HDMI ALLM — see `platform::webos::game_mode`). Off by default;
+    /// unverified on non-rooted installs, so it rides the Experimental screen. Applied at
+    /// stream start (SDR "game" / HDR "hdrGame" per the negotiated colour path) and reverted
+    /// on stream exit. `serde(default)` so an existing settings.json loads as `false`.
+    #[serde(default)]
+    pub game_mode: bool,
 }
 
 fn default_audio_channels() -> u8 {
@@ -267,6 +274,7 @@ impl Default for Settings {
             video_pacing: false,
             gamepad_type: GamepadType::Auto,
             cursor_capture: default_cursor_capture(),
+            game_mode: false,
         }
     }
 }

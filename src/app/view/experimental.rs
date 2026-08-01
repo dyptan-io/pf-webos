@@ -6,15 +6,28 @@ use anyhow::Result;
 
 impl App {
     pub(crate) fn experimental_rows(&self) -> Vec<FocusRow> {
-        ui::experimental_rows(&self.settings)
+        ui::experimental_rows(&self.settings, crate::platform::webos::game_mode::is_rooted())
+    }
+
+    /// Row count without building the `FocusRow` vec — for card/hit-test sizing.
+    pub(crate) fn experimental_row_count(&self) -> usize {
+        ui::experimental_row_count(crate::platform::webos::game_mode::is_rooted())
     }
 
     pub(crate) fn experimental_subtitle(&self) -> String {
-        "Unstable, off by default. Frame pacer also toggles live with the Blue button.".to_string()
+        "Unstable, off by default.".to_string()
     }
 
-    pub(crate) fn experimental_card_rect(screen_w: u32, screen_h: u32, fonts: &ui::Fonts, subtitle: &str) -> Rect {
-        ui::list_modal_card_rect(screen_w, screen_h, fonts, subtitle, ui::EXPERIMENTAL_ROW_COUNT)
+    /// `rows` is the live experimental-row count (`experimental_row_count`) — one shorter when
+    /// the Game mode row is hidden on a non-rooted TV, so the card sizes to what's shown.
+    pub(crate) fn experimental_card_rect(
+        screen_w: u32,
+        screen_h: u32,
+        fonts: &ui::Fonts,
+        subtitle: &str,
+        rows: usize,
+    ) -> Rect {
+        ui::list_modal_card_rect(screen_w, screen_h, fonts, subtitle, rows)
     }
 
     pub(crate) fn render_experimental(
@@ -26,7 +39,8 @@ impl App {
         screen_h: u32,
     ) -> Result<()> {
         let subtitle = self.experimental_subtitle();
-        let card = Self::experimental_card_rect(screen_w, screen_h, fonts, &subtitle);
+        let rows = self.experimental_rows();
+        let card = Self::experimental_card_rect(screen_w, screen_h, fonts, &subtitle, rows.len());
         self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
         ui::render_list_modal(
             painter,
@@ -35,7 +49,7 @@ impl App {
             card,
             "Experimental",
             &subtitle,
-            &self.experimental_rows(),
+            &rows,
         )
     }
 }

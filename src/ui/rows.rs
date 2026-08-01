@@ -58,9 +58,8 @@ pub struct RowSubtext {
 }
 
 impl RowSubtext {
-    /// Neutral secondary line (muted grey) — the default for extra context. No caller
-    /// yet; provided alongside `caution` so a future row's plain sub-label reads the same.
-    #[allow(dead_code)]
+    /// Neutral secondary line (muted grey) — the default for extra context (e.g. the
+    /// rooted-TV note on the experimental Game mode row).
     pub fn hint(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),

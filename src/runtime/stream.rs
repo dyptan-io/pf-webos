@@ -187,6 +187,15 @@ pub(super) fn run_inner() -> Result<()> {
             );
         }
 
+        // Experimental: drive the TV into Game picture + sound mode (app-plane stand-in for
+        // HDMI ALLM), plus max Peak Brightness on HDR, matched to the negotiated SDR/HDR path.
+        // Best-effort; the returned changes are reverted on stream exit. See `game_mode`.
+        let restore_tv_modes = if settings.game_mode {
+            crate::platform::webos::game_mode::enter(connected.hdr)
+        } else {
+            Vec::new()
+        };
+
         // DualSense HID feedback (adaptive triggers, lightbar), only when the host is
         // actually presenting a DualSense — anything else never emits these events, so
         // starting the sender thread would be pure overhead. Absent for any other reason
@@ -712,6 +721,8 @@ pub(super) fn run_inner() -> Result<()> {
         // frame actually gets sent before this function returns (see its docs).
         connected.shutdown();
         crate::platform::webos::ndl::quit();
+        // Put the TV's picture/sound modes back (no-op unless game mode switched them).
+        crate::platform::webos::game_mode::restore(restore_tv_modes);
         sdl.mouse().show_cursor(true);
         match outcome {
             StreamOutcome::Quit => {

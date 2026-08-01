@@ -141,6 +141,10 @@ pub struct Connected {
     /// Resolved decode backend name for the stats overlay — the *actual* player,
     /// which can differ from the requested `VideoBackend` (Starfish falls back to NDL).
     pub backend_name: &'static str,
+    /// Whether HDR mastering metadata is being applied this session (negotiated codec is
+    /// HEVC *and* the host signalled HDR). Drives which Game picture mode the runtime asks
+    /// the TV for — `game` vs `hdrGame` (see `platform::webos::game_mode`).
+    pub hdr: bool,
 }
 
 /// Live video-pump counters for stats overlay (read at ~2Hz); relaxed atomics written per frame.
@@ -567,6 +571,7 @@ pub fn connect(
         audio_thread,
         audio_offloaded,
         backend_name,
+        hdr: is_hdr,
     })
 }
 

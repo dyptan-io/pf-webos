@@ -27,6 +27,11 @@ impl App {
                 self.settings.video_pacing = !from;
                 self.switch_anim = Some((Instant::now(), from));
             }
+            (ui::EXP_ROW_GAME_MODE, MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
+                let from = self.settings.game_mode;
+                self.settings.game_mode = !from;
+                self.switch_anim = Some((Instant::now(), from));
+            }
             (_, MenuEvent::Back) => {
                 self.settings_writer.save(self.settings);
                 self.screen = Screen::Settings;

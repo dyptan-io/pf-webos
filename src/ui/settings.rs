@@ -101,7 +101,15 @@ pub const SETTINGS_ROW_COUNT: usize = 13;
 
 /// Experimental modal row indices (see `experimental_rows`).
 pub const EXP_ROW_FRAME_PACER: usize = 0;
-pub const EXPERIMENTAL_ROW_COUNT: usize = 1;
+/// Only present on rooted TVs (see `experimental_rows`), so it's the last row when shown.
+pub const EXP_ROW_GAME_MODE: usize = 1;
+
+/// Live experimental-row count without building the rows — the Game mode row is only offered on
+/// a rooted TV (see `experimental_rows`), so the screen is one row shorter otherwise. Used by the
+/// card/hit-test sizing paths that need the count but not the `FocusRow` allocations.
+pub fn experimental_row_count(rooted: bool) -> usize {
+    1 + usize::from(rooted)
+}
 
 /// Diagnostics modal row indices (see `diagnostics_rows`). Log level keeps index
 /// 0 so its dropdown's `(Screen, row)` tile key stays stable.
@@ -418,8 +426,8 @@ pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
 /// Experimental modal rows: the frame pacer toggle (`session::PtsPacer`). Off by default,
 /// untested on hardware, live-toggleable mid-stream with the Blue button. Order must match
 /// `EXP_ROW_*`.
-pub fn experimental_rows(settings: &Settings) -> Vec<FocusRow> {
-    vec![FocusRow {
+pub fn experimental_rows(settings: &Settings, rooted: bool) -> Vec<FocusRow> {
+    let mut rows = vec![FocusRow {
         icon: ICON_SCHEDULE,
         label: "Frame pacer".into(),
         value: if settings.video_pacing {
@@ -431,8 +439,24 @@ pub fn experimental_rows(settings: &Settings) -> Vec<FocusRow> {
         fraction: 0.0,
         danger: false,
         menu: None,
-        subtext: None,
-    }]
+        subtext: Some(RowSubtext::hint("Toggles live with the Blue button")),
+    }];
+    // Driving the TV's Game picture/sound modes needs the Homebrew Channel's root helper — the
+    // public bus is denied `settingsservice` outright (see `platform::webos::game_mode`). So the
+    // row only exists on a rooted set, where it's known to work.
+    if rooted {
+        rows.push(FocusRow {
+            icon: ICON_GAMEPAD,
+            label: "Game mode".into(),
+            value: if settings.game_mode { "On".into() } else { "Off".into() },
+            kind: RowKind::Toggle,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+            subtext: Some(RowSubtext::hint("Your TV is rooted, you can use ALLM")),
+        });
+    }
+    rows
 }
 
 /// Wake settings modal rows.

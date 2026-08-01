@@ -55,27 +55,57 @@ pub fn available() -> bool {
 /// fix during bring-up, not a runtime condition to branch on. Feedback is idempotent — the
 /// next state update re-sends everything — so a dropped call needs no recovery path.
 pub fn call(uri: &str, payload: &str) -> anyhow::Result<()> {
+    run_bounded(&["-n", "1", uri, payload], CALL_TIMEOUT, false).map(|_| ())
+}
+
+/// Like [`call`] but waits for and returns the reply JSON on stdout — for the callers that
+/// must read a value back (e.g. `getSystemSettings`, or an `exec` service that returns command
+/// output). Non-interactive `luna-send-pub` only waits for the reply when given `-w` (without
+/// it, it fires and exits before the reply arrives — verified on-device, webOS 10.3), so the
+/// caller's `timeout` is passed through as `-w` AND, plus a margin, as the kill deadline.
+pub fn call_capture(uri: &str, payload: &str, timeout: Duration) -> anyhow::Result<String> {
+    let wait_ms = timeout.as_millis().to_string();
+    // Own deadline sits past `-w` so `luna-send-pub` exits on its own timeout first.
+    run_bounded(
+        &["-n", "1", "-w", &wait_ms, uri, payload],
+        timeout + Duration::from_millis(500),
+        true,
+    )
+}
+
+/// Spawns `luna-send-pub` with `args`, polling until it exits or `timeout` elapses (killing and
+/// reaping on timeout so no zombie is left). Returns its stdout when `capture` is set, else an
+/// empty string. Shared by [`call`] and [`call_capture`] — the only differences between them are
+/// the args, `capture`, and the deadline.
+fn run_bounded(args: &[&str], timeout: Duration, capture: bool) -> anyhow::Result<String> {
     if !available() {
         anyhow::bail!("luna-send-pub unavailable");
     }
     let mut child = Command::new(LUNA_SEND_PUB)
-        .args(["-n", "1", uri, payload])
+        .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(if capture { Stdio::piped() } else { Stdio::null() })
         .stderr(Stdio::null())
         .spawn()?;
 
-    let deadline = Instant::now() + CALL_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait()? {
-            Some(status) if status.success() => return Ok(()),
+            Some(status) if status.success() => {
+                let out = if capture {
+                    String::from_utf8_lossy(&child.wait_with_output()?.stdout).into_owned()
+                } else {
+                    String::new()
+                };
+                return Ok(out);
+            }
             Some(status) => anyhow::bail!("luna-send-pub exited {status}"),
             None if Instant::now() >= deadline => {
                 // Kill AND reap: an unreaped child becomes a zombie held for the life of
                 // the app, and this path repeats for every send once a call starts hanging.
                 let _ = child.kill();
                 let _ = child.wait();
-                anyhow::bail!("luna-send-pub timed out after {CALL_TIMEOUT:?}");
+                anyhow::bail!("luna-send-pub timed out after {timeout:?}");
             }
             None => std::thread::sleep(Duration::from_millis(10)),
         }
