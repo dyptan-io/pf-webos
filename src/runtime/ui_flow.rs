@@ -297,12 +297,15 @@ pub(super) fn run_ui_flow(
         }
         let content_dirty = dirty;
         dirty = false;
+        // Advance per-tick app state (card size, modal fades) exactly once before compose.
+        let screen_changed = app.advance_frame(display_mode.w as u32);
         let updated = app.prepare_tiles(
             &mut text_cache,
             fonts,
             display_mode.w as u32,
             display_mode.h as u32,
             content_dirty,
+            screen_changed,
         )?;
         // Free old textures before uploading new (reduce peak memory during scroll).
         for tile in std::mem::take(&mut app.evicted_tiles) {

@@ -1510,31 +1510,24 @@ impl App {
         }
     }
 
-    /// Rasterizes every stale tile (tiny-skia, CPU — the only place rasterization
-    /// happens) and returns which tiles need their GPU texture re-uploaded.
-    /// `content_dirty` is the main loop's "an event/drain changed something this
-    /// tick" flag — it forces the open modal's tile to re-rasterize, since modal
-    /// content has no finer dirty tracking of its own. Pure animation frames pass
-    /// `false` and rasterize nothing at all.
-    pub fn prepare_tiles(
-        &mut self,
-        text_cache: &mut crate::ui::TextCache,
-        fonts: &ui::Fonts,
-        screen_w: u32,
-        screen_h: u32,
-        content_dirty: bool,
-    ) -> Result<Vec<Tile>> {
-        let mut updated = Vec::new();
+    /// Per-tick app-state advance that must run exactly once, *before* `prepare_tiles`
+    /// composes the frame — kept out of `prepare_tiles` so that method only touches tiles.
+    /// Derives `card_size` from the current width and advances the modal open/close fades on
+    /// a screen transition. Ordering matters: fades must advance once per tick before compose,
+    /// so the `ui_flow`/`stream` loops call this immediately ahead of `prepare_tiles`.
+    /// Returns whether the screen changed this tick — `prepare_tiles` needs it to force a
+    /// modal-tile rebuild on entry, but this method has already consumed the transition by
+    /// advancing `last_screen`, so it hands the flag back rather than leaving it to recompute.
+    pub fn advance_frame(&mut self, screen_w: u32) -> bool {
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
         let columns = ui::grid_columns(available_w);
-        let (card_w, card_h) = ui::grid_card_size(available_w, columns);
-        self.card_size = (card_w, card_h);
+        self.card_size = ui::grid_card_size(available_w, columns);
 
         // Every screen transition triggers close-fade for the left screen and
         // open-fade for the entered screen, centralized here rather than at each
         // dispatch site. Close-fade only on returning to Home: a direct
         // modal-to-modal jump (Settings <-> About) shares `modal_tile`, which
-        // this same block rebuilds for the entered screen below — a close-fade
+        // `prepare_tiles` rebuilds for the entered screen — a close-fade
         // there would replay a tile that already holds the new screen's content.
         let screen_changed = self.screen != self.last_screen;
         if screen_changed {
@@ -1550,6 +1543,30 @@ impl App {
                 self.modal_fade.cancel_closing(self.screen);
             }
         }
+        screen_changed
+    }
+
+    /// Rasterizes every stale tile (tiny-skia, CPU — the only place rasterization
+    /// happens) and returns which tiles need their GPU texture re-uploaded.
+    /// `content_dirty` is the main loop's "an event/drain changed something this
+    /// tick" flag — it forces the open modal's tile to re-rasterize, since modal
+    /// content has no finer dirty tracking of its own. Pure animation frames pass
+    /// `false` and rasterize nothing at all. Call `advance_frame` first.
+    pub fn prepare_tiles(
+        &mut self,
+        text_cache: &mut crate::ui::TextCache,
+        fonts: &ui::Fonts,
+        screen_w: u32,
+        screen_h: u32,
+        content_dirty: bool,
+        screen_changed: bool,
+    ) -> Result<Vec<Tile>> {
+        let mut updated = Vec::new();
+        let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
+        let columns = ui::grid_columns(available_w);
+        // `self.card_size` is set by `advance_frame` (same formula) before this runs; the
+        // local copy is what the tile-build loop below reads.
+        let (card_w, card_h) = ui::grid_card_size(available_w, columns);
 
         if self.sidebar_dirty || self.sidebar_layer.is_none() {
             let mut layer = match self.sidebar_layer.take() {
