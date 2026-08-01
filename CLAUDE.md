@@ -25,7 +25,7 @@ Layered by module, deps point inward (acyclic). Leaves first:
 
 - **`core/`** — pure domain, no `sdl2`/`tiny_skia`/I/O. `model` (`Settings`, `KnownHost`,
   `GameEntry`, `ConnectTarget`), `screen` (`Screen` + focus enums), `event` (`MenuEvent`/
-  `InputEvent`). Depends on nothing in-crate.
+  `InputEvent`).
 - **`ui/`** — presentation, `tiny_skia` only, **no `sdl2`**. `render` (`Rect`/`Color`/
   `TileId`/`DrawList` — platform-neutral draw types), `painter`, `text` +
   `text_raster` (`TextRaster` trait/`FontId`; glyph rasterization is a platform seam),

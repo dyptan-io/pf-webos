@@ -31,8 +31,19 @@ smoke-tested on device**):
   it references still live in `app`; relocating them (+ re-pathing `Settings`/`LogLevelOverride`
   to `core`) is A2's job. `TileCache` is already App-agnostic, so A2 can lift it into `ui`.
 
-Remaining: **A2** (move render methods onto the renderer behind `RenderInput`, incl. relocating
-the key enums to `ui`), **D** (emulator). Both need on-device screenshot verification.
+In progress: **A2**, staged one tile family at a time (per the plan's "one family at a time,
+old method delegating" note):
+- **A2 stage 1 (done, compile-verified, behavior-identical — no device test needed yet):**
+  `ui::RenderInput` + `App::render_input()` added; `draw_list`'s home/sidebar-chrome reads
+  (`host_selected`, `has_status`, `grid_reveal_ready`, `home_focus`, `entries`) now go through
+  the input slice. Struct grows as each family migrates.
+- **A2 remaining stages:** move the tile *build* + *compose* logic per family (sidebar → grid
+  → modal/focus → dropdown → scroll) onto `TileCache` methods taking `&RenderInput`, old `App`
+  method delegating until the last moves; then relocate the key enums (`ModalFocusKey`/
+  `ScrollContentKey`/`CardTile`) to `ui` and lift `TileCache` into `ui`. **Each family move
+  needs on-device screenshot verification before the next.**
+
+Remaining after A2: **D** (emulator). Needs on-device screenshot verification.
 
 ---
 
