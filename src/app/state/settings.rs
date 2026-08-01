@@ -119,7 +119,8 @@ impl App {
         };
         if crate::ui::adjust_setting(&mut self.settings, row, forward) {
             if let Some(from) = toggled_from {
-                self.switch_anim = Some((Instant::now(), from));
+                // Scope the slide to the display row being rendered (see `toggle_frac`).
+                self.switch_anim = Some((Instant::now(), from, display_row));
             }
         }
         // Cycling the codec can hide/show the HDR row above; keep focus on `row`.

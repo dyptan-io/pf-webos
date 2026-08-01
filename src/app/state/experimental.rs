@@ -25,12 +25,12 @@ impl App {
             (ui::EXP_ROW_FRAME_PACER, MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
                 let from = self.settings.video_pacing;
                 self.settings.video_pacing = !from;
-                self.switch_anim = Some((Instant::now(), from));
+                self.switch_anim = Some((Instant::now(), from, self.experimental_focused));
             }
             (ui::EXP_ROW_GAME_MODE, MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
                 let from = self.settings.game_mode;
                 self.settings.game_mode = !from;
-                self.switch_anim = Some((Instant::now(), from));
+                self.switch_anim = Some((Instant::now(), from, self.experimental_focused));
             }
             (_, MenuEvent::Back) => {
                 self.settings_writer.save(self.settings);

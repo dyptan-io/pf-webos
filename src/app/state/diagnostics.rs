@@ -57,13 +57,13 @@ impl App {
             (ui::DIAG_ROW_STATS_OVERLAY, MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
                 let from = self.settings.stats_overlay;
                 self.settings.stats_overlay = !from;
-                self.switch_anim = Some((Instant::now(), from));
+                self.switch_anim = Some((Instant::now(), from, self.diagnostics_focused));
             }
             (ui::DIAG_ROW_SHOW_LOGS, MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
                 let from = self.settings.show_logs;
                 self.settings.show_logs = !from;
                 crate::runtime::set_log_overlay_enabled(!from);
-                self.switch_anim = Some((Instant::now(), from));
+                self.switch_anim = Some((Instant::now(), from, self.diagnostics_focused));
             }
             (ui::DIAG_ROW_SEND_LOGS, MenuEvent::Confirm) => {
                 // Persist any pending diagnostics changes before leaving the screen —

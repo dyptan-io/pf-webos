@@ -432,8 +432,8 @@ pub enum ModalFocusKey {
     MenuRow(usize, String, bool),
     /// (focused row, log level, stats-overlay on, show-logs on) — any change invalidates the tile.
     DiagnosticsRow(usize, LogLevelOverride, bool, bool),
-    /// (focused row, frame-pacing on) — any change invalidates the tile.
-    ExperimentalRow(usize, bool),
+    /// (focused row, frame-pacing on, game-mode on) — any change invalidates the tile.
+    ExperimentalRow(usize, bool, bool),
     /// Which `Screen::SendLogs` button is focused (0 = Cancel, 1 = Send).
     SendLogsButton(usize),
 }

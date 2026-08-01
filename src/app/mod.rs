@@ -236,6 +236,7 @@ pub(crate) enum ModalShellKey {
     },
     Experimental {
         video_pacing: bool,
+        game_mode: bool,
         hover_close: bool,
     },
     /// Fixed warning copy + two buttons; only the close (X) hover varies.
@@ -442,10 +443,14 @@ pub struct App {
     /// button) since only one is ever open, and focused, at a time.
     pub(crate) modal_focus_anim: Option<Instant>,
     /// In-flight `Toggle` row flip: `(when it started, the value it flipped
-    /// from)` — lets `modal_focus_tile`'s render slide the switch knob from
-    /// its old state to its new one over `ui::FOCUS_POP` instead of snapping.
+    /// from, the focused row it flipped)` — lets `modal_focus_tile`'s render
+    /// slide the switch knob from its old state to its new one over
+    /// `ui::FOCUS_POP` instead of snapping. The row index scopes the slide to
+    /// the row that actually changed: without it, navigating onto a different
+    /// toggle whose state happens to differ from `from` mid-animation would
+    /// make that unrelated switch spuriously slide (see `toggle_frac`).
     /// Shared by Settings' HDR/Stats-overlay toggles and Wake's auto-send one.
-    pub(crate) switch_anim: Option<(Instant, bool)>,
+    pub(crate) switch_anim: Option<(Instant, bool, usize)>,
     /// Last screen `prepare_tiles` saw — a change triggers the modal-open
     /// animation and a modal re-rasterize without every transition site
     /// needing to remember to.
@@ -826,7 +831,7 @@ impl App {
             }
             animating = true;
         }
-        if let Some((t, _)) = self.switch_anim {
+        if let Some((t, _, _)) = self.switch_anim {
             if t.elapsed() >= ui::FOCUS_POP {
                 self.switch_anim = None;
             }
@@ -1441,11 +1446,13 @@ impl App {
 
     /// The current position (0.0..=1.0, see `ui::draw_switch`) of a `Toggle`
     /// row's switch given its settled state `target_on` — mid-slide while
-    /// `switch_anim` is in flight *for that same transition*, otherwise
-    /// settled at the endpoint.
-    pub(crate) fn toggle_frac(&self, target_on: bool) -> f32 {
+    /// `switch_anim` is in flight *for that same row and transition*, otherwise
+    /// settled at the endpoint. `row` is the focused row being rendered; the
+    /// slide only plays for the row that actually flipped, not a same-valued
+    /// neighbor focused mid-animation.
+    pub(crate) fn toggle_frac(&self, target_on: bool, row: usize) -> f32 {
         match self.switch_anim {
-            Some((t, from_on)) if from_on != target_on => {
+            Some((t, from_on, anim_row)) if anim_row == row && from_on != target_on => {
                 let f = ui::anim_frac(Some(t), ui::FOCUS_POP);
                 if target_on {
                     f
@@ -1820,6 +1827,7 @@ impl App {
             }),
             Screen::Experimental => Some(ModalShellKey::Experimental {
                 video_pacing: self.settings.video_pacing,
+                game_mode: self.settings.game_mode,
                 hover_close: self.hover_close,
             }),
             Screen::SendLogs => Some(ModalShellKey::SendLogs {
@@ -1937,6 +1945,7 @@ impl App {
             Screen::Experimental => Some(ModalFocusKey::ExperimentalRow(
                 self.experimental_focused,
                 self.settings.video_pacing,
+                self.settings.game_mode,
             )),
             Screen::SendLogs => Some(ModalFocusKey::SendLogsButton(self.send_logs_focused)),
             // Neither has a single focused widget: the address form is one always-active
@@ -1963,7 +1972,7 @@ impl App {
                             content.width(),
                             self.settings_focused,
                             dropdown_open,
-                            self.toggle_frac(target_on),
+                            self.toggle_frac(target_on, self.settings_focused),
                         )?
                     }
                     Screen::Wake => {
@@ -2061,7 +2070,7 @@ impl App {
                             content.width(),
                             self.wake_settings_focused,
                             false,
-                            self.toggle_frac(on),
+                            self.toggle_frac(on, self.wake_settings_focused),
                         )?
                     }
                     Screen::SpeedTest => {
@@ -2101,7 +2110,7 @@ impl App {
                             content.width(),
                             self.diagnostics_focused,
                             dropdown_open,
-                            self.toggle_frac(target_on),
+                            self.toggle_frac(target_on, self.diagnostics_focused),
                         )?
                     }
                     Screen::Experimental => {
@@ -2117,7 +2126,7 @@ impl App {
                             content.width(),
                             self.experimental_focused,
                             false,
-                            self.toggle_frac(target_on),
+                            self.toggle_frac(target_on, self.experimental_focused),
                         )?
                     }
                     Screen::SendLogs => {
