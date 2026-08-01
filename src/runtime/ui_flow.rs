@@ -56,7 +56,7 @@ pub(super) fn run_ui_flow(
     let mut app = App::new(identity.clone());
     // The GPU tile cache is the render loop's, not App's — App holds only screen state
     // (see docs/REMAINING_IMPROVEMENTS.md A2). Recreated per menu entry, same as `app`.
-    let mut tiles = crate::app::TileCache::new();
+    let mut tiles = crate::ui::TileCache::new();
     // Upload every spinner frame's GPU texture now, once, rather than letting each
     // frame's first appearance create it lazily inside the render loop. `upload_raw`
     // creates a *new* static texture (allocation, not just a pixel copy) the first

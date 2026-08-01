@@ -75,6 +75,71 @@ Remaining after A2: **D** (emulator). Needs on-device screenshot verification.
 
 ---
 
+## Handoff — codebase state as of A2 phase 2 (read this before continuing A2/D)
+
+**Where the render code lives now:**
+- `src/app/mod.rs` — all render methods, still on `impl App`, each taking a `tiles` param:
+  - `prepare_tiles(&mut self, tiles: &mut TileCache, text_cache, fonts, w, h, content_dirty, screen_changed)`
+    — ~50-line driver that calls the five family builders below.
+  - Builders: `prepare_sidebar`, `prepare_grid`, `prepare_modal`, `prepare_dropdown`,
+    `prepare_scroll` — all `(&mut self, tiles: &mut TileCache, …)`, push changed `Tile`s onto an
+    `&mut Vec<Tile>`.
+  - `draw_list(&self, tiles: &TileCache, w, h, fonts) -> DrawList` — composes the frame; calls
+    `compose_sidebar_focus` (a `static` fn taking `&RenderInput` only — the pattern to copy),
+    `compose_grid(&self, …)` (needs no `tiles` — it only emits `Tile::Card` ids), and
+    `compose_modal(&self, tiles: &TileCache, …)`.
+  - `tile_pixmap<'a>(&self, tiles: &'a TileCache, tile) -> Option<&'a Painter>` — upload lookup.
+  - `advance_frame(&mut self, w) -> bool` — sets `self.card_size`, advances modal fades, returns
+    `screen_changed`. **No `tiles` param** (card_size is an App field now).
+  - `render_input(&self) -> ui::RenderInput<'_>` — builds the read-only slice.
+- `src/app/tiles.rs` — `pub(crate) struct TileCache` (the `Painter` cache), re-exported as
+  `crate::app::TileCache`. `card_tiles` is now `HashMap<String, Painter>` (the `CardTile` struct
+  is gone; its `pop_since` clock moved to `App.card_pop`).
+- `src/ui/render_input.rs` — `ui::RenderInput<'a>`. **Deliberately minimal**: only the fields
+  already migrated (`home_focus`, `entries`, `host_selected`, `has_status`, `grid_reveal_ready`).
+  Grow it as you migrate reads. Consumed today only by `draw_list` + `compose_sidebar_focus`.
+- `src/runtime/ui_flow.rs` — owns the cache: `let mut tiles = crate::app::TileCache::new();`
+  (recreated per menu entry, same lifetime as `App::new`). Threads it into `app.prepare_tiles`,
+  `app.tile_pixmap`, `app.draw_list`. `stream.rs` does not use these menu tiles.
+- Keys still in `src/app/mod.rs`: `ModalShellKey`, `ModalFocusKey`, `ScrollContentKey`.
+
+**Gotchas discovered (don't relearn these the hard way):**
+- **Borrow conflict is why `tiles` is a param, not a field.** `render_input()` borrows `&self`;
+  a tile *builder* needs `&mut` the cache. While the cache was a field of `App`, holding an
+  `&RenderInput` (an `&self` borrow) and mutating `self.tiles` at once was rejected. With the
+  cache as a separate parameter the two borrows are disjoint. **Do not** move the cache back onto
+  `App` — it will re-block the `RenderInput` conversion.
+- **`card_pop` behavior (unverified on device as of this writing):** the reorder replay
+  (`replay_reorder_pop` in `src/app/state/home.rs`) now re-arms pop clocks *unconditionally*
+  (old code gated on a currently-built `CardTile`). Reasoned-equivalent because an unbuilt card
+  has no visible pop and gets a fresh clock when `prepare_grid` builds it — but confirm card
+  pop-in on library load / scroll-back / pin-unpin looks right.
+- Pop clocks are evicted in lockstep with their tiles in `prepare_grid` (drain→`card_pop.clear()`,
+  per-id removes→`card_pop.remove`). Keep that invariant or the map leaks / stales.
+- `prepare_tiles` has 8 args → carries `#[allow(clippy::too_many_arguments)]`. Clippy is
+  `-D warnings` in CI; keep the allow or bundle args into a struct.
+
+**The coupling that blocks "move render methods onto `impl ui::TileCache`" (the A2 tail):**
+The `prepare_*`/`compose_*` bodies call App-side helpers that read broad state and live outside
+`ui`. A future agent must break these before the methods can move to `ui`:
+- `prepare_modal` → `render_settings`/`render_pairing`/`render_wake`/`render_host_menu`/… (all
+  `app::view::*`, they rasterize a whole modal shell) plus `host_menu_actions`,
+  `host_menu_subtitle`, `settings_layout`, `speed_test_status`, `wake_settings_*`,
+  `diagnostics_*`, `experimental_*` (state/geometry readers).
+- `prepare_scroll` → `settings_layout`, `ui::about_card_rect`/`about_body_rect`,
+  `ensure_about_wrapped`, `scroll_geometry`, `scroll_stride`, `sync_modal_scroll`.
+- `prepare_dropdown` → `settings_layout`, `ui::settings_logical_row`, `ui::dropdown_options`,
+  `diagnostics_subtitle`/`diagnostics_card_rect`.
+- `compose_modal`/`compose_grid` → dozens of `Self::*_rect` / `ui::*_rect` geometry helpers and
+  `scroll_geometry_for`, `scroll_stride_for`, `dropdown_geom`, `dropdown_draw_state`,
+  `scrolled_card_rect`, `pinned_separator_rect`, `card_pop_frac`, `selected_known_host`.
+  The pure-geometry `*_rect` helpers (`ui::*`) are fine; the `Self::*` ones read state.
+Practical implication: the shell **rasterization** (`render_settings` et al.) can't be expressed
+as `RenderInput` data — it *is* App-driven drawing. Moving it to `ui` means moving `app::view::*`
+into `ui` (taking a `RenderInput`), which is a whole separate project. **Recommendation:** do NOT
+chase "methods on `impl TileCache`" for its own sake. The ownership split already achieved is the
+valuable, shippable outcome. Only pursue the move as far as D actually forces (see below).
+
 ## Current coupling (the thing to fix in A)
 
 `app/mod.rs` (~2970 lines) fuses two responsibilities in one `App` struct:

@@ -5,7 +5,6 @@
 //! and `view` (geometry + draw-list building). Keeping them under `app` lets `ui`/`core`
 //! stay dependency leaves — neither reaches back into `App`.
 pub(crate) mod state;
-pub(crate) mod tiles;
 pub(crate) mod view;
 
 use std::time::{Duration, Instant};
@@ -19,8 +18,7 @@ use crate::core::model::GameEntry;
 pub use crate::core::screen::{HomeFocus, PairingFocus, Screen};
 use crate::services::store::{self, KnownHost, Settings};
 use crate::ui::render::{DrawCmd, TileId as Tile};
-use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};
-pub(crate) use tiles::TileCache;
+use crate::ui::{self, AddHostState, HostEntry, MenuEvent, ModalFocusKey, Painter, ScrollContentKey, TileCache};
 
 /// Rows beyond viewport kept rasterized (prevents scroll stalls).
 const CARD_PREFETCH_ROWS: i32 = 2;
@@ -239,37 +237,6 @@ pub(crate) enum ModalShellKey {
     SendLogs {
         hover_close: bool,
     },
-}
-
-/// Focused widget in the open modal. Each variant carries its content,
-/// so value changes (not just focus moves) invalidate the tile.
-#[derive(PartialEq)]
-pub(crate) enum ModalFocusKey {
-    SettingsRow(usize, Settings),
-    WakeToggle(bool),
-    WakeButton(usize),
-    PairingDigit(usize, u8),
-    PairingButton,
-    ForgetButton(usize),
-    /// Carries label to prevent stale tiles across screen changes.
-    SpeedTestButton(usize, String),
-    /// Carries label+menu flag for row list shape changes and ⋯ state.
-    MenuRow(usize, String, bool),
-    /// (focused row, log level, stats-overlay on, show-logs on) — any change invalidates the tile.
-    DiagnosticsRow(usize, store::LogLevelOverride, bool, bool),
-    /// (focused row, frame-pacing on) — any change invalidates the tile.
-    ExperimentalRow(usize, bool),
-    /// Which `Screen::SendLogs` button is focused (0 = Cancel, 1 = Send).
-    SendLogsButton(usize),
-}
-
-/// Scrollable modal content keys. Paired with Screen for staleness checks.
-#[derive(Clone, PartialEq)]
-pub(crate) enum ScrollContentKey {
-    /// Settings row list + open dropdown row.
-    Settings(Settings, Option<usize>),
-    /// About window's start line.
-    About(usize),
 }
 
 pub struct App {
