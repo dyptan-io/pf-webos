@@ -2,23 +2,18 @@
 
 ## What this is
 
-Native LG webOS TV client for [punktfunk](https://git.unom.io/unom/punktfunk) — low-latency desktop/game streaming. Targets webOS 5.x+. Built directly on `punktfunk-core` (pinned git dep), not upstream `pf-client-core` (drags FFmpeg/PipeWire/SDL3).
-
-**Read `docs/NOTES.md` before touching video decode, rendering perf, toolchain, input** — on-device findings + "don't re-attempt" list.
+Native LG webOS TV client for [punktfunk](https://git.unom.io/unom/punktfunk) — low-latency desktop/game streaming. Targets webOS 5.x+. Built on `punktfunk-core` (pinned git dep), not upstream `pf-client-core` (drags FFmpeg/PipeWire/SDL3).
 
 ## Commands
 
-Via [go-task](https://taskfile.dev) (`task --list`). Bare `build`/`check`/`lint`/`package` run natively (Linux-aarch64 host, how CI runs); `docker:*` variants wrap them in Docker for local dev (cross-toolchain Linux-aarch64-only, so only Docker needed locally).
+Via [go-task](https://taskfile.dev) (`task --list`). Bare `build`/`check`/`lint`/`package` run natively (Linux-aarch64 host, how CI runs); `docker:*` variants wrap in Docker for local dev (cross-toolchain Linux-aarch64-only, so only Docker needed locally).
 
 | Task | What it does |
 | --- | --- |
 | `task docker:package` | Build + package `dist/*.ipk` (native: `task package`) |
 | `task docker:build` / `task docker:check` | Compile release / quick `cargo check` |
 | `task docker:lint` / `task fmt` | `cargo clippy` (Docker) / `cargo fmt` |
-| `task deploy TV_HOST=root@<tv-ip>` | Build, package, install, launch on TV over SSH |
-| `task deploy ... TELEMETRY=auto` | Live app logs to this machine over TCP (no rebuild needed; see `src/logger.rs`). Set `TELEMETRY=<host:port>` or `TELEMETRY_LEVEL=debug\|info\|warn\|error` |
-| `task shell` | Interactive Docker shell (debugging) |
-| `task clean` / `task clean:all` | Remove `dist/`, or everything |
+| `task deploy ... TELEMETRY=auto` | Live app logs to this machine over TCP (no rebuild; see `src/logger.rs`). Set `TELEMETRY=<host:port>` or `TELEMETRY_LEVEL=debug\|info\|warn\|error` |
 
 Set `TV_HOST` in `.env` (copy `.env.example`). `task -s` skips echo. No test suite — verify via `task deploy TELEMETRY=auto` on real hardware or native `cargo check` (macOS/Windows use stub).
 
@@ -26,43 +21,39 @@ Set `TV_HOST` in `.env` (copy `.env.example`). `task -s` skips echo. No test sui
 
 ## Architecture
 
-Layered by module, dependencies point inward (acyclic). Leaves first:
+Layered by module, deps point inward (acyclic). Leaves first:
 
 - **`core/`** — pure domain, no `sdl2`/`tiny_skia`/I/O. `model` (`Settings`, `KnownHost`,
   `GameEntry`, `ConnectTarget`), `screen` (`Screen` + focus enums), `event` (`MenuEvent`/
   `InputEvent`). Depends on nothing in-crate.
 - **`ui/`** — presentation, `tiny_skia` only, **no `sdl2`**. `render` (`Rect`/`Color`/
-  `TileId`/`DrawList` — the platform-neutral draw types), `painter`, `text` +
+  `TileId`/`DrawList` — platform-neutral draw types), `painter`, `text` +
   `text_raster` (`TextRaster` trait/`FontId`; glyph rasterization is a platform seam),
-  and shared primitives (`sidebar`/`rows`/`cards`/`modal`/`tiles`/…). Depends on `core` only.
+  shared primitives (`sidebar`/`rows`/`cards`/`modal`/`tiles`/…). Depends on `core` only.
 - **`services/`** — portable I/O: `store` (JSON persistence), `discovery` (mDNS),
   `library` (mTLS REST), `art`, `wol`. Depends on `core`.
 - **`session/`** — streaming orchestration on `punktfunk-core`: `session::connect` spawns
   the video pump thread; `session/pacing.rs` is the PTS pacer.
-- **`platform/webos/`** — the SDL2/hardware boundary (all `#[cfg(target_os = "linux")]`):
+- **`platform/webos/`** — SDL2/hardware boundary (all `#[cfg(target_os = "linux")]`):
   `compositor` (translates `ui::DrawList` → SDL textures, owns the texture cache),
   `input` (SDL events → `InputEvent`), `text_sdl` (SDL2_ttf impl of `TextRaster`),
   video (`ndl`/`starfish`/`luna`), `audio`, `device`, `gamepad`/`keyboard`/`mouse`/
-  `dualsense`, and the C build shims.
-- **`app/`** — the `App` state machine. Per-screen `impl App` blocks are split by concern:
+  `dualsense`, C build shims.
+- **`app/`** — the `App` state machine. Per-screen `impl App` blocks split by concern:
   `app::state::<screen>` (event handling/transitions) and `app::view::<screen>` (geometry +
-  draw-list building). Kept under `app` — not `core`/`ui` — so those stay dependency leaves.
-  `App` also owns the GPU tile cache (`sidebar_layer`, `card_tiles`, `modal_tile`, … —
-  rasterized-once `Painter`s that `prepare_tiles`/`draw_list` rebuild and compose per frame),
-  since those fields are `tiny_skia`-typed.
-- **`runtime/`** — the top-level loop (was `main.rs`'s `mod real`): `mod.rs` (`run()`, connect
+  draw-list building).
+- **`runtime/`** — top-level loop (was `main.rs`'s `mod real`): `mod.rs` (`run()`, connect
   spawn, signal handlers, log-overlay state, shared input/dialog helpers), `ui_flow.rs`
-  (`run_ui_flow`, the menu loop), `stream.rs` (`run_inner`, the streaming loop). `main.rs` is
-  thin (~50 lines): module declarations + the non-linux stub + `main()`.
+  (`run_ui_flow`, the menu loop), `stream.rs` (`run_inner`, the streaming loop).
 
 Add a screen: build on `ui::ListModal` (see `app/state/hostmenu.rs` / `app/view/hostmenu.rs`);
 the `Screen` enum has eight dispatch sites across `app/mod.rs` and `runtime/` (compiler finds
 all at once, mechanical but safe). Rendering: `tiny_skia` software framebuffer,
 redraw-on-change (`dirty` flag, no time-based animation).
 
-**Platform gating**: only the SDL2/webOS-linked layers are `#[cfg(target_os = "linux")]` in
-`main.rs` — `app`, `platform`, `session`, `runtime`. The platform-independent layers (`core`,
-`ui`, `services`, `errors`, `logger`) are ungated and build on any host (their deps —
+**Platform gating**: only SDL2/webOS-linked layers are `#[cfg(target_os = "linux")]` in
+`main.rs` — `app`, `platform`, `session`, `runtime`. Platform-independent layers (`core`,
+`ui`, `services`, `errors`, `logger`) ungated, build on any host (their deps —
 `tiny-skia`, `image`, `ureq`, `rustls` — are base; only `sdl2`/`opus`/`libc` stay Linux-gated
 in `Cargo.toml`). webOS target reports Linux same as dev box; macOS/Windows get a stub
 `anyhow::bail!` in `main()` — builds stay green without SDL2, and now typecheck `ui`/`core`/
@@ -86,4 +77,4 @@ maps SDL2 events to `InputEvent`s.
 
 ## Code comments
 
-**Only when necessary**: no comments repeating obvious code. Concise WHY comments (non-obvious invariants, platform workarounds, subtle constraints) only when needed.
+**Only when necessary**: no comments repeating obvious code. Concise WHY comments (non-obvious invariants, platform workarounds, subtle constraints) only.

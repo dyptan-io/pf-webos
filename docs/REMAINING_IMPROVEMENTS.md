@@ -19,6 +19,7 @@ Priority order: **A** (highest value, largest), then **B**, **C**, **D** (stretc
 
 Done (verified: `docker:check` + `docker:lint` clean, macOS `cargo check` 0 warnings; **not yet
 smoke-tested on device**):
+
 - **C2** — crate-root `#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]`.
 - **C1** — `Rect::right/bottom/offset` added and adopted (no `center()`: no call site yet).
 - **B** — menu-input plumbing moved to `runtime/input.rs` (`pub(super)`, re-exported via `use input::*`).

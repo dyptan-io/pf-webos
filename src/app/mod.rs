@@ -2413,7 +2413,20 @@ impl App {
     /// params are only for pure geometry — `ui::modal_header_end_y` and
     /// friends — needed to position a modal's focused-widget tile without
     /// re-rendering its header). The GPU executes it (`Compositor::execute`).
+    /// Assembles the read-only view of state the render path consumes (see
+    /// `ui::RenderInput`). Grows as families migrate off direct `self` reads.
+    pub fn render_input(&self) -> ui::RenderInput<'_> {
+        ui::RenderInput {
+            home_focus: self.home_focus,
+            entries: &self.entries,
+            host_selected: self.selected_host.is_some(),
+            has_status: self.home_status.is_some(),
+            grid_reveal_ready: self.grid_reveal_ready,
+        }
+    }
+
     pub fn draw_list(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> ui::render::DrawList {
+        let input = self.render_input();
         let mut cmds = Vec::new();
         let grid_x = ui::SIDEBAR_W as i32;
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
@@ -2425,7 +2438,7 @@ impl App {
             alpha: 0xff,
         });
 
-        if self.selected_host.is_none() {
+        if !input.host_selected {
             if let Some(p) = &self.tiles.nohost_tile {
                 cmds.push(DrawCmd::Tex {
                     tile: Tile::NoHost,
@@ -2433,7 +2446,7 @@ impl App {
                     alpha: 0xff,
                 });
             }
-        } else if !self.grid_reveal_ready {
+        } else if !input.grid_reveal_ready {
             let phase = self.spinner_since.map_or(0.0, |s| s.elapsed().as_secs_f32());
             let (idx, frame) = ui::spinner_frame_at(phase);
             let x = grid_x + (available_w as i32 - frame.width as i32) / 2;
@@ -2561,7 +2574,7 @@ impl App {
                 }
             }
         }
-        if self.home_status.is_some() {
+        if input.has_status {
             if let Some((_, p)) = &self.tiles.status_tile {
                 let line_h = fonts.raster.height(fonts.label) + 6;
                 let box_h = 2 * line_h as u32 + 2 * STATUS_BG_PAD as u32;
@@ -2579,12 +2592,12 @@ impl App {
             }
         }
 
-        let sidebar_focus_row = match self.home_focus {
+        let sidebar_focus_row = match input.home_focus {
             HomeFocus::Sidebar(i) | HomeFocus::SidebarMenu(i) => Some(i),
             HomeFocus::Grid(_) => None,
         };
         if let Some(i) = sidebar_focus_row {
-            let rect = if i == self.entries.len() + 1 {
+            let rect = if i == input.entries.len() + 1 {
                 ui::settings_row_rect(screen_h)
             } else {
                 ui::sidebar_row_rect(i)
