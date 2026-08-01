@@ -1,5 +1,10 @@
 //! Native webOS TV client for punktfunk (see `docs/NOTES.md` for architecture).
 //! Platform-gated to `target_os` = "linux" (both webOS and Linux dev boxes).
+//
+// `app`/`platform`/`session`/`runtime` are cfg-gated out on non-Linux hosts, so the `ui`/`core`/
+// `services` items (and the glob re-exports feeding them) that they consume look "never used" on
+// the macOS host build. Silence that there only — the Linux CI build still surfaces real dead code.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 #[cfg(target_os = "linux")]
 mod app;
 mod core;
