@@ -32,9 +32,21 @@ impl Rect {
         self.h
     }
 
+    pub fn right(&self) -> i32 {
+        self.x + self.w as i32
+    }
+
+    pub fn bottom(&self) -> i32 {
+        self.y + self.h as i32
+    }
+
+    pub fn offset(self, dx: i32, dy: i32) -> Self {
+        Self::new(self.x + dx, self.y + dy, self.w, self.h)
+    }
+
     pub fn contains_point(&self, p: (i32, i32)) -> bool {
         let (px, py) = p;
-        px >= self.x && px < self.x + self.w as i32 && py >= self.y && py < self.y + self.h as i32
+        px >= self.x && px < self.right() && py >= self.y && py < self.bottom()
     }
 
     /// Overlap of `self` and `other`, or `None` if they don't intersect (matches
@@ -42,8 +54,8 @@ impl Rect {
     pub fn intersection(&self, other: Self) -> Option<Self> {
         let x1 = self.x.max(other.x);
         let y1 = self.y.max(other.y);
-        let x2 = (self.x + self.w as i32).min(other.x + other.w as i32);
-        let y2 = (self.y + self.h as i32).min(other.y + other.h as i32);
+        let x2 = self.right().min(other.right());
+        let y2 = self.bottom().min(other.bottom());
         if x2 <= x1 || y2 <= y1 {
             return None;
         }

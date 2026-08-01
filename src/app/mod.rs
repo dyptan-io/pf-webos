@@ -2507,7 +2507,7 @@ impl App {
                     continue;
                 };
                 let r = self.scrolled_card_rect(idx, columns, grid_x, available_w);
-                if r.y() + r.height() as i32 + pad < 0 || r.y() - pad > screen_h as i32 {
+                if r.bottom() + pad < 0 || r.y() - pad > screen_h as i32 {
                     continue; // culled — fully off-screen at this scroll offset
                 }
                 // A card that just landed is still zooming up to full size.
@@ -2590,7 +2590,7 @@ impl App {
                     if self.selected_known_host().is_some_and(|h| h.is_pinned(pin_id)) {
                         let badge = ui::PIN_BADGE_SIZE;
                         let badge_base = Rect::new(
-                            r.x() + r.width() as i32 - badge as i32 - PIN_BADGE_MARGIN,
+                            r.right() - badge as i32 - PIN_BADGE_MARGIN,
                             r.y() + PIN_BADGE_MARGIN,
                             badge,
                             badge,
@@ -2691,7 +2691,7 @@ impl App {
                 cmds.push(DrawCmd::TexCropped {
                     tile: Tile::ScrollContent(screen),
                     src: Rect::new(0, src_y, content.width(), content.height()),
-                    dst: Rect::new(content.x(), content.y() + dy, content.width(), content.height()),
+                    dst: content.offset(0, dy),
                     alpha: (255.0 * m) as u8,
                 });
                 // Bottom fade, only while rows remain below the viewport — it is the
@@ -2917,7 +2917,7 @@ impl App {
                         // offset isn't derived from either modal's own width fraction —
                         // re-check both if either changes.
                         let dst = Rect::new(
-                            card.x() + card.width() as i32 - 26,
+                            card.right() - 26,
                             content.y() + dy,
                             SCROLL_INDICATOR_TILE_W,
                             content.height(),

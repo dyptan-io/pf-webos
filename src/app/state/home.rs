@@ -348,7 +348,7 @@ impl App {
         let viewport_bottom = screen_h as i32 - ui::GRID_PAD;
         let max_scroll = self.max_grid_scroll(columns, available_w, screen_h);
         let card_top = r.y() - FOCUS_MARGIN;
-        let card_bottom = r.y() + r.height() as i32 + FOCUS_MARGIN;
+        let card_bottom = r.bottom() + FOCUS_MARGIN;
         let mut target = self.grid_scroll_target;
         if card_top - target < viewport_top {
             target = card_top - viewport_top;

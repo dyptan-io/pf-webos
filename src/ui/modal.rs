@@ -77,7 +77,7 @@ pub fn modal_close_rect(card_rect: Rect) -> Rect {
     const SIZE: u32 = 44;
     const MARGIN: i32 = 20;
     Rect::new(
-        card_rect.x() + card_rect.width() as i32 - MARGIN - SIZE as i32,
+        card_rect.right() - MARGIN - SIZE as i32,
         card_rect.y() + MARGIN,
         SIZE,
         SIZE,
@@ -109,10 +109,7 @@ pub fn draw_or_divider(
     let half = (content.width() as i32 - word_w - 2 * gap) / 2;
     if half > 0 {
         painter.fill_rect(Rect::new(content.x(), line_y, half as u32, 1), rule);
-        painter.fill_rect(
-            Rect::new(content.x() + content.width() as i32 - half, line_y, half as u32, 1),
-            rule,
-        );
+        painter.fill_rect(Rect::new(content.right() - half, line_y, half as u32, 1), rule);
     }
     draw_text(
         painter,

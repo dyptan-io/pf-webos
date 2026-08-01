@@ -84,7 +84,7 @@ pub fn about_card_rect(screen_w: u32, screen_h: u32) -> Rect {
 pub fn about_body_rect(card: Rect, fonts: &Fonts) -> Rect {
     let header_end = modal_header_end_y(fonts.raster, fonts.label, fonts.value, card, ABOUT_SUBTITLE_PROBE);
     let top = header_end + 20;
-    let bottom = card.y() + card.height() as i32 - 28;
+    let bottom = card.bottom() - 28;
     Rect::new(
         card.x() + SIDE_PAD,
         top,

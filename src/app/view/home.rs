@@ -22,7 +22,7 @@ impl App {
     pub(crate) fn unscrolled_card_rect(&self, idx: usize, columns: usize, grid_x: i32, available_w: u32) -> Rect {
         let r = ui::grid_card_rect(idx, columns, grid_x, available_w);
         let extra = self.extra_row_gap(idx, columns);
-        Rect::new(r.x(), r.y() + extra, r.width(), r.height())
+        r.offset(0, extra)
     }
 
     /// `unscrolled_card_rect`, translated by the current scroll offset — every

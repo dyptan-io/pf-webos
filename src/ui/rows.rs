@@ -222,7 +222,7 @@ pub fn draw_focus_row(
     let control_pad = 28;
     match row.kind {
         RowKind::Dropdown => {
-            let right_edge = row_rect.x() + row_rect.width() as i32 - control_pad;
+            let right_edge = row_rect.right() - control_pad;
             draw_dropdown_value(
                 painter,
                 text_cache,
@@ -235,7 +235,7 @@ pub fn draw_focus_row(
         }
         RowKind::Slider => {
             let value_w = fonts.raster.measure(fonts.value, &row.value).0;
-            let slot_right = row_rect.x() + row_rect.width() as i32 - control_pad;
+            let slot_right = row_rect.right() - control_pad;
             draw_text(
                 painter,
                 text_cache,
@@ -257,7 +257,7 @@ pub fn draw_focus_row(
         }
         RowKind::Toggle => {
             let switch = Rect::new(
-                row_rect.x() + row_rect.width() as i32 - control_pad - 64,
+                row_rect.right() - control_pad - 64,
                 row_rect.y() + (row_rect.height() as i32 - 34) / 2,
                 64,
                 34,
@@ -275,7 +275,7 @@ pub fn draw_focus_row(
                     fonts.raster,
                     fonts.value,
                     &row.value,
-                    row_rect.x() + row_rect.width() as i32 - control_pad - menu_w - value_w as i32,
+                    row_rect.right() - control_pad - menu_w - value_w as i32,
                     row_rect.y() + (row_rect.height() as i32 - fonts.raster.height(fonts.value)) / 2,
                     MUTED,
                 )?;

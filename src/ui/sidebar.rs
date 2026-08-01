@@ -42,7 +42,7 @@ const PRESENCE_DOT: f32 = 9.0;
 pub fn sidebar_menu_button_rect(row_rect: Rect) -> Rect {
     let inset = 10i32;
     Rect::new(
-        row_rect.x() + row_rect.width() as i32 - SIDEBAR_MENU_BTN as i32 - inset,
+        row_rect.right() - SIDEBAR_MENU_BTN as i32 - inset,
         row_rect.y() + (row_rect.height() as i32 - SIDEBAR_MENU_BTN as i32) / 2,
         SIDEBAR_MENU_BTN,
         SIDEBAR_MENU_BTN,
