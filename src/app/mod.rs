@@ -1482,28 +1482,16 @@ impl App {
         screen_changed
     }
 
-    /// Rasterizes every stale tile (tiny-skia, CPU — the only place rasterization
-    /// happens) and returns which tiles need their GPU texture re-uploaded.
-    /// `content_dirty` is the main loop's "an event/drain changed something this
-    /// tick" flag — it forces the open modal's tile to re-rasterize, since modal
-    /// content has no finer dirty tracking of its own. Pure animation frames pass
-    /// `false` and rasterize nothing at all. Call `advance_frame` first.
-    pub fn prepare_tiles(
+    /// Sidebar family: the focus-free strip (rebuilt on content change) plus the
+    /// single focused-row overlay tile. Pushes any rebuilt tiles onto `updated`.
+    /// Extracted from `prepare_tiles` as a self-contained family (A2 staging).
+    fn prepare_sidebar(
         &mut self,
         text_cache: &mut crate::ui::TextCache,
         fonts: &ui::Fonts,
-        screen_w: u32,
         screen_h: u32,
-        content_dirty: bool,
-        screen_changed: bool,
-    ) -> Result<Vec<Tile>> {
-        let mut updated = Vec::new();
-        let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
-        let columns = ui::grid_columns(available_w);
-        // `self.tiles.card_size` is set by `advance_frame` (same formula) before this runs; the
-        // local copy is what the tile-build loop below reads.
-        let (card_w, card_h) = ui::grid_card_size(available_w, columns);
-
+        updated: &mut Vec<Tile>,
+    ) -> Result<()> {
         if self.sidebar_dirty || self.tiles.sidebar_layer.is_none() {
             let mut layer = match self.tiles.sidebar_layer.take() {
                 Some(l) => l,
@@ -1540,6 +1528,32 @@ impl App {
                 updated.push(Tile::FocusRow);
             }
         }
+        Ok(())
+    }
+
+    /// Rasterizes every stale tile (tiny-skia, CPU — the only place rasterization
+    /// happens) and returns which tiles need their GPU texture re-uploaded.
+    /// `content_dirty` is the main loop's "an event/drain changed something this
+    /// tick" flag — it forces the open modal's tile to re-rasterize, since modal
+    /// content has no finer dirty tracking of its own. Pure animation frames pass
+    /// `false` and rasterize nothing at all. Call `advance_frame` first.
+    pub fn prepare_tiles(
+        &mut self,
+        text_cache: &mut crate::ui::TextCache,
+        fonts: &ui::Fonts,
+        screen_w: u32,
+        screen_h: u32,
+        content_dirty: bool,
+        screen_changed: bool,
+    ) -> Result<Vec<Tile>> {
+        let mut updated = Vec::new();
+        let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
+        let columns = ui::grid_columns(available_w);
+        // `self.tiles.card_size` is set by `advance_frame` (same formula) before this runs; the
+        // local copy is what the tile-build loop below reads.
+        let (card_w, card_h) = ui::grid_card_size(available_w, columns);
+
+        self.prepare_sidebar(text_cache, fonts, screen_h, &mut updated)?;
 
         // Reset before the branch: it is only ever set inside it, and a stale `true` left
         // behind by a host that has since been deselected would spin the render loop at
@@ -2425,6 +2439,34 @@ impl App {
         }
     }
 
+    /// Sidebar family compose: the focused-row highlight overlay (the strip itself
+    /// is an unconditional `Tile::Sidebar` blit in `draw_list`). Reads only the
+    /// `RenderInput` slice — a template for the per-family `TileCache::compose` split.
+    fn compose_sidebar_focus(input: &ui::RenderInput<'_>, screen_h: u32, cmds: &mut Vec<DrawCmd>) {
+        let sidebar_focus_row = match input.home_focus {
+            HomeFocus::Sidebar(i) | HomeFocus::SidebarMenu(i) => Some(i),
+            HomeFocus::Grid(_) => None,
+        };
+        if let Some(i) = sidebar_focus_row {
+            let rect = if i == input.entries.len() + 1 {
+                ui::settings_row_rect(screen_h)
+            } else {
+                ui::sidebar_row_rect(i)
+            };
+            let pad = ui::ROW_TILE_PAD;
+            cmds.push(DrawCmd::Tex {
+                tile: Tile::FocusRow,
+                dst: Rect::new(
+                    rect.x() - pad,
+                    rect.y() - pad,
+                    rect.width() + 2 * pad as u32,
+                    rect.height() + 2 * pad as u32,
+                ),
+                alpha: 0xff,
+            });
+        }
+    }
+
     pub fn draw_list(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> ui::render::DrawList {
         let input = self.render_input();
         let mut cmds = Vec::new();
@@ -2592,28 +2634,7 @@ impl App {
             }
         }
 
-        let sidebar_focus_row = match input.home_focus {
-            HomeFocus::Sidebar(i) | HomeFocus::SidebarMenu(i) => Some(i),
-            HomeFocus::Grid(_) => None,
-        };
-        if let Some(i) = sidebar_focus_row {
-            let rect = if i == input.entries.len() + 1 {
-                ui::settings_row_rect(screen_h)
-            } else {
-                ui::sidebar_row_rect(i)
-            };
-            let pad = ui::ROW_TILE_PAD;
-            cmds.push(DrawCmd::Tex {
-                tile: Tile::FocusRow,
-                dst: Rect::new(
-                    rect.x() - pad,
-                    rect.y() - pad,
-                    rect.width() + 2 * pad as u32,
-                    rect.height() + 2 * pad as u32,
-                ),
-                alpha: 0xff,
-            });
-        }
+        Self::compose_sidebar_focus(&input, screen_h, &mut cmds);
 
         // While closing, `self.screen` has already moved on — render the fade's
         // captured screen instead, so the still-uploaded tiles keep drawing for one
