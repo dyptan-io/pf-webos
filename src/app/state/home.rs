@@ -258,12 +258,12 @@ impl App {
             .filter_map(|idx| layout.pin_id_at(&self.games, idx).map(str::to_string))
             .collect();
         if !was_pinned {
-            if let Some(card) = self.card_tiles.get_mut(id) {
+            if let Some(card) = self.tiles.card_tiles.get_mut(id) {
                 card.pop_since = Some(now);
             }
         }
         for pin_id in rest_ids {
-            if let Some(card) = self.card_tiles.get_mut(&pin_id) {
+            if let Some(card) = self.tiles.card_tiles.get_mut(&pin_id) {
                 card.pop_since = Some(now);
             }
         }
@@ -306,7 +306,10 @@ impl App {
     /// Eased 0..=1 progress of pin id `id`'s zoom-in (see `CardTile::pop_since`)
     /// — 1.0, full size, for anything not animating.
     pub(crate) fn card_pop_frac(&self, id: &str) -> f32 {
-        ui::anim_frac(self.card_tiles.get(id).and_then(|c| c.pop_since), crate::app::CARD_POP)
+        ui::anim_frac(
+            self.tiles.card_tiles.get(id).and_then(|c| c.pop_since),
+            crate::app::CARD_POP,
+        )
     }
 
     /// Whether the pinned front block is followed by anything — false when
@@ -456,7 +459,7 @@ impl App {
                     .and_then(|h| h.fingerprint);
                 // Covers are requested per card as the grid window reaches them (see
                 // `App::prepare_tiles`), not fetched for the whole library up front.
-                let (card_w, card_h) = self.card_size;
+                let (card_w, card_h) = self.tiles.card_size;
                 self.art_loader = Some(crate::services::art::ArtLoader::spawn(
                     host,
                     port,
