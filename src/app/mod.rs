@@ -894,8 +894,9 @@ impl App {
         let focus_changed = self.hover_focus_at(x, y, screen_w, screen_h, fonts);
         // Parity with the D-pad: a hover that moves modal focus replays the focus-pop zoom
         // (and shows the new row's caption). Home drives its own `focus_anim` instead, so
-        // it's excluded.
-        if focus_changed && !matches!(self.screen, Screen::Home) {
+        // it's excluded. An open dropdown is excluded too — hover there only moves the
+        // option cursor, so popping the parent row (as the D-pad also declines to) is wrong.
+        if focus_changed && self.dropdown.is_none() && !matches!(self.screen, Screen::Home) {
             self.modal_focus_anim = Some(Instant::now());
         }
         let close_changed = self.hover_close_at(x, y, screen_w, screen_h, fonts);

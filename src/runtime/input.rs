@@ -309,14 +309,25 @@ impl ConfirmDialog {
     }
 }
 
-/// Rising-edge detect on the webOS EXIT gesture (a held Back, delivered as
-/// `WEBOS_EXIT_SCANCODE` — polled since it's outside rust-sdl2's `Scancode` enum).
-/// `prev` carries the last-frame state across calls.
-pub(super) fn exit_gesture_fired(prev: &mut bool) -> bool {
-    let down = crate::platform::webos::input::webos_scancode_down(crate::platform::webos::input::WEBOS_EXIT_SCANCODE);
+/// Rising-edge detect on a raw webOS scancode (polled since these sit outside
+/// rust-sdl2's `Scancode` enum). `prev` carries the last-frame state across calls.
+fn scancode_rising_edge(scancode: i32, prev: &mut bool) -> bool {
+    let down = crate::platform::webos::input::webos_scancode_down(scancode);
     let fired = down && !*prev;
     *prev = down;
     fired
+}
+
+/// The webOS EXIT gesture (a held Back, delivered as `WEBOS_EXIT_SCANCODE`).
+pub(super) fn exit_gesture_fired(prev: &mut bool) -> bool {
+    scancode_rising_edge(crate::platform::webos::input::WEBOS_EXIT_SCANCODE, prev)
+}
+
+/// The webOS Home key (`WEBOS_HOME_SCANCODE`) — captured, so callers re-open the
+/// launcher themselves via `luna::launch_home`. Distinct from EXIT, so a long Back
+/// never trips it.
+pub(super) fn home_key_fired(prev: &mut bool) -> bool {
+    scancode_rising_edge(crate::platform::webos::input::WEBOS_HOME_SCANCODE, prev)
 }
 
 /// webOS ships a real on-screen keyboard, and the SDL fork this app links wires it

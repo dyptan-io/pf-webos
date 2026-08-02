@@ -47,6 +47,17 @@ pub fn available() -> bool {
     })
 }
 
+/// Opens the webOS launcher by relaunching the Home app — the stand-in for the OS's
+/// Home shortcut once `KEYS_HOME` capture takes it over (so a keyboard's Windows key
+/// reaches the host). Fire-and-forget: a Home press must not block the input loop.
+pub fn launch_home() {
+    std::thread::spawn(|| {
+        if let Err(e) = call("luna://com.webos.applicationManager/launch", r#"{"id":"com.webos.app.home"}"#) {
+            tracing::warn!("launch webOS home failed: {e:#}");
+        }
+    });
+}
+
 /// Fires one `luna://` call and discards the reply. Blocking (bounded by [`CALL_TIMEOUT`]);
 /// `Err` covers spawn failure, the deadline, and a non-zero exit.
 ///

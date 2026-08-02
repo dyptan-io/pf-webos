@@ -81,6 +81,10 @@ pub const WEBOS_GREEN_SCANCODE: i32 = 487;
 pub const WEBOS_YELLOW_SCANCODE: i32 = 488;
 pub const WEBOS_BLUE_SCANCODE: i32 = 489;
 
+/// webOS Home key (`SDL_SCANCODE_WEBOS_HOME = 384`, also the keyboard Super key).
+/// Polled to re-open the launcher once `KEYS_HOME` capture stops the OS doing it.
+pub const WEBOS_HOME_SCANCODE: i32 = 384;
+
 /// webOS EXIT key (`SDL_SCANCODE_WEBOS_EXIT`). A held/root-level Back is turned
 /// by the OS into its own EXIT gesture and delivered as this discrete keypress —
 /// *not* as a held [`WEBOS_BACK_KEYCODE`] — so it's the reliable signal for

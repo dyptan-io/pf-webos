@@ -91,6 +91,7 @@ pub(super) fn run_ui_flow(
     let mut connect_handle: Option<ConnectOutcome> = None;
     // Yellow button log overlay works here too (see streaming loop).
     let mut yellow_held = false;
+    let mut home_held = false;
     let mut log_overlay_last: Option<Instant> = None;
     // Cache last overlay tile size for idle frames (no re-render if size stable).
     let mut log_overlay_dims: Option<(u32, u32)> = None;
@@ -125,6 +126,11 @@ pub(super) fn run_ui_flow(
             log_overlay_last = None;
         }
         yellow_held = yellow_down;
+        // Home key re-opens the webOS launcher (captured so a keyboard's Super key can
+        // reach the host); works from any menu state, a long Back never trips it.
+        if home_key_fired(&mut home_held) {
+            crate::platform::webos::luna::launch_home();
+        }
         // Long-press Back (root/held Back, surfaced as the EXIT gesture) quits
         // straight away from any menu state, no confirm — the short Back tap below
         // opens the dialog instead. Menu loop only; stream is unaffected.

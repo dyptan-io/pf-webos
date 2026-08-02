@@ -14,18 +14,17 @@ pub(super) fn run_inner() -> Result<()> {
     // which is what killed the app mid-hold. aurora-tv, moonlight-tv, ihsplay and
     // RetroArch all pair EXIT with BACK for exactly this.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_EXIT", "true");
-    // Left to the OS (=false) so the Magic Remote's physical Home button opens
-    // webOS's launcher, in menu and stream. Gated separately from KEYS_META, so the
-    // keyboard's Windows/Meta key still reaches the app and forwards to the host
-    // (VK_LWIN/VK_RWIN, see `keyboard.rs`) without popping the launcher.
-    sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_HOME", "false");
+    // Captured (=true): webOS classes a USB keyboard's Windows/Super key as a
+    // Home-class key, gated here together with the remote's Home button — there's no
+    // separate policy for them. Capturing is the only way the keyboard key reaches
+    // the app to forward to the host (VK_LWIN/VK_RWIN, see `keyboard.rs`). The cost
+    // is the remote's Home no longer opens the launcher natively, so we detect it in
+    // the input loop (bare keycode, no scancode) and relaunch it via `luna::launch_home`.
+    sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_HOME", "true");
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_META", "true");
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_GUIDE", "true");
-    // What actually paints the launcher when the OS acts on Home (KEYS_HOME=false);
-    // false suppressed it entirely so Home did nothing. Only OS-intercepted keys
-    // reach the ribbon, and KEYS_META/KEYS_GUIDE keep keyboard/gamepad off it, so
-    // only the remote's Home button pops it.
-    sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_RIBBON", "true");
+    // Suppress webOS's launcher ribbon overlay from popping over the foregrounded app.
+    sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_RIBBON", "false");
     // Linear texture filtering (SDL defaults to nearest) — the focus pop
     // scales card textures slightly, which shimmers without it.
     sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "1");
@@ -236,6 +235,7 @@ pub(super) fn run_inner() -> Result<()> {
         let mut log_fade = crate::ui::ModalFade::<()>::new();
         let mut green_held = false;
         let mut yellow_held = false;
+        let mut home_held = false;
         // Blue button flips pacing live via `stats.pacing_enabled` (`video_pump` reads it
         // per frame). Pure PTS math, no decoder state — safe to toggle mid-stream.
         let mut blue_held = false;
@@ -408,6 +408,11 @@ pub(super) fn run_inner() -> Result<()> {
             if exit_gesture_fired(&mut exit_held) && !disconnect.is_open() {
                 tracing::info!("EXIT gesture — opening disconnect dialog");
                 disconnect.open(1);
+            }
+            // Home key re-opens the webOS launcher (captured so a keyboard's Super key
+            // can reach the host); a long Back fires EXIT above, never this.
+            if home_key_fired(&mut home_held) {
+                crate::platform::webos::luna::launch_home();
             }
             // Green button: local-only stats-overlay toggle, edge-detected here (raw
             // scancode poll — the safe SDL2 event API can't see this key at all).
