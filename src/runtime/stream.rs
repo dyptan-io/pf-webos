@@ -7,25 +7,28 @@ pub(super) fn run_inner() -> Result<()> {
     // the app into the launcher — see `keyboard.rs`'s LGui/RGui mapping and
     // `gamepad.rs`'s BTN_GUIDE mapping, which need these to actually reach the app
     // instead). Must be set before window creation — confirmed on-device these
-    // hints only latch at creation time, so there's no way to scope them to just
-    // the stream: the tradeoff is the remote's own physical Home button no longer
-    // opens webOS's launcher either, in the menu or mid-stream (accepted — the
-    // priority is that no keyboard/gamepad input can ever reach the TV OS, only
-    // the Magic Remote can).
+    // hints only latch at creation time.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
     // Distinct from KEYS_BACK: without it webOS closes (SIGTERMs) the app on its own
     // Back/exit gesture — a held or root-level Back — before the app can act on the key,
     // which is what killed the app mid-hold. aurora-tv, moonlight-tv, ihsplay and
     // RetroArch all pair EXIT with BACK for exactly this.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_EXIT", "true");
-    sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_HOME", "true");
+    // KEYS_HOME left to the OS (=false): the Magic Remote's physical Home button
+    // opens webOS's own launcher, in the menu and mid-stream. Distinct from
+    // KEYS_META below, which gates a *keyboard's* Windows/Meta key separately — so
+    // that key still reaches the app and is forwarded to the host (VK_LWIN/VK_RWIN,
+    // see `keyboard.rs`), and never pops the TV launcher.
+    sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_HOME", "false");
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_META", "true");
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_GUIDE", "true");
-    // The hints above stop the key itself from backgrounding the app, but webOS's
-    // card-switcher ribbon overlay is gated separately — without this it can still
-    // pop the launcher UI on top even though the app stays foregrounded (confirmed
-    // pairing in aurora-tv's app.c).
-    sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_RIBBON", "false");
+    // Allow webOS's launcher/card-switcher ribbon overlay to appear: this is what
+    // actually paints the launcher when the OS acts on the physical Home button
+    // (KEYS_HOME=false above). Forcing it false suppressed the overlay entirely, so
+    // Home did nothing. Only OS-intercepted keys reach the ribbon — the keyboard
+    // Meta key (KEYS_META) and gamepad Guide (KEYS_GUIDE) are captured by the app
+    // and never trigger it, so only the remote's Home button pops the launcher.
+    sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_RIBBON", "true");
     // Linear texture filtering (SDL defaults to nearest) — the focus pop
     // scales card textures slightly, which shimmers without it.
     sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "1");
