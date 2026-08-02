@@ -106,6 +106,12 @@ impl FocusRow {
         self
     }
 
+    /// Adds a muted caption line under the label.
+    pub fn with_subtext(mut self, subtext: RowSubtext) -> Self {
+        self.subtext = Some(subtext);
+        self
+    }
+
     /// Adds a ⋯ actions button; `focused` indicates button vs row focus.
     pub fn with_menu(mut self, focused: bool) -> Self {
         self.menu = Some(focused);

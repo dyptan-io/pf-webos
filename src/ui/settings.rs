@@ -271,7 +271,11 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
-            subtext: None,
+            subtext: Some(RowSubtext::hint(if settings.cursor_capture {
+                "Capture (games)"
+            } else {
+                "Desktop (absolute)"
+            })),
         },
         FocusRow::action(ICON_BUG, "Experimental"),
         FocusRow::action(ICON_WRENCH, "Diagnostics"),
@@ -343,7 +347,7 @@ pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
-            subtext: None,
+            subtext: settings.stats_overlay.then(|| RowSubtext::hint("Or use the Green button")),
         },
         FocusRow {
             icon: ICON_VISIBILITY,
@@ -353,9 +357,10 @@ pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
-            subtext: None,
+            subtext: settings.show_logs.then(|| RowSubtext::hint("Or use the Yellow button")),
         },
-        FocusRow::action(ICON_SEND, "Send logs to developer"),
+        FocusRow::action(ICON_SEND, "Send logs to developer")
+            .with_subtext(RowSubtext::hint("If a developer asked you to")),
     ]
 }
 
