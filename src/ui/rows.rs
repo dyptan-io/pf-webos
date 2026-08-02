@@ -43,9 +43,10 @@ pub struct FocusRow {
     /// Confirm can mean, reached with Right, so the row's own action stays a single
     /// press. `None` (the default) draws no button at all.
     pub menu: Option<bool>,
-    /// A small secondary line drawn under the row's label (e.g. the high-bitrate
-    /// "may be unstable on Wi-Fi" caution on the Bitrate row). `None` draws nothing and
-    /// the label stays vertically centred; `Some` centres label + subtext as a block.
+    /// A small secondary line drawn under the row's label *only while the row is focused*
+    /// (e.g. the high-bitrate "may be unstable on Wi-Fi" caution on the Bitrate row).
+    /// Unfocused, the label stays vertically centred and nothing is drawn; on focus the
+    /// label + caption centre as a block. `None` never draws anything.
     pub subtext: Option<RowSubtext>,
 }
 
@@ -240,27 +241,28 @@ pub fn draw_focus_row(
     };
     draw_icon(painter, text_cache, fonts.raster, fonts.icon, icon_rect, row.icon, fg)?;
     let label_x = icon_rect.x() + SETTINGS_ICON_SIZE as i32 + 20;
-    // With a caution caption the label + caption are centred as a block; without one the
-    // label alone stays centred (the common case).
+    // A caption belongs to the focused row only: unfocused rows keep the label centred
+    // (the common case), while a focused row with one centres label + caption as a block.
     let label_h = fonts.raster.height(fonts.label);
-    let label_y = if let Some(subtext) = &row.subtext {
-        let caption_h = fonts.raster.height(fonts.caption);
-        let gap = 4;
-        let block_h = label_h + gap + caption_h;
-        let top = row_rect.y() + (row_rect.height() as i32 - block_h) / 2;
-        draw_text(
-            painter,
-            text_cache,
-            fonts.raster,
-            fonts.caption,
-            &subtext.text,
-            label_x,
-            top + label_h + gap,
-            subtext.color,
-        )?;
-        top
-    } else {
-        row_rect.y() + (row_rect.height() as i32 - label_h) / 2
+    let label_y = match &row.subtext {
+        Some(subtext) if focused => {
+            let caption_h = fonts.raster.height(fonts.caption);
+            let gap = 4;
+            let block_h = label_h + gap + caption_h;
+            let top = row_rect.y() + (row_rect.height() as i32 - block_h) / 2;
+            draw_text(
+                painter,
+                text_cache,
+                fonts.raster,
+                fonts.caption,
+                &subtext.text,
+                label_x,
+                top + label_h + gap,
+                subtext.color,
+            )?;
+            top
+        }
+        _ => row_rect.y() + (row_rect.height() as i32 - label_h) / 2,
     };
     draw_text(
         painter,

@@ -579,13 +579,12 @@ pub(super) fn run_inner() -> Result<()> {
                     });
                     let mut lines = vec![
                         format!(
-                            "{}x{}@{} {}{} · {}",
+                            "{}x{}@{} {}{}",
                             mode.width,
                             mode.height,
                             mode.refresh_hz,
                             session::codec_name(connected.client.codec),
                             if connected.client.color.is_hdr() { " HDR" } else { "" },
-                            connected.backend_name,
                         ),
                         format!("Video {fps:.1} fps · {frames} frames"),
                         {

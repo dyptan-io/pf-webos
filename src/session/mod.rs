@@ -89,10 +89,6 @@ impl VideoPlayer {
     fn render_buffer_length(&self) -> Option<i32> {
         self.0.render_buffer_length()
     }
-
-    fn backend_name(&self) -> &'static str {
-        "NDL"
-    }
 }
 
 pub struct Connected {
@@ -106,8 +102,6 @@ pub struct Connected {
     audio_thread: Option<std::thread::JoinHandle<()>>,
     /// True when NDL accepted Opus config; prevents opening SDL2 audio device.
     pub audio_offloaded: bool,
-    /// Decode backend name for the stats overlay (always "NDL").
-    pub backend_name: &'static str,
     /// Whether HDR mastering metadata is being applied this session (negotiated codec is
     /// HEVC *and* the host signalled HDR). Drives which Game picture mode the runtime asks
     /// the TV for — `game` vs `hdrGame` (see `platform::webos::game_mode`).
@@ -418,7 +412,7 @@ pub fn connect(
     let mut color = client.color;
     color_range_override.apply(&mut color);
     if let Err(e) = player.set_color_info(initial_meta.as_ref(), color) {
-        tracing::warn!("{} colour metadata failed: {e:#}", player.backend_name());
+        tracing::warn!("NDL colour metadata failed: {e:#}");
     }
     tracing::debug!(
         "colour metadata sent: transfer={} primaries={} matrix={} full_range={} (override={color_range_override:?})",
@@ -428,7 +422,6 @@ pub fn connect(
         color.full_range,
     );
 
-    let backend_name = player.backend_name();
     let audio_offloaded = player.audio_offloaded();
     tracing::info!(
         "audio path: {} (host resolved {} channel(s))",
@@ -482,7 +475,6 @@ pub fn connect(
         video_thread,
         audio_thread,
         audio_offloaded,
-        backend_name,
         hdr: is_hdr,
     })
 }
@@ -1011,8 +1003,7 @@ fn video_pump(
 
                     if feed_elapsed >= FEED_BACKPRESSURE_WARN {
                         tracing::warn!(
-                            "{} slow: {:.1}ms (frame {}, pts {:.2}ms)",
-                            player.backend_name(),
+                            "NDL slow: {:.1}ms (frame {}, pts {:.2}ms)",
                             feed_elapsed.as_secs_f32() * 1000.0,
                             frame.frame_index,
                             pts_ns as f64 / 1_000_000.0,
@@ -1033,8 +1024,7 @@ fn video_pump(
                     }
                     if let Err(e) = play_result {
                         tracing::warn!(
-                            "{} error (frame {}, pts {:.2}ms): {e:#}",
-                            player.backend_name(),
+                            "NDL error (frame {}, pts {:.2}ms): {e:#}",
                             frame.frame_index,
                             pts_ns as f64 / 1_000_000.0,
                         );
@@ -1079,7 +1069,7 @@ fn video_pump(
                 let mut color = client.color;
                 color_range_override.apply(&mut color);
                 if let Err(e) = player.set_color_info(Some(&meta), color) {
-                    tracing::warn!("{} set_color_info: {e:#}", player.backend_name());
+                    tracing::warn!("NDL set_color_info: {e:#}");
                 }
             }
         }

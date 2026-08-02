@@ -884,6 +884,12 @@ impl App {
     /// `true` rather than on every event.
     pub fn handle_mouse_motion(&mut self, x: i32, y: i32, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> bool {
         let focus_changed = self.hover_focus_at(x, y, screen_w, screen_h, fonts);
+        // Parity with the D-pad: a hover that moves modal focus replays the focus-pop zoom
+        // (and shows the new row's caption). Home drives its own `focus_anim` instead, so
+        // it's excluded.
+        if focus_changed && !matches!(self.screen, Screen::Home) {
+            self.modal_focus_anim = Some(Instant::now());
+        }
         let close_changed = self.hover_close_at(x, y, screen_w, screen_h, fonts);
         focus_changed || close_changed
     }

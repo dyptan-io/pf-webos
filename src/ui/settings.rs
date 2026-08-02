@@ -223,7 +223,7 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
-            subtext: None,
+            subtext: (settings.codec == CodecPref::H264).then(|| RowSubtext::hint("HDR is not supported with this codec")),
         },
         FocusRow {
             icon: ICON_SUN,
@@ -375,7 +375,11 @@ pub fn experimental_rows(settings: &Settings, rooted: bool) -> Vec<FocusRow> {
         fraction: 0.0,
         danger: false,
         menu: None,
-        subtext: Some(RowSubtext::hint("Toggles live with the Blue button")),
+        subtext: Some(RowSubtext::hint(if settings.video_pacing {
+            "Toggles live with the Blue button"
+        } else {
+            "May improve framerate smoothness, adds latency"
+        })),
     }];
     // Driving the TV's Game picture/sound modes needs the Homebrew Channel's root helper — the
     // public bus is denied `settingsservice` outright (see `platform::webos::game_mode`). So the
