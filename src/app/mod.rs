@@ -597,7 +597,6 @@ impl App {
             crate::runtime::set_log_overlay_enabled(true);
         }
         std::thread::spawn(ui::spinner_frames);
-        std::thread::spawn(crate::platform::webos::device::supports_av1);
         app
     }
 

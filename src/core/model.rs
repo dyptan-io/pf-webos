@@ -58,21 +58,9 @@ impl KnownHost {
     }
 }
 
-/// Video decode backend selectable in Settings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum VideoBackend {
-    /// NDL `DirectMedia` v2 — stable baseline, no `pauseAtDecodeTime`.
-    #[default]
-    Ndl,
-    /// Starfish/SMP (`libplayerAPIs_C.so`) — `pauseAtDecodeTime` + smooth PTS pacing
-    /// + `maxFrameRate`; better above 1080p, requires the bundled wrapper .so.
-    Starfish,
-}
-
 /// Codec preference selectable in Settings — a *preference*, not a demand. The host
 /// resolves the session codec from the client's advertised set via its own precedence
-/// ladder (HEVC > AV1 > H.264), honouring the preference only when its encoder can
+/// ladder (HEVC > H.264), honouring the preference only when its encoder can
 /// actually produce it — so "H264" on a host that can't encode H.264 still gets HEVC
 /// rather than no session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -83,10 +71,6 @@ pub enum CodecPref {
     Auto,
     H264,
     Hevc,
-    /// AV1 — only decodable through the Starfish backend (the platform decoder
-    /// advertises `video/x-av1`; NDL's impl does not — see docs/NOTES.md), so this
-    /// choice is only offered/advertised when `video_backend` is `Starfish`.
-    Av1,
 }
 
 /// Override for the VUI `video_full_range_flag` sent to the decoder — see
@@ -178,14 +162,7 @@ pub struct Settings {
     /// slider — see `ui::BITRATE_MIN_KBPS`/`BITRATE_MAX_KBPS`.
     pub bitrate_kbps: u32,
     pub hdr_enabled: bool,
-    /// Which hardware decode pipeline to use. Defaults to `Ndl` (stable baseline);
-    /// switch to `Starfish` to test `pauseAtDecodeTime` + smooth-pacing above 1080p.
-    /// Persisted across restarts; takes effect on the next stream.
-    #[serde(default)]
-    pub video_backend: VideoBackend,
-    /// Preferred session codec — see [`CodecPref`]. `Av1` is additionally gated on the
-    /// Starfish backend and the platform decoder actually declaring AV1
-    /// (`device::supports_av1`), both in the picker and again at connect time.
+    /// Preferred session codec — see [`CodecPref`].
     #[serde(default)]
     pub codec: CodecPref,
     /// Whether the in-stream stats overlay (resolution/codec, measured fps, drops,
@@ -265,7 +242,6 @@ impl Default for Settings {
             bitrate_kbps: 0,
             hdr_enabled: true,
             stats_overlay: false,
-            video_backend: VideoBackend::Ndl,
             codec: CodecPref::Auto,
             audio_channels: default_audio_channels(),
             color_range_override: ColorRangeOverride::Auto,

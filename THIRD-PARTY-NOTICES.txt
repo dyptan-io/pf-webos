@@ -23,8 +23,8 @@ BUNDLED / EMBEDDED NON-RUST COMPONENTS
   Material Icons (subset)
       Google's Material Icons, subsetted to the glyphs this UI draws and embedded via include_bytes!. Apache License 2.0.
       https://github.com/google/material-design-icons
-  NDL DirectMedia / Starfish (libplayerAPIs)
-      LG webOS system libraries, linked at runtime from the device — NOT redistributed by this package. Header signatures were taken from mariotaku/ss4s.
+  NDL DirectMedia
+      LG webOS system library, linked at runtime from the device — NOT redistributed by this package. Header signatures were taken from mariotaku/ss4s.
       https://github.com/mariotaku/ss4s
 
 ----------------------------------------------------------------------------

@@ -33,30 +33,6 @@ pub struct DeviceInfo {
 const OS_INFO: &str = "/var/run/nyx/os_info.json";
 const DEVICE_INFO: &str = "/var/run/nyx/device_info.json";
 
-/// The platform's real hardware video-decode element — both NDL and Starfish drive it
-/// underneath (see docs/NOTES.md "The two backends are front-ends to the same
-/// pipeline"). Its caps template strings declare exactly what the silicon decodes,
-/// which makes it the authoritative per-model answer to "does this TV do AV1" without
-/// loading a decoder to find out. World-readable under the SAM jail (`-rwxr-xr-x`,
-/// confirmed on a G5).
-const LX_VIDEODEC_PLUGIN: &str = "/usr/lib/gstreamer-1.0/libgstlxvideodec.so";
-
-/// Whether platform decoder *declares* AV1 (not the same as ability to stream it).
-/// WHY: G5 declares it but fails in Starfish/NDL. Weak signal; caller must also
-/// require `dev_override_enable_av1`. Still needed as necessary condition + diagnostic.
-pub fn supports_av1() -> bool {
-    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        let needle = b"video/x-av1";
-        let found = std::fs::read(LX_VIDEODEC_PLUGIN).is_ok_and(|data| data.windows(needle.len()).any(|w| w == needle));
-        tracing::info!(
-            "device: platform decoder {} AV1 ({LX_VIDEODEC_PLUGIN})",
-            if found { "declares" } else { "does not declare" },
-        );
-        found
-    })
-}
-
 /// Extract JSON field without parser (avoids serde on filesystem source).
 fn json_str_field(text: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");

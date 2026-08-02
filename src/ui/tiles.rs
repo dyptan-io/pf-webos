@@ -235,7 +235,7 @@ pub fn render_wrapped_text_tile(
 }
 
 /// Worst-case stat line used to lock overlay width.
-pub const STATS_OVERLAY_REF_LINE: &str = "3840x2160@120 HEVC HDR Starfish";
+pub const STATS_OVERLAY_REF_LINE: &str = "3840x2160@120 HEVC HDR";
 
 /// In-stream stats overlay with fixed width and centered hint.
 /// `lines[0]` is highlighted; remaining lines are muted.

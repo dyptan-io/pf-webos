@@ -1,5 +1,5 @@
 use super::*;
-use crate::services::store::{CodecPref, ColorRangeOverride, GamepadType, LogLevelOverride, Settings, VideoBackend};
+use crate::services::store::{CodecPref, GamepadType, LogLevelOverride, Settings};
 
 /// User-requested presets: 1080p, 1440p, 4K.
 pub const RESOLUTIONS: [(u32, u32, &str); 3] = [
@@ -66,38 +66,29 @@ pub const fn settings_row_stride() -> u32 {
 pub const ROW_RESOLUTION: usize = 0;
 pub const ROW_FRAMERATE: usize = 1;
 pub const ROW_BITRATE: usize = 2;
-pub const ROW_VIDEO_BACKEND: usize = 3;
-/// Directly below Video backend: only Starfish honours the VUI range flag, so the row
-/// is hidden on NDL (see `color_range_row_shown`) — adjacency keeps that dependency
-/// discoverable. Forces the VUI range flag sent to the decoder — see
-/// `store::ColorRangeOverride`. Debug aid for the washed-out-colour investigation.
-pub const ROW_COLOR_RANGE: usize = 4;
-/// Below Video backend, deliberately: the AV1 option's availability depends on that
-/// row's value (see `codec_options`), and adjacency is what makes the dependency
-/// discoverable without explaining it in copy.
-pub const ROW_CODEC: usize = 5;
+pub const ROW_CODEC: usize = 3;
 /// Directly below Codec: HDR applies only to HEVC, so the row is hidden on an explicit
 /// H.264 pick (see `hdr_row_shown`) — adjacency keeps that dependency discoverable.
-pub const ROW_HDR: usize = 6;
-pub const ROW_AUDIO: usize = 7;
+pub const ROW_HDR: usize = 4;
+pub const ROW_AUDIO: usize = 5;
 /// Which controller the host presents to the game — see `store::GamepadType`. Last of the
 /// real settings: it's the only input-side one, and picking `DualSense` is what turns on
 /// adaptive triggers (`crate::platform::webos::dualsense`).
-pub const ROW_GAMEPAD: usize = 8;
+pub const ROW_GAMEPAD: usize = 6;
 /// Directly below Controller — the other input-side setting. See
 /// `store::Settings::cursor_capture`.
-pub const ROW_CURSOR_CAPTURE: usize = 9;
+pub const ROW_CURSOR_CAPTURE: usize = 7;
 /// Not a setting — a link to `Screen::Experimental` (unstable toggles, currently the
 /// frame pacer). Grouped off the main list so an untested option isn't one keystroke away.
-pub const ROW_EXPERIMENTAL: usize = 10;
+pub const ROW_EXPERIMENTAL: usize = 8;
 /// Not a setting — a link to `Screen::Diagnostics` (log level + stats overlay).
 /// A debug aid, not something a normal user needs to find quickly.
-pub const ROW_DIAGNOSTICS: usize = 11;
+pub const ROW_DIAGNOSTICS: usize = 9;
 /// Not a setting — a link to `Screen::About`. Sits last: every other punktfunk
 /// client puts the version + licences at the very bottom of Settings, and a
 /// `RowKind::Action` row costs nothing extra to render.
-pub const ROW_ABOUT: usize = 12;
-pub const SETTINGS_ROW_COUNT: usize = 13;
+pub const ROW_ABOUT: usize = 10;
+pub const SETTINGS_ROW_COUNT: usize = 11;
 
 /// Experimental modal row indices (see `experimental_rows`).
 pub const EXP_ROW_FRAME_PACER: usize = 0;
@@ -122,18 +113,6 @@ pub const DIAG_ROW_SHOW_LOGS: usize = 2;
 pub const DIAG_ROW_SEND_LOGS: usize = 3;
 pub const DIAGNOSTICS_ROW_COUNT: usize = 4;
 
-pub const COLOR_RANGE_OPTIONS: [ColorRangeOverride; 3] = [
-    ColorRangeOverride::Auto,
-    ColorRangeOverride::Full,
-    ColorRangeOverride::Limited,
-];
-
-/// Only Starfish honours the VUI full-range flag; NDL has no equivalent field,
-/// so the row is hidden there rather than shown disabled.
-pub fn color_range_row_shown(settings: &Settings) -> bool {
-    settings.video_backend == VideoBackend::Starfish
-}
-
 /// HDR only applies to HEVC — the host never resolves HDR for an explicit H.264
 /// session, and the toggle would be a no-op. On Automatic the row stays (the host may
 /// still resolve HEVC); it's hidden only when H.264 is picked explicitly. Application
@@ -142,14 +121,13 @@ pub fn hdr_row_shown(settings: &Settings) -> bool {
     settings.codec != CodecPref::H264
 }
 
-/// Logical `ROW_*` indices currently visible, in display order. Some rows are dropped
-/// (rather than shown disabled) depending on other settings — Color range off NDL, HDR
-/// on explicit H.264. Every visibility-aware helper derives from this one list.
+/// Logical `ROW_*` indices currently visible, in display order. The HDR row is dropped
+/// (rather than shown disabled) on an explicit H.264 pick. Every visibility-aware helper
+/// derives from this one list.
 pub fn settings_visible_logical_rows(settings: &Settings) -> Vec<usize> {
     (0..SETTINGS_ROW_COUNT)
         .filter(|&row| match row {
             ROW_HDR => hdr_row_shown(settings),
-            ROW_COLOR_RANGE => color_range_row_shown(settings),
             _ => true,
         })
         .collect()
@@ -166,14 +144,6 @@ pub fn settings_logical_row(settings: &Settings, display: usize) -> usize {
         .get(display)
         .copied()
         .unwrap_or(display)
-}
-
-pub fn color_range_label(o: ColorRangeOverride) -> &'static str {
-    match o {
-        ColorRangeOverride::Auto => "Automatic",
-        ColorRangeOverride::Full => "Full",
-        ColorRangeOverride::Limited => "Limited",
-    }
 }
 
 /// Cycle through options, wrapping.
@@ -246,39 +216,9 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
                 .then(|| RowSubtext::caution("May be unstable on Wi-Fi — try Ethernet")),
         },
         FocusRow {
-            icon: ICON_MEMORY,
-            label: "Video backend".into(),
-            value: match settings.video_backend {
-                VideoBackend::Ndl => "NDL".into(),
-                VideoBackend::Starfish => "Starfish".into(),
-            },
-            kind: RowKind::Dropdown,
-            fraction: 0.0,
-            danger: false,
-            menu: None,
-            subtext: None,
-        },
-        FocusRow {
-            icon: ICON_PALETTE,
-            label: "Color range".into(),
-            value: color_range_label(settings.color_range_override).into(),
-            kind: RowKind::Dropdown,
-            fraction: 0.0,
-            danger: false,
-            menu: None,
-            subtext: None,
-        },
-        FocusRow {
             icon: ICON_MOVIE,
             label: "Codec".into(),
-            // A persisted choice that is no longer offered (AV1 after Starfish proved it
-            // won't load this run) says so, rather than displaying a codec the session
-            // will silently not use — `session::connect` clamps it back to Automatic.
-            value: if codec_options(settings).contains(&settings.codec) {
-                codec_label(settings.codec).into()
-            } else {
-                format!("{} (unavailable)", codec_label(settings.codec))
-            },
+            value: codec_label(settings.codec).into(),
             kind: RowKind::Dropdown,
             fraction: 0.0,
             danger: false,
@@ -341,12 +281,8 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
         FocusRow::action_with_value(ICON_INFO, "About & licenses", format!("v{VERSION}")),
     ];
     // Mirrors `settings_visible_logical_rows`: drop rather than disable when hidden.
-    // Remove highest index first so an earlier removal doesn't shift a later one.
     if !hdr_row_shown(settings) {
         rows.remove(ROW_HDR);
-    }
-    if !color_range_row_shown(settings) {
-        rows.remove(ROW_COLOR_RANGE);
     }
     rows
 }
@@ -473,37 +409,9 @@ pub fn wake_settings_rows(auto_send: bool) -> Vec<FocusRow> {
     }]
 }
 
-/// The codec choices offered right now — which is why this is a function of the live
-/// `Settings`, not a const: AV1 appears only when the Starfish backend is selected
-/// (NDL's impl can't decode it — docs/NOTES.md) *and* this TV's platform decoder
-/// actually declares AV1 (`device::supports_av1`, probed once per run). Everything
-/// downstream (dropdown, Left/Right cycling, current-index lookup) derives from this
-/// one list, so an unavailable AV1 simply doesn't exist as an option anywhere.
-pub fn codec_options(settings: &Settings) -> Vec<CodecPref> {
-    let mut options = vec![CodecPref::Auto, CodecPref::H264, CodecPref::Hevc];
-    // Four conditions, and AV1 has never satisfied the last one on real hardware — see
-    // `store::dev_override_enable_av1`. The other three stay because each rules out a
-    // distinct way of handing a decoder something it can't present. The platform decoder
-    // capability (`AV1_CAPABLE`) is pushed in by the runtime rather than probed here, so
-    // this stays free of `platform::webos` — see `set_av1_capable`.
-    if crate::services::store::dev_override_enable_av1()
-        && settings.video_backend == VideoBackend::Starfish
-        && AV1_CAPABLE.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        options.push(CodecPref::Av1);
-    }
-    options
-}
-
-/// Whether this TV's platform decoder can present AV1 *and* the Starfish backend is still
-/// viable. The runtime re-evaluates and sets this on each menu entry (its two inputs live in
-/// `platform::webos`), keeping `codec_options` — and all of `ui` — free of any `platform`
-/// dependency. Defaults `false` until the first probe.
-static AV1_CAPABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Sets the AV1-capability flag `codec_options` reads. Called from `runtime`.
-pub fn set_av1_capable(capable: bool) {
-    AV1_CAPABLE.store(capable, std::sync::atomic::Ordering::Relaxed);
+/// The codec choices offered. NDL decodes H.264/HEVC only, so the list is fixed.
+pub fn codec_options() -> Vec<CodecPref> {
+    vec![CodecPref::Auto, CodecPref::H264, CodecPref::Hevc]
 }
 
 pub fn codec_label(pref: CodecPref) -> &'static str {
@@ -511,7 +419,6 @@ pub fn codec_label(pref: CodecPref) -> &'static str {
         CodecPref::Auto => "Automatic",
         CodecPref::H264 => "H.264",
         CodecPref::Hevc => "HEVC",
-        CodecPref::Av1 => "AV1",
     }
 }
 
@@ -549,22 +456,15 @@ fn audio_label(channels: u8) -> String {
         .map_or_else(|| format!("{channels} channels"), |(_, s)| (*s).to_string())
 }
 
-/// Dropdown labels for a row. Codec list depends on `video_backend`.
+/// Dropdown labels for a row.
 pub fn dropdown_options(settings: &Settings, row_index: usize) -> Vec<String> {
+    let _ = settings;
     match row_index {
         ROW_RESOLUTION => RESOLUTIONS.iter().map(|(w, h, _)| resolution_label(*w, *h)).collect(),
         ROW_FRAMERATE => REFRESH_RATES.iter().map(|hz| format!("{hz} Hz")).collect(),
-        ROW_VIDEO_BACKEND => vec!["NDL (DirectMedia)".into(), "SMP (Starfish Media Pipeline)".into()],
-        ROW_CODEC => codec_options(settings)
-            .iter()
-            .map(|&p| codec_label(p).to_string())
-            .collect(),
+        ROW_CODEC => codec_options().iter().map(|&p| codec_label(p).to_string()).collect(),
         ROW_AUDIO => AUDIO_CHANNELS.iter().map(|(_, s)| (*s).to_string()).collect(),
         ROW_GAMEPAD => GAMEPAD_TYPES.iter().map(|&t| gamepad_label(t).to_string()).collect(),
-        ROW_COLOR_RANGE => COLOR_RANGE_OPTIONS
-            .iter()
-            .map(|&o| color_range_label(o).to_string())
-            .collect(),
         _ => Vec::new(),
     }
 }
@@ -580,14 +480,7 @@ pub fn dropdown_current_index(settings: &Settings, row_index: usize) -> usize {
             .iter()
             .position(|hz| *hz == settings.refresh_hz)
             .unwrap_or(0),
-        ROW_VIDEO_BACKEND => match settings.video_backend {
-            VideoBackend::Ndl => 0,
-            VideoBackend::Starfish => 1,
-        },
-        ROW_CODEC => codec_options(settings)
-            .iter()
-            .position(|&p| p == settings.codec)
-            .unwrap_or(0),
+        ROW_CODEC => codec_options().iter().position(|&p| p == settings.codec).unwrap_or(0),
         ROW_AUDIO => AUDIO_CHANNELS
             .iter()
             .position(|(c, _)| *c == settings.audio_channels)
@@ -595,10 +488,6 @@ pub fn dropdown_current_index(settings: &Settings, row_index: usize) -> usize {
         ROW_GAMEPAD => GAMEPAD_TYPES
             .iter()
             .position(|&t| t == settings.gamepad_type)
-            .unwrap_or(0),
-        ROW_COLOR_RANGE => COLOR_RANGE_OPTIONS
-            .iter()
-            .position(|&o| o == settings.color_range_override)
             .unwrap_or(0),
         _ => 0,
     }
@@ -617,20 +506,8 @@ pub fn apply_dropdown_choice(settings: &mut Settings, row_index: usize, choice_i
                 settings.refresh_hz = *hz;
             }
         }
-        ROW_VIDEO_BACKEND => {
-            settings.video_backend = match choice_index {
-                1 => VideoBackend::Starfish,
-                _ => VideoBackend::Ndl,
-            };
-            // AV1 only exists as a choice under Starfish (see `codec_options`) —
-            // switching away must take the stranded preference with it, or it would
-            // silently ride along invisible (no row shows it, connect would clamp it).
-            if settings.video_backend != VideoBackend::Starfish && settings.codec == CodecPref::Av1 {
-                settings.codec = CodecPref::Auto;
-            }
-        }
         ROW_CODEC => {
-            if let Some(&pref) = codec_options(settings).get(choice_index) {
+            if let Some(&pref) = codec_options().get(choice_index) {
                 settings.codec = pref;
             }
         }
@@ -642,11 +519,6 @@ pub fn apply_dropdown_choice(settings: &mut Settings, row_index: usize, choice_i
         ROW_GAMEPAD => {
             if let Some(&t) = GAMEPAD_TYPES.get(choice_index) {
                 settings.gamepad_type = t;
-            }
-        }
-        ROW_COLOR_RANGE => {
-            if let Some(&o) = COLOR_RANGE_OPTIONS.get(choice_index) {
-                settings.color_range_override = o;
             }
         }
         _ => {}
@@ -690,15 +562,9 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
             settings.cursor_capture = !settings.cursor_capture;
             true
         }
-        ROW_VIDEO_BACKEND => {
-            let idx = dropdown_current_index(settings, ROW_VIDEO_BACKEND);
-            let next = cycle_index(idx, 2, forward);
-            apply_dropdown_choice(settings, ROW_VIDEO_BACKEND, next);
-            true
-        }
         ROW_CODEC => {
             let idx = dropdown_current_index(settings, ROW_CODEC);
-            let next = cycle_index(idx, codec_options(settings).len(), forward);
+            let next = cycle_index(idx, codec_options().len(), forward);
             apply_dropdown_choice(settings, ROW_CODEC, next);
             true
         }
@@ -712,12 +578,6 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
             let idx = dropdown_current_index(settings, ROW_GAMEPAD);
             let next = cycle_index(idx, GAMEPAD_TYPES.len(), forward);
             apply_dropdown_choice(settings, ROW_GAMEPAD, next);
-            true
-        }
-        ROW_COLOR_RANGE => {
-            let idx = dropdown_current_index(settings, ROW_COLOR_RANGE);
-            let next = cycle_index(idx, COLOR_RANGE_OPTIONS.len(), forward);
-            apply_dropdown_choice(settings, ROW_COLOR_RANGE, next);
             true
         }
         _ => false,

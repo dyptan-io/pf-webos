@@ -78,11 +78,9 @@ impl App {
                 }
                 logical @ (crate::ui::ROW_RESOLUTION
                 | crate::ui::ROW_FRAMERATE
-                | crate::ui::ROW_VIDEO_BACKEND
                 | crate::ui::ROW_CODEC
                 | crate::ui::ROW_AUDIO
-                | crate::ui::ROW_GAMEPAD
-                | crate::ui::ROW_COLOR_RANGE) => {
+                | crate::ui::ROW_GAMEPAD) => {
                     let focused = crate::ui::dropdown_current_index(&self.settings, logical);
                     // `row` is the display position (what the overlay is drawn against);
                     // the logical row is recovered on lookup via `settings_logical_row`.

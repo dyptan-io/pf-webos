@@ -35,7 +35,7 @@ Layered by module, deps point inward (acyclic). Leaves first:
 - **`platform/webos/`** — SDL2/hardware boundary (all `#[cfg(target_os = "linux")]`):
   `compositor` (translates `ui::DrawList` → SDL textures, owns the texture cache),
   `input` (SDL events → `InputEvent`), `text_sdl` (SDL2_ttf impl of `TextRaster`),
-  video (`ndl`/`starfish`/`luna`), `audio`, `device`, `gamepad`/`keyboard`/`mouse`/
+  video (`ndl`/`luna`), `audio`, `device`, `gamepad`/`keyboard`/`mouse`/
   `dualsense`, C build shims.
 - **`app/`** — the `App` state machine. Per-screen `impl App` blocks split by concern:
   `app::state::<screen>` (event handling/transitions) and `app::view::<screen>` (geometry +

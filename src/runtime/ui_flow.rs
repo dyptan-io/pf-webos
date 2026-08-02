@@ -32,25 +32,9 @@ pub(super) fn run_ui_flow(
     if let Some((host, port)) = store::dev_override_connect() {
         tracing::info!("dev override: connecting to {host}:{port}");
         let settings = resolve_gamepad_type(store::load_settings(), game_controller);
-        let handle = spawn_connect(
-            identity.clone(),
-            host,
-            port,
-            None,
-            None,
-            settings,
-            display_mode.w,
-            display_mode.h,
-        )?;
+        let handle = spawn_connect(identity.clone(), host, port, None, None, settings)?;
         return Ok(Some((handle, settings)));
     }
-
-    // Re-evaluate AV1 decoder availability each menu entry and hand it to `ui`, so the codec
-    // picker stays platform-free. Starfish can prove itself unavailable during a failed
-    // stream attempt, so this is refreshed on every return to the menu, not just at boot.
-    crate::ui::set_av1_capable(
-        crate::platform::webos::device::supports_av1() && !crate::platform::webos::starfish::proven_unavailable(),
-    );
 
     canvas.window_mut().show();
     let mut app = App::new(identity.clone());
@@ -196,8 +180,6 @@ pub(super) fn run_ui_flow(
                     Some(target.fingerprint),
                     target.launch,
                     settings,
-                    display_mode.w,
-                    display_mode.h,
                 )?;
                 connect_handle = Some((handle, settings));
             }

@@ -36,7 +36,7 @@ pub fn reconciled_pace_interval_ns(stream_hz: u32) -> u64 {
 
 /// Max drift ([`PtsPacer`]) from the unpaced reference, as a fraction of one frame
 /// interval — same figure aurora-tv ships as `SS4S_SMOOTH_PACING_MAX_DRIFT_FRAMES` for
-/// these same NDL/Starfish backends.
+/// this same NDL backend.
 const PACE_MAX_DRIFT_FRAMES: f64 = 0.5;
 /// Minimum step between successive paced PTS values, so NDL's ms-truncation
 /// (`NdlVideo::play`) never sees two equal/decreasing timestamps in a row.

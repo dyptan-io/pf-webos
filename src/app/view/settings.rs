@@ -8,7 +8,7 @@ use anyhow::Result;
 
 impl App {
     /// How many settings rows are *fully* visible. Capped at the live row count so a hidden
-    /// row (Color range on NDL) leaves no empty slot.
+    /// row (HDR on an explicit H.264 pick) leaves no empty slot.
     ///
     /// When the list overflows, one row's worth of budget is spent on `SETTINGS_PEEK` instead
     /// — the partially-visible sliver the bottom fade dissolves. Computed without the peek

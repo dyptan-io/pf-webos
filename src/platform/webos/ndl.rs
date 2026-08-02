@@ -11,7 +11,7 @@ use anyhow::{bail, Result};
 struct NdlVideoInfo {
     width: c_int,
     height: c_int,
-    /// `NDL_VIDEO_TYPE`: 1=H264, 2=H265, 3=VP9, 4=AV1.
+    /// `NDL_VIDEO_TYPE`: 1=H264, 2=H265, 3=VP9.
     kind: c_int,
     unknown1: c_int,
 }
@@ -80,7 +80,6 @@ struct NdlDataInfo {
 pub enum NdlCodec {
     H264,
     H265,
-    Av1,
 }
 
 impl NdlCodec {
@@ -88,7 +87,6 @@ impl NdlCodec {
         match self {
             Self::H264 => 1,
             Self::H265 => 2,
-            Self::Av1 => 4,
         }
     }
 
@@ -97,7 +95,6 @@ impl NdlCodec {
         match codec {
             punktfunk_core::quic::CODEC_H264 => Some(Self::H264),
             punktfunk_core::quic::CODEC_HEVC => Some(Self::H265),
-            punktfunk_core::quic::CODEC_AV1 => Some(Self::Av1),
             _ => None,
         }
     }
@@ -145,6 +142,28 @@ extern "C" {
     fn NDL_DirectVideoSetFrameDropThreshold(threshold: c_int) -> c_int;
     fn NDL_DirectAudioPlay(buffer: *mut c_void, size: c_uint, pts: c_longlong) -> c_int;
     fn NDL_DirectVideoSetHDRInfo(hdr_info: NdlHdrInfo) -> c_int;
+}
+
+/// NDL load-state values reported through the media-load callback (ss4s logs these).
+const NDL_STATE_LOADCOMPLETED: c_int = 0x16;
+const NDL_STATE_UNLOADCOMPLETED: c_int = 0x17;
+const NDL_STATE_PLAYING: c_int = 0x1a;
+
+/// One silent stereo Opus frame (ss4s `opus_empty_frame_211`) fed once post-load to make
+/// sure the NDL Opus decoder is ready before real audio arrives.
+const OPUS_EMPTY_FRAME: [u8; 3] = [0xec, 0xff, 0xfe];
+
+/// Logs NDL load-state transitions. `PLAYING` is the only signal the present pipeline
+/// actually started — the reference point for the framerate diagnosis
+/// (docs/NDL-FRAMERATE-INVESTIGATION.md). Best-effort logging only, no state kept.
+extern "C" fn on_load_state(state: c_int, _num: c_longlong, _str: *const c_char) {
+    let name = match state {
+        NDL_STATE_LOADCOMPLETED => "LOADCOMPLETED",
+        NDL_STATE_UNLOADCOMPLETED => "UNLOADCOMPLETED",
+        NDL_STATE_PLAYING => "PLAYING",
+        _ => "other",
+    };
+    tracing::info!("NDL load state: {name} (0x{state:x})");
 }
 
 /// Reads NDL's last error string (set on the most recent failing call).
@@ -203,8 +222,18 @@ impl NdlVideo {
                 audio: audio.to_union(),
             };
             // SAFETY: `info` is valid for the duration of this call.
-            let ret = unsafe { NDL_DirectMediaLoad(&mut info, None) };
+            let ret = unsafe { NDL_DirectMediaLoad(&mut info, Some(on_load_state)) };
             if ret == 0 {
+                // Prime the Opus decoder with one silent frame (ss4s does this right after a
+                // successful audio-enabled load). Best-effort — a failure here doesn't
+                // invalidate the load, so it's logged but not propagated.
+                let mut frame = OPUS_EMPTY_FRAME;
+                // SAFETY: NDL reads `size` bytes synchronously and does not retain the pointer.
+                let prime =
+                    unsafe { NDL_DirectAudioPlay(frame.as_mut_ptr() as *mut c_void, frame.len() as c_uint, 0) };
+                if prime != 0 {
+                    tracing::warn!("NDL empty-Opus prime failed (ret={prime} error={})", last_error());
+                }
                 return Ok(Self {
                     load_instant: Instant::now(),
                     audio_offloaded: true,
@@ -224,7 +253,7 @@ impl NdlVideo {
             audio: NdlAudioUnion { bytes: [0; 32] },
         };
         // SAFETY: `info` is valid for the duration of this call.
-        let ret = unsafe { NDL_DirectMediaLoad(&mut info, None) };
+        let ret = unsafe { NDL_DirectMediaLoad(&mut info, Some(on_load_state)) };
         if ret != 0 {
             bail!("NDL_DirectMediaLoad failed: ret={ret} error={}", last_error());
         }
@@ -292,7 +321,7 @@ impl NdlVideo {
         let Some(m) = meta else {
             return Ok(());
         };
-        // G/B/R order (ST.2086 convention; same as starfish.rs).
+        // G/B/R order (ST.2086 convention).
         let ([g, b, r], white, max_dml, min_dml, cll, fall) = (
             m.display_primaries,
             m.white_point,

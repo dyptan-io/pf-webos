@@ -50,8 +50,6 @@ fn spawn_connect(
     fp: Option<[u8; 32]>,
     launch: Option<String>,
     settings: store::Settings,
-    display_w: i32,
-    display_h: i32,
 ) -> Result<std::thread::JoinHandle<Result<session::Connected>>> {
     std::thread::Builder::new()
         .name("punktfunk-webos-connect".into())
@@ -80,9 +78,6 @@ fn spawn_connect(
                 launch,
                 // 185s: host parks unpinned/TOFU until approval (15s handhake budget too short)
                 Duration::from_secs(185),
-                display_w,
-                display_h,
-                settings.video_backend,
                 settings.codec,
                 settings.color_range_override,
                 settings.video_pacing,

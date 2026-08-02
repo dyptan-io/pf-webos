@@ -1,7 +1,7 @@
 //! Connects to a punktfunk host and drives the video/audio hardware pipelines.
 //!
-//! Video runs on a dedicated thread ([`video_pump`]) behind a [`VideoPlayer`] abstraction
-//! over the NDL and Starfish backends.
+//! Video runs on a dedicated thread ([`video_pump`]) behind a [`VideoPlayer`] wrapper
+//! over the NDL `DirectMedia` backend (the sole video backend).
 //!
 //! Audio takes one of two paths: software-decoded audio is drained from the main
 //! thread ([`pump_audio_once`]) because `sdl2::audio::AudioQueue` is `!Send`; the
@@ -22,16 +22,14 @@ use punktfunk_core::packet::{FLAG_SOF, USER_FLAG_RECOVERY_ANCHOR};
 use punktfunk_core::quic;
 
 use crate::platform::webos::ndl::{NdlCodec, NdlVideo};
-use crate::platform::webos::starfish::StarfishVideo;
-use crate::services::store::{CodecPref, ColorRangeOverride, VideoBackend};
+use crate::services::store::{CodecPref, ColorRangeOverride};
 use crate::session::pacing::{HostPtsAnchor, PtsPacer};
 
 impl ColorRangeOverride {
     /// Force the VUI `full_range` flag per the user override before it's handed to
-    /// the decoder; `Auto` leaves the host-signalled value untouched. Applied on
-    /// both the NDL and Starfish paths (via `VideoPlayer::set_color_info`), though
-    /// NDL's native HDR-info struct has no range field so it's a no-op there — see
-    /// `ndl.rs`/`starfish.rs` `set_color_info`.
+    /// the decoder; `Auto` leaves the host-signalled value untouched. NDL's native
+    /// HDR-info struct has no range field so this is a no-op there — see
+    /// `ndl.rs` `set_color_info`.
     fn apply(self, color: &mut quic::ColorInfo) {
         match self {
             Self::Full => color.full_range = 1,
@@ -41,89 +39,59 @@ impl ColorRangeOverride {
     }
 }
 
-/// Unified video-decode backend. NDL arm is Arc'd because audio-offload shares it with
-/// `ndl_audio_pump`; NDL unloads process-globally, so unload waits for both threads (`Arc::drop`).
-enum VideoPlayer {
-    Starfish(StarfishVideo),
-    Ndl(Arc<NdlVideo>),
-}
+/// Video-decode backend (NDL `DirectMedia` — the only one). Arc'd because the audio-offload
+/// path shares the handle with `ndl_audio_pump`; NDL unloads process-globally, so unload
+/// waits for both threads (`Arc::drop`).
+struct VideoPlayer(Arc<NdlVideo>);
 
 impl VideoPlayer {
     /// Feed access unit; return (result, `feed_duration`) for ABR latency reporting.
-    /// `pts_ns` must already be in this backend's PTS clock domain (see
-    /// [`Self::pace_base_ns`]).
+    /// `pts_ns` must already be in NDL's PTS clock domain (see [`Self::pace_base_ns`]).
     fn play(&self, au: &[u8], pts_ns: u64) -> (anyhow::Result<()>, Duration) {
         let t = Instant::now();
-        let result = match self {
-            Self::Starfish(sf) => sf.play(au, pts_ns),
-            Self::Ndl(ndl) => ndl.play(au, pts_ns),
-        };
+        let result = self.0.play(au, pts_ns);
         (result, t.elapsed())
     }
 
-    /// Unpaced PTS reference for `frame` in this backend's clock domain, smoothed by
-    /// [`PtsPacer`] before it reaches [`Self::play`]. Starfish already runs on the host's
-    /// capture clock, so its reference is the host PTS untouched. NDL has no PTS clock of
-    /// its own (see `NdlVideo::elapsed_ns`); with `anchor` present the host PTS is mapped
-    /// onto NDL's player clock ([`HostPtsAnchor`]) so the reference tracks host frame
-    /// cadence instead of feed-time wall-clock, keeping delivery jitter out of the pacer's
-    /// drift-clamp anchor. Without `anchor` (pacing off) NDL falls back to raw player time.
+    /// Unpaced PTS reference for `frame` in NDL's clock domain, smoothed by [`PtsPacer`]
+    /// before it reaches [`Self::play`]. NDL has no PTS clock of its own (see
+    /// `NdlVideo::elapsed_ns`); with `anchor` present the host PTS is mapped onto NDL's
+    /// player clock ([`HostPtsAnchor`]) so the reference tracks host frame cadence instead
+    /// of feed-time wall-clock, keeping delivery jitter out of the pacer's drift-clamp
+    /// anchor. Without `anchor` (pacing off) NDL falls back to raw player time.
     fn pace_base_ns(&self, frame_pts_ns: u64, anchor: Option<&mut HostPtsAnchor>) -> u64 {
-        match self {
-            Self::Starfish(_) => frame_pts_ns,
-            Self::Ndl(ndl) => {
-                let player_clock_ns = ndl.elapsed_ns();
-                match anchor {
-                    Some(a) => a.map(frame_pts_ns, player_clock_ns),
-                    None => player_clock_ns,
-                }
-            }
+        let player_clock_ns = self.0.elapsed_ns();
+        match anchor {
+            Some(a) => a.map(frame_pts_ns, player_clock_ns),
+            None => player_clock_ns,
         }
     }
 
     fn flush(&self) -> anyhow::Result<()> {
-        match self {
-            Self::Starfish(sf) => sf.flush(),
-            Self::Ndl(ndl) => ndl.flush(),
-        }
+        self.0.flush()
     }
 
     fn set_color_info(&self, meta: Option<&quic::HdrMeta>, color: quic::ColorInfo) -> anyhow::Result<()> {
-        match self {
-            Self::Starfish(sf) => sf.set_color_info(meta, color),
-            Self::Ndl(ndl) => ndl.set_color_info(meta, color),
-        }
+        self.0.set_color_info(meta, color)
     }
 
-    /// Whether backend decodes audio itself (NDL only; Starfish always uses software decoder).
+    /// Whether the backend decodes audio itself.
     fn audio_offloaded(&self) -> bool {
-        match self {
-            Self::Ndl(ndl) => ndl.audio_offloaded(),
-            Self::Starfish(_) => false,
-        }
+        self.0.audio_offloaded()
     }
 
-    /// Shared NDL handle when audio-offloaded; None on Starfish or video-only NDL.
+    /// Shared NDL handle when audio-offloaded; None on a video-only load.
     fn ndl_audio_handle(&self) -> Option<Arc<NdlVideo>> {
-        match self {
-            Self::Ndl(ndl) if ndl.audio_offloaded() => Some(ndl.clone()),
-            _ => None,
-        }
+        self.0.audio_offloaded().then(|| self.0.clone())
     }
 
-    /// NDL render-buffer backlog; None on Starfish (overlay/log omit the figure).
+    /// NDL render-buffer backlog (None if the query fails).
     fn render_buffer_length(&self) -> Option<i32> {
-        match self {
-            Self::Ndl(ndl) => ndl.render_buffer_length(),
-            Self::Starfish(_) => None,
-        }
+        self.0.render_buffer_length()
     }
 
     fn backend_name(&self) -> &'static str {
-        match self {
-            Self::Starfish(_) => "Starfish",
-            Self::Ndl(_) => "NDL",
-        }
+        "NDL"
     }
 }
 
@@ -138,8 +106,7 @@ pub struct Connected {
     audio_thread: Option<std::thread::JoinHandle<()>>,
     /// True when NDL accepted Opus config; prevents opening SDL2 audio device.
     pub audio_offloaded: bool,
-    /// Resolved decode backend name for the stats overlay — the *actual* player,
-    /// which can differ from the requested `VideoBackend` (Starfish falls back to NDL).
+    /// Decode backend name for the stats overlay (always "NDL").
     pub backend_name: &'static str,
     /// Whether HDR mastering metadata is being applied this session (negotiated codec is
     /// HEVC *and* the host signalled HDR). Drives which Game picture mode the runtime asks
@@ -256,43 +223,28 @@ impl Connected {
     }
 }
 
-/// Whether NDL should decode audio (stereo only). NDL struct has no multistream mapping field,
-/// so 5.1/7.1 layouts would produce noise; anything >stereo stays on software decoder.
+/// Master switch for decoding Opus through NDL (hardware offload). **Disabled**: an
+/// audio-enabled `NDL_DirectMediaLoad` holds the first video frame forever on the tested
+/// webOS 10.3 (G5), despite byte-exact `mariotaku/ss4s` parity (kHz sample rate, the
+/// `opus_empty_frame_211` prime, combined load, feed-time PTS). The load returns success,
+/// so the failure can't be probe-detected — the only safe move is not taking the path.
+/// Flip to `true` to re-test the NDL audio path on another model.
+const NDL_AUDIO_OFFLOAD: bool = false;
+
+/// Whether NDL should decode audio itself. Gated off by [`NDL_AUDIO_OFFLOAD`]; software
+/// Opus→SDL is the default. Stereo only even when enabled: NDL's struct has no multistream
+/// mapping field, so 5.1/7.1 layouts would produce noise and stay on the software decoder.
 fn ndl_audio_config(resolved_channels: u8) -> Option<crate::platform::webos::ndl::NdlAudioConfig> {
-    if !crate::services::store::dev_override_enable_ndl_audio_offload() {
+    if !NDL_AUDIO_OFFLOAD {
         return None;
     }
-    tracing::warn!("NDL audio offload opted in via ndl-audio-offload.conf — known to freeze video on webOS 10.3");
     (resolved_channels == 2).then_some(crate::platform::webos::ndl::NdlAudioConfig {
         channels: 2,
+        // NDL wants the sample rate in **kHz**, not Hz (ss4s passes `sampleRate / 1000.0`).
         // punktfunk's audio plane is fixed at 48 kHz (see `audio.rs`'s SAMPLE_RATE).
-        sample_rate: 48_000.0,
+        // Passing Hz here was the offload-freeze root cause.
+        sample_rate: 48.0,
     })
-}
-
-/// NDL cannot decode AV1 — and it will not say so.
-///
-/// `libNDL_directmedia_impl.so.1` implements H264/H265/VP9 only (docs/NOTES.md), but
-/// `NDL_VIDEO_TYPE_AV1 = 4` exists in the v2 header and `NDL_DirectMediaLoad` **accepts
-/// it**: the load returns success, every `NDL_DirectVideoPlay` returns success, the frame
-/// counters climb, nothing is ever dropped — and the panel holds the first frame forever.
-/// Confirmed on-device 2026-07-25, on a session whose Starfish load timed out and fell
-/// back here carrying an already-negotiated AV1 stream.
-///
-/// That fallback is why a UI-side gate is not sufficient on its own: `Screen::Settings`
-/// only offers AV1 under the Starfish backend, but *selecting* Starfish does not mean
-/// Starfish will **load** (on the G5 under test it times out waiting for LOADCOMPLETED),
-/// and by then the codec is already negotiated — the handshake happens before any decoder
-/// is opened. So the fallback path has to refuse: a named failure the user can act on
-/// beats a silent freeze that reads as a network problem.
-fn ensure_ndl_can_decode(codec: NdlCodec) -> Result<()> {
-    if matches!(codec, NdlCodec::Av1) {
-        anyhow::bail!(
-            "NDL can't decode AV1 on this TV — set Codec back to Automatic in Settings. \
-             (AV1 needs the Starfish backend, which isn't available for this session.)"
-        );
-    }
-    Ok(())
 }
 
 /// Default HDR10 mastering metadata for the LG CX OLED panel.
@@ -312,10 +264,9 @@ fn cx_display_hdr() -> quic::HdrMeta {
 /// Connects to a punktfunk host and starts the video pump thread.
 ///
 /// Blocks until the handshake completes or `timeout` elapses. `pin` is the trusted
-/// host fingerprint from a prior pairing (`None` = trust-on-first-use). `display_w`
-/// / `display_h` is the physical panel size for the Starfish punch-through window —
-/// independent of `mode` (the negotiated stream resolution). NDL manages its own
-/// punch-through area natively (see [`crate::platform::webos::ndl`]'s module docs).
+/// host fingerprint from a prior pairing (`None` = trust-on-first-use). NDL manages its
+/// own punch-through area natively (see [`crate::platform::webos::ndl`]'s module docs),
+/// so no display geometry is needed here.
 #[allow(clippy::too_many_arguments)]
 pub fn connect(
     host: &str,
@@ -328,9 +279,6 @@ pub fn connect(
     pin: Option<[u8; 32]>,
     launch: Option<String>,
     timeout: Duration,
-    display_w: i32,
-    display_h: i32,
-    video_backend: VideoBackend,
     codec_pref: CodecPref,
     color_range_override: ColorRangeOverride,
     video_pacing: bool,
@@ -352,41 +300,14 @@ pub fn connect(
         };
     let display_hdr = hdr_enabled.then(cx_display_hdr);
 
-    // Advertised decode set + soft preference. H.264/HEVC decode on both backends,
-    // always. AV1 is advertised ONLY when the user explicitly picked it, the Starfish
-    // backend is selected (NDL's impl lacks AV1 despite the header's
-    // `NDL_VIDEO_TYPE_AV1` — docs/NOTES.md), and this TV's platform decoder declares
-    // AV1 (`device::supports_av1`). The picker (`ui::codec_options`) enforces the same
-    // three conditions, so the clamp here should never fire — it exists for a stale
-    // settings.json (hand-edited, or written before a backend switch path existed).
-    // Opt-in-only advertisement also means the host's own precedence ladder can never
-    // auto-pick a codec path this client has not verified on its own panel.
-    let starfish_selected = matches!(video_backend, VideoBackend::Starfish);
-    let av1_usable = crate::services::store::dev_override_enable_av1()
-        && starfish_selected
-        && crate::platform::webos::device::supports_av1()
-        && !crate::platform::webos::starfish::proven_unavailable();
-    let codec_pref = if codec_pref == CodecPref::Av1 && !av1_usable {
-        tracing::warn!(
-            "AV1 preference dropped: opted_in={} starfish_selected={starfish_selected} \
-             decoder_declares_av1={} starfish_proven_unavailable={}",
-            crate::services::store::dev_override_enable_av1(),
-            crate::platform::webos::device::supports_av1(),
-            crate::platform::webos::starfish::proven_unavailable(),
-        );
-        CodecPref::Auto
-    } else {
-        codec_pref
-    };
-    let mut video_codecs = quic::CODEC_HEVC | quic::CODEC_H264;
+    // Advertised decode set + soft preference. NDL decodes H.264/HEVC only, so those are
+    // the only codecs ever advertised — the host's precedence ladder can never auto-pick a
+    // path this client can't present.
+    let video_codecs = quic::CODEC_HEVC | quic::CODEC_H264;
     let preferred_codec = match codec_pref {
         CodecPref::Auto => 0,
         CodecPref::H264 => quic::CODEC_H264,
         CodecPref::Hevc => quic::CODEC_HEVC,
-        CodecPref::Av1 => {
-            video_codecs |= quic::CODEC_AV1;
-            quic::CODEC_AV1
-        }
     };
 
     let client = NativeClient::connect(
@@ -445,83 +366,29 @@ pub fn connect(
         NdlCodec::from_wire(client.codec).with_context(|| format!("unsupported codec 0x{:02x}", client.codec))?;
     let app_id = std::env::var("APPID").unwrap_or_else(|_| "io.dyptan.punktfunk.webos".into());
 
-    let player = match video_backend {
-        VideoBackend::Starfish => {
-            // `StarfishVideo::load` documents failure (its wrapper `.so` absent /
-            // the service refusing the load) as "caller falls back to NDL" — honor
-            // that instead of propagating, which would take the whole app down on
-            // every launch until the user remembered to flip the setting back.
-            match StarfishVideo::load(
-                &app_id,
-                resolved_mode.width as i32,
-                resolved_mode.height as i32,
-                fps,
-                codec,
-                display_w,
-                display_h,
-            ) {
-                Ok(sf) => {
-                    tracing::info!(
-                        "Starfish loaded ({codec:?} {}x{}@{fps}fps, display {display_w}x{display_h})",
-                        resolved_mode.width,
-                        resolved_mode.height,
-                    );
-                    VideoPlayer::Starfish(sf)
-                }
-                Err(e) => {
-                    tracing::warn!("Starfish load failed ({e:#}) — falling back to NDL");
-                    // NOT a fallback NDL can serve for every codec — see its docs.
-                    ensure_ndl_can_decode(codec).with_context(|| format!("Starfish load failed ({e:#})"))?;
-                    let ndl = NdlVideo::load(
-                        &app_id,
-                        resolved_mode.width as i32,
-                        resolved_mode.height as i32,
-                        codec,
-                        ndl_audio_config(client.audio_channels),
-                    )
-                    .context("NDL load (Starfish fallback)")?;
-                    tracing::info!(
-                        "NDL loaded ({codec:?} {}x{}@{fps}fps)",
-                        resolved_mode.width,
-                        resolved_mode.height,
-                    );
-                    VideoPlayer::Ndl(Arc::new(ndl))
-                }
-            }
-        }
-        VideoBackend::Ndl => {
-            // Defense in depth: `connect`'s own clamp above already drops an AV1
-            // preference unless Starfish is selected, and AV1 is advertised only when
-            // preferred — so the host cannot pick it for this arm. The guard costs
-            // nothing and the failure it prevents is invisible.
-            ensure_ndl_can_decode(codec)?;
-            let ndl = NdlVideo::load(
-                &app_id,
-                resolved_mode.width as i32,
-                resolved_mode.height as i32,
-                codec,
-                ndl_audio_config(client.audio_channels),
-            )
-            .context("NDL load")?;
-            tracing::info!(
-                "NDL loaded ({codec:?} {}x{}@{fps}fps)",
-                resolved_mode.width,
-                resolved_mode.height,
-            );
-            VideoPlayer::Ndl(Arc::new(ndl))
-        }
-    };
+    let ndl = NdlVideo::load(
+        &app_id,
+        resolved_mode.width as i32,
+        resolved_mode.height as i32,
+        codec,
+        ndl_audio_config(client.audio_channels),
+    )
+    .context("NDL load")?;
+    tracing::info!(
+        "NDL loaded ({codec:?} {}x{}@{fps}fps)",
+        resolved_mode.width,
+        resolved_mode.height,
+    );
+    let player = VideoPlayer(Arc::new(ndl));
 
     // An on-device sweep value for NDL's undocumented frame-drop threshold, if one has
     // been dropped in (see `store::dev_override_ndl_drop_threshold`). Never set by
     // default — the units aren't documented and a guessed pacing change to this decoder
     // is exactly what `docs/NOTES.md` warns against shipping unverified.
-    if matches!(video_backend, VideoBackend::Ndl) {
-        if let Some(threshold) = crate::services::store::dev_override_ndl_drop_threshold() {
-            match crate::platform::webos::ndl::NdlVideo::set_frame_drop_threshold(threshold) {
-                Ok(()) => tracing::info!("NDL frame-drop threshold override: {threshold}"),
-                Err(e) => tracing::warn!("NDL frame-drop threshold override failed: {e:#}"),
-            }
+    if let Some(threshold) = crate::services::store::dev_override_ndl_drop_threshold() {
+        match crate::platform::webos::ndl::NdlVideo::set_frame_drop_threshold(threshold) {
+            Ok(()) => tracing::info!("NDL frame-drop threshold override: {threshold}"),
+            Err(e) => tracing::warn!("NDL frame-drop threshold override failed: {e:#}"),
         }
     }
 
@@ -626,7 +493,7 @@ pub fn connect(
 /// to pin and tear the connection straight back down.
 ///
 /// Uses [`NativeClient`] directly rather than [`connect`] above: no video backend
-/// (NDL/Starfish) is loaded and no pump thread is spawned, so the video plane is never
+/// is loaded and no pump thread is spawned, so the video plane is never
 /// touched — this only needs the handshake to reach `Welcome`, not a running stream. The
 /// negotiated `mode`/codec are irrelevant here (immediately dropped); a small 720p H.264
 /// request keeps the host from doing needless 4K/HEVC setup for a connection we close at
@@ -896,17 +763,15 @@ const FEED_BACKPRESSURE_WARN: Duration = Duration::from_millis(20);
 const BACKLOG_POLL: Duration = Duration::from_millis(250);
 
 /// Suffix identifying a `GStreamer` pad-task thread (`"<element-name>:<pad-name>"`,
-/// truncated to the kernel's 15-char `comm` limit) — both the NDL and Starfish vendor
-/// `.so`s build their internal decode pipeline out of `GStreamer` elements, each with its
-/// own pad-task thread spawned *inside our own process*. These are invisible to
-/// punktfunk-core's hot-thread registry (that only covers threads this crate and
-/// punktfunk-core spawn themselves) and sit at the default nice 0 despite doing real
-/// decode work — confirmed via live `/proc/<pid>/task` sampling during an active NDL
-/// stream (its `lxvideodec1:src`/`video-src:src` threads), a real contention cost
-/// against our own already-boosted video-pump/data-pump threads on this `SoC`'s 3 cores.
-/// Matched by suffix, not a fixed name list, so this also covers whichever
-/// differently-named elements the active backend's pipeline happens to use (e.g.
-/// Starfish's own, not just the ones observed under NDL).
+/// truncated to the kernel's 15-char `comm` limit) — the NDL vendor `.so` builds its
+/// internal decode pipeline out of `GStreamer` elements, each with its own pad-task
+/// thread spawned *inside our own process*. These are invisible to punktfunk-core's
+/// hot-thread registry (that only covers threads this crate and punktfunk-core spawn
+/// themselves) and sit at the default nice 0 despite doing real decode work — confirmed
+/// via live `/proc/<pid>/task` sampling during an active NDL stream (its
+/// `lxvideodec1:src`/`video-src:src` threads), a real contention cost against our own
+/// already-boosted video-pump/data-pump threads on this `SoC`'s 3 cores. Matched by
+/// suffix, not a fixed name list, so it covers whichever elements the pipeline uses.
 const VENDOR_DECODE_THREAD_SUFFIX: &str = ":src";
 /// How long a decode-thread scan may run with no new match before concluding the
 /// backend's pipeline has finished spawning threads (typically well under this in
@@ -1027,7 +892,7 @@ fn video_pump(
     // exist even when it starts off. Pacer interval reconciles against the panel's measured
     // refresh (`reconciled_pace_interval_ns`); ABR backlog folding above stays on the stream
     // rate (host's actual cadence). `host_anchor` is the NDL host-PTS→player-clock mapping,
-    // reset in lockstep with the pacer (no-op on Starfish).
+    // reset in lockstep with the pacer.
     let mut pacer = PtsPacer::new(crate::session::pacing::reconciled_pace_interval_ns(stream_hz));
     let mut host_anchor = HostPtsAnchor::new();
     // Previous-frame pacing state, so an off→on flip can re-anchor cleanly.

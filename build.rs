@@ -13,9 +13,6 @@ fn main() {
     let cc = std::env::var("CC_armv7_unknown_linux_gnueabi")
         .or_else(|_| std::env::var("CC"))
         .unwrap_or_else(|_| "cc".into());
-    let cxx = std::env::var("CXX_armv7_unknown_linux_gnueabi")
-        .or_else(|_| std::env::var("CXX"))
-        .unwrap_or_else(|_| "c++".into());
 
     let obj = format!("{out_dir}/glibc_compat_shim.o");
     let status = std::process::Command::new(&cc)
@@ -29,32 +26,6 @@ fn main() {
     // Object must come AFTER libstd in link order (so linker pulls glibc shim symbols).
     println!("cargo:rustc-link-arg={obj}");
     println!("cargo:rerun-if-changed=src/platform/webos/glibc_compat_shim.c");
-
-    // Build C wrapper for libplayerAPIs.so (TV exposes C++ ABI only).
-    let sysroot = format!(
-        "{manifest_dir}/.toolchains/arm-webos-linux-gnueabi_sdk-buildroot\
-         /arm-webos-linux-gnueabi/sysroot"
-    );
-    let include_dir = format!("{sysroot}/usr/include/starfish-media-pipeline");
-    let shim_src = format!("{manifest_dir}/src/platform/webos/starfish_c_shim.cpp");
-    let release_dir = std::path::PathBuf::from(&out_dir)
-        .ancestors()
-        .nth(3)
-        .expect("OUT_DIR should be 3 ancestor levels above target/<target>/<profile>")
-        .to_path_buf();
-    let so_out = release_dir.join("libplayerAPIs_C.so");
-
-    let status = std::process::Command::new(&cxx)
-        .args(["-shared", "-fPIC", "-std=c++14", "-I", &include_dir])
-        .arg(&shim_src)
-        .arg("-o")
-        .arg(&so_out)
-        .arg(format!("-L{sysroot}/usr/lib"))
-        .arg("-lplayerAPIs")
-        .status()
-        .unwrap_or_else(|e| panic!("run {cxx} to compile starfish_c_shim.cpp: {e}"));
-    assert!(status.success(), "{cxx} failed compiling starfish_c_shim.cpp");
-    println!("cargo:rerun-if-changed=src/platform/webos/starfish_c_shim.cpp");
 
     // On-device libSDL2 is too old; bundle newer version in ipk/lib/ and use $ORIGIN-relative rpath.
     println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
@@ -79,8 +50,8 @@ fn generate_third_party_notices(manifest_dir: &str) {
          "Google's Material Icons, subsetted to the glyphs this UI draws and embedded via include_bytes!. Apache License 2.0.",
          Some("assets/icons/LICENSE"),
          "https://github.com/google/material-design-icons"),
-        ("NDL DirectMedia / Starfish (libplayerAPIs)",
-         "LG webOS system libraries, linked at runtime from the device — NOT redistributed by this package. Header signatures were taken from mariotaku/ss4s.",
+        ("NDL DirectMedia",
+         "LG webOS system library, linked at runtime from the device — NOT redistributed by this package. Header signatures were taken from mariotaku/ss4s.",
          None,
          "https://github.com/mariotaku/ss4s"),
     ];

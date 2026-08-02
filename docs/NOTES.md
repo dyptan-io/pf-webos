@@ -83,13 +83,13 @@ CX/G5 are 32-bit userland on ARMv8-A. RustCrypto's `aes` crate has ARMv8 intrins
 - **Lost packets concealed** with libopus PLC: ask `AudioGapTracker` how many precede current packet, synthesize that many PLC frames first (decode with empty input).
 - Underrun vs overrun logged separately (`Underrun`/`Dropped`/`Resnapped`/`Queued`). Underrun sources: audio feed thread too slow, or main thread stats overlay renders every 500 ms on 2-core device.
 
-## Opus offload to NDL (OFF BY DEFAULT)
+## Opus offload to NDL (OFF BY DEFAULT — still freezes 10.3)
 
-**Freezes video on webOS 10.3.** Load succeeds, frames accepted at 120 fps with `frames_dropped=0`, but panel holds first frame forever. Opt-in via `$HOME/ndl-audio-offload.conf = 1`. No runtime test distinguishes a TV that offloads from one that dies silently. Keep opt-in until verified on new hardware.
+NDL is the sole video backend. Software Opus→SDL is the audio path; NDL hardware Opus is gated off behind the `NDL_AUDIO_OFFLOAD` const in `session/mod.rs` (flip to `true` to re-test).
 
-## AV1 support (unreliable, opt-in)
+The wiring is byte-exact with `mariotaku/ss4s` `ndl/webos5`: `NdlAudioConfig.sample_rate` in **kHz** (`48.0`, not `48000.0`), the stereo `opus_empty_frame_211 = {0xec,0xff,0xfe}` decoder prime fed once right after a successful audio-enabled `NDL_DirectMediaLoad`, combined audio+video in one load, and feed-time PTS (`elapsed since load`, ms) on both audio and video planes — identical to ss4s's `FeedVideo`/`FeedAudio` `GetPts`. Struct layouts (`NDL_DIRECTMEDIA_AUDIO_OPUS_INFO_T`, `..._DATA_INFO_T`) verified field-for-field against the ss4s mock headers.
 
-Advertised by G5's silicon, unusable in practice. Silicon accepts AV1 load then silently presents nothing (or black screen, or process dies). NDL ignores it. Starfish sometimes times out. Gate: Starfish backend selected, decoder claims AV1, `store::dev_override_enable_av1() = 1` (file `$HOME/av1.conf = 1`). Settings row labels stranded choice `AV1 (unavailable)` rather than showing unused option. Keep wired for future testing; promote to real setting when a device plays it.
+**Despite full parity it still holds the first video frame forever on the tested G5 (webOS 10.3).** The audio-enabled load returns success, so no runtime probe can distinguish a TV that offloads from one that dies silently — the only safe move is not taking the path by default. Kept opt-in for continued testing on other models; the new `NDL load state:` log (`LOADCOMPLETED`/`PLAYING`) is the signal for whether the present pipeline ever starts.
 
 ## ABR startup probe: 2 Gbps, upstream-hardcoded
 
@@ -114,6 +114,6 @@ Blind alleys, so they aren't re-tried:
 
 Burst is 320 Mbps / 3s (not 3 Gbps / 5s) — 3-core Cortex-A9 runs UI thread; unbounded firehose starves app. 320 detects any ceiling that changes clamped recommendation (>~285 Mbps). Probe must advertise `VIDEO_CAP_CHACHA20` like real session (core's `bytes_received` counter increments *after* AEAD decrypt). Measured on G5 Wi-Fi: ~245 Mbps airlink ceiling (MediaTek USB 2.0 Hi-Speed bus), nothing client code can raise. New flows sometimes black-hole ~10-29s (AP/driver setup); `run_speed_probe` waits for first completed video frame (cap 35s) before burst — plane is live and path is warm.
 
-## Starfish (Opus multistream, 5.1/7.1 audio)
+## Video backend: NDL DirectMedia only
 
-Header signatures from `mariotaku/ss4s`. Load succeeds via `StarfishMediaAPIs_load` callback; LOADCOMPLETED may never arrive. Try `Ss4s` payload first on all releases (webOS 5 shape works on modern webOS), `Modern` as never-successful fallback (added analysis inconclusive). No decode context handle; all NDL/Starfish calls serialized behind `NdlVideo::ffi` mutex (not thread-safe per header).
+NDL DirectMedia is the **sole** video backend (Starfish/SMP and its `libplayerAPIs_C.so` wrapper were removed, along with AV1 — only ever decodable through Starfish). Header signatures from `mariotaku/ss4s`. No decode context handle; all NDL calls are serialized behind `NdlVideo::ffi` mutex (not thread-safe per header).

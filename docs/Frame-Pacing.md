@@ -11,7 +11,7 @@ Port SS4S's smoothing as an **experimental, default-off**, live-toggleable modul
 - **`PtsPacer`** — advances an "ideal" PTS by a fixed interval, clamped to `PACE_MAX_DRIFT_FRAMES = 0.5` around the real reference; `PACE_MIN_STEP_NS = 1_000_000` keeps values strictly increasing after NDL's ms-truncation.
 - **`HostPtsAnchor`** — maps host capture-clock PTS onto NDL's player clock (first-frame anchor) to isolate delivery jitter from the drift reference.
 - **`reconciled_pace_interval_ns(stream_hz)`** — reads panel Hz via `SDL_webOSGetRefreshRate` (clamped 20–240); anchors to panel cadence within **±2 Hz** of stream fps, otherwise keeps stream interval. Software quantization only — **not** real vsync.
-- **Base reference**: Starfish → `frame_pts_ns`; NDL → `ndl.elapsed_ns()` via `HostPtsAnchor`.
+- **Base reference**: NDL → `ndl.elapsed_ns()` via `HostPtsAnchor`.
 - **Live toggle**: `StreamStats::pacing_enabled: AtomicBool` Arc-shared between threads; re-anchors on off→on edge; edge-detected in `main.rs` with log, overlay redraw, and toast. Stats overlay shows `Pace ±X.X ms`.
 - **Settings**: `Screen::Experimental` (`src/app/experimental.rs`) hosts the toggle via an **Experimental** action row in Settings.
 - **Input**: Toggle uses **Blue (489)** (`WEBOS_BLUE_SCANCODE`). Red (486) is OS-intercepted; Green (487) and Yellow (488) are confirmed working.
