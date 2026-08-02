@@ -14,20 +14,17 @@ pub(super) fn run_inner() -> Result<()> {
     // which is what killed the app mid-hold. aurora-tv, moonlight-tv, ihsplay and
     // RetroArch all pair EXIT with BACK for exactly this.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_EXIT", "true");
-    // KEYS_HOME left to the OS (=false): the Magic Remote's physical Home button
-    // opens webOS's own launcher, in the menu and mid-stream. Distinct from
-    // KEYS_META below, which gates a *keyboard's* Windows/Meta key separately — so
-    // that key still reaches the app and is forwarded to the host (VK_LWIN/VK_RWIN,
-    // see `keyboard.rs`), and never pops the TV launcher.
+    // Left to the OS (=false) so the Magic Remote's physical Home button opens
+    // webOS's launcher, in menu and stream. Gated separately from KEYS_META, so the
+    // keyboard's Windows/Meta key still reaches the app and forwards to the host
+    // (VK_LWIN/VK_RWIN, see `keyboard.rs`) without popping the launcher.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_HOME", "false");
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_META", "true");
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_GUIDE", "true");
-    // Allow webOS's launcher/card-switcher ribbon overlay to appear: this is what
-    // actually paints the launcher when the OS acts on the physical Home button
-    // (KEYS_HOME=false above). Forcing it false suppressed the overlay entirely, so
-    // Home did nothing. Only OS-intercepted keys reach the ribbon — the keyboard
-    // Meta key (KEYS_META) and gamepad Guide (KEYS_GUIDE) are captured by the app
-    // and never trigger it, so only the remote's Home button pops the launcher.
+    // What actually paints the launcher when the OS acts on Home (KEYS_HOME=false);
+    // false suppressed it entirely so Home did nothing. Only OS-intercepted keys
+    // reach the ribbon, and KEYS_META/KEYS_GUIDE keep keyboard/gamepad off it, so
+    // only the remote's Home button pops it.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_RIBBON", "true");
     // Linear texture filtering (SDL defaults to nearest) — the focus pop
     // scales card textures slightly, which shimmers without it.
@@ -365,11 +362,9 @@ pub(super) fn run_inner() -> Result<()> {
                     // to the host as real HID mouse input during a stream instead of
                     // driving local UI focus (see `mouse.rs`).
                     Event::MouseMotion { x, y, .. } => {
-                        // webOS (re)materializes its system cursor on pointer
-                        // activity, which can undo the one-shot hide at stream
-                        // start — most visibly when the app was launched with a
-                        // mouse already moving, leaving the TV cursor overlaid on
-                        // the host's. Re-assert the hide here so capture is sticky.
+                        // webOS re-materializes its system cursor on pointer activity,
+                        // undoing the one-shot hide at stream start (most visibly when
+                        // launched with a mouse in motion) — re-assert so it stays hidden.
                         if settings.cursor_capture && sdl.mouse().is_cursor_showing() {
                             sdl.mouse().show_cursor(false);
                         }

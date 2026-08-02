@@ -701,11 +701,19 @@ impl App {
     /// button click (`handle_mouse_click`'s `hover_close` branch below).
     pub fn back(&mut self) -> Option<ConnectTarget> {
         match self.screen {
-            // Home has nothing to "back out" of (it's the root screen) — Back is a
-            // no-op. (It used to be a shortcut straight to Settings, but that made
-            // Back in Settings feel broken: close Settings, press Back again, and
-            // Settings popped right back up.)
-            Screen::Home => None,
+            // Back steps focus out of the game grid (and the ⋯ column) back onto the
+            // host sidebar first. Only a Back from the sidebar itself is a no-op here
+            // — the menu loop turns that into the quit dialog.
+            Screen::Home => {
+                match self.home_focus {
+                    HomeFocus::Grid(_) => {
+                        self.home_focus = HomeFocus::Sidebar(self.sidebar_index_for_selected());
+                    }
+                    HomeFocus::SidebarMenu(i) => self.home_focus = HomeFocus::Sidebar(i),
+                    HomeFocus::Sidebar(_) => {}
+                }
+                None
+            }
             Screen::Pairing => {
                 self.handle_pairing_event(MenuEvent::Back);
                 None

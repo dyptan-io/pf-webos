@@ -125,14 +125,14 @@ pub(super) fn run_ui_flow(
             log_overlay_last = None;
         }
         yellow_held = yellow_down;
-        // EXIT gesture opens the quit dialog on Home; a short Back tap still flows
-        // through `handle_ui_event` as normal back-navigation (a no-op on Home).
-        if exit_gesture_fired(&mut exit_held) && !quit_dialog.is_open() && matches!(app.screen, Screen::Home) {
-            tracing::info!("EXIT gesture — opening quit dialog");
-            quit_dialog.open(1);
-            dirty = true;
+        // Long-press Back (root/held Back, surfaced as the EXIT gesture) quits
+        // straight away from any menu state, no confirm — the short Back tap below
+        // opens the dialog instead. Menu loop only; stream is unaffected.
+        if exit_gesture_fired(&mut exit_held) {
+            tracing::info!("EXIT gesture — quitting app");
+            return Ok(None);
         }
-        // Controller quit shortcut, mirroring the EXIT gesture: held long enough on Home,
+        // Controller quit shortcut: held long enough on Home,
         // then forgotten so it fires once per hold rather than repeatedly while held.
         if !quit_dialog.is_open() && matches!(app.screen, Screen::Home) && chord.held_for(EXIT_HOLD) {
             tracing::info!("quit shortcut held — opening quit dialog");
@@ -232,6 +232,19 @@ pub(super) fn run_ui_flow(
                     Some(_) => dirty = true,
                     None => {}
                 }
+                continue;
+            }
+            // Short Back tap on Home with sidebar focus opens the quit dialog. From a
+            // game card / the ⋯ column, Back first steps focus back to the sidebar
+            // (see `App::back`), so it falls through to normal dispatch instead.
+            if matches!(app.screen, Screen::Home)
+                && matches!(app.home_focus, HomeFocus::Sidebar(_))
+                && matches!(&event, Event::KeyDown { keycode: Some(k), repeat: false, .. }
+                    if crate::platform::webos::input::menu_event_for_key(*k) == Some(MenuEvent::Back))
+            {
+                tracing::info!("Back tap on Home sidebar — opening quit dialog");
+                quit_dialog.open(1);
+                dirty = true;
                 continue;
             }
             match handle_ui_event(&mut app, event, &mut input, display_mode, fonts, &mut dirty) {

@@ -196,6 +196,8 @@ impl App {
                     }
                 }
             }
+            // Back on Home is owned by `App::back` (grid/⋯ → sidebar), reached via
+            // `dispatch_menu_event` before this handler — never routed here.
             MenuEvent::Back => {}
         }
         None
