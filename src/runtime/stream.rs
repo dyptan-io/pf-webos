@@ -365,6 +365,14 @@ pub(super) fn run_inner() -> Result<()> {
                     // to the host as real HID mouse input during a stream instead of
                     // driving local UI focus (see `mouse.rs`).
                     Event::MouseMotion { x, y, .. } => {
+                        // webOS (re)materializes its system cursor on pointer
+                        // activity, which can undo the one-shot hide at stream
+                        // start — most visibly when the app was launched with a
+                        // mouse already moving, leaving the TV cursor overlaid on
+                        // the host's. Re-assert the hide here so capture is sticky.
+                        if settings.cursor_capture && sdl.mouse().is_cursor_showing() {
+                            sdl.mouse().show_cursor(false);
+                        }
                         let ev = mouse::move_event(x, y, display_mode.w as u32, display_mode.h as u32);
                         let _ = session::send_input(&connected.client, &ev);
                     }

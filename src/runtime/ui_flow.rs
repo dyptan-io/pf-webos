@@ -97,9 +97,9 @@ pub(super) fn run_ui_flow(
     // `quit_dialog_was_active` catches the close-fade's final frame so it gets one last
     // redraw-on-change tick to wipe the dialog off the menu.
     let mut quit_dialog = ConfirmDialog::new(
-        "Quit?",
-        "punktfunk will close and you'll return to the webOS home screen.",
-        crate::ui::confirm_buttons(Some(crate::ui::ICON_CLOSE), "Quit app", crate::ui::ERROR_RED),
+        "Quit app?",
+        "Punktfunk will close and you'll return to the webOS home screen.",
+        crate::ui::confirm_buttons(Some(crate::ui::ICON_CLOSE), "Quit", crate::ui::ERROR_RED),
     );
     let mut exit_held = false;
     // Controller routes to the quit dialog the same way it routes to the disconnect
