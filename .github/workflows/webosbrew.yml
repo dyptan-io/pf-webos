@@ -1,0 +1,105 @@
+name: webOS Homebrew
+
+on:
+  workflow_call:
+    inputs:
+      artifact:
+        description: Name of the artifact holding the built .ipk
+        required: true
+        type: string
+      release_tag:
+        description: Release tag to attach the .ipk and manifest to (empty = no release)
+        required: false
+        default: ''
+        type: string
+  workflow_dispatch:
+    inputs:
+      artifact:
+        description: Name of the artifact holding the built .ipk
+        required: true
+        default: io.dyptan.punktfunk.webos
+        type: string
+      release_tag:
+        description: Release tag to attach the .ipk and manifest to (empty = no release)
+        required: false
+        default: ''
+        type: string
+
+env:
+  TOOLBOX_RELEASE: 0.5.0
+  TOOLBOX_VERSION: 0.5.0-1
+
+jobs:
+  verify-and-manifest:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.artifact }}
+          path: dist
+
+      - name: Cache dev-toolbox-cli packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/webosbrew-toolbox
+          key: webosbrew-toolbox-${{ env.TOOLBOX_RELEASE }}-${{ env.TOOLBOX_VERSION }}-amd64
+
+      - name: Install webosbrew/dev-toolbox-cli
+        run: |
+          set -euo pipefail
+          DEBS="$HOME/.cache/webosbrew-toolbox"
+          mkdir -p "$DEBS"
+          for tool in fw-symbols elf-verify ipk-verify gen-manifest; do
+            deb="$DEBS/webosbrew-toolbox-${tool}_${TOOLBOX_VERSION}_amd64.deb"
+            [ -s "$deb" ] || curl -sSL --fail -o "$deb" \
+              "https://github.com/webosbrew/dev-toolbox-cli/releases/download/${TOOLBOX_RELEASE}/$(basename "$deb")"
+          done
+          sudo apt-get install -y --no-install-recommends "$DEBS"/*.deb
+
+      - name: Verify .ipk against firmware symbol data
+        run: |
+          set -uo pipefail
+          webosbrew-toolbox-ipk-verify dist/*.ipk --details --format markdown \
+            --output verify.md
+          status=$?
+          [ -s verify.md ] && cat verify.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Generate Homebrew manifest
+        run: |
+          set -euo pipefail
+          IPK="$(ls dist/*.ipk)"
+          APP_ID="$(basename "$IPK" | cut -d_ -f1)"
+          webosbrew-toolbox-gen-manifest \
+            --pkgfile "$IPK" \
+            --icon "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/packaging/icon_large.png" \
+            --link "https://github.com/${GITHUB_REPOSITORY}" \
+            --root false \
+            --output "dist/${APP_ID}.manifest.json"
+          # gen-manifest only knows the local file name; point ipkUrl at the release asset.
+          TAG='${{ inputs.release_tag }}'
+          if [ -n "$TAG" ]; then
+            URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/$(basename "$IPK")"
+            jq --arg url "$URL" '.ipkUrl = $url' "dist/${APP_ID}.manifest.json" > "$RUNNER_TEMP/m.json"
+            mv "$RUNNER_TEMP/m.json" "dist/${APP_ID}.manifest.json"
+          fi
+          cat "dist/${APP_ID}.manifest.json"
+
+      - name: Upload manifest artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact }}-manifest
+          path: dist/*.manifest.json
+
+      - name: Attach .ipk and manifest to the release
+        if: inputs.release_tag != ''
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: |
+            dist/*.ipk
+            dist/*.manifest.json

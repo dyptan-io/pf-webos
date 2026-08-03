@@ -53,28 +53,16 @@ jobs:
         run: task package
 
       - name: Upload .ipk artifact
-        if: github.event_name != 'release'
         uses: actions/upload-artifact@v7
         with:
           name: io.dyptan.punktfunk.webos
           path: dist/*.ipk
 
-      - name: Validate Homebrew manifest against schema
-        if: github.event_name == 'release'
-        run: |
-          set -euo pipefail
-          curl -sSL -o /tmp/HomebrewPackageManifest.schema.json \
-            https://raw.githubusercontent.com/webosbrew/docs/main/schemas/HomebrewPackageManifest.schema.json
-          npx --yes ajv-cli@5 validate \
-            --spec=draft2020 \
-            -s /tmp/HomebrewPackageManifest.schema.json \
-            -d dist/*.manifest.json \
-            --strict=false
-
-      - name: Attach .ipk and manifest to the release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            dist/*.ipk
-            dist/*.manifest.json
+  webosbrew:
+    needs: cross-build
+    permissions:
+      contents: write
+    uses: ./.github/workflows/webosbrew.yml
+    with:
+      artifact: io.dyptan.punktfunk.webos
+      release_tag: ${{ github.event_name == 'release' && github.event.release.tag_name || '' }}

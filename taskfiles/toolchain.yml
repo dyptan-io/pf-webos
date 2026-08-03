@@ -114,25 +114,9 @@ tasks:
         mkdir -p dist
         ares-package "$STAGE_DIR" -o dist --force-arch arm
 
-        if [ "$PKG_VERSION" = "$APP_VERSION" ]; then
-          IPK_FILE="dist/${APP_ID}_${PKG_VERSION}_arm.ipk"
-          IPK_SHA256="$(sha256sum "$IPK_FILE" | cut -d' ' -f1)"
-          REPO="${GITHUB_REPOSITORY:-dyptan-io/punktfunk-webos}"
-          cat > "dist/${APP_ID}.manifest.json" <<EOF
-        {
-          "id": "${APP_ID}",
-          "version": "${APP_VERSION}",
-          "type": "native",
-          "title": "punktfunk",
-          "appDescription": "punktfunk — low-latency desktop/game streaming client",
-          "iconUri": "https://raw.githubusercontent.com/${REPO}/main/packaging/icon_large.png",
-          "sourceUrl": "https://github.com/${REPO}",
-          "rootRequired": false,
-          "ipkUrl": "https://github.com/${REPO}/releases/download/${GITHUB_REF_NAME}/$(basename "$IPK_FILE")",
-          "ipkHash": { "sha256": "$IPK_SHA256" }
-        }
-        EOF
-        else
+        # Homebrew manifest is generated in CI by webosbrew-toolbox-gen-manifest
+        # (.github/workflows/webosbrew.yml), not here.
+        if [ "$PKG_VERSION" != "$APP_VERSION" ]; then
           mv "dist/${APP_ID}_${APP_VERSION}_arm.ipk" "dist/${APP_ID}_${PKG_VERSION}_arm.ipk"
         fi
 
