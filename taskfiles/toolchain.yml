@@ -72,20 +72,27 @@ tasks:
     desc: Fetch the full webOS cross-toolchain
     deps: [sdl2]
 
-  ares:
-    desc: >-
-      Install the webosbrew/ares-cli-rs tools (package + the device tools the
-      deploy path uses instead of raw ssh/scp) if they aren't already on PATH
+  ares-package:
+    desc: Install ares-package (webosbrew/ares-cli-rs) if it isn't already on PATH
     status:
       - command -v ares-package
+    cmds:
+      - cargo install --locked --git https://github.com/webosbrew/ares-cli-rs ares-package
+
+  ares-device:
+    # Kept separate from ares-package: these link libssh/OpenSSL/GTK and take
+    # minutes to build, and only `deploy` needs them — CI packages without them.
+    desc: >-
+      Install the ares-cli-rs device tools (setup-device/install/launch) that
+      deploy uses instead of raw ssh/scp, if they aren't already on PATH
+    status:
       - command -v ares-setup-device
       - command -v ares-install
       - command -v ares-launch
-      - command -v ares-shell
     cmds:
       - >-
         cargo install --locked --git https://github.com/webosbrew/ares-cli-rs
-        ares-package ares-setup-device ares-install ares-launch ares-shell
+        ares-setup-device ares-install ares-launch
 
   stage-and-package:
     internal: true

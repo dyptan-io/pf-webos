@@ -82,7 +82,7 @@ tasks:
 
   package:
     desc: Build and package dist/*.ipk, no Docker (used by CI). Thin LTO (fast); override with RELEASE_LTO=fat for optimized.
-    deps: [build, toolchain:ares]
+    deps: [build, toolchain:ares-package]
     cmds:
       - task: toolchain:stage-and-package
         vars:
@@ -123,7 +123,7 @@ tasks:
 
   register-device:
     internal: true
-    deps: [toolchain:ares]
+    deps: [toolchain:ares-device]
     requires:
       vars: [TV_HOST]
     vars:
