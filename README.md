@@ -85,7 +85,7 @@ Linux-aarch64-only; works on amd64 hosts too via QEMU). Run `task --list` for ev
 | `task docker:package` | Build + package `dist/*.ipk` — the one you usually want |
 | `task docker:build` / `task docker:check` | Faster inner loop: compile only, or `cargo check` only |
 | `task docker:lint` / `task fmt` | `cargo clippy` / `cargo fmt` |
-| `task deploy TV_HOST=root@<tv-ip>` | Build, package, install, and launch on a real TV over SSH |
+| `task deploy TV_HOST=root@<tv-ip>` | Build, package, install, and launch on a real TV (via [ares-cli-rs](https://github.com/webosbrew/ares-cli-rs)) |
 | `task deploy TV_HOST=... TELEMETRY=auto` | Same, but streams the app's logs live to this machine instead of a file on-device |
 | `task clean` | Remove build output and caches |
 
@@ -93,7 +93,10 @@ Drop the `docker:` prefix (`task package`, `task lint`, …) to run natively on 
 
 **Build optimization**: Dev builds use thin LTO for speed (~2-3x faster iteration). For final release builds optimized for weak TV hardware, append `RELEASE_LTO=fat` to any build task: `task docker:package RELEASE_LTO=fat` or `task deploy TV_HOST=... RELEASE_LTO=fat`.
 
-Set `TV_HOST` once in a local `.env` (copy `.env.example`) to skip typing it each time. Architecture
+Set `TV_HOST` once in a local `.env` (copy `.env.example`) to skip typing it each time — it's the
+only thing `deploy` needs: it installs the `ares-*` binaries on first use and registers the TV from
+it (root over ssh on port 22). ares ignores `~/.ssh/config`, so set `SSH_KEY` in `.env` if your key
+isn't `~/.ssh/id_rsa`. Architecture
 and on-device gotchas live in [`docs/NOTES.md`](docs/NOTES.md) and `CLAUDE.md`.
 
 ## License

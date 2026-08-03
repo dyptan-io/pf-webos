@@ -14,6 +14,11 @@ silent: true
 # instead of being typed on every invocation — see .env.example.
 dotenv: ['.env']
 
+env:
+  # Modern CMake refuses vendored libopus's old cmake_minimum_required
+  # (audiopus_sys, pulled in transitively by punktfunk-core's `quic` feature).
+  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+
 includes:
   toolchain:
     taskfile: ./taskfiles/toolchain.yml
@@ -21,9 +26,14 @@ includes:
       NDK_DIR: '{{.NDK_DIR}}'
       SYSROOT: '{{.SYSROOT}}'
       TARGET: '{{.TARGET}}'
+      APP_ID: '{{.APP_ID}}'
       RUST_IMAGE: '{{.RUST_IMAGE}}'
 
 vars:
+  APP_ID: io.dyptan.punktfunk.webos
+  TV_DEVICE: webos-tv
+  SSH_KEY: '{{.SSH_KEY | default "$HOME/.ssh/id_rsa"}}'
+  RELEASE_LTO: '{{.RELEASE_LTO | default "thin"}}'
   NDK_DIR: .toolchains/arm-webos-linux-gnueabi_sdk-buildroot
   SYSROOT: '{{.NDK_DIR}}/arm-webos-linux-gnueabi/sysroot'
   TARGET: armv7-unknown-linux-gnueabi
@@ -47,9 +57,6 @@ tasks:
       with RELEASE_LTO=fat for an optimized build.
     deps: [toolchain:all]
     env:
-      # Modern CMake refuses vendored libopus's old cmake_minimum_required
-      # (audiopus_sys, pulled in transitively by punktfunk-core's `quic` feature).
-      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
       # Thread the packaged version into the binary so the UI's build marker matches
       # the .ipk (Cargo.toml stays a fixed 0.0.1; recomputed inside Docker from the
       # mounted repo's git, so both `build` and CI's `build` pick it up).
@@ -61,8 +68,6 @@ tasks:
   check:
     desc: Quick cross-target `cargo check`, no Docker (used by CI)
     deps: [toolchain:all]
-    env:
-      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
     cmds:
       - rustup target add {{.TARGET}}
       - cargo check --target {{.TARGET}}
@@ -70,8 +75,6 @@ tasks:
   lint:
     desc: Cross-target `cargo clippy` (the lint set in Cargo.toml's `[lints.clippy]`), no Docker (used by CI)
     deps: [toolchain:all]
-    env:
-      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
     cmds:
       - rustup target add {{.TARGET}}
       - rustup component add clippy
@@ -79,7 +82,7 @@ tasks:
 
   package:
     desc: Build and package dist/*.ipk, no Docker (used by CI). Thin LTO (fast); override with RELEASE_LTO=fat for optimized.
-    deps: [build, toolchain:ares-package]
+    deps: [build, toolchain:ares]
     cmds:
       - task: toolchain:stage-and-package
         vars:
@@ -96,7 +99,7 @@ tasks:
       - task: toolchain:docker-run
         vars:
           TARGET_TASK: build
-          RELEASE_LTO: '{{.RELEASE_LTO | default "thin"}}'
+          RELEASE_LTO: '{{.RELEASE_LTO}}'
 
   docker:check:
     desc: Quick cross-target `cargo check`, inside Docker — the local dev entry point
@@ -116,11 +119,29 @@ tasks:
       - task: toolchain:docker-run
         vars:
           TARGET_TASK: package
-          RELEASE_LTO: '{{.RELEASE_LTO | default "thin"}}'
+          RELEASE_LTO: '{{.RELEASE_LTO}}'
+
+  register-device:
+    internal: true
+    deps: [toolchain:ares]
+    requires:
+      vars: [TV_HOST]
+    vars:
+      TV_IP: '{{splitList "@" .TV_HOST | last}}'
+      TV_USER: '{{if contains "@" .TV_HOST}}{{splitList "@" .TV_HOST | first}}{{else}}root{{end}}'
+    status:
+      - ares-setup-device -l | grep -qE '^{{.TV_DEVICE}}( \(default\))? +{{.TV_USER}}@{{.TV_IP}}:22 '
+      - 'ares-setup-device -F | grep -qF "openSshPath : {{.SSH_KEY}}"'
+    cmds:
+      - ares-setup-device -r {{.TV_DEVICE}} >/dev/null 2>&1 || true
+      - >-
+        ares-setup-device -a {{.TV_DEVICE}} -i host={{.TV_IP}}
+        -i port=22 -i username={{.TV_USER}} -i keyPath="{{.SSH_KEY}}" -i default=true >/dev/null
 
   deploy:
     desc: >-
-      Build, package, install on a real TV over SSH, and launch it. Usage:
+      Build, package, install on a real TV, and launch it — all over ares-cli-rs
+      (ares-install/ares-launch), no raw ssh/scp. Usage:
       task deploy TV_HOST=root@<tv-ip> (or set TV_HOST in .env). Without TELEMETRY,
       the app just writes a versioned file in its data dir (info-and-above only) —
       the same as always. Pass TELEMETRY=<host:port> to stream logs live to that
@@ -129,19 +150,13 @@ tasks:
       use this machine's own LAN IP on a random port (printed once the listener is
       up, in case you need to connect to it manually). TELEMETRY_LEVEL
       (debug/info/warn/error, default debug) sets the minimum level sent.
-    deps: [docker:package]
-    requires:
-      vars: [TV_HOST]
+    deps: [docker:package, register-device]
     vars:
-      IPK: dist/io.dyptan.punktfunk.webos_{{.PKG_VERSION}}_arm.ipk
+      IPK: dist/{{.APP_ID}}_{{.PKG_VERSION}}_arm.ipk
       TELEMETRY_LEVEL: '{{.TELEMETRY_LEVEL | default "debug"}}'
     cmds:
-      - test -f "{{.IPK}}" || exit 1
-      - scp "{{.IPK}}" {{.TV_HOST}}:/tmp/
-      - >-
-        ssh -tt {{.TV_HOST}}
-        "luna-send -i -n 1 -f luna://com.webos.appInstallService/dev/install
-        '{\"id\":\"io.dyptan.punktfunk.webos\",\"ipkUrl\":\"/tmp/$(basename {{.IPK}})\",\"subscribe\":true}'"
+      - test -f "{{.IPK}}" || { echo "no {{.IPK}} — packaging failed?" >&2; exit 1; }
+      - ares-install -d {{.TV_DEVICE}} "{{.IPK}}"
       - sleep 3
       - |
         set -eu
@@ -152,8 +167,8 @@ tasks:
           TELEMETRY="${IP}:${PORT}"
         fi
 
-        PARAMS=""
         NC_PID=""
+        set -- {{.APP_ID}}
         if [ -n "$TELEMETRY" ]; then
           PORT="${TELEMETRY##*:}"
           ( while true; do nc -l "$PORT"; done ) &
@@ -161,9 +176,9 @@ tasks:
           trap 'kill "$NC_PID" 2>/dev/null || true' EXIT
           sleep 0.5
           echo "listening on :${PORT} (destination sent to device: $TELEMETRY)" >&2
-          PARAMS=",\"params\":{\"telemetry\":\"$TELEMETRY\",\"telemetry_level\":\"{{.TELEMETRY_LEVEL}}\"}"
+          set -- "$@" -p "telemetry=$TELEMETRY" -p "telemetry_level={{.TELEMETRY_LEVEL}}"
         fi
-        ssh -tt {{.TV_HOST}} "luna-send -n 1 -f luna://com.webos.applicationManager/launch '{\"id\":\"io.dyptan.punktfunk.webos\"${PARAMS}}'"
+        ares-launch -d {{.TV_DEVICE}} "$@"
         if [ -n "$NC_PID" ]; then
           wait "$NC_PID"
         fi
@@ -172,4 +187,4 @@ tasks:
     desc: Remove everything — dist/, .toolchains/, target/, and the Docker volumes
     cmds:
       - rm -rf ./dist ./.toolchains ./target
-      - docker volume rm -f punktfunk-webos-toolchains punktfunk-webos-target punktfunk-webos-cargo punktfunk-webos-apt-cache punktfunk-webos-apt-lists punktfunk-webos-tools
+      - docker volume ls -q --filter name=punktfunk-webos- | xargs docker volume rm -f

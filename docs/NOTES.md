@@ -62,7 +62,8 @@ Host side: a game only emits trigger effects when it sees a `DualSense`, so pad 
 ## Runtime gotchas (LG CX/G5)
 
 - Apps install to `/media/developer/apps/usr/palm/applications/<appid>/` = `$HOME` (writable dir for logs, `connect.conf`).
-- `luna-send` **needs `ssh -tt`** (real PTY) or output silently swallowed.
+- `luna-send` over raw ssh **needs `ssh -tt`** (real PTY) or output silently swallowed — the task
+  targets go through `ares-install`/`ares-launch` instead, which don't have this problem.
 - **Black screen despite decode**: launch through real app lifecycle (`luna-send .../launch`, SAM jailed uid). NDL punch-through only composites for SAM-managed foreground app.
 - No env vars in SAM launch, but `params` in `applicationManager/launch` reaches native app as argv[1] JSON (parsed by `src/logger.rs`).
 - SDL2/Wayland may report `refresh_rate=0` — clamp to sensible default.

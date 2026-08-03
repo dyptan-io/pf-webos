@@ -70,29 +70,38 @@ tasks:
 
   all:
     desc: Fetch the full webOS cross-toolchain
-    deps: [ndk, sdl2]
+    deps: [sdl2]
 
-  ares-package:
-    desc: Install ares-package (webosbrew/ares-cli-rs) if it isn't already on PATH
+  ares:
+    desc: >-
+      Install the webosbrew/ares-cli-rs tools (package + the device tools the
+      deploy path uses instead of raw ssh/scp) if they aren't already on PATH
     status:
       - command -v ares-package
+      - command -v ares-setup-device
+      - command -v ares-install
+      - command -v ares-launch
+      - command -v ares-shell
     cmds:
-      - cargo install --git https://github.com/webosbrew/ares-cli-rs ares-package
+      - >-
+        cargo install --locked --git https://github.com/webosbrew/ares-cli-rs
+        ares-package ares-setup-device ares-install ares-launch ares-shell
 
   stage-and-package:
     internal: true
     requires:
-      vars: [PKG_VERSION, TARGET, NDK_DIR, SYSROOT]
+      vars: [PKG_VERSION, APP_ID, TARGET, NDK_DIR, SYSROOT]
     cmds:
       - |
         set -eu
+        APP_ID={{.APP_ID}}
         STAGE_DIR="$(mktemp -d)"
         trap 'rm -rf "$STAGE_DIR"' EXIT
         mkdir -p "$STAGE_DIR/bin" "$STAGE_DIR/lib"
         cp target/{{.TARGET}}/release/punktfunk-webos "$STAGE_DIR/bin/"
-        {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-strip "$STAGE_DIR/bin/punktfunk-webos"
         cp -L {{.SYSROOT}}/usr/lib/libSDL2-2.0.so.0 "$STAGE_DIR/lib/libSDL2-2.0.so.0"
-        {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-strip "$STAGE_DIR/lib/libSDL2-2.0.so.0"
+        {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-strip \
+          "$STAGE_DIR/bin/punktfunk-webos" "$STAGE_DIR/lib/libSDL2-2.0.so.0"
         cp packaging/appinfo.json packaging/icon.png packaging/icon_large.png packaging/splash.png "$STAGE_DIR/"
 
         PKG_VERSION="{{.PKG_VERSION}}"
@@ -106,12 +115,12 @@ tasks:
         ares-package "$STAGE_DIR" -o dist --force-arch arm
 
         if [ "$PKG_VERSION" = "$APP_VERSION" ]; then
-          IPK_FILE="dist/io.dyptan.punktfunk.webos_${PKG_VERSION}_arm.ipk"
+          IPK_FILE="dist/${APP_ID}_${PKG_VERSION}_arm.ipk"
           IPK_SHA256="$(sha256sum "$IPK_FILE" | cut -d' ' -f1)"
           REPO="${GITHUB_REPOSITORY:-dyptan-io/punktfunk-webos}"
-          cat > dist/io.dyptan.punktfunk.webos.manifest.json <<EOF
+          cat > "dist/${APP_ID}.manifest.json" <<EOF
         {
-          "id": "io.dyptan.punktfunk.webos",
+          "id": "${APP_ID}",
           "version": "${APP_VERSION}",
           "type": "native",
           "title": "punktfunk",
@@ -124,8 +133,7 @@ tasks:
         }
         EOF
         else
-          mv "dist/io.dyptan.punktfunk.webos_${APP_VERSION}_arm.ipk" \
-             "dist/io.dyptan.punktfunk.webos_${PKG_VERSION}_arm.ipk"
+          mv "dist/${APP_ID}_${APP_VERSION}_arm.ipk" "dist/${APP_ID}_${PKG_VERSION}_arm.ipk"
         fi
 
   docker-run:
