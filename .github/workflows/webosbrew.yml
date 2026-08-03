@@ -70,8 +70,9 @@ jobs:
       - name: Verify .ipk against firmware symbol data
         run: |
           set -uo pipefail
-          webosbrew-ipk-verify dist/*.ipk --details --format markdown \
-            --output verify.md
+          # webOS 5.x+ only: NDL DirectMedia/DirectVideo don't exist before that.
+          webosbrew-ipk-verify dist/*.ipk --fw-releases '>=5' \
+            --details --format markdown --output verify.md
           status=$?
           [ -s verify.md ] && cat verify.md >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
