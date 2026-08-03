@@ -42,14 +42,6 @@ impl App {
         let rows = self.experimental_rows();
         let card = Self::experimental_card_rect(screen_w, screen_h, fonts, &subtitle, rows.len());
         self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
-        ui::render_list_modal(
-            painter,
-            text_cache,
-            fonts,
-            card,
-            "Experimental",
-            &subtitle,
-            &rows,
-        )
+        ui::render_list_modal(painter, text_cache, fonts, card, "Experimental", &subtitle, &rows)
     }
 }

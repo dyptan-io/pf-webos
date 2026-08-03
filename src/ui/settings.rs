@@ -223,7 +223,8 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
-            subtext: (settings.codec == CodecPref::H264).then(|| RowSubtext::hint("HDR is not supported with this codec")),
+            subtext: (settings.codec == CodecPref::H264)
+                .then(|| RowSubtext::hint("HDR is not supported with this codec")),
         },
         FocusRow {
             icon: ICON_SUN,
@@ -347,7 +348,9 @@ pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
             fraction: 0.0,
             danger: false,
             menu: None,
-            subtext: settings.stats_overlay.then(|| RowSubtext::hint("Or use the Green button")),
+            subtext: settings
+                .stats_overlay
+                .then(|| RowSubtext::hint("Or use the Green button")),
         },
         FocusRow {
             icon: ICON_VISIBILITY,

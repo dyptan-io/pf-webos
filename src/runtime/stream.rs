@@ -129,15 +129,12 @@ pub(super) fn run_inner() -> Result<()> {
         // from scratch when the user returns to the menu.
         tracing::debug!("releasing all compositor textures for stream handoff");
         compositor.clear_all();
-        // The system draws its own cursor (a real SDL2 cursor this fork loads from
-        // `/usr/share/im/...` — confirmed via `SDL_waylandwebos_cursor.c`) tracking
-        // the physical remote directly; the host draws a second, independent one
-        // wherever our forwarded `MouseMoveAbs` puts it. Two visible cursors reads
-        // as "the pointer doesn't match the remote" — hidden here unless "Cursor
-        // capture" is off (see `store::Settings::cursor_capture`). Restored when back
-        // in the menu (`sdl.mouse()` is the same standard SDL2 API on any platform,
-        // not webOS-specific).
-        sdl.mouse().show_cursor(!settings.cursor_capture);
+        // The TV draws a local pointer; the host draws a second one wherever our
+        // forwarded `MouseMoveAbs` puts it, and two cursors read as "the pointer
+        // doesn't match the mouse". Local one goes unless "Cursor capture" is off
+        // (`store::Settings::cursor_capture`), and comes back in the menu.
+        let mut cursor = cursor::Cursor::new(sdl.mouse());
+        cursor.set_visible(!settings.cursor_capture);
 
         // Already running (started back in `run_ui_flow`, overlapping the launch
         // zoom/fade) — joining just waits out whatever's left of the handshake,
@@ -150,7 +147,7 @@ pub(super) fn run_inner() -> Result<()> {
                 // and take the whole app down — return to the menu with the
                 // reason on screen instead.
                 tracing::error!("session connect failed: {e:#}");
-                sdl.mouse().show_cursor(true);
+                cursor.set_visible(true);
                 menu_status = Some(format!("Couldn't connect: {}", crate::errors::friendly(&e)));
                 continue;
             }
@@ -175,7 +172,7 @@ pub(super) fn run_inner() -> Result<()> {
                     } else {
                         tracing::warn!("session teardown timed out — skipping NDL unload for this run");
                     }
-                    sdl.mouse().show_cursor(true);
+                    cursor.set_visible(true);
                     menu_status = Some(format!("Couldn't start audio: {e:#}"));
                     continue;
                 }
@@ -362,12 +359,7 @@ pub(super) fn run_inner() -> Result<()> {
                     // to the host as real HID mouse input during a stream instead of
                     // driving local UI focus (see `mouse.rs`).
                     Event::MouseMotion { x, y, .. } => {
-                        // webOS re-materializes its system cursor on pointer activity,
-                        // undoing the one-shot hide at stream start (most visibly when
-                        // launched with a mouse in motion) — re-assert so it stays hidden.
-                        if settings.cursor_capture && sdl.mouse().is_cursor_showing() {
-                            sdl.mouse().show_cursor(false);
-                        }
+                        cursor.on_pointer_activity();
                         let ev = mouse::move_event(x, y, display_mode.w as u32, display_mode.h as u32);
                         let _ = session::send_input(&connected.client, &ev);
                     }
@@ -741,7 +733,7 @@ pub(super) fn run_inner() -> Result<()> {
         }
         // Put the TV's picture/sound modes back (no-op unless game mode switched them).
         crate::platform::webos::game_mode::restore(restore_tv_modes);
-        sdl.mouse().show_cursor(true);
+        cursor.set_visible(true);
         match outcome {
             StreamOutcome::Quit => {
                 tracing::info!("punktfunk-webos exiting cleanly");

@@ -27,9 +27,8 @@ const HBCHANNEL_SERVICE: &str = "/media/developer/apps/usr/palm/services/org.web
 /// gates whether the Experimental "Game mode" row is offered at all.
 pub fn is_rooted() -> bool {
     static ROOTED: OnceLock<bool> = OnceLock::new();
-    *ROOTED.get_or_init(|| {
-        crate::platform::webos::luna::available() && std::path::Path::new(HBCHANNEL_SERVICE).is_dir()
-    })
+    *ROOTED
+        .get_or_init(|| crate::platform::webos::luna::available() && std::path::Path::new(HBCHANNEL_SERVICE).is_dir())
 }
 /// Generous: the outer call forks `luna-send` as root on the TV, which itself round-trips to
 /// `settingsservice`. Passed through as `luna-send-pub -w` and the process kill deadline.

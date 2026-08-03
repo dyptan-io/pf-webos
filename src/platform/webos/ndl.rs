@@ -229,8 +229,7 @@ impl NdlVideo {
                 // invalidate the load, so it's logged but not propagated.
                 let mut frame = OPUS_EMPTY_FRAME;
                 // SAFETY: NDL reads `size` bytes synchronously and does not retain the pointer.
-                let prime =
-                    unsafe { NDL_DirectAudioPlay(frame.as_mut_ptr() as *mut c_void, frame.len() as c_uint, 0) };
+                let prime = unsafe { NDL_DirectAudioPlay(frame.as_mut_ptr() as *mut c_void, frame.len() as c_uint, 0) };
                 if prime != 0 {
                     tracing::warn!("NDL empty-Opus prime failed (ret={prime} error={})", last_error());
                 }

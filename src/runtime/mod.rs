@@ -8,6 +8,7 @@ use sdl2::controller::GameController;
 
 use crate::app::{App, HomeFocus, Screen, MODAL_FADE, MODAL_POP_SHRINK};
 use crate::platform::webos::compositor::Compositor;
+use crate::platform::webos::cursor;
 use crate::platform::webos::gamepad;
 use crate::platform::webos::keyboard;
 use crate::platform::webos::mouse;
@@ -209,6 +210,9 @@ pub fn run() -> Result<()> {
             "PANIC on thread {:?}: {info}",
             std::thread::current().name().unwrap_or("unnamed"),
         );
+        // Global compositor state: a panic mid-stream would otherwise leave the whole
+        // TV without a cursor.
+        cursor::restore_on_exit();
         default_hook(info);
     }));
 

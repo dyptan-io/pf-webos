@@ -52,7 +52,10 @@ pub fn available() -> bool {
 /// reaches the host). Fire-and-forget: a Home press must not block the input loop.
 pub fn launch_home() {
     std::thread::spawn(|| {
-        if let Err(e) = call("luna://com.webos.applicationManager/launch", r#"{"id":"com.webos.app.home"}"#) {
+        if let Err(e) = call(
+            "luna://com.webos.applicationManager/launch",
+            r#"{"id":"com.webos.app.home"}"#,
+        ) {
             tracing::warn!("launch webOS home failed: {e:#}");
         }
     });
