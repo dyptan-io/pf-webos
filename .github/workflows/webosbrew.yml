@@ -70,7 +70,7 @@ jobs:
       - name: Verify .ipk against firmware symbol data
         run: |
           set -uo pipefail
-          webosbrew-toolbox-ipk-verify dist/*.ipk --details --format markdown \
+          webosbrew-ipk-verify dist/*.ipk --details --format markdown \
             --output verify.md
           status=$?
           [ -s verify.md ] && cat verify.md >> "$GITHUB_STEP_SUMMARY"
@@ -81,7 +81,7 @@ jobs:
           set -euo pipefail
           IPK="$(ls dist/*.ipk)"
           APP_ID="$(basename "$IPK" | cut -d_ -f1)"
-          webosbrew-toolbox-gen-manifest \
+          webosbrew-gen-manifest \
             --pkgfile "$IPK" \
             --icon "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/packaging/icon_large.png" \
             --link "https://github.com/${GITHUB_REPOSITORY}" \
