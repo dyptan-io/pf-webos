@@ -25,11 +25,6 @@ on:
         default: ''
         type: string
 
-env:
-  # Release tag, not the 0.5.0 release title — the two differ upstream.
-  TOOLBOX_RELEASE: v20260802-8aad4f1
-  TOOLBOX_VERSION: 0.5.0-1
-
 jobs:
   manifest:
     runs-on: ubuntu-24.04
@@ -43,22 +38,33 @@ jobs:
           name: ${{ inputs.artifact }}
           path: dist
 
+      - name: Resolve latest dev-toolbox-cli release
+        id: toolbox
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view --repo webosbrew/dev-toolbox-cli \
+            --json tagName --jq '"tag=" + .tagName' >> "$GITHUB_OUTPUT"
+
       - name: Cache dev-toolbox-cli packages
         uses: actions/cache@v5
         with:
           path: ~/.cache/webosbrew-toolbox
-          key: webosbrew-toolbox-${{ env.TOOLBOX_RELEASE }}-${{ env.TOOLBOX_VERSION }}-amd64
+          key: webosbrew-toolbox-${{ steps.toolbox.outputs.tag }}-amd64
 
       - name: Install webosbrew/dev-toolbox-cli
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOOLBOX_TAG: ${{ steps.toolbox.outputs.tag }}
         run: |
           set -euo pipefail
           DEBS="$HOME/.cache/webosbrew-toolbox"
           mkdir -p "$DEBS"
-          for tool in fw-symbols elf-verify ipk-verify gen-manifest; do
-            deb="$DEBS/webosbrew-toolbox-${tool}_${TOOLBOX_VERSION}_amd64.deb"
-            [ -s "$deb" ] || curl -sSL --fail -o "$deb" \
-              "https://github.com/webosbrew/dev-toolbox-cli/releases/download/${TOOLBOX_RELEASE}/$(basename "$deb")"
-          done
+          if ! ls "$DEBS"/*_amd64.deb >/dev/null 2>&1; then
+            gh release download "$TOOLBOX_TAG" --repo webosbrew/dev-toolbox-cli \
+              --dir "$DEBS" --pattern '*_amd64.deb'
+          fi
           sudo apt-get install -y --no-install-recommends "$DEBS"/*.deb
 
       - name: Verify .ipk against firmware symbol data
