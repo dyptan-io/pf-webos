@@ -26,11 +26,12 @@ on:
         type: string
 
 env:
-  TOOLBOX_RELEASE: 0.5.0
+  # Release tag, not the 0.5.0 release title — the two differ upstream.
+  TOOLBOX_RELEASE: v20260802-8aad4f1
   TOOLBOX_VERSION: 0.5.0-1
 
 jobs:
-  verify-and-manifest:
+  manifest:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
