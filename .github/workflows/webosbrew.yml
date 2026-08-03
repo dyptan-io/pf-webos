@@ -71,11 +71,10 @@ jobs:
         run: |
           set -uo pipefail
           # webOS 5.x+ only: NDL DirectMedia/DirectVideo don't exist before that.
+          # Markdown so the same text reads as a table in the job summary.
           webosbrew-ipk-verify dist/*.ipk --fw-releases '>=5' \
-            --details --format markdown --output verify.md
-          status=$?
-          [ -s verify.md ] && cat verify.md >> "$GITHUB_STEP_SUMMARY"
-          exit "$status"
+            --details --format markdown | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "${PIPESTATUS[0]}"
 
       - name: Generate Homebrew manifest
         run: |
