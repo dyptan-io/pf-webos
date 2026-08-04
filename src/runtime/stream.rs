@@ -1,32 +1,24 @@
+use std::sync::Arc;
+
 use super::*;
 
 pub(super) fn run_inner() -> Result<()> {
-    // Prevents webOS's system launcher from intercepting the Magic Remote's Back
-    // key, a connected HID keyboard's Windows/Meta key, and a gamepad's Guide
-    // button (which webOS otherwise treats as its own Home shortcut, backgrounding
-    // the app into the launcher — see `keyboard.rs`'s LGui/RGui mapping and
-    // `gamepad.rs`'s BTN_GUIDE mapping, which need these to actually reach the app
-    // instead). Must be set before window creation — confirmed on-device these
-    // hints only latch at creation time.
+    // Stops webOS's launcher intercepting Back/Windows-Meta/Guide as its own Home shortcut
+    // (see `keyboard.rs`'s LGui/RGui and `gamepad.rs`'s BTN_GUIDE mapping). Must be set before
+    // window creation — these hints only latch at creation time.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
-    // Distinct from KEYS_BACK: without it webOS closes (SIGTERMs) the app on its own
-    // Back/exit gesture — a held or root-level Back — before the app can act on the key,
-    // which is what killed the app mid-hold. aurora-tv, moonlight-tv, ihsplay and
-    // RetroArch all pair EXIT with BACK for exactly this.
+    // Without this webOS SIGTERMs the app on a held/root-level Back before it can react.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_EXIT", "true");
-    // Captured (=true): webOS classes a USB keyboard's Windows/Super key as a
-    // Home-class key, gated here together with the remote's Home button — there's no
-    // separate policy for them. Capturing is the only way the keyboard key reaches
-    // the app to forward to the host (VK_LWIN/VK_RWIN, see `keyboard.rs`). The cost
-    // is the remote's Home no longer opens the launcher natively, so we detect it in
-    // the input loop (bare keycode, no scancode) and relaunch it via `luna::launch_home`.
+    // Shares the Home-class policy with the remote's Home button (no separate policy exists);
+    // capturing is the only way a keyboard's Super key reaches the app to forward as
+    // VK_LWIN/VK_RWIN. Cost: remote Home no longer opens the launcher natively, so the input
+    // loop detects it (bare keycode, no scancode) and relaunches via `luna::launch_home`.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_HOME", "true");
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_META", "true");
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_GUIDE", "true");
-    // Suppress webOS's launcher ribbon overlay from popping over the foregrounded app.
+    // Suppress webOS's launcher ribbon popping over the foregrounded app.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_RIBBON", "false");
-    // Linear texture filtering (SDL defaults to nearest) — the focus pop
-    // scales card textures slightly, which shimmers without it.
+    // Linear texture filtering — the focus-pop scale shimmers on SDL's default nearest.
     sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "1");
     let sdl = sdl2::init().map_err(|e| anyhow::anyhow!("SDL_Init: {e}"))?;
     let ttf = sdl2::ttf::init().map_err(|e| anyhow::anyhow!("SDL_ttf init: {e}"))?;
@@ -59,17 +51,15 @@ pub(super) fn run_inner() -> Result<()> {
     let texture_creator = canvas.texture_creator();
     tracing::info!("window + canvas created (renderer: {})", canvas.info().name);
 
-    // The pre-stream UI's rendering backend: tiny-skia rasterizes cached
-    // widget tiles (see `ui.rs`'s `render_*_tile` helpers), and the GPU
-    // (`opengles2`, confirmed live on-device) composites them each frame via
-    // this compositor — see `compositor.rs`'s module docs.
+    // Pre-stream UI backend: tiny-skia rasterizes cached widget tiles, GPU composites them
+    // each frame — see `compositor.rs`.
     let mut compositor = Compositor::new();
 
     let mut events = sdl.event_pump().map_err(|e| anyhow::anyhow!("event pump: {e}"))?;
 
     let identity = store::load_or_create_identity().context("load_or_create_identity")?;
 
-    // Sized for a 10-foot TV viewing distance — see ui.rs's ROW_H/ROW_MAX_W docs.
+    // Sized for a 10-foot TV viewing distance.
     let text_raster = crate::platform::webos::text_sdl::SdlTextRaster::new(&ttf, display_mode.h as u32)?;
     let fonts = crate::ui::Fonts {
         raster: &text_raster,
@@ -80,15 +70,10 @@ pub(super) fn run_inner() -> Result<()> {
         caption: crate::ui::FontId::Caption,
     };
 
-    // Owned here, at the top of the menu/stream cycle, rather than re-declared in
-    // each: `ControllerDeviceAdded` only fires once per physical (re)connection, so
-    // a pad already open from the menu (or a previous stream) needs to carry
-    // straight through a screen transition instead of waiting for a replug neither
-    // side will ever see.
+    // Owned above the loop, not re-declared per iteration: `ControllerDeviceAdded` fires only
+    // once per physical (re)connection, so a pad opened earlier must carry across screens.
     let mut controller: Option<GameController> = None;
-    // Carried across the loop: why the *last* stream attempt bounced back to
-    // the menu (connect/audio failure), surfaced as the fresh Home screen's
-    // status line.
+    // Why the *last* stream attempt bounced to the menu, shown on the fresh Home screen.
     let mut menu_status: Option<String> = None;
 
     loop {
@@ -110,61 +95,44 @@ pub(super) fn run_inner() -> Result<()> {
         };
         tracing::debug!("settings: {settings:?}");
 
-        // `hide()` (the previous approach here, when `set_opacity` fails — confirmed
-        // unsupported on this Wayland backend) unmaps the surface entirely, which
-        // stops it receiving pointer focus/motion at all — silently breaking the
-        // Magic Remote pointer → host-mouse forwarding above, since there's no
-        // mapped surface left for Wayland to route those events to (still fine for
-        // keyboard-style remote-key polling, which webOS seems to route by
-        // foreground app identity rather than surface focus). aurora-tv (the same
-        // NDL punch-through technique, with its own working pointer support) never
-        // hides its window at all — it stays mapped, just cleared fully transparent
-        // each frame so the video plane underneath shows through. Doing the same
-        // here: one transparent clear, window stays visible/mapped.
+        // `hide()` unmaps the surface entirely, silently breaking the Magic Remote's pointer
+        // forwarding since Wayland has nowhere left to route motion. aurora-tv never hides its
+        // window either — stays mapped, cleared fully transparent so the video shows through.
         canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
         canvas.clear();
         canvas.present();
-        // Release all UI GPU textures (spinner frames, card art, sidebar …)
-        // before the stream takes the GPU. The compositor is re-populated
-        // from scratch when the user returns to the menu.
+        // Release UI GPU textures before the stream takes the GPU; re-populated on menu return.
         tracing::debug!("releasing all compositor textures for stream handoff");
         compositor.clear_all();
-        // The TV draws a local pointer; the host draws a second one wherever our
-        // forwarded `MouseMoveAbs` puts it, and two cursors read as "the pointer
-        // doesn't match the mouse". Local one goes unless "Cursor capture" is off
-        // (`store::Settings::cursor_capture`), and comes back in the menu.
+        // Local pointer hidden unless "Cursor capture" is off — otherwise it and the host's own
+        // forwarded-position cursor read as "the pointer doesn't match the mouse".
         let mut cursor = cursor::Cursor::new(sdl.mouse());
-        cursor.set_visible(!settings.cursor_capture);
+        cursor.set_captured(settings.cursor_capture);
 
-        // Already running (started back in `run_ui_flow`, overlapping the launch
-        // zoom/fade) — joining just waits out whatever's left of the handshake,
-        // which for a fast local connect is often nothing at all.
+        // Already running (started in `run_ui_flow`, overlapping the launch zoom/fade) — joining
+        // just waits out whatever handshake is left.
         let connected = match connect_thread.join().expect("connect thread panicked") {
             Ok(c) => c,
             Err(e) => {
-                // A failed connect (host went down in the race, codec/launch
-                // rejection, handshake error) used to `?` out of `run_inner`
-                // and take the whole app down — return to the menu with the
-                // reason on screen instead.
+                // Return to the menu with the reason on screen instead of `?`-ing the app down.
                 tracing::error!("session connect failed: {e:#}");
-                cursor.set_visible(true);
+                cursor.set_captured(false);
                 menu_status = Some(format!("Couldn't connect: {}", crate::errors::friendly(&e)));
                 continue;
             }
         };
         tracing::info!("session connected, entering event loop");
 
-        // Skipped entirely when NDL took the Opus stream: opening a second audio
-        // device that nothing ever feeds would still claim a PulseAudio sink.
+        // Skipped when NDL took the Opus stream — a second unfed audio device would still
+        // claim a PulseAudio sink.
         let mut audio_player = if connected.audio_offloaded {
             None
         } else {
             match crate::platform::webos::audio::AudioPlayer::new(&sdl_audio, connected.client.audio_channels) {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    // Same no-crash policy as the connect above — including the
-                    // video-side teardown the normal stream exit does, since the
-                    // connect succeeded and loaded a decoder.
+                    // Same no-crash policy as the connect above, plus the video teardown a
+                    // loaded decoder now needs.
                     tracing::error!("audio player init failed: {e:#}");
                     connected.client.disconnect_quit();
                     if connected.shutdown() {
@@ -172,7 +140,7 @@ pub(super) fn run_inner() -> Result<()> {
                     } else {
                         tracing::warn!("session teardown timed out — skipping NDL unload for this run");
                     }
-                    cursor.set_visible(true);
+                    cursor.set_captured(false);
                     menu_status = Some(format!("Couldn't start audio: {e:#}"));
                     continue;
                 }
@@ -186,20 +154,17 @@ pub(super) fn run_inner() -> Result<()> {
             );
         }
 
-        // Experimental: drive the TV into Game picture + sound mode (app-plane stand-in for
-        // HDMI ALLM), plus max Peak Brightness on HDR, matched to the negotiated SDR/HDR path.
-        // Best-effort; the returned changes are reverted on stream exit. See `game_mode`.
+        // Experimental: Game picture/sound mode, app-plane stand-in for HDMI ALLM. Best-effort;
+        // reverted on stream exit. See `game_mode`.
         let restore_tv_modes = if settings.game_mode {
             crate::platform::webos::game_mode::enter(connected.hdr)
         } else {
             Vec::new()
         };
 
-        // DualSense HID feedback (adaptive triggers, lightbar), only when the host is
-        // actually presenting a DualSense — anything else never emits these events, so
-        // starting the sender thread would be pure overhead. Absent for any other reason
-        // (pad on USB rather than Bluetooth, no `luna-send-pub`) is not an error: the
-        // stream is unaffected, so it's logged once and the feature is simply off.
+        // DualSense HID feedback (adaptive triggers, lightbar), started only for an actual
+        // DualSense — anything else never emits these events. Not found (USB pad, no
+        // `luna-send-pub`) isn't an error: logged once, feature just stays off.
         let mut ds_feedback = if settings.gamepad_type.is_dualsense() {
             match crate::platform::webos::dualsense::find_address() {
                 Some(addr) => crate::platform::webos::dualsense::Feedback::new(addr),
@@ -216,15 +181,32 @@ pub(super) fn run_inner() -> Result<()> {
         };
 
         let mut scroll_acc = mouse::ScrollAccumulator::default();
-        // In-stream stats overlay: refreshed at ~2Hz onto the otherwise-transparent
-        // stream window, composited OVER the punch-through video plane via the
-        // surface's per-pixel alpha. The window is never shown/hidden here (that's
-        // what crashed the old overlay attempt — see docs/NOTES.md). Starts from the
-        // Settings-screen default; the Green button below flips it live for the rest
-        // of this stream only, without writing back to `settings`.
+        // Raw evdev mouse, only under cursor capture (uncaptured, raw deltas can't express the
+        // remote's absolute pointing). Sends happen on the reader thread, not queued for the
+        // ~2ms main loop, to avoid re-resampling a 1000 Hz mouse. `forward_hid` gates sends
+        // since `disconnect.is_open()` isn't readable from that thread.
+        let forward_hid = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hid_mouse = if settings.cursor_capture {
+            let client = Arc::clone(&connected.client);
+            let gate = Arc::clone(&forward_hid);
+            crate::platform::webos::evmouse::HidMouse::start(move |ev| {
+                if gate.load(Ordering::Relaxed) {
+                    let _ = session::send_input(&client, ev);
+                }
+            })
+        } else {
+            None
+        };
+        // Reader owns this stream's motion, so SDL's relative mode (enabled above, before we
+        // knew whether it would) is now just a warp per report.
+        if hid_mouse.is_some() {
+            cursor.disable_sdl_relative();
+        }
+        // Stats overlay: refreshed ~2Hz onto the transparent stream window, over the
+        // punch-through video plane via per-pixel alpha — window is never shown/hidden (that
+        // crashed an earlier attempt, see docs/NOTES.md). Green button flips it live, session-only.
         let mut stats_enabled = settings.stats_overlay;
-        // Fades stats/log in on their toggle and out the same way, on the same curve
-        // (`OVERLAY_FADE`) as the toast below — see `ModalFade::visibility_alpha`.
+        // Fades in/out on the same curve as the toast below — see `ModalFade::visibility_alpha`.
         let mut stats_fade = crate::ui::ModalFade::<()>::new();
         if stats_enabled {
             stats_fade.open();
@@ -233,13 +215,10 @@ pub(super) fn run_inner() -> Result<()> {
         let mut green_held = false;
         let mut yellow_held = false;
         let mut home_held = false;
-        // Blue button flips pacing live via `stats.pacing_enabled` (`video_pump` reads it
-        // per frame). Pure PTS math, no decoder state — safe to toggle mid-stream.
+        // Blue button flips pacing live via `stats.pacing_enabled` (pure PTS math, safe mid-stream).
         let mut blue_held = false;
-        // Transient toasts (frame-pacing on/off, etc). `overlay_was_active` catches the
-        // fade-out edge (toast, stats, or log) so the canvas gets wiped once (nothing else
-        // clears it). `stats_dst`/`log_dst` let the tile recomposite every frame while its
-        // content stays on a slower cadence (`stats_built_at`, and the log tail's own poll).
+        // Transient toasts. `overlay_was_active` catches the fade-out edge so the canvas gets
+        // wiped once; `stats_dst`/`log_dst` recomposite each frame at their own slower cadence.
         let mut notif = crate::ui::Notification::new();
         let mut overlay_was_active = false;
         let mut stats_dst: Option<crate::ui::render::Rect> = None;
@@ -258,10 +237,9 @@ pub(super) fn run_inner() -> Result<()> {
         );
         // Gamepad routes to the disconnect dialog — see `DisconnectChord`.
         let mut chord = DisconnectChord::default();
-        // A short Back tap forwards Esc to the host; a held Back becomes webOS's EXIT
-        // gesture (`WEBOS_EXIT_SCANCODE`), polled/edge-detected below to open the dialog.
+        // Short Back tap forwards Esc; a held Back becomes webOS's EXIT gesture, polled below.
         let mut exit_held = false;
-        // Delayed outcome: waits for close-fade to finish.
+        // Waits for close-fade to finish.
         let mut pending_outcome: Option<StreamOutcome> = None;
         let outcome = 'running: loop {
             if QUIT_REQUESTED.load(Ordering::Relaxed) {
@@ -271,6 +249,14 @@ pub(super) fn run_inner() -> Result<()> {
             }
             for event in events.poll_iter() {
                 use sdl2::event::Event;
+                // While the HID reader is seeing mouse reports, SDL's pointer events are that
+                // same input echoed by the compositor and must be dropped; once it idles, what
+                // arrives is the remote. Read once per event, not per guard — the window is
+                // 250ms, so per-arm freshness buys nothing.
+                let (hid_motion, hid_clicks) = match hid_mouse.as_ref() {
+                    Some(hid) => (hid.owns_sdl_motion(), hid.owns_sdl_clicks()),
+                    None => (false, false),
+                };
                 match event {
                     Event::Quit { .. } => {
                         connected.client.disconnect_quit();
@@ -287,8 +273,7 @@ pub(super) fn run_inner() -> Result<()> {
                     }
                     Event::ControllerDeviceRemoved { .. } => {
                         controller = None;
-                        // An unplugged pad sends no releases, so a chord held at the
-                        // moment it vanished would otherwise stay armed forever.
+                        // An unplugged pad sends no releases, so a held chord would stay armed forever.
                         chord.clear();
                     }
                     // Dialog open: navigate it only, don't forward input to the host.
@@ -304,16 +289,14 @@ pub(super) fn run_inner() -> Result<()> {
                             Some(ConfirmAction::Navigated) | None => {}
                         }
                     }
-                    // Scancode keys are real game input (Backspace/Escape/etc.
-                    // included) — forward only, never open the dialog.
+                    // Scancode keys are real game input — forward only, never open the dialog.
                     Event::KeyDown { scancode: Some(sc), .. } => {
                         if let Some(ev) = keyboard::key_event(sc, true) {
                             let _ = session::send_input(&connected.client, &ev);
                         }
                     }
-                    // Magic Remote Back (0x200003): no scancode of its own — forwarded to
-                    // the host as Esc. A held Back never arrives here; webOS delivers it as
-                    // the EXIT gesture instead (see the `WEBOS_EXIT_SCANCODE` poll below).
+                    // Magic Remote Back has no scancode — forwarded as Esc. A held Back never
+                    // arrives here; webOS delivers it as the EXIT gesture polled below instead.
                     Event::KeyDown {
                         keycode: Some(k),
                         scancode: None,
@@ -340,8 +323,8 @@ pub(super) fn run_inner() -> Result<()> {
                     }
                     Event::ControllerButtonDown { button, .. } => {
                         chord.set(button, true);
-                        // Still forwarded: every shortcut button is also game input, and
-                        // the hold requirement is what keeps the two uses apart.
+                        // Still forwarded: the hold requirement is what keeps game input and
+                        // the shortcut apart.
                         let ev = gamepad::button_event(button, true, 0);
                         let _ = session::send_input(&connected.client, &ev);
                     }
@@ -354,26 +337,33 @@ pub(super) fn run_inner() -> Result<()> {
                         let ev = gamepad::axis_event(axis, value, 0);
                         let _ = session::send_input(&connected.client, &ev);
                     }
-                    // The Magic Remote's pointer mode surfaces as plain SDL2 mouse
-                    // events (same as the pre-stream menu's hover/click) — forwarded
-                    // to the host as real HID mouse input during a stream instead of
-                    // driving local UI focus (see `mouse.rs`).
-                    Event::MouseMotion { x, y, .. } => {
+                    // Magic Remote pointer mode surfaces as plain SDL2 mouse events, forwarded
+                    // to the host instead of driving local UI focus (see `mouse.rs`).
+                    Event::MouseMotion { x, y, xrel, yrel, .. } => {
                         cursor.on_pointer_activity();
-                        let ev = mouse::move_event(x, y, display_mode.w as u32, display_mode.h as u32);
-                        let _ = session::send_input(&connected.client, &ev);
+                        if !hid_motion {
+                            // Relative only for the remote alone: SDL's warp emulation is off
+                            // whenever the evdev reader owns motion, so the remote sends
+                            // absolute — also the better fit for a device the user aims.
+                            let ev = if settings.cursor_capture && hid_mouse.is_none() {
+                                mouse::move_relative_event(xrel, yrel)
+                            } else {
+                                mouse::move_event(x, y, display_mode.w as u32, display_mode.h as u32)
+                            };
+                            let _ = session::send_input(&connected.client, &ev);
+                        }
                     }
-                    Event::MouseButtonDown { mouse_btn, .. } => {
+                    Event::MouseButtonDown { mouse_btn, .. } if !hid_clicks => {
                         if let Some(ev) = mouse::button_event(mouse_btn, true) {
                             let _ = session::send_input(&connected.client, &ev);
                         }
                     }
-                    Event::MouseButtonUp { mouse_btn, .. } => {
+                    Event::MouseButtonUp { mouse_btn, .. } if !hid_clicks => {
                         if let Some(ev) = mouse::button_event(mouse_btn, false) {
                             let _ = session::send_input(&connected.client, &ev);
                         }
                     }
-                    Event::MouseWheel { x, y, .. } => {
+                    Event::MouseWheel { x, y, .. } if !hid_clicks => {
                         if y != 0 {
                             if let Some(ev) = scroll_acc.scroll_event(y, false) {
                                 let _ = session::send_input(&connected.client, &ev);
@@ -388,27 +378,23 @@ pub(super) fn run_inner() -> Result<()> {
                     _ => {}
                 }
             }
-            // A disconnect chord held long enough (and the dialog isn't already up) —
-            // open it, then forget the chord so it fires once per hold rather than
-            // repeatedly while the buttons stay down.
+            // Chord held long enough — open the dialog, then forget it so it fires once per hold.
             if !disconnect.is_open() && chord.held_for(EXIT_HOLD) {
                 tracing::info!("disconnect shortcut held — opening dialog");
                 chord.clear();
                 disconnect.open(1);
             }
-            // EXIT gesture (held Back) opens the dialog; a short Back tap is Esc, above.
+            // EXIT gesture (held Back) opens the dialog; a short tap is Esc, above.
             if exit_gesture_fired(&mut exit_held) && !disconnect.is_open() {
                 tracing::info!("EXIT gesture — opening disconnect dialog");
                 disconnect.open(1);
             }
-            // Home key re-opens the webOS launcher (captured so a keyboard's Super key
-            // can reach the host); a long Back fires EXIT above, never this.
+            // Re-opens the webOS launcher; a long Back fires EXIT above, never this.
             if home_key_fired(&mut home_held) {
                 crate::platform::webos::luna::launch_home();
             }
-            // Green button: local-only stats-overlay toggle, edge-detected here (raw
-            // scancode poll — the safe SDL2 event API can't see this key at all).
-            // Skipped while the disconnect dialog owns input, same as scancode forwarding.
+            // Green button: stats-overlay toggle, edge-detected via raw scancode poll (the
+            // safe SDL2 event API can't see this key). Skipped while the dialog owns input.
             let green_down = !disconnect.is_open()
                 && crate::platform::webos::input::webos_scancode_down(
                     crate::platform::webos::input::WEBOS_GREEN_SCANCODE,
@@ -423,9 +409,8 @@ pub(super) fn run_inner() -> Result<()> {
                 }
             }
             green_held = green_down;
-            // Yellow button: log-tail overlay Off -> Live -> Frozen -> Off, same
-            // edge-detect technique as Green above. Works on every screen, not just
-            // while streaming — see the matching handling in `run_ui_flow`.
+            // Yellow button: log-tail overlay Off -> Live -> Frozen -> Off, same edge-detect
+            // as Green above; also handled in `run_ui_flow` for non-streaming screens.
             let yellow_down = !disconnect.is_open()
                 && crate::platform::webos::input::webos_scancode_down(
                     crate::platform::webos::input::WEBOS_YELLOW_SCANCODE,
@@ -442,8 +427,7 @@ pub(super) fn run_inner() -> Result<()> {
                 }
             }
             yellow_held = yellow_down;
-            // Blue button: live frame-pacing toggle, same edge-detect as Green/Yellow above
-            // (Red is OS-intercepted on-device). Force a redraw so Pace reflects the new state.
+            // Blue button: live frame-pacing toggle, same edge-detect (Red is OS-intercepted).
             let blue_down = !disconnect.is_open()
                 && crate::platform::webos::input::webos_scancode_down(
                     crate::platform::webos::input::WEBOS_BLUE_SCANCODE,
@@ -460,14 +444,20 @@ pub(super) fn run_inner() -> Result<()> {
                 overlay_last = None;
             }
             blue_held = blue_down;
-            // Captured once: reused below to skip the stats overlay for exactly the
-            // ticks the dialog block itself owns the canvas — that's wider than
-            // `is_open()`, since a dismissed dialog still draws (fading out) for a
-            // few more ticks after `focus` has already gone back to `None`.
+            // The dialog is navigated with the Magic Remote's pointer, so a captured stream
+            // must hand the pointer back while it's up — hidden/relative there'd be nothing
+            // to aim with. Recaptured on dismiss.
+            let want_captured = settings.cursor_capture && !disconnect.is_open();
+            if want_captured != cursor.is_captured() {
+                cursor.set_captured(want_captured);
+                forward_hid.store(want_captured, Ordering::Relaxed);
+            }
+            // Wider than `is_open()`: a dismissed dialog still draws (fading out) a few more
+            // ticks, used below to skip the stats overlay for exactly those ticks.
             let dialog_frame = disconnect.frame(MODAL_FADE);
             if dialog_frame.is_some() {
-                // Its own clear/present pass over the punch-through video plane, unlike
-                // the menu which appends into a shared command list.
+                // Own clear/present pass over the punch-through video, unlike the menu's
+                // shared command list.
                 let mut cmds = Vec::new();
                 disconnect.draw(
                     &mut compositor,
@@ -483,52 +473,39 @@ pub(super) fn run_inner() -> Result<()> {
                 compositor.present(&mut canvas, &cmds)?;
                 canvas.present();
             } else if disconnect.fade.tick(MODAL_FADE) {
-                // The close-fade (Cancel/Back, or a confirmed Disconnect) just
-                // finished this tick. A confirmed Disconnect breaks out of the
-                // loop now — the fade already played, and the pre-stream UI takes
-                // the canvas over next, so there's nothing to wipe for that case.
+                // Close-fade just finished. Confirmed Disconnect: break now, nothing to wipe
+                // since the pre-stream UI takes the canvas next.
                 if let Some(outcome) = pending_outcome.take() {
                     break 'running outcome;
                 }
-                // Otherwise (Cancel/Back): wipe the last frame so it doesn't stick
-                // over the video, same as a stats-overlay toggle-off.
+                // Cancel/Back: wipe the last frame so it doesn't stick over the video.
                 canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
                 canvas.clear();
                 canvas.present();
                 canvas.clear();
                 canvas.present();
             }
-            // Offloaded audio is drained by its own dedicated thread instead (see
-            // `session::ndl_audio_pump`) — nothing to do here.
+            // Offloaded audio drains on its own dedicated thread instead (`session::ndl_audio_pump`).
             if let Some(player) = &mut audio_player {
                 session::pump_audio_once(&connected.client, player);
             }
-            // Host→client gamepad feedback: rumble onto the pad via SDL, DualSense
-            // trigger/lightbar effects via the Bluetooth service. Called unconditionally
-            // so both planes keep draining even with no pad attached — see the fn's docs.
+            // Unconditional so both feedback planes keep draining with no pad attached.
             session::pump_feedback_once(&connected.client, controller.as_mut(), ds_feedback.as_mut());
-            // Skipped whenever the dialog block drew this tick (open or still fading
-            // out) — its own redraw above already owns the canvas. Stats and the log
-            // overlay share one clear/execute/present so neither erases the other's
-            // tile with its own `canvas.clear()`.
+            // Skipped while the dialog owns the canvas. Stats/log share one clear/execute/present
+            // so neither erases the other's tile.
             //
-            // `log_overlay_lines()` is deferred to the throttled block below rather
-            // than called every ~2ms tick — it locks the same ring-buffer mutex every
-            // log call writes to, which was contending with log writes ~500x/s and
-            // stuttering this thread's input polling.
+            // `log_overlay_lines()` deferred to the throttled block below, not called every
+            // ~2ms tick — it locks the same mutex log writes contend on ~500x/s.
             let notif_frame = if dialog_frame.is_none() { notif.frame() } else { None };
             let notif_active = notif_frame.is_some();
-            // Stats/log fade in on their toggle and fade out the same way the toast does
-            // (same `OVERLAY_FADE` curve) instead of cutting instantly — `visibility_alpha`
-            // keeps returning `Some` through the close fade even once the toggle itself
-            // has already flipped off.
+            // Fade in/out on the toast's curve instead of cutting instantly; `visibility_alpha`
+            // keeps returning `Some` through the close fade after the toggle itself flips off.
             let stats_alpha = stats_fade.visibility_alpha(crate::ui::OVERLAY_FADE, stats_enabled);
             let log_overlay_on = log_overlay_state() != LogOverlayState::Off;
             let log_alpha = log_fade.visibility_alpha(crate::ui::OVERLAY_FADE, log_overlay_on);
             let overlay_active = stats_alpha.is_some() || log_alpha.is_some() || notif_active;
             if overlay_was_active && !overlay_active {
-                // Same "nothing else clears this canvas" wipe as before — the last
-                // faded-out tile would otherwise stick over the video.
+                // Nothing else clears this canvas — the faded-out tile would stick otherwise.
                 canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
                 canvas.clear();
                 canvas.present();
@@ -548,15 +525,14 @@ pub(super) fn run_inner() -> Result<()> {
             if overlay_active && dialog_frame.is_none() && overlay_last.is_none_or(|t| t.elapsed() >= redraw_interval) {
                 overlay_last = Some(Instant::now());
                 let mut cmds: Vec<DrawCmd> = Vec::new();
-                // Content stays on a 500ms cadence even when the loop runs faster for a
-                // toast fade; `stats_dst` lets the retained texture recomposite every frame.
+                // Content stays on a 500ms cadence even when a toast fade runs the loop faster.
                 if stats_enabled && stats_built_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(500)) {
                     stats_built_at = Some(Instant::now());
                     let frames = connected.stats.frames.load(Ordering::Relaxed);
                     let bytes = connected.stats.bytes.load(Ordering::Relaxed);
                     let dt = overlay_prev_at.elapsed().as_secs_f32().max(0.001);
                     let fps = (frames.saturating_sub(overlay_prev_frames)) as f32 / dt;
-                    // Measured (received bytes/dt), vs. `resolved_bitrate_kbps` (negotiated).
+                    // Measured, vs. negotiated `resolved_bitrate_kbps`.
                     let actual_kbps = (bytes.saturating_sub(overlay_prev_bytes)) as f32 * 8.0 / 1000.0 / dt;
                     overlay_prev_frames = frames;
                     overlay_prev_bytes = bytes;
@@ -564,9 +540,9 @@ pub(super) fn run_inner() -> Result<()> {
                     let mode = connected.client.mode();
                     let feed_ms = connected.stats.feed_us.load(Ordering::Relaxed) as f32 / 1000.0;
                     let holding = connected.stats.holding.load(Ordering::Relaxed);
-                    // CPU% (of one core) + RSS; only read while the overlay is up.
+                    // CPU% (one core) + RSS, only read while the overlay is up.
                     let cpu_mem_line = session::process_cpu_mem().map(|(cpu_ticks, mem_bytes)| {
-                        // No baseline on the first sample, so CPU shows only from the 2nd on.
+                        // No baseline on the first sample, so CPU shows from the 2nd on.
                         let cpu = overlay_prev_cpu_ticks.map(|prev| {
                             let pct =
                                 (cpu_ticks.saturating_sub(prev)) as f32 / session::clock_ticks_per_sec() as f32 / dt
@@ -591,9 +567,8 @@ pub(super) fn run_inner() -> Result<()> {
                         ),
                         format!("Video {fps:.1} fps · {frames} frames"),
                         {
-                            // `backlog` is NDL's own undecoded/unpresented depth: rising
-                            // means the decoder is behind, flat-near-zero while the
-                            // picture stutters means the problem is upstream of it.
+                            // NDL's undecoded/unpresented depth: rising means decode is behind,
+                            // flat-near-zero while stuttering means the problem is upstream.
                             let backlog = connected.stats.render_backlog.load(Ordering::Relaxed);
                             let backlog = if backlog < 0 {
                                 "n/a".to_string()
@@ -649,8 +624,7 @@ pub(super) fn run_inner() -> Result<()> {
                         });
                     }
                 }
-                // Re-rendered only while actually on (`None` during the fade-out, once
-                // the toggle has already flipped the state to Off) — the fade keeps
+                // `None` during fade-out once the toggle flips Off — the fade keeps
                 // recompositing the last uploaded tile via `log_dst`.
                 if let Some(lines) = log_overlay_lines() {
                     match crate::ui::render_log_overlay_tile(fonts.raster, fonts.caption, display_mode.w as u32, &lines)
@@ -677,8 +651,7 @@ pub(super) fn run_inner() -> Result<()> {
                         Ok(tile) => {
                             let (tw, th) = (tile.width(), tile.height());
                             compositor.upload(&texture_creator, Tile::Notification, &tile)?;
-                            // Top-centre: clears the top-right stats overlay and the
-                            // bottom log overlay, so it never overlaps either.
+                            // Top-centre: never overlaps the top-right stats or bottom log overlay.
                             cmds.push(DrawCmd::Tex {
                                 tile: Tile::Notification,
                                 dst: crate::ui::render::Rect::new((display_mode.w - tw as i32) / 2, 24, tw, th),
@@ -701,31 +674,23 @@ pub(super) fn run_inner() -> Result<()> {
                 break 'running StreamOutcome::ReturnToMenu;
             }
 
-            // This tick bounds how stale a forwarded input event or a queued audio
-            // packet can get (video has its own thread and never waits on this loop).
-            // 8ms here meant up to 8ms added to every remote/gamepad event and to the
-            // audio drain cadence; at 2ms an idle poll_iter + try-recv round is a few
-            // microseconds of work, so ~500 wakeups/s is noise even on this SoC while
-            // keeping the added input latency near zero.
+            // Bounds staleness of forwarded input/audio (video has its own thread). 2ms keeps
+            // added latency near zero; the wakeup rate is noise even on this SoC.
             std::thread::sleep(Duration::from_millis(2));
         };
 
-        // Hand the pad back before anything else: trigger resistance is firmware state
-        // that outlives the session, so a game that ended with R2 stiff would leave it
-        // stiff on the TV's home screen (and after the app exits) with nothing to connect
-        // it to punktfunk. Dropping the sender flushes and joins it — see `Feedback::drop`.
+        // Trigger resistance is firmware state that outlives the session — hand the pad back
+        // first or a game that ended with R2 stiff leaves it stiff on the TV home screen.
         if let Some(mut fb) = ds_feedback.take() {
             fb.release();
         }
-        // Any rumble still running is likewise the pad's own state, not the stream's.
+        // Rumble is likewise pad state, not stream state.
         if let Some(pad) = controller.as_mut() {
             let _ = pad.set_rumble(0, 0, 0);
         }
-        // `disconnect_quit()` was already called above for every deliberate-stop path;
-        // `shutdown()` joins the video thread and drops `client` so the QUIC close
-        // frame actually gets sent before this function returns (see its docs). A `false`
-        // return means some teardown thread is still wedged inside an FFI call — unloading
-        // NDL from under it would race, so skip that call and accept the leak for this run.
+        // `shutdown()` joins the video thread and drops `client` so the QUIC close frame
+        // actually sends. `false` means a teardown thread is wedged in FFI — skip the NDL
+        // unload rather than race it, and accept the leak for this run.
         if connected.shutdown() {
             crate::platform::webos::ndl::quit();
         } else {
@@ -733,7 +698,7 @@ pub(super) fn run_inner() -> Result<()> {
         }
         // Put the TV's picture/sound modes back (no-op unless game mode switched them).
         crate::platform::webos::game_mode::restore(restore_tv_modes);
-        cursor.set_visible(true);
+        cursor.set_captured(false);
         match outcome {
             StreamOutcome::Quit => {
                 tracing::info!("punktfunk-webos exiting cleanly");

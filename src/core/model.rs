@@ -203,13 +203,12 @@ pub struct Settings {
     /// effect on the next stream, since it rides the handshake.
     #[serde(default)]
     pub gamepad_type: GamepadType,
-    /// Let the TV capture the pointer for the host in-stream. On (default): local OS
-    /// cursor hidden, host draws the only cursor tracking our forwarded pointer motion,
-    /// no `CLIENT_CAP_CURSOR` sent. Off: handshake sends `CLIENT_CAP_CURSOR` so a capable
-    /// host stops compositing its cursor, and the local pointer stays visible instead
-    /// (see `main.rs`'s stream handoff) — otherwise you'd see two cursors or none. Takes
-    /// effect on the next stream. `serde(default)` uses [`default_cursor_capture`] so an
-    /// existing settings.json without the key still loads as `true`.
+    /// Let the TV capture the pointer for the host in-stream. On (default): local cursor
+    /// hidden, relative `MouseMove` deltas sent (absolute coords stop at the panel edge), host
+    /// draws the only cursor. Off: absolute `MouseMoveAbs`, and `CLIENT_CAP_CURSOR` tells a
+    /// capable host to stop compositing its own so the local pointer stays visible — otherwise
+    /// two cursors or none. Takes effect next stream; `serde(default)` keeps old settings.json
+    /// loading as `true`.
     #[serde(default = "default_cursor_capture")]
     pub cursor_capture: bool,
     /// Ask the TV to switch to its Game picture mode for the duration of a stream (the

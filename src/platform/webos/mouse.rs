@@ -20,18 +20,39 @@ fn button_code(button: MouseButton) -> Option<u32> {
 /// `None` for a button id the host has no mapping for (`MouseButton::Unknown`) —
 /// the caller just drops the event.
 pub fn button_event(button: MouseButton, pressed: bool) -> Option<InputEvent> {
-    Some(InputEvent {
+    Some(raw_button_event(button_code(button)?, pressed))
+}
+
+/// Same wire event from an already-mapped button number — for [`super::evmouse`], whose
+/// buttons come off evdev and never pass through an `sdl2::mouse::MouseButton`.
+pub fn raw_button_event(code: u32, pressed: bool) -> InputEvent {
+    InputEvent {
         kind: if pressed {
             InputKind::MouseButtonDown
         } else {
             InputKind::MouseButtonUp
         },
         _pad: [0; 3],
-        code: button_code(button)?,
+        code,
         x: 0,
         y: 0,
         flags: 0,
-    })
+    }
+}
+
+/// Relative motion, for a captured stream. Absolute coordinates can't leave the panel —
+/// webOS's pointer stops at the screen edge, so `MouseMoveAbs` saturates there and the
+/// host cursor can neither cross onto another display nor keep turning in a game that
+/// wants continuous motion. Deltas have no such ceiling.
+pub fn move_relative_event(dx: i32, dy: i32) -> InputEvent {
+    InputEvent {
+        kind: InputKind::MouseMove,
+        _pad: [0; 3],
+        code: 0,
+        x: dx,
+        y: dy,
+        flags: 0,
+    }
 }
 
 /// Absolute pointer position — `client_w`/`client_h` is this app's own coordinate
