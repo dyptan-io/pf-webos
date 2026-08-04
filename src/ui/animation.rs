@@ -19,7 +19,7 @@ pub const HERO_FADE_OUT: Duration = Duration::from_millis(280);
 
 /// How long past the launch fade a game with wide art waits for a hero that hasn't
 /// arrived yet. Only paid on a cold cache — a prefetched hero is already up by then.
-pub const HERO_WAIT: Duration = Duration::from_millis(1_200);
+pub const HERO_WAIT: Duration = Duration::from_millis(2_200);
 
 /// How long the hero stays up once it appears, fade-in included — long enough to read as
 /// a loading screen with a visible pan, not a flash. A floor, not a cap: a slower
