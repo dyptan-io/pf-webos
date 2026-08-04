@@ -2,6 +2,10 @@ use std::sync::Arc;
 
 use super::*;
 
+/// How long the finished menu frame is held while waiting for NDL's `PLAYING` state before
+/// uncovering the video plane regardless — see the reveal in `run_inner`.
+const NDL_REVEAL_TIMEOUT: Duration = Duration::from_millis(1_500);
+
 pub(super) fn run_inner() -> Result<()> {
     // Stops webOS's launcher intercepting Back/Windows-Meta/Guide as its own Home shortcut
     // (see `keyboard.rs`'s LGui/RGui and `gamepad.rs`'s BTN_GUIDE mapping). Must be set before
@@ -99,6 +103,34 @@ pub(super) fn run_inner() -> Result<()> {
         };
         tracing::debug!("settings: {settings:?}");
 
+        // Joined BEFORE the window is cleared transparent: the menu's last frame (the
+        // finished launch zoom) stays on screen for the rest of the handshake and the NDL
+        // load, so a slow connect shows the app, not a black punch-through hole. A failed
+        // connect never uncovers the plane at all.
+        let connected = match connect_thread.join().expect("connect thread panicked") {
+            Ok(c) => c,
+            Err(e) => {
+                // Return to the menu with the reason on screen instead of `?`-ing the app down.
+                tracing::error!("session connect failed: {e:#}");
+                menu_status = Some(format!("Couldn't connect: {}", crate::errors::friendly(&e)));
+                continue;
+            }
+        };
+        tracing::info!("session connected, entering event loop");
+        // `connect` returns with NDL past LOADCOMPLETED and the video pump feeding; `PLAYING`
+        // is the decoder confirming it is actually presenting. Waiting for it here means the
+        // reveal below swaps the menu straight for live video instead of for an empty plane.
+        // Bounded: if it never arrives, uncover anyway rather than sit on a stale menu frame.
+        let reveal_wait = Instant::now();
+        while !crate::platform::webos::ndl::playing() && reveal_wait.elapsed() < NDL_REVEAL_TIMEOUT {
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        tracing::info!(
+            "NDL reveal after {:?} (playing={})",
+            reveal_wait.elapsed(),
+            crate::platform::webos::ndl::playing(),
+        );
+
         // `hide()` unmaps the surface entirely, silently breaking the Magic Remote's pointer
         // forwarding since Wayland has nowhere left to route motion. aurora-tv never hides its
         // window either — stays mapped, cleared fully transparent so the video shows through.
@@ -112,20 +144,6 @@ pub(super) fn run_inner() -> Result<()> {
         // forwarded-position cursor read as "the pointer doesn't match the mouse".
         let mut cursor = cursor::Cursor::new(sdl.mouse());
         cursor.set_captured(settings.cursor_capture);
-
-        // Already running (started in `run_ui_flow`, overlapping the launch zoom/fade) — joining
-        // just waits out whatever handshake is left.
-        let connected = match connect_thread.join().expect("connect thread panicked") {
-            Ok(c) => c,
-            Err(e) => {
-                // Return to the menu with the reason on screen instead of `?`-ing the app down.
-                tracing::error!("session connect failed: {e:#}");
-                cursor.set_captured(false);
-                menu_status = Some(format!("Couldn't connect: {}", crate::errors::friendly(&e)));
-                continue;
-            }
-        };
-        tracing::info!("session connected, entering event loop");
 
         // Skipped when NDL took the Opus stream — a second unfed audio device would still
         // claim a PulseAudio sink.
@@ -617,11 +635,21 @@ pub(super) fn run_inner() -> Result<()> {
                                 if holding { "yes" } else { "no" },
                             )
                         },
-                        format!(
-                            "Feed {feed_ms:.1} ms · {:.0}/{} Mbps",
-                            actual_kbps / 1000.0,
-                            connected.client.resolved_bitrate_kbps / 1000,
-                        ),
+                        {
+                            // The encoder's CURRENT target, not the session-start negotiation:
+                            // on Automatic the ABR re-targets mid-session (and the host can
+                            // re-pick on a pipeline rebuild), which is exactly what you watch
+                            // when the picture is soft. `0` = a host too old to report one.
+                            let target_kbps = match connected.client.current_bitrate_kbps() {
+                                0 => connected.client.resolved_bitrate_kbps,
+                                live => live,
+                            };
+                            format!(
+                                "Feed {feed_ms:.1} ms · {:.0}/{} Mbps",
+                                actual_kbps / 1000.0,
+                                target_kbps / 1000,
+                            )
+                        },
                     ];
                     if let Some(line) = cpu_mem_line {
                         lines.push(line);
@@ -681,7 +709,15 @@ pub(super) fn run_inner() -> Result<()> {
                         });
                     }
                 }
-                push_notification_cmd(&mut compositor, &texture_creator, &fonts, &notif_frame, display_mode.w, &mut notif_tile, &mut cmds)?;
+                push_notification_cmd(
+                    &mut compositor,
+                    &texture_creator,
+                    &fonts,
+                    &notif_frame,
+                    display_mode.w,
+                    &mut notif_tile,
+                    &mut cmds,
+                )?;
                 if !cmds.is_empty() {
                     canvas.set_blend_mode(sdl2::render::BlendMode::None);
                     canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));

@@ -1,7 +1,7 @@
 //! Home screen logic: sidebar/grid navigation, host selection, game library fetch,
 //! launching. Grid pixel geometry (rect helpers) lives in `app::view::home`.
 use crate::app::App;
-use crate::app::{ConnectTarget, GridCard, GridLayout, PendingLaunch};
+use crate::app::{ConnectTarget, GridCard, GridLayout};
 use crate::core::screen::{HomeFocus, Screen};
 use crate::services::store::{self};
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent};
@@ -503,9 +503,13 @@ impl App {
             self.home_status = Some(reason);
         }
     }
-    /// Confirms grid card; runs reachability check first (library-fetch alone may be stale).
+    /// Confirms grid card: arms the launch straight away so the runtime's connect thread
+    /// starts on the click and overlaps the launch zoom. There is deliberately no pre-flight
+    /// reachability probe — it cost a whole mTLS round trip before the handshake could even
+    /// begin, and the connect attempt itself reports an unreachable host anyway (the host list
+    /// already probes reachability on selection, which is where the Wake dialog comes from).
     pub(crate) fn confirm_grid_card(&mut self, idx: usize, columns: usize) {
-        if self.pending_launch.is_some() {
+        if self.launch_ready.is_some() || self.launch_anim.is_some() {
             return;
         }
         let Some((host, port)) = self.selected_host.clone() else {
@@ -520,77 +524,24 @@ impl App {
             Some(GridCard::Game(game)) => (Some(game.id.clone()), game.title.clone()),
             None => return,
         };
-        let mgmt_port = known.mgmt_port.unwrap_or(crate::services::library::DEFAULT_MGMT_PORT);
-        let identity = (self.identity.0.clone(), self.identity.1.clone());
-        tracing::debug!("launch: checking {host}:{port} is still reachable before connecting…");
-        self.home_status = Some(format!("Checking the host is still reachable before starting {title}…"));
-        let rx = crate::services::library::load_games_async(host.clone(), port, mgmt_port, identity, Some(fingerprint));
-        self.pending_launch = Some(PendingLaunch {
+        tracing::debug!("launch: connecting to {host}:{port} now, zoom runs in parallel");
+        // Stays up through the launch zoom and the connect that follows it —
+        // `run_inner` puts its own UI on screen from there.
+        self.home_status = Some(format!("Starting {title}…"));
+        self.launch_anim_idx = Some(idx);
+        self.launch_ready = Some(ConnectTarget {
             host,
             port,
             fingerprint,
             launch,
-            title,
-            rx,
-            idx,
         });
-    }
-
-    /// Drains `confirm_grid_card`'s pre-flight reachability check, if it's finished. On
-    /// success, stashes the result in `launch_ready` for `main.rs` to pick up via
-    /// `take_ready_launch` (dropped instead if the selection has since moved to a
-    /// different host). On failure, defers to `handle_library_error`.
-    pub fn drain_launch_check(&mut self) -> bool {
-        let Some(pending) = &self.pending_launch else {
-            return false;
-        };
-        let Ok(loaded) = pending.rx.try_recv() else {
-            return false;
-        };
-        let PendingLaunch {
-            host,
-            port,
-            fingerprint,
-            launch,
-            title,
-            idx,
-            ..
-        } = self.pending_launch.take().expect("just matched Some above");
-        match loaded.result {
-            Ok(_) => {
-                if self
-                    .selected_host
-                    .as_ref()
-                    .is_some_and(|(h, p)| *h == host && *p == port)
-                {
-                    // Stays up through the launch zoom and the connect that follows it —
-                    // `run_inner` puts its own UI on screen from there.
-                    self.home_status = Some(format!("Starting {title}…"));
-                    self.launch_anim_idx = Some(idx);
-                    self.launch_ready = Some(ConnectTarget {
-                        host,
-                        port,
-                        fingerprint,
-                        launch,
-                    });
-                }
-            }
-            Err(e) => {
-                tracing::warn!("launch check failed ({host}:{port}): {e}");
-                self.handle_library_error(host, port, e);
-            }
-        }
-        // Not `grid_dirty`: this is a reachability probe only (`loaded.games` is
-        // discarded), so the grid's contents haven't changed — marking it dirty
-        // would rebuild every card tile and re-arm the loading spinner right as
-        // the launch zoom is about to start.
+        // Not `grid_dirty`: the grid's contents haven't changed, and marking it dirty would
+        // rebuild every card tile and re-arm the loading spinner right as the zoom starts.
         self.sidebar_dirty = true;
-        true
     }
 
-    /// Takes the `ConnectTarget` a finished `drain_launch_check` produced, if any —
-    /// `main.rs`'s tick loop calls this right after `drain_launch_check` and breaks its
-    /// event loop with it to actually start the stream.
+    /// Takes the `ConnectTarget` `confirm_grid_card` armed, if any — the runtime's tick loop
+    /// calls this and breaks its event loop with it to actually start the stream.
     pub fn take_ready_launch(&mut self) -> Option<ConnectTarget> {
         self.launch_ready.take()
     }

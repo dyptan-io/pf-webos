@@ -325,6 +325,9 @@ pub fn connect(
         display_hdr,
         // client_caps: see `store::Settings::cursor_capture` for the on/off split.
         if cursor_capture { 0 } else { quic::CLIENT_CAP_CURSOR },
+        // frame_parts: NDL DirectMedia takes whole access units only — it has no
+        // `PARTIAL_FRAME` equivalent, so slice-progressive prefixes would have nowhere to go.
+        false,
         launch,
         // Device name for the host's pending-approval list. `None` keeps the host's
         // fingerprint-derived label ("device abcd1234"), i.e. exactly the behaviour before
@@ -507,11 +510,12 @@ pub fn request_access(host: &str, port: u16, identity: (String, String), timeout
         2,
         quic::CODEC_H264,
         0,
-        None, // no HDR display metadata
-        0,    // client_caps: no local cursor rendering
-        None, // no launch
-        None, // name: keep the host's fingerprint-derived label (see `connect`)
-        None, // pin = None → trust-on-first-use, host parks until operator approval
+        None,  // no HDR display metadata
+        0,     // client_caps: no local cursor rendering
+        false, // frame_parts: whole AUs (see `connect`)
+        None,  // no launch
+        None,  // name: keep the host's fingerprint-derived label (see `connect`)
+        None,  // pin = None → trust-on-first-use, host parks until operator approval
         Some(identity),
         timeout,
     )
@@ -624,11 +628,12 @@ pub fn run_speed_probe(
         quic::VIDEO_CAP_CHACHA20,
         2, // stereo baseline
         quic::CODEC_HEVC | quic::CODEC_H264,
-        0,    // no preferred codec
-        None, // no HDR display metadata: nothing presents
-        0,    // client_caps: nothing renders a cursor
-        None, // no launch
-        None, // name: keep the host's fingerprint-derived label (see `connect`)
+        0,     // no preferred codec
+        None,  // no HDR display metadata: nothing presents
+        0,     // client_caps: nothing renders a cursor
+        false, // frame_parts: whole AUs (see `connect`)
+        None,  // no launch
+        None,  // name: keep the host's fingerprint-derived label (see `connect`)
         pin,
         Some(identity),
         timeout,

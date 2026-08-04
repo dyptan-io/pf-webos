@@ -164,7 +164,6 @@ pub(super) fn run_ui_flow(
         app.tick_reachability();
         dirty |= app.drain_reachability();
         dirty |= app.tick_wake();
-        dirty |= app.drain_launch_check();
         // Fire on hold elapsed, not release, so user sees it before letting go.
         if let Some(hold) = input
             .pin_held
@@ -384,7 +383,15 @@ pub(super) fn run_ui_flow(
                 });
             }
         }
-        push_notification_cmd(compositor, texture_creator, fonts, &notif_frame, display_mode.w, &mut notif_tile, &mut cmds)?;
+        push_notification_cmd(
+            compositor,
+            texture_creator,
+            fonts,
+            &notif_frame,
+            display_mode.w,
+            &mut notif_tile,
+            &mut cmds,
+        )?;
         // Quit dialog overlay, appended to this loop's single command list rather than
         // getting its own present (unlike the stream, which draws over the video plane).
         quit_dialog.draw(

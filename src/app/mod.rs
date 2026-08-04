@@ -165,18 +165,6 @@ impl GridLayout {
     }
 }
 
-/// Pending launch awaiting pre-flight reachability check.
-pub(crate) struct PendingLaunch {
-    pub(crate) host: String,
-    pub(crate) port: u16,
-    pub(crate) fingerprint: [u8; 32],
-    pub(crate) launch: Option<String>,
-    pub(crate) title: String,
-    pub(crate) rx: std::sync::mpsc::Receiver<crate::services::library::GamesLoaded>,
-    /// Card index for `launch_anim`.
-    pub(crate) idx: usize,
-}
-
 /// Open dropdown on settings modal.
 pub struct DropdownState {
     pub row: usize,
@@ -264,7 +252,6 @@ pub struct App {
     /// Cover art pixmaps by game id.
     pub art: std::collections::HashMap<String, Pixmap>,
     pub(crate) art_loader: Option<crate::services::art::ArtLoader>,
-    pub(crate) pending_launch: Option<PendingLaunch>,
     pub(crate) launch_ready: Option<ConnectTarget>,
     pub(crate) launch_anim: Option<Instant>,
     pub(crate) launch_anim_idx: Option<usize>,
@@ -508,7 +495,6 @@ impl App {
             home_status: None,
             art: std::collections::HashMap::new(),
             art_loader: None,
-            pending_launch: None,
             launch_ready: None,
             launch_anim: None,
             launch_anim_idx: None,

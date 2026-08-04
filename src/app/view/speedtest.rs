@@ -36,9 +36,10 @@ impl App {
                 format!("Connecting to {}…", self.speed_test_name)
             }
             Some(SpeedTestState::Measuring { partial }) => {
-                // Deliberately bytes, not Mbps: `throughput_kbps` divides by the HOST's
-                // reported burst duration, which stays 0 until the end-of-burst report
-                // lands — so a "Mbps so far" reading here could never show anything.
+                // Deliberately bytes, not Mbps: `throughput_kbps`'s denominator (since core
+                // 0.24, the client-measured receive interval, falling back to the host's
+                // burst duration) is frozen only when the end-of-burst report lands — so a
+                // "Mbps so far" reading here could never show anything.
                 // `recv_bytes` is live throughout.
                 let so_far = partial
                     .filter(|p| p.recv_bytes > 0)
