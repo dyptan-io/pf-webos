@@ -4,6 +4,7 @@
 //! Per-screen `impl App` blocks are split by concern: `state` (event handling, transitions)
 //! and `view` (geometry + draw-list building). Keeping them under `app` lets `ui`/`core`
 //! stay dependency leaves — neither reaches back into `App`.
+pub(crate) mod hero;
 pub(crate) mod state;
 pub(crate) mod view;
 
@@ -252,25 +253,8 @@ pub struct App {
     /// Cover art pixmaps by game id.
     pub art: std::collections::HashMap<String, Pixmap>,
     pub(crate) art_loader: Option<crate::services::art::ArtLoader>,
-    /// The one decoded hero image kept in memory (id + pixels) — several MB each, and
-    /// only the focused card's can ever be needed, so a newer one replaces it.
-    pub(crate) hero: Option<(String, crate::services::art::HeroImage)>,
-    /// Id of the hero last asked for, so a hero that arrives after focus moved on
-    /// (or after a different game was launched) is dropped rather than kept.
-    pub(crate) hero_wanted: Option<String>,
-    /// Game id whose hero belongs on the connecting screen — `None` for Desktop.
-    pub(crate) hero_target: Option<String>,
-    /// Whether the launching game has wide art at all. The menu loop waits a moment for
-    /// one that is still in flight, but must not delay a game that will never have one.
-    pub(crate) hero_expected: bool,
-    /// Id of the hero currently uploaded as `Tile::Hero`, uploaded only once the
-    /// launch starts (browsing must not put a multi-MB texture on the GPU).
-    pub(crate) hero_uploaded: Option<String>,
-    /// When the uploaded hero started fading in. Its own clock, not `launch_anim`'s:
-    /// a hero can land mid-handshake, and then it fades in from there.
-    pub(crate) hero_since: Option<Instant>,
-    /// When the hero started fading back out, i.e. when the stream became ready.
-    pub(crate) hero_fade_out: Option<Instant>,
+    /// The connecting screen's backdrop, and every clock it runs on.
+    pub(crate) hero: hero::Hero,
     pub(crate) launch_ready: Option<ConnectTarget>,
     pub(crate) launch_anim: Option<Instant>,
     pub(crate) launch_anim_idx: Option<usize>,
@@ -514,13 +498,7 @@ impl App {
             home_status: None,
             art: std::collections::HashMap::new(),
             art_loader: None,
-            hero: None,
-            hero_wanted: None,
-            hero_target: None,
-            hero_expected: false,
-            hero_uploaded: None,
-            hero_since: None,
-            hero_fade_out: None,
+            hero: hero::Hero::default(),
             launch_ready: None,
             launch_anim: None,
             launch_anim_idx: None,
@@ -706,16 +684,13 @@ impl App {
                     self.art.insert(game_id, pixmap);
                 }
                 crate::services::art::ArtLoaded::Hero { game_id, image } => {
-                    // A hero for a card that is no longer focused (and isn't the one being
-                    // launched) is dead weight — it would only evict the one that matters.
-                    if self.hero_wanted.as_deref() == Some(game_id.as_str())
-                        || self.hero_target.as_deref() == Some(game_id.as_str())
-                    {
-                        self.hero = Some((game_id, image));
-                    } else if let Some(loader) = &mut self.art_loader {
-                        // Dropped, so let it be re-requested when focus comes back — it is
-                        // served from the disk cache by then, no round trip.
-                        loader.forget_hero(&game_id);
+                    // One that's no longer of use (focus moved on) is let go of in the
+                    // loader too, so coming back to that card asks again — served from the
+                    // disk cache by then, no round trip.
+                    if !self.hero.accept(game_id.clone(), image) {
+                        if let Some(loader) = &mut self.art_loader {
+                            loader.forget_hero(&game_id);
+                        }
                     }
                 }
             }
@@ -860,7 +835,10 @@ impl App {
         }
         // The hero loading screen keeps panning for as long as the launch is on screen,
         // which (unlike the fade) is however long the handshake takes.
-        if self.launch_anim.is_some_and(|t| t.elapsed() < ui::LAUNCH_FADE) || self.hero_showing() {
+        if self
+            .launch_anim
+            .is_some_and(|t| t.elapsed() < ui::LAUNCH_FADE || self.hero.showing())
+        {
             animating = true;
         }
         if let Some(t) = self.modal_focus_anim {
@@ -1744,7 +1722,7 @@ impl App {
                         if let Some(loader) = &mut self.art_loader {
                             loader.request_hero(game);
                         }
-                        self.hero_wanted = Some(game.id.clone());
+                        self.hero.want(&game.id);
                     }
                 }
             }
@@ -1825,19 +1803,10 @@ impl App {
         if self.launch_anim.is_none() {
             return;
         }
-        let Some(id) = self.hero_target.clone() else { return };
-        if self.hero_uploaded.as_deref() == Some(id.as_str()) {
-            return;
-        }
-        if !self.hero.as_ref().is_some_and(|(loaded, _)| *loaded == id) {
-            // Still fetching — the fade to black covers this, and the hero joins it
-            // whenever it lands (possibly not at all, on a slow host).
-            return;
-        }
-        if let Some(stale) = self.hero_uploaded.replace(id.clone()) {
+        let Some(id) = self.hero.pending_upload() else { return };
+        if let Some(stale) = self.hero.mark_uploaded(id.clone()) {
             self.evicted_tiles.push(Tile::Hero(stale));
         }
-        self.hero_since = Some(Instant::now());
         updated.push(Tile::Hero(id));
     }
 
@@ -3222,40 +3191,16 @@ impl App {
         cmds
     }
 
-    /// Starts the hero's fade-out (idempotent) and reports whether it has finished. The
-    /// menu loop calls this once the stream is ready and hands over on `true`.
-    pub(crate) fn hero_faded_out(&mut self) -> bool {
-        let since = *self.hero_fade_out.get_or_insert_with(Instant::now);
-        since.elapsed() >= ui::HERO_FADE_OUT
-    }
-
-    /// Whether the hero has been on screen (fade-in included) for at least `least`.
-    pub(crate) fn hero_shown_for(&self, least: Duration) -> bool {
-        self.hero_since.is_some_and(|t| t.elapsed() >= least)
-    }
-
-    /// Whether an uploaded hero is currently on screen as the connecting backdrop.
-    pub(crate) fn hero_showing(&self) -> bool {
-        self.launch_anim.is_some() && self.hero_since.is_some() && self.hero_uploaded.is_some()
-    }
-
-    /// The connecting screen's hero backdrop: fade-in, slow pan, and its dimming scrim.
+    /// The connecting screen's hero backdrop: fade in/out, slow pan, and its dimming
+    /// scrim. Fading rather than cutting at both ends, over the same black the launch
+    /// faded to, so a hero arriving mid-handshake eases in and live video arrives out of
+    /// black rather than from a lit image.
     fn compose_hero(&self, screen_w: u32, screen_h: u32, cmds: &mut ui::render::DrawList) {
-        let (Some(id), Some(since)) = (self.hero_uploaded.as_ref(), self.hero_since) else {
-            return;
-        };
-        let Some((_, hero)) = self.hero.as_ref().filter(|(loaded, _)| loaded == id) else {
-            return;
-        };
-        // Fades out over the black scrim it faded in over, so the hand-off to live video
-        // goes through black rather than cutting from a lit image.
-        let out = self
-            .hero_fade_out
-            .map_or(0.0, |t| ui::anim_frac(Some(t), ui::HERO_FADE_OUT));
-        let f = ui::anim_frac(Some(since), ui::HERO_FADE) * (1.0 - out);
+        let Some((id, hero)) = self.hero.visible() else { return };
+        let f = self.hero.opacity();
         cmds.push(DrawCmd::TexF {
             tile: Tile::Hero(id.clone()),
-            dst: ui::hero_pan_dst(hero.width, hero.height, screen_w, screen_h, since.elapsed()),
+            dst: ui::hero_pan_dst(hero.width, hero.height, screen_w, screen_h, self.hero.panned_for()),
             alpha: (255.0 * f) as u8,
         });
         cmds.push(DrawCmd::Fill {

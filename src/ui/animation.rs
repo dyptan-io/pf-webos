@@ -17,6 +17,22 @@ pub const HERO_FADE: Duration = Duration::from_millis(1_100);
 /// hand-off, not a transition, and every frame of it delays live video.
 pub const HERO_FADE_OUT: Duration = Duration::from_millis(280);
 
+/// How long past the launch fade a game with wide art waits for a hero that hasn't
+/// arrived yet. Only paid on a cold cache — a prefetched hero is already up by then.
+pub const HERO_WAIT: Duration = Duration::from_millis(1_200);
+
+/// Least time the hero stays up once it appears, fade-in included, so a late arrival
+/// reads as a loading screen rather than a flash.
+pub const HERO_MIN_SHOW: Duration = Duration::from_millis(1_600);
+
+/// How much longer it holds after the handshake lands, before the fade-out starts. That
+/// and the fade-out together are the ~1s of stream that would be black regardless.
+pub const HERO_LINGER: Duration = Duration::from_millis(700);
+
+/// Longest the loading screen runs before handing over regardless of the connect thread.
+/// Only a backstop — `session::connect` has its own timeouts.
+pub const HERO_LOADING_MAX: Duration = Duration::from_secs(30);
+
 /// How much the hero is darkened once fully faded in, so it reads as a backdrop
 /// rather than as content.
 pub const HERO_SCRIM_ALPHA: f32 = 70.0;
