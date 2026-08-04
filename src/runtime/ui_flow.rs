@@ -203,12 +203,14 @@ pub(super) fn run_ui_flow(
         // Without a hero the screen is handed to the streaming loop at the end of the
         // launch fade, as it always was. With one, this loop keeps animating it as the
         // loading screen until `Hero::handover_ready` is satisfied — the handshake having
-        // landed (`run_inner`'s join then returns immediately) plus its hold and fade-out.
+        // landed (`run_inner`'s join then returns immediately), the decoder presenting (so
+        // its reveal wait is satisfied too), and the hold and fade-out done.
         if let Some(t) = app.launch_anim {
             if connect_done_at.is_none() && connect_handle.as_ref().is_none_or(|(h, _)| h.is_finished()) {
                 connect_done_at = Some(Instant::now());
             }
-            if app.hero.handover_ready(t.elapsed(), connect_done_at) {
+            let presenting = crate::platform::webos::ndl::playing();
+            if app.hero.handover_ready(t.elapsed(), connect_done_at, presenting) {
                 break 'ui;
             }
         }

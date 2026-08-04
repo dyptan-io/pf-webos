@@ -112,7 +112,17 @@ impl Hero {
 
     /// Whether the loading screen is finished, so the streaming loop can take the screen.
     /// Also what starts the fade-out, once everything else it waits on is satisfied.
-    pub(crate) fn handover_ready(&mut self, launch_elapsed: Duration, connect_done: Option<Instant>) -> bool {
+    ///
+    /// `presenting` is the decoder reporting live frames. The backdrop waits for it, so
+    /// the fade-out is the last thing that happens before the plane is uncovered rather
+    /// than leaving black in between — with no hero this is not consulted at all, and the
+    /// plain fade to black hands over exactly as it always did.
+    pub(crate) fn handover_ready(
+        &mut self,
+        launch_elapsed: Duration,
+        connect_done: Option<Instant>,
+        presenting: bool,
+    ) -> bool {
         if launch_elapsed < ui::LAUNCH_FADE {
             return false;
         }
@@ -127,11 +137,13 @@ impl Hero {
             // still be a fetch away, and would otherwise land just after the hand-off.
             return !self.expected || launch_elapsed >= ui::LAUNCH_FADE + ui::HERO_WAIT;
         }
-        // Held a beat past the handshake rather than cut at it (the stream's own first
-        // second is black anyway), for its own minimum so a late arrival isn't cut
-        // mid-fade-in, and then for the fade-out — so live video arrives out of black.
-        let held_past_connect = connect_done.is_some_and(|done| done.elapsed() >= ui::HERO_LINGER);
-        held_past_connect && self.shown_for(ui::HERO_MIN_SHOW) && self.faded_out()
+        // Held until the stream is genuinely up: a beat past the handshake (the stream's
+        // own first frames are black anyway) and until the decoder presents, so the
+        // fade-out runs straight into live video. Also for its own minimum, so a late
+        // arrival isn't cut mid-fade-in.
+        let Some(done) = connect_done else { return false };
+        let stream_up = presenting || done.elapsed() >= ui::STREAM_REVEAL_WAIT;
+        stream_up && done.elapsed() >= ui::HERO_LINGER && self.shown_for(ui::HERO_MIN_SHOW) && self.faded_out()
     }
 
     /// Whether the backdrop has been up (fade-in included) for at least `least`.

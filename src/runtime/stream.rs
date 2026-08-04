@@ -3,8 +3,10 @@ use std::sync::Arc;
 use super::*;
 
 /// How long the finished menu frame is held waiting for NDL `PLAYING` before uncovering the
-/// video plane regardless.
-const NDL_REVEAL_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// video plane regardless. Shared with the hero loading screen, which waits on the same
+/// signal for the same reason (`ui::STREAM_REVEAL_WAIT`) — so when a hero held the screen
+/// this wait is already satisfied and returns immediately.
+const NDL_REVEAL_TIMEOUT: Duration = crate::ui::STREAM_REVEAL_WAIT;
 
 pub(super) fn run_inner() -> Result<()> {
     // Stops webOS's launcher intercepting Back/Windows-Meta/Guide as its own Home shortcut

@@ -29,6 +29,11 @@ pub const HERO_MIN_SHOW: Duration = Duration::from_millis(1_600);
 /// and the fade-out together are the ~1s of stream that would be black regardless.
 pub const HERO_LINGER: Duration = Duration::from_millis(700);
 
+/// Longest anything waits for the decoder to report that it is presenting before
+/// uncovering the video plane regardless — both the hero's fade-out (`app::hero`) and, for
+/// the launches that have no hero to hold, `runtime::stream`'s reveal.
+pub const STREAM_REVEAL_WAIT: Duration = Duration::from_millis(1_500);
+
 /// Longest the loading screen runs before handing over regardless of the connect thread.
 /// Only a backstop — `session::connect` has its own timeouts.
 pub const HERO_LOADING_MAX: Duration = Duration::from_secs(30);
