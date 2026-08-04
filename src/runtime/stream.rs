@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use super::*;
 
-/// How long the finished menu frame is held while waiting for NDL's `PLAYING` state before
-/// uncovering the video plane regardless — see the reveal in `run_inner`.
+/// How long the finished menu frame is held waiting for NDL `PLAYING` before uncovering the
+/// video plane regardless.
 const NDL_REVEAL_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 pub(super) fn run_inner() -> Result<()> {
@@ -103,10 +103,9 @@ pub(super) fn run_inner() -> Result<()> {
         };
         tracing::debug!("settings: {settings:?}");
 
-        // Joined BEFORE the window is cleared transparent: the menu's last frame (the
-        // finished launch zoom) stays on screen for the rest of the handshake and the NDL
-        // load, so a slow connect shows the app, not a black punch-through hole. A failed
-        // connect never uncovers the plane at all.
+        // Joined BEFORE the window is cleared transparent, so the finished launch zoom stays
+        // on screen across the handshake and NDL load instead of a black punch-through hole,
+        // and a failed connect never uncovers the plane at all.
         let connected = match connect_thread.join().expect("connect thread panicked") {
             Ok(c) => c,
             Err(e) => {
@@ -117,10 +116,9 @@ pub(super) fn run_inner() -> Result<()> {
             }
         };
         tracing::info!("session connected, entering event loop");
-        // `connect` returns with NDL past LOADCOMPLETED and the video pump feeding; `PLAYING`
-        // is the decoder confirming it is actually presenting. Waiting for it here means the
-        // reveal below swaps the menu straight for live video instead of for an empty plane.
-        // Bounded: if it never arrives, uncover anyway rather than sit on a stale menu frame.
+        // `connect` returns past LOADCOMPLETED with the pump feeding; `PLAYING` is the decoder
+        // confirming it presents, so the reveal swaps the menu straight for live video.
+        // Bounded — never arriving must not leave a stale menu frame up.
         let reveal_wait = Instant::now();
         while !crate::platform::webos::ndl::playing() && reveal_wait.elapsed() < NDL_REVEAL_TIMEOUT {
             std::thread::sleep(Duration::from_millis(4));

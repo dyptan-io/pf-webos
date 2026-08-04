@@ -153,18 +153,15 @@ const NDL_STATE_PLAYING: c_int = 0x1a;
 /// sure the NDL Opus decoder is ready before real audio arrives.
 const OPUS_EMPTY_FRAME: [u8; 3] = [0xec, 0xff, 0xfe];
 
-/// How long `load()` waits for the `LOADCOMPLETED` callback before giving up and feeding
-/// anyway. Feeding an access unit into a decoder that hasn't finished loading is what the
-/// first-frames-black/late-start behaviour traced back to, but a model that never delivers
-/// the callback must still stream — so this is a bound, not a hard requirement.
+/// Bound, not a requirement: feeding an unloaded decoder is the first-frames-black cause,
+/// but a model that never delivers the callback must still stream.
 const LOAD_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_000);
 
-/// Set by the media-load callback. Process-global like the NDL session itself (one
-/// load at a time), cleared right before each `NDL_DirectMediaLoad`.
+/// Process-global like the NDL session itself (one load at a time); cleared right before
+/// each `NDL_DirectMediaLoad`.
 static LOAD_COMPLETED: AtomicBool = AtomicBool::new(false);
-/// `PLAYING` — the only signal the present pipeline actually started (the reference point
-/// for docs/NDL-FRAMERATE-INVESTIGATION.md). Arrives only after frames are being fed, so
-/// it gates *revealing* the plane, never the feed itself.
+/// The only signal the present pipeline actually started (docs/NDL-FRAMERATE-INVESTIGATION.md).
+/// Arrives only once frames are being fed, so it gates *revealing* the plane, never the feed.
 static PLAYING: AtomicBool = AtomicBool::new(false);
 
 /// Records NDL load-state transitions so `load()` and the UI reveal can wait on them.
@@ -174,11 +171,9 @@ extern "C" fn on_load_state(state: c_int, _num: c_longlong, _str: *const c_char)
             LOAD_COMPLETED.store(true, Ordering::SeqCst);
             "LOADCOMPLETED"
         }
-        // Deliberately clears nothing: the audio-offload probe unloads and immediately
-        // re-loads video-only, so this callback can land AFTER the retry's LOADCOMPLETED and
-        // would clear the live load's flags. Both `load()` paths reset them before the load,
-        // and `Drop` resets them on teardown — those are the points that know which load
-        // they mean.
+        // Clears nothing: the audio-offload probe unloads then re-loads video-only, so this
+        // can land AFTER the retry's LOADCOMPLETED. `load()` and `Drop` reset the flags —
+        // they know which load they mean.
         NDL_STATE_UNLOADCOMPLETED => "UNLOADCOMPLETED",
         NDL_STATE_PLAYING => {
             PLAYING.store(true, Ordering::SeqCst);
@@ -189,8 +184,7 @@ extern "C" fn on_load_state(state: c_int, _num: c_longlong, _str: *const c_char)
     tracing::info!("NDL load state: {name} (0x{state:x})");
 }
 
-/// Whether NDL has reported `PLAYING` for the current load, i.e. the plane is presenting
-/// real frames and is safe to uncover.
+/// `PLAYING` for the current load: the plane is presenting and safe to uncover.
 pub fn playing() -> bool {
     PLAYING.load(Ordering::SeqCst)
 }
@@ -267,9 +261,8 @@ impl NdlVideo {
             // SAFETY: `info` is valid for the duration of this call.
             let ret = unsafe { NDL_DirectMediaLoad(&mut info, Some(on_load_state)) };
             if ret == 0 {
-                // `NDL_DirectMediaLoad` returning 0 only means the request was accepted; the
-                // pipeline is ready at `LOADCOMPLETED`. Both the Opus prime below and the
-                // caller's first `play()` must wait for it.
+                // `ret == 0` means the request was accepted, not that the pipeline is ready —
+                // the Opus prime below and the caller's first `play()` both need LOADCOMPLETED.
                 if !wait_load_completed() {
                     tracing::warn!("NDL load: no LOADCOMPLETED within {LOAD_COMPLETE_TIMEOUT:?} — feeding anyway");
                 }

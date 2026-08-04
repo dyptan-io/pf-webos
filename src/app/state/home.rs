@@ -503,11 +503,10 @@ impl App {
             self.home_status = Some(reason);
         }
     }
-    /// Confirms grid card: arms the launch straight away so the runtime's connect thread
-    /// starts on the click and overlaps the launch zoom. There is deliberately no pre-flight
-    /// reachability probe — it cost a whole mTLS round trip before the handshake could even
-    /// begin, and the connect attempt itself reports an unreachable host anyway (the host list
-    /// already probes reachability on selection, which is where the Wake dialog comes from).
+    /// Confirms grid card, arming the launch straight away so the connect thread starts on the
+    /// click and overlaps the zoom. No pre-flight reachability probe: it cost a whole mTLS
+    /// round trip before the handshake, and connect reports an unreachable host itself (the
+    /// host list probes on selection, which is where the Wake dialog comes from).
     pub(crate) fn confirm_grid_card(&mut self, idx: usize, columns: usize) {
         if self.launch_ready.is_some() || self.launch_anim.is_some() {
             return;
@@ -525,8 +524,7 @@ impl App {
             None => return,
         };
         tracing::debug!("launch: connecting to {host}:{port} now, zoom runs in parallel");
-        // Stays up through the launch zoom and the connect that follows it —
-        // `run_inner` puts its own UI on screen from there.
+        // Stays up through the zoom and the connect; `run_inner` owns the screen from there.
         self.home_status = Some(format!("Starting {title}…"));
         self.launch_anim_idx = Some(idx);
         self.launch_ready = Some(ConnectTarget {
@@ -535,8 +533,8 @@ impl App {
             fingerprint,
             launch,
         });
-        // Not `grid_dirty`: the grid's contents haven't changed, and marking it dirty would
-        // rebuild every card tile and re-arm the loading spinner right as the zoom starts.
+        // Not `grid_dirty`: contents are unchanged, and dirtying rebuilds every card tile and
+        // re-arms the loading spinner right as the zoom starts.
         self.sidebar_dirty = true;
     }
 
