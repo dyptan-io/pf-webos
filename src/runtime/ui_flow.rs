@@ -27,6 +27,15 @@ pub(super) fn run_ui_flow(
     // the loop at a steady ~60Hz regardless of work cost, which comfortably samples
     // every 33ms spinner frame.
     const TICK_BUDGET: Duration = Duration::from_millis(16);
+    // Longest the hero loading screen is animated before handing over regardless of the
+    // connect thread. Only a backstop — `session::connect` has its own timeouts.
+    const HERO_LOADING_MAX: Duration = Duration::from_secs(30);
+    // How long past the fade a game with wide art waits for a hero that hasn't arrived
+    // yet. Only paid on a cold cache — a prefetched hero is already up by then.
+    const HERO_WAIT: Duration = Duration::from_millis(1_200);
+    // How much longer the hero holds after the handshake lands, before its fade-out
+    // starts — the two together are the ~1s of stream that would be black regardless.
+    const HERO_LINGER: Duration = Duration::from_millis(700);
     // Test/dev override: skip the UI entirely if a connect.conf was dropped
     // alongside sideloading (see store.rs docs) — the UI flow is the normal path.
     // Bypasses the library screen too (`launch: None`, a plain desktop session).
@@ -98,6 +107,8 @@ pub(super) fn run_ui_flow(
     // running by then, so this just carries its handle out of the loop for
     // `run_inner` to join once the launch animation finishes.
     let mut connect_handle: Option<ConnectOutcome> = None;
+    // When the connect thread was first seen finished — the hero linger runs off this.
+    let mut connect_done_at: Option<Instant> = None;
     // Yellow button log overlay works here too (see streaming loop).
     let mut yellow_held = false;
     let mut home_held = false;
@@ -198,11 +209,43 @@ pub(super) fn run_ui_flow(
                 connect_handle = Some((handle, settings));
             }
         }
-        if app.launch_anim.is_some_and(|t| t.elapsed() >= crate::ui::LAUNCH_FADE) {
-            break 'ui;
+        // When to hand the screen over to the streaming loop. Without a hero that is the
+        // end of the launch fade, as it always was. With one, this loop keeps animating it
+        // as the loading screen until the handshake lands (`run_inner`'s join then returns
+        // immediately), holds a beat, and fades it out — so live video arrives out of
+        // black rather than cutting from a lit image.
+        if let Some(t) = app.launch_anim.filter(|t| t.elapsed() >= crate::ui::LAUNCH_FADE) {
+            if connect_done_at.is_none() && connect_handle.as_ref().is_none_or(|(h, _)| h.is_finished()) {
+                connect_done_at = Some(Instant::now());
+            }
+            // A game with wide art gets a grace period before giving up on it: on a cold
+            // cache the hero can still be a fetch away, and would otherwise land just
+            // after the hand-off and never be seen.
+            let hero_late = t.elapsed() >= crate::ui::LAUNCH_FADE + HERO_WAIT;
+            let hero_coming = app.hero_expected && !hero_late;
+            let held_past_connect = connect_done_at.is_some_and(|done| done.elapsed() >= HERO_LINGER);
+            let done = if app.hero_showing() {
+                held_past_connect && app.hero_faded_out()
+            } else {
+                !hero_coming
+            };
+            // Capped either way, so a connect that somehow never returns can't strand the
+            // app on a panning image.
+            if done || t.elapsed() >= HERO_LOADING_MAX {
+                break 'ui;
+            }
         }
         for event in events.poll_iter() {
             use sdl2::event::Event;
+            // Launch committed: the menu is behind the loading screen and its input would
+            // move a grid the user can no longer see. Only shutdown still counts.
+            if app.launch_anim.is_some() {
+                if matches!(event, Event::Quit { .. }) {
+                    tracing::info!("quit during launch");
+                    return Ok(None);
+                }
+                continue;
+            }
             // Device-level events, handled before anything screen-specific:
             // shutdown and controller hotplug.
             match event {
@@ -344,6 +387,11 @@ pub(super) fn run_ui_flow(
                 &Tile::SpinnerFrame(idx) => {
                     if let Some(frame) = crate::ui::spinner_frame(idx) {
                         compositor.upload_raw(texture_creator, tile, frame.width, frame.height, &frame.pixels)?;
+                    }
+                }
+                Tile::Hero(id) => {
+                    if let Some((_, hero)) = app.hero.as_ref().filter(|(loaded, _)| loaded == id) {
+                        compositor.upload_raw(texture_creator, tile.clone(), hero.width, hero.height, &hero.pixels)?;
                     }
                 }
                 _ => {

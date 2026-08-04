@@ -63,6 +63,17 @@ impl Rect {
     }
 }
 
+/// Float rectangle, for the one case where whole-pixel placement is too coarse: a pan
+/// slow enough that an integer destination would advance in visible jumps rather than
+/// drift (see `DrawCmd::TexF`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RectF {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
 /// Straight-alpha RGBA8. Mirrors `sdl2::pixels::Color`'s public field layout.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Color {
@@ -104,6 +115,8 @@ pub enum TileId {
     ScrollFade,
     ScrollFadeTop,
     SpinnerFrame(usize),
+    /// Wide hero art for the connecting screen, keyed by game id.
+    Hero(String),
     StatsOverlay,
     Notification,
     LogOverlay,
@@ -122,6 +135,14 @@ pub enum DrawCmd {
         tile: TileId,
         src: Rect,
         dst: Rect,
+        alpha: u8,
+    },
+    /// Whole texture to a subpixel destination, clipped by the render target. Bilinear
+    /// filtering turns the fractional offset into real subpixel motion, which is what
+    /// makes a very slow pan look continuous instead of stepped.
+    TexF {
+        tile: TileId,
+        dst: RectF,
         alpha: u8,
     },
     Fill {

@@ -252,6 +252,25 @@ pub struct App {
     /// Cover art pixmaps by game id.
     pub art: std::collections::HashMap<String, Pixmap>,
     pub(crate) art_loader: Option<crate::services::art::ArtLoader>,
+    /// The one decoded hero image kept in memory (id + pixels) — several MB each, and
+    /// only the focused card's can ever be needed, so a newer one replaces it.
+    pub(crate) hero: Option<(String, crate::services::art::HeroImage)>,
+    /// Id of the hero last asked for, so a hero that arrives after focus moved on
+    /// (or after a different game was launched) is dropped rather than kept.
+    pub(crate) hero_wanted: Option<String>,
+    /// Game id whose hero belongs on the connecting screen — `None` for Desktop.
+    pub(crate) hero_target: Option<String>,
+    /// Whether the launching game has wide art at all. The menu loop waits a moment for
+    /// one that is still in flight, but must not delay a game that will never have one.
+    pub(crate) hero_expected: bool,
+    /// Id of the hero currently uploaded as `Tile::Hero`, uploaded only once the
+    /// launch starts (browsing must not put a multi-MB texture on the GPU).
+    pub(crate) hero_uploaded: Option<String>,
+    /// When the uploaded hero started fading in. Its own clock, not `launch_anim`'s:
+    /// a hero can land mid-handshake, and then it fades in from there.
+    pub(crate) hero_since: Option<Instant>,
+    /// When the hero started fading back out, i.e. when the stream became ready.
+    pub(crate) hero_fade_out: Option<Instant>,
     pub(crate) launch_ready: Option<ConnectTarget>,
     pub(crate) launch_anim: Option<Instant>,
     pub(crate) launch_anim_idx: Option<usize>,
@@ -495,6 +514,13 @@ impl App {
             home_status: None,
             art: std::collections::HashMap::new(),
             art_loader: None,
+            hero: None,
+            hero_wanted: None,
+            hero_target: None,
+            hero_expected: false,
+            hero_uploaded: None,
+            hero_since: None,
+            hero_fade_out: None,
             launch_ready: None,
             launch_anim: None,
             launch_anim_idx: None,
@@ -672,10 +698,27 @@ impl App {
             return false;
         }
         for item in loaded {
-            // Layout is unchanged by art arriving — queue a repaint of just that
-            // card's tile (see `grid_cards_dirty`) rather than a full layer rebuild.
-            self.grid_cards_dirty.push(item.game_id.clone());
-            self.art.insert(item.game_id, item.pixmap);
+            match item {
+                crate::services::art::ArtLoaded::Card { game_id, pixmap } => {
+                    // Layout is unchanged by art arriving — queue a repaint of just that
+                    // card's tile (see `grid_cards_dirty`) rather than a full layer rebuild.
+                    self.grid_cards_dirty.push(game_id.clone());
+                    self.art.insert(game_id, pixmap);
+                }
+                crate::services::art::ArtLoaded::Hero { game_id, image } => {
+                    // A hero for a card that is no longer focused (and isn't the one being
+                    // launched) is dead weight — it would only evict the one that matters.
+                    if self.hero_wanted.as_deref() == Some(game_id.as_str())
+                        || self.hero_target.as_deref() == Some(game_id.as_str())
+                    {
+                        self.hero = Some((game_id, image));
+                    } else if let Some(loader) = &mut self.art_loader {
+                        // Dropped, so let it be re-requested when focus comes back — it is
+                        // served from the disk cache by then, no round trip.
+                        loader.forget_hero(&game_id);
+                    }
+                }
+            }
         }
         true
     }
@@ -815,7 +858,9 @@ impl App {
         if self.dropdown_fade.tick(DROPDOWN_FADE) {
             animating = true;
         }
-        if self.launch_anim.is_some_and(|t| t.elapsed() < ui::LAUNCH_FADE) {
+        // The hero loading screen keeps panning for as long as the launch is on screen,
+        // which (unlike the fade) is however long the handshake takes.
+        if self.launch_anim.is_some_and(|t| t.elapsed() < ui::LAUNCH_FADE) || self.hero_showing() {
             animating = true;
         }
         if let Some(t) = self.modal_focus_anim {
@@ -1686,6 +1731,24 @@ impl App {
             }
             self.tiles_pending = pending;
 
+            // Prefetch the focused card's hero, so the connecting screen has one ready the
+            // moment OK is pressed. Deduped in the loader, and the fetched bytes are
+            // disk-cached, so hovering back over a card costs no round trip.
+            //
+            // Only once the visible window has settled: the loader serves hero requests
+            // ahead of card art, so queueing one mid-scroll would put the cards the user is
+            // actually looking at behind a full-screen fetch and decode.
+            if self.grid_reveal_ready && !pending {
+                if let HomeFocus::Grid(focus_idx) = self.home_focus {
+                    if let Some(game) = layout.game_at(&self.games, focus_idx) {
+                        if let Some(loader) = &mut self.art_loader {
+                            loader.request_hero(game);
+                        }
+                        self.hero_wanted = Some(game.id.clone());
+                    }
+                }
+            }
+
             // The pinned badge tile — built once, composited over the focused
             // card in `draw_list` rather than baked into individual card tiles.
             if tiles.pin_badge_tile.is_none() {
@@ -1752,6 +1815,30 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Uploads the launching game's hero art as `Tile::Hero`, once, and starts its
+    /// fade-in clock. Gated on the launch having actually started: at ~1600px wide this
+    /// is a multi-MB texture, and putting one on the GPU for every card the user merely
+    /// scrolls past would undo the whole point of the windowed card cache.
+    fn prepare_hero(&mut self, updated: &mut Vec<Tile>) {
+        if self.launch_anim.is_none() {
+            return;
+        }
+        let Some(id) = self.hero_target.clone() else { return };
+        if self.hero_uploaded.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        if !self.hero.as_ref().is_some_and(|(loaded, _)| *loaded == id) {
+            // Still fetching — the fade to black covers this, and the hero joins it
+            // whenever it lands (possibly not at all, on a slow host).
+            return;
+        }
+        if let Some(stale) = self.hero_uploaded.replace(id.clone()) {
+            self.evicted_tiles.push(Tile::Hero(stale));
+        }
+        self.hero_since = Some(Instant::now());
+        updated.push(Tile::Hero(id));
     }
 
     /// Modal family: the open modal's full-screen shell tile (rebuilt only on content
@@ -2371,6 +2458,8 @@ impl App {
             &mut updated,
         )?;
 
+        self.prepare_hero(&mut updated);
+
         // Status line block — built whenever `home_status` is set, independent of
         // whether a host is selected (the "Send logs" result shows here too).
         match &self.home_status {
@@ -2545,11 +2634,12 @@ impl App {
             Tile::ScrollFadeTop => tiles.scroll_fade_top_tile.as_ref(),
             Tile::Status => tiles.status_tile.as_ref().map(|(_, p)| p),
             Tile::NoHost => tiles.nohost_tile.as_ref(),
-            // `SpinnerFrame` is uploaded directly from its raw decoded pixels (see
+            // `SpinnerFrame` and `Hero` are uploaded directly from their raw decoded pixels (see
             // `main.rs`), never rasterized as a `Painter`; the rest are stream-side only
             // (uploaded directly by `run_inner`'s overlay refresh) — never one of App's
             // menu tiles.
             Tile::SpinnerFrame(_)
+            | Tile::Hero(_)
             | Tile::StatsOverlay
             | Tile::Notification
             | Tile::LogOverlay
@@ -3123,8 +3213,50 @@ impl App {
                 rect: Rect::new(0, 0, screen_w, screen_h),
                 color: crate::ui::render::Color::RGBA(0, 0, 0, (255.0 * f) as u8),
             });
+            // With wide art for this game, the loading screen is that art instead of the
+            // bare black: it fades in over the scrim above (so a hero arriving mid-
+            // handshake still eases in rather than snapping), then drifts slowly left to
+            // right for as long as the stream takes to come up.
+            self.compose_hero(screen_w, screen_h, &mut cmds);
         }
         cmds
+    }
+
+    /// Starts the hero's fade-out (idempotent) and reports whether it has finished. The
+    /// menu loop calls this once the stream is ready and hands over on `true`.
+    pub(crate) fn hero_faded_out(&mut self) -> bool {
+        let since = *self.hero_fade_out.get_or_insert_with(Instant::now);
+        since.elapsed() >= ui::HERO_FADE_OUT
+    }
+
+    /// Whether an uploaded hero is currently on screen as the connecting backdrop.
+    pub(crate) fn hero_showing(&self) -> bool {
+        self.launch_anim.is_some() && self.hero_since.is_some() && self.hero_uploaded.is_some()
+    }
+
+    /// The connecting screen's hero backdrop: fade-in, slow pan, and its dimming scrim.
+    fn compose_hero(&self, screen_w: u32, screen_h: u32, cmds: &mut ui::render::DrawList) {
+        let (Some(id), Some(since)) = (self.hero_uploaded.as_ref(), self.hero_since) else {
+            return;
+        };
+        let Some((_, hero)) = self.hero.as_ref().filter(|(loaded, _)| loaded == id) else {
+            return;
+        };
+        // Fades out over the black scrim it faded in over, so the hand-off to live video
+        // goes through black rather than cutting from a lit image.
+        let out = self
+            .hero_fade_out
+            .map_or(0.0, |t| ui::anim_frac(Some(t), ui::HERO_FADE_OUT));
+        let f = ui::anim_frac(Some(since), ui::HERO_FADE) * (1.0 - out);
+        cmds.push(DrawCmd::TexF {
+            tile: Tile::Hero(id.clone()),
+            dst: ui::hero_pan_dst(hero.width, hero.height, screen_w, screen_h, since.elapsed()),
+            alpha: (255.0 * f) as u8,
+        });
+        cmds.push(DrawCmd::Fill {
+            rect: Rect::new(0, 0, screen_w, screen_h),
+            color: crate::ui::render::Color::RGBA(0, 0, 0, (ui::HERO_SCRIM_ALPHA * f) as u8),
+        });
     }
 
     /// Shared modal chrome — dark backdrop, the rounded card, and its close (X)

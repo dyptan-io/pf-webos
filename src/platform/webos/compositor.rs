@@ -156,6 +156,15 @@ impl Compositor {
                         .copy(tex, Some(to_sdl_rect(*src)), Some(to_sdl_rect(*dst)))
                         .map_err(|e| anyhow::anyhow!("copy cropped {tile:?}: {e}"))?;
                 }
+                DrawCmd::TexF { tile, dst, alpha } => {
+                    let Some(tex) = self.textures.get_mut(tile) else {
+                        continue; // not uploaded yet — skip
+                    };
+                    tex.set_alpha_mod(*alpha);
+                    canvas
+                        .copy_f(tex, None, Some(sdl2::rect::FRect::new(dst.x, dst.y, dst.w, dst.h)))
+                        .map_err(|e| anyhow::anyhow!("copy float {tile:?}: {e}"))?;
+                }
                 DrawCmd::Fill { rect, color } => {
                     canvas.set_blend_mode(BlendMode::Blend);
                     canvas.set_draw_color(to_sdl_color(*color));

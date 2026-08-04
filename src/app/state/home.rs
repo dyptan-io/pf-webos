@@ -523,6 +523,18 @@ impl App {
             Some(GridCard::Game(game)) => (Some(game.id.clone()), game.title.clone()),
             None => return,
         };
+        // The loading screen's backdrop. Requested here as well as on focus, since a card
+        // can be confirmed before the focus prefetch got round to it; Desktop has no art,
+        // so it keeps the plain fade to black.
+        self.hero_target = launch.clone();
+        self.hero_expected = false;
+        if let Some(game) = launch.as_ref().and_then(|id| self.games.iter().find(|g| &g.id == id)) {
+            let expected = game.art.hero.is_some() || game.art.header.is_some();
+            if let Some(loader) = &mut self.art_loader {
+                loader.request_hero(game);
+            }
+            self.hero_expected = expected;
+        }
         tracing::debug!("launch: connecting to {host}:{port} now, zoom runs in parallel");
         // Stays up through the zoom and the connect; `run_inner` owns the screen from there.
         self.home_status = Some(format!("Starting {title}…"));

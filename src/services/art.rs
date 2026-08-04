@@ -1,6 +1,6 @@
 //! On-demand cover-art loading with disk cache (not all-at-once, which caused OOM).
 //! Fetches via mTLS, decodes with pure-Rust `image` crate, handed to UI as `Pixmap`.
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
@@ -9,15 +9,34 @@ use tiny_skia::{FilterQuality, IntSize, Pixmap, PixmapPaint, Transform};
 use crate::services::library::GameEntry;
 use crate::ui::premultiply_rgba;
 
-/// One decoded cover, ready to composite straight into the UI's frame `Painter`.
-pub struct ArtLoaded {
-    pub game_id: String,
-    pub pixmap: Pixmap,
+/// A decoded wide hero image, straight (not premultiplied) RGBA8 — it goes to the
+/// GPU as a raw texture (`Compositor::upload_raw`) rather than through a `Painter`,
+/// since nothing is ever rasterized on top of it.
+pub struct HeroImage {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
 }
 
-/// A cover the UI wants soon.
+/// One decoded image, ready to composite.
+pub enum ArtLoaded {
+    /// Grid cover, stretched to card size.
+    Card { game_id: String, pixmap: Pixmap },
+    /// Wide art for the connecting screen.
+    Hero { game_id: String, image: HeroImage },
+}
+
+/// Which variant of a game's art a request wants.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArtKind {
+    Card,
+    Hero,
+}
+
+/// An image the UI wants soon.
 struct ArtRequest {
     game_id: String,
+    kind: ArtKind,
     /// Candidate art paths (host-relative or external URL), tried in order — a
     /// host-reported path can 404 even when another variant works fine.
     paths: Vec<String>,
@@ -27,6 +46,13 @@ struct ArtRequest {
 const MAX_ART_DIMENSION: u32 = 480;
 /// Grid card portrait aspect (cropped to avoid distortion).
 const TARGET_ART_ASPECT: f32 = 3.0 / 4.0;
+/// Max decoded hero width. Full-screen art, so far larger than a card — but still
+/// upscaled a little by the GPU on a 4K panel rather than held at panel size, which
+/// would be four times the decode cost and the memory for one transient screen.
+const MAX_HERO_WIDTH: u32 = 1600;
+/// Hero crop aspect. Deliberately wider than any panel (16:9 at its widest), because
+/// the slack between the two is exactly what the connecting screen's pan travels.
+const HERO_ASPECT: f32 = 2.4;
 
 /// Center-crop to aspect ratio (no-op if already close).
 fn crop_to_aspect(img: image::DynamicImage, aspect: f32) -> image::DynamicImage {
@@ -70,8 +96,25 @@ pub fn clear_host_cache(host: &str, port: u16) {
     let _ = std::fs::remove_dir_all(cache_dir(host, port));
 }
 
+/// Decoded-pixel cache path (cards only — see the worker's hero branch).
 fn raw_cache_path(dir: &std::path::Path, game_id: &str) -> PathBuf {
     dir.join(format!("{}.raw", cache_name(game_id)))
+}
+
+/// Encoded-bytes cache path (what the host served, undecoded).
+fn bytes_cache_path(dir: &std::path::Path, game_id: &str, kind: ArtKind) -> PathBuf {
+    match kind {
+        ArtKind::Card => dir.join(cache_name(game_id)),
+        ArtKind::Hero => dir.join(format!("{}.hero", cache_name(game_id))),
+    }
+}
+
+/// Staging name for a write-then-rename. Appends to the whole filename rather than
+/// replacing an extension, which would make `id.raw` and `id` stage to the same path.
+fn tmp_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
 }
 
 /// Write-then-rename (prevents truncated cache files on kill mid-write).
@@ -81,7 +124,7 @@ fn write_raw_cache(path: &std::path::Path, pixmap: &Pixmap) {
     buf.extend_from_slice(&pixmap.width().to_le_bytes());
     buf.extend_from_slice(&pixmap.height().to_le_bytes());
     buf.extend_from_slice(pixmap.data());
-    let tmp = path.with_extension("raw.tmp");
+    let tmp = tmp_path(path);
     if std::fs::write(&tmp, &buf).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
@@ -90,15 +133,15 @@ fn write_raw_cache(path: &std::path::Path, pixmap: &Pixmap) {
 /// Read raw cache, if present and well-formed.
 fn read_raw_cache(path: &std::path::Path) -> Option<Pixmap> {
     let buf = std::fs::read(path).ok()?;
-    let magic = u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?);
-    if magic != RAW_CACHE_MAGIC {
+    if u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?) != RAW_CACHE_MAGIC {
         return None;
     }
     let width = u32::from_le_bytes(buf.get(4..8)?.try_into().ok()?);
     let height = u32::from_le_bytes(buf.get(8..12)?.try_into().ok()?);
-    let size = IntSize::from_wh(width, height)?;
-    let pixels = buf.get(12..)?.to_vec();
-    Pixmap::from_vec(pixels, size)
+    if buf.len() - 12 != width as usize * height as usize * 4 {
+        return None;
+    }
+    Pixmap::from_vec(buf.get(12..)?.to_vec(), IntSize::from_wh(width, height)?)
 }
 
 /// Stretch to card size (done here, not in each card build, to save armv7 cost).
@@ -136,6 +179,9 @@ pub struct ArtLoader {
     /// Ids already handed to the worker, so scrolling over the same card repeatedly
     /// doesn't queue it repeatedly.
     requested: HashSet<String>,
+    /// Same, for hero art — a separate set because focus moving back and forth over a
+    /// card must not re-queue its (much larger) hero either.
+    hero_requested: HashSet<String>,
 }
 
 impl ArtLoader {
@@ -170,6 +216,7 @@ impl ArtLoader {
             tx: tx_req,
             rx: rx_done,
             requested: HashSet::new(),
+            hero_requested: HashSet::new(),
         }
     }
 
@@ -198,8 +245,42 @@ impl ArtLoader {
         // A closed channel means the worker is gone; the card keeps its placeholder.
         let _ = self.tx.send(ArtRequest {
             game_id: game.id.clone(),
+            kind: ArtKind::Card,
             paths,
         });
+    }
+
+    /// Asks for `game`'s wide hero art (the connecting screen's backdrop) if it hasn't
+    /// been asked for already. Called for the focused card, so the image is usually
+    /// decoded and waiting by the time the user actually launches.
+    ///
+    /// Portrait art is deliberately not a fallback here: cropped to a hero's aspect
+    /// there'd be almost nothing left of it, and the connecting screen falls back to
+    /// its plain black fade perfectly well.
+    pub fn request_hero(&mut self, game: &GameEntry) {
+        if !self.hero_requested.insert(game.id.clone()) {
+            return;
+        }
+        let paths: Vec<String> = [game.art.hero.as_deref(), game.art.header.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::to_string)
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        let _ = self.tx.send(ArtRequest {
+            game_id: game.id.clone(),
+            kind: ArtKind::Hero,
+            paths,
+        });
+    }
+
+    /// Forgets that `game_id`'s hero was requested, so it can be asked for again. Needed
+    /// when a hero arrives too late to be of use and is dropped — without this the game
+    /// would never get another chance at one, even though its bytes are now cached.
+    pub fn forget_hero(&mut self, game_id: &str) {
+        self.hero_requested.remove(game_id);
     }
 
     /// Forgets that `game_id` was requested, so a later scroll back re-requests it. Served
@@ -238,20 +319,42 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
     // never opens a connection at all.
     let mut agent = None;
 
-    // A closed channel means the host was switched away from; the caller stops draining.
-    let deliver = |tx: &Sender<ArtLoaded>, game_id: String, pixmap: Pixmap| tx.send(ArtLoaded { game_id, pixmap });
-
-    while let Ok(req) = rx.recv() {
-        let raw_cached = raw_cache_path(dir, &req.game_id);
-        if let Some(pixmap) = read_raw_cache(&raw_cached) {
-            let sized = resize_pixmap(&pixmap, card_w, card_h).unwrap_or(pixmap);
-            if deliver(tx, req.game_id, sized).is_err() {
-                return;
+    // Local queue rather than straight `recv()`: a hero request gates the connecting
+    // screen, so it has to jump whatever card-art backlog the grid has just queued. A
+    // closed channel means the host was switched away from, and the worker is done.
+    let mut queue: VecDeque<ArtRequest> = VecDeque::new();
+    loop {
+        if queue.is_empty() {
+            match rx.recv() {
+                Ok(req) => queue.push_back(req),
+                Err(_) => return,
             }
-            continue;
+        }
+        while let Ok(req) = rx.try_recv() {
+            queue.push_back(req);
+        }
+        let at = queue.iter().position(|r| r.kind == ArtKind::Hero).unwrap_or_default();
+        let Some(req) = queue.remove(at) else { continue };
+
+        // Decoded-pixel cache, cards only: a hero's would be ~4MB per game, and one gets
+        // cached for every card the user so much as focuses. The encoded bytes below
+        // already spare the network, and the decode runs here, off the UI thread.
+        let raw_cached = raw_cache_path(dir, &req.game_id);
+        if req.kind == ArtKind::Card {
+            if let Some(pixmap) = read_raw_cache(&raw_cached) {
+                let sized = resize_pixmap(&pixmap, card_w, card_h).unwrap_or(pixmap);
+                let loaded = ArtLoaded::Card {
+                    game_id: req.game_id,
+                    pixmap: sized,
+                };
+                if tx.send(loaded).is_err() {
+                    return;
+                }
+                continue;
+            }
         }
 
-        let cached = dir.join(cache_name(&req.game_id));
+        let cached = bytes_cache_path(dir, &req.game_id, req.kind);
         let bytes = match std::fs::read(&cached) {
             Ok(b) if !b.is_empty() => b,
             _ => {
@@ -281,7 +384,7 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
                 // Write-then-rename, never truncate-in-place: a kill mid-write would
                 // otherwise leave a truncated file that gets served from cache forever
                 // (same discipline, and the same reason, as `store::write_atomic`).
-                let tmp = cached.with_extension("tmp");
+                let tmp = tmp_path(&cached);
                 if std::fs::write(&tmp, &fetched).is_ok() {
                     let _ = std::fs::rename(&tmp, &cached);
                 }
@@ -299,32 +402,67 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
                 continue;
             }
         };
-        let decoded = crop_to_aspect(decoded, TARGET_ART_ASPECT);
-        let longer_side = decoded.width().max(decoded.height());
-        let decoded = if longer_side > MAX_ART_DIMENSION {
-            decoded.resize(
-                MAX_ART_DIMENSION,
-                MAX_ART_DIMENSION,
-                image::imageops::FilterType::Triangle,
-            )
-        } else {
-            decoded
+        let decoded = match req.kind {
+            ArtKind::Card => {
+                let cropped = crop_to_aspect(decoded, TARGET_ART_ASPECT);
+                if cropped.width().max(cropped.height()) > MAX_ART_DIMENSION {
+                    cropped.resize(
+                        MAX_ART_DIMENSION,
+                        MAX_ART_DIMENSION,
+                        image::imageops::FilterType::Triangle,
+                    )
+                } else {
+                    cropped
+                }
+            }
+            ArtKind::Hero => {
+                let cropped = crop_to_aspect(decoded, HERO_ASPECT);
+                if cropped.width() > MAX_HERO_WIDTH {
+                    // `u32::MAX` height: `resize` preserves aspect, so width alone bounds it.
+                    cropped.resize(MAX_HERO_WIDTH, u32::MAX, image::imageops::FilterType::Triangle)
+                } else {
+                    cropped
+                }
+            }
         };
         let rgba = decoded.to_rgba8();
         let (width, height) = rgba.dimensions();
-        let Some(size) = IntSize::from_wh(width, height) else {
+        if width == 0 || height == 0 {
             tracing::warn!("art: {} decoded to zero size ({width}x{height})", req.game_id);
             continue;
-        };
+        }
         let mut buf = rgba.into_raw();
-        premultiply_rgba(&mut buf);
-        let Some(pixmap) = Pixmap::from_vec(buf, size) else {
-            tracing::warn!("art: {} Pixmap::from_vec failed ({width}x{height})", req.game_id);
-            continue;
+        let loaded = match req.kind {
+            ArtKind::Hero => {
+                // Left straight-alpha (no `premultiply_rgba`): it is uploaded as a raw
+                // texture, and SDL's blend mode expects straight alpha.
+                ArtLoaded::Hero {
+                    game_id: req.game_id,
+                    image: HeroImage {
+                        width,
+                        height,
+                        pixels: buf,
+                    },
+                }
+            }
+            ArtKind::Card => {
+                premultiply_rgba(&mut buf);
+                let Some(size) = IntSize::from_wh(width, height) else {
+                    continue;
+                };
+                let Some(pixmap) = Pixmap::from_vec(buf, size) else {
+                    tracing::warn!("art: {} Pixmap::from_vec failed ({width}x{height})", req.game_id);
+                    continue;
+                };
+                write_raw_cache(&raw_cached, &pixmap);
+                let sized = resize_pixmap(&pixmap, card_w, card_h).unwrap_or(pixmap);
+                ArtLoaded::Card {
+                    game_id: req.game_id,
+                    pixmap: sized,
+                }
+            }
         };
-        write_raw_cache(&raw_cached, &pixmap);
-        let sized = resize_pixmap(&pixmap, card_w, card_h).unwrap_or(pixmap);
-        if deliver(tx, req.game_id, sized).is_err() {
+        if tx.send(loaded).is_err() {
             return;
         }
     }
