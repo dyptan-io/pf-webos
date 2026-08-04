@@ -77,12 +77,12 @@ fn spawn_connect(
                 identity,
                 fp,
                 launch,
-                // 185s only for a host that isn't pinned yet: it parks the TOFU connection until
-                // its operator approves, and a 15s handshake budget can't outlast that. A pinned
-                // host has nothing to approve, so waiting three minutes there just means a
-                // powered-off TV sits on the launch scrim — fail fast and say so instead.
+                // 185s applies only to a host that isn't pinned yet: it parks the TOFU
+                // connection until its operator approves. A pinned host has nothing to
+                // approve, so a long budget there just means an unreachable/powered-off TV
+                // sits on the black launch scrim — fail fast and report it instead.
                 if fp.is_some() {
-                    Duration::from_secs(15)
+                    Duration::from_secs(5)
                 } else {
                     Duration::from_secs(185)
                 },

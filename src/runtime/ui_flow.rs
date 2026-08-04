@@ -198,14 +198,7 @@ pub(super) fn run_ui_flow(
                 connect_handle = Some((handle, settings));
             }
         }
-        // The launch scrim ends fully black, so leaving the loop while the handshake is
-        // still running would hand the stream loop a black screen for however long the
-        // connect takes (a whole connect timeout, if the host is powered off). Stay here
-        // instead, spinner on the scrim, and leave only once the connect thread is done —
-        // `run_inner`'s join is then immediate, success or failure.
-        let launch_faded = app.launch_anim.is_some_and(|t| t.elapsed() >= crate::ui::LAUNCH_FADE);
-        let awaiting_connect = launch_faded && connect_handle.as_ref().is_some_and(|(handle, _)| !handle.is_finished());
-        if launch_faded && !awaiting_connect {
+        if app.launch_anim.is_some_and(|t| t.elapsed() >= crate::ui::LAUNCH_FADE) {
             break 'ui;
         }
         for event in events.poll_iter() {
@@ -311,8 +304,7 @@ pub(super) fn run_ui_flow(
         // Polled every tick like the streaming loop's toast, not gated behind
         // `content_dirty` — its own fade needs frames regardless of anything else.
         let notif_frame = notif.frame();
-        let animating = awaiting_connect
-            || app.tick_animations()
+        let animating = app.tick_animations()
             || app.tiles_pending
             || !app.grid_reveal_ready
             || quit_dialog_active
@@ -362,22 +354,6 @@ pub(super) fn run_ui_flow(
             }
         }
         let mut cmds = app.draw_list(&tiles, display_mode.w as u32, display_mode.h as u32, fonts);
-        // Centred spinner over the finished launch scrim — the only thing on screen while a
-        // slow handshake finishes, so the wait doesn't read as a hang.
-        if awaiting_connect {
-            let phase = app.launch_anim.map_or(0.0, |t| t.elapsed().as_secs_f32());
-            let (idx, frame) = crate::ui::spinner_frame_at(phase);
-            cmds.push(DrawCmd::Tex {
-                tile: Tile::SpinnerFrame(idx),
-                dst: crate::ui::render::Rect::new(
-                    (display_mode.w - frame.width as i32) / 2,
-                    (display_mode.h - frame.height as i32) / 2,
-                    frame.width,
-                    frame.height,
-                ),
-                alpha: 0xff,
-            });
-        }
         // Appended into the same single draw list/present as the rest of the
         // screen — this loop has no separate overlay pass (see the streaming
         // loop's `Tile::LogOverlay` handling for why that one differs).
