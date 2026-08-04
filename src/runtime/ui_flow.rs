@@ -33,6 +33,8 @@ pub(super) fn run_ui_flow(
     // How long past the fade a game with wide art waits for a hero that hasn't arrived
     // yet. Only paid on a cold cache — a prefetched hero is already up by then.
     const HERO_WAIT: Duration = Duration::from_millis(1_200);
+    // Least time a hero stays up once it appears, fade-in included.
+    const HERO_MIN_SHOW: Duration = Duration::from_millis(1_600);
     // How much longer the hero holds after the handshake lands, before its fade-out
     // starts — the two together are the ~1s of stream that would be black regardless.
     const HERO_LINGER: Duration = Duration::from_millis(700);
@@ -225,7 +227,10 @@ pub(super) fn run_ui_flow(
             let hero_coming = app.hero_expected && !hero_late;
             let held_past_connect = connect_done_at.is_some_and(|done| done.elapsed() >= HERO_LINGER);
             let done = if app.hero_showing() {
-                held_past_connect && app.hero_faded_out()
+                // Also held for its own minimum: a hero that only arrived near the end of
+                // the grace period would otherwise be cut mid-fade-in, which reads as a
+                // flash rather than a loading screen.
+                held_past_connect && app.hero_shown_for(HERO_MIN_SHOW) && app.hero_faded_out()
             } else {
                 !hero_coming
             };

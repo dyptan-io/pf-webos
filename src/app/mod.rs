@@ -3229,6 +3229,11 @@ impl App {
         since.elapsed() >= ui::HERO_FADE_OUT
     }
 
+    /// Whether the hero has been on screen (fade-in included) for at least `least`.
+    pub(crate) fn hero_shown_for(&self, least: Duration) -> bool {
+        self.hero_since.is_some_and(|t| t.elapsed() >= least)
+    }
+
     /// Whether an uploaded hero is currently on screen as the connecting backdrop.
     pub(crate) fn hero_showing(&self) -> bool {
         self.launch_anim.is_some() && self.hero_since.is_some() && self.hero_uploaded.is_some()

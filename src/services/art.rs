@@ -46,10 +46,11 @@ struct ArtRequest {
 const MAX_ART_DIMENSION: u32 = 480;
 /// Grid card portrait aspect (cropped to avoid distortion).
 const TARGET_ART_ASPECT: f32 = 3.0 / 4.0;
-/// Max decoded hero width. Full-screen art, so far larger than a card — but still
-/// upscaled a little by the GPU on a 4K panel rather than held at panel size, which
-/// would be four times the decode cost and the memory for one transient screen.
-const MAX_HERO_WIDTH: u32 = 1600;
+/// Max decoded hero width. Full-screen art, so far larger than a card — but deliberately
+/// under 1080p width and left for the GPU to upscale: it is a dimmed, moving backdrop, and
+/// every extra pixel is resize time on the launch path plus memory for one transient
+/// screen. Source heroes are often 3840 wide, so this is where most of the cost is.
+const MAX_HERO_WIDTH: u32 = 1280;
 /// Hero crop aspect. Deliberately wider than any panel (16:9 at its widest), because
 /// the slack between the two is exactly what the connecting screen's pan travels.
 const HERO_ASPECT: f32 = 2.4;
@@ -75,6 +76,13 @@ fn crop_to_aspect(img: image::DynamicImage, aspect: f32) -> image::DynamicImage 
 
 /// Cache version magic ("PFR2" — bumped for center-cropped art).
 const RAW_CACHE_MAGIC: u32 = 0x50465232;
+/// Hero decoded-pixel cache magic ("PFH1").
+const HERO_CACHE_MAGIC: u32 = 0x50464831;
+/// Filename suffix for a decoded hero, also what `prune_hero_cache` matches on.
+const HERO_RAW_SUFFIX: &str = ".hero.raw";
+/// How many decoded heroes are kept on disk. At a few MB each this bounds the cache at
+/// tens of MB while still covering everything recently launched.
+const HERO_RAW_CACHE_KEEP: usize = 8;
 
 fn cache_root() -> PathBuf {
     let home = std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from);
@@ -96,9 +104,12 @@ pub fn clear_host_cache(host: &str, port: u16) {
     let _ = std::fs::remove_dir_all(cache_dir(host, port));
 }
 
-/// Decoded-pixel cache path (cards only — see the worker's hero branch).
-fn raw_cache_path(dir: &std::path::Path, game_id: &str) -> PathBuf {
-    dir.join(format!("{}.raw", cache_name(game_id)))
+/// Decoded-pixel cache path. Heroes get their own name so a game can cache both.
+fn raw_cache_path(dir: &std::path::Path, game_id: &str, kind: ArtKind) -> PathBuf {
+    match kind {
+        ArtKind::Card => dir.join(format!("{}.raw", cache_name(game_id))),
+        ArtKind::Hero => dir.join(format!("{}{HERO_RAW_SUFFIX}", cache_name(game_id))),
+    }
 }
 
 /// Encoded-bytes cache path (what the host served, undecoded).
@@ -118,22 +129,24 @@ fn tmp_path(path: &std::path::Path) -> PathBuf {
 }
 
 /// Write-then-rename (prevents truncated cache files on kill mid-write).
-fn write_raw_cache(path: &std::path::Path, pixmap: &Pixmap) {
-    let mut buf = Vec::with_capacity(12 + pixmap.data().len());
-    buf.extend_from_slice(&RAW_CACHE_MAGIC.to_le_bytes());
-    buf.extend_from_slice(&pixmap.width().to_le_bytes());
-    buf.extend_from_slice(&pixmap.height().to_le_bytes());
-    buf.extend_from_slice(pixmap.data());
+fn write_raw(path: &std::path::Path, magic: u32, width: u32, height: u32, pixels: &[u8]) {
+    let mut buf = Vec::with_capacity(12 + pixels.len());
+    buf.extend_from_slice(&magic.to_le_bytes());
+    buf.extend_from_slice(&width.to_le_bytes());
+    buf.extend_from_slice(&height.to_le_bytes());
+    buf.extend_from_slice(pixels);
     let tmp = tmp_path(path);
     if std::fs::write(&tmp, &buf).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
 }
 
-/// Read raw cache, if present and well-formed.
-fn read_raw_cache(path: &std::path::Path) -> Option<Pixmap> {
+/// Read raw cache, if present and written with this magic (and so this pixel convention —
+/// card pixels are premultiplied, hero pixels straight, and the two must never be
+/// mistaken for each other).
+fn read_raw(path: &std::path::Path, magic: u32) -> Option<(u32, u32, Vec<u8>)> {
     let buf = std::fs::read(path).ok()?;
-    if u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?) != RAW_CACHE_MAGIC {
+    if u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?) != magic {
         return None;
     }
     let width = u32::from_le_bytes(buf.get(4..8)?.try_into().ok()?);
@@ -141,7 +154,39 @@ fn read_raw_cache(path: &std::path::Path) -> Option<Pixmap> {
     if buf.len() - 12 != width as usize * height as usize * 4 {
         return None;
     }
-    Pixmap::from_vec(buf.get(12..)?.to_vec(), IntSize::from_wh(width, height)?)
+    Some((width, height, buf.get(12..)?.to_vec()))
+}
+
+fn write_card_cache(path: &std::path::Path, pixmap: &Pixmap) {
+    write_raw(path, RAW_CACHE_MAGIC, pixmap.width(), pixmap.height(), pixmap.data());
+}
+
+fn read_card_cache(path: &std::path::Path) -> Option<Pixmap> {
+    let (width, height, pixels) = read_raw(path, RAW_CACHE_MAGIC)?;
+    Pixmap::from_vec(pixels, IntSize::from_wh(width, height)?)
+}
+
+/// Keeps the newest `HERO_RAW_CACHE_KEEP` decoded heroes and deletes the rest. They are
+/// megabytes each, so unlike card art they can't all be kept — but a decode is far too
+/// slow here to redo on the launch path, so the recently played ones stay resident.
+fn prune_hero_cache(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut heroes: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(HERO_RAW_SUFFIX))
+        .filter_map(|p| {
+            let modified = p.metadata().and_then(|m| m.modified()).ok()?;
+            Some((modified, p))
+        })
+        .collect();
+    if heroes.len() <= HERO_RAW_CACHE_KEEP {
+        return;
+    }
+    heroes.sort_by_key(|(modified, _)| *modified);
+    for (_, path) in heroes.iter().take(heroes.len() - HERO_RAW_CACHE_KEEP) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Stretch to card size (done here, not in each card build, to save armv7 cost).
@@ -336,22 +381,28 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
         let at = queue.iter().position(|r| r.kind == ArtKind::Hero).unwrap_or_default();
         let Some(req) = queue.remove(at) else { continue };
 
-        // Decoded-pixel cache, cards only: a hero's would be ~4MB per game, and one gets
-        // cached for every card the user so much as focuses. The encoded bytes below
-        // already spare the network, and the decode runs here, off the UI thread.
-        let raw_cached = raw_cache_path(dir, &req.game_id);
-        if req.kind == ArtKind::Card {
-            if let Some(pixmap) = read_raw_cache(&raw_cached) {
+        // Decoded-pixel cache. Worth far more for a hero than for a card: decoding a
+        // full-size hero JPEG on this SoC takes long enough to miss the launch it was
+        // fetched for, so the encoded-bytes layer below is not enough on its own.
+        let raw_cached = raw_cache_path(dir, &req.game_id, req.kind);
+        let cached_raw = match req.kind {
+            ArtKind::Card => read_card_cache(&raw_cached).map(|pixmap| {
                 let sized = resize_pixmap(&pixmap, card_w, card_h).unwrap_or(pixmap);
-                let loaded = ArtLoaded::Card {
-                    game_id: req.game_id,
+                ArtLoaded::Card {
+                    game_id: req.game_id.clone(),
                     pixmap: sized,
-                };
-                if tx.send(loaded).is_err() {
-                    return;
                 }
-                continue;
+            }),
+            ArtKind::Hero => read_raw(&raw_cached, HERO_CACHE_MAGIC).map(|(width, height, pixels)| ArtLoaded::Hero {
+                game_id: req.game_id.clone(),
+                image: HeroImage { width, height, pixels },
+            }),
+        };
+        if let Some(loaded) = cached_raw {
+            if tx.send(loaded).is_err() {
+                return;
             }
+            continue;
         }
 
         let cached = bytes_cache_path(dir, &req.game_id, req.kind);
@@ -436,6 +487,8 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
             ArtKind::Hero => {
                 // Left straight-alpha (no `premultiply_rgba`): it is uploaded as a raw
                 // texture, and SDL's blend mode expects straight alpha.
+                write_raw(&raw_cached, HERO_CACHE_MAGIC, width, height, &buf);
+                prune_hero_cache(dir);
                 ArtLoaded::Hero {
                     game_id: req.game_id,
                     image: HeroImage {
@@ -454,7 +507,7 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
                     tracing::warn!("art: {} Pixmap::from_vec failed ({width}x{height})", req.game_id);
                     continue;
                 };
-                write_raw_cache(&raw_cached, &pixmap);
+                write_card_cache(&raw_cached, &pixmap);
                 let sized = resize_pixmap(&pixmap, card_w, card_h).unwrap_or(pixmap);
                 ArtLoaded::Card {
                     game_id: req.game_id,
