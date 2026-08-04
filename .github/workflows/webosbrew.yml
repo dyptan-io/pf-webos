@@ -87,15 +87,13 @@ jobs:
             --link "https://github.com/${GITHUB_REPOSITORY}" \
             --root false \
             --output "dist/${APP_ID}.manifest.json"
-          # gen-manifest only knows the local file name; point ipkUrl at the release
-          # asset. Off a release the tag is unset, so fall back to the app version —
-          # the URL the release for this version will have.
-          MANIFEST="dist/${APP_ID}.manifest.json"
+          # gen-manifest only knows the local file name; point ipkUrl at the release asset.
           TAG='${{ inputs.release_tag }}'
-          [ -n "$TAG" ] || TAG="$(jq -r .version "$MANIFEST")"
-          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/$(basename "$IPK")"
-          jq --arg url "$URL" '.ipkUrl = $url' "$MANIFEST" > "$RUNNER_TEMP/m.json"
-          mv "$RUNNER_TEMP/m.json" "$MANIFEST"
+          if [ -n "$TAG" ]; then
+            URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/$(basename "$IPK")"
+            jq --arg url "$URL" '.ipkUrl = $url' "dist/${APP_ID}.manifest.json" > "$RUNNER_TEMP/m.json"
+            mv "$RUNNER_TEMP/m.json" "dist/${APP_ID}.manifest.json"
+          fi
           cat "dist/${APP_ID}.manifest.json"
 
       - name: Upload manifest artifact

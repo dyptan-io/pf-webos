@@ -140,16 +140,11 @@ tasks:
 
   deploy:
     desc: >-
-      Build, package, install on a real TV, and launch it — all over ares-cli-rs
-      (ares-install/ares-launch), no raw ssh/scp. Usage:
-      task deploy TV_HOST=root@<tv-ip> (or set TV_HOST in .env). Without TELEMETRY,
-      the app just writes a versioned file in its data dir (info-and-above only) —
-      the same as always. Pass TELEMETRY=<host:port> to stream logs live to that
-      address instead (SAM hands launch `params` to a native app as argv[1] JSON on
-      initial launch — see src/logger.rs — no rebuild needed), or TELEMETRY=auto to
-      use this machine's own LAN IP on a random port (printed once the listener is
-      up, in case you need to connect to it manually). TELEMETRY_LEVEL
-      (debug/info/warn/error, default debug) sets the minimum level sent.
+      Build, package, install, and launch on a real TV via ares-cli-rs only.
+      Usage: task deploy TV_HOST=root@<tv-ip> (or set TV_HOST in .env).
+      TELEMETRY=<host:port> streams logs; TELEMETRY=auto uses this machine's LAN IP
+      and a random port. TELEMETRY_LEVEL (debug/info/warn/error, default debug)
+      sets the minimum streamed level.
     deps: [docker:package, register-device]
     vars:
       IPK: dist/{{.APP_ID}}_{{.PKG_VERSION}}_arm.ipk
@@ -157,7 +152,6 @@ tasks:
     cmds:
       - test -f "{{.IPK}}" || { echo "no {{.IPK}} — packaging failed?" >&2; exit 1; }
       - ares-install -d {{.TV_DEVICE}} "{{.IPK}}"
-      - sleep 3
       - |
         set -eu
         TELEMETRY="{{.TELEMETRY}}"
@@ -174,7 +168,6 @@ tasks:
           ( while true; do nc -l "$PORT"; done ) &
           NC_PID=$!
           trap 'kill "$NC_PID" 2>/dev/null || true' EXIT
-          sleep 0.5
           echo "listening on :${PORT} (destination sent to device: $TELEMETRY)" >&2
           set -- "$@" -p "telemetry=$TELEMETRY" -p "telemetry_level={{.TELEMETRY_LEVEL}}"
         fi
