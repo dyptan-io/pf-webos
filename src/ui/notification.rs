@@ -57,7 +57,12 @@ pub fn render_notification_tile(raster: &dyn TextRaster, font: FontId, text: &st
     let h = (raster.height(font) + 2 * pad) as u32;
     let mut p = Painter::new(w.max(1), h.max(1));
     let mut tc = TextCache::new();
-    p.fill_rounded_rect(Rect::new(0, 0, w, h), 14, Color::RGBA(0x14, 0x10, 0x1f, 0x90));
+    let rect = Rect::new(0, 0, w, h);
+    p.fill_rounded_rect(rect, 14, Color::RGBA(0x14, 0x10, 0x1f, 0x90));
+    // The fill is the same near-black hue as the menu's own background (`ui::BG`), so over
+    // that screen it's a same-color-on-same-color box — a light stroke keeps the panel
+    // legible there, not just over the stream's video content.
+    p.stroke_rounded_rect(rect, 14, Color::RGBA(0xff, 0xff, 0xff, 0x40), 1.5);
     draw_text(&mut p, &mut tc, raster, font, text, pad, pad, WHITE)?;
     Ok(p)
 }

@@ -17,6 +17,7 @@ pub(super) fn run_ui_flow(
     display_mode: sdl2::video::DisplayMode,
     fonts: &crate::ui::Fonts,
     initial_status: Option<String>,
+    initial_toast: Option<String>,
 ) -> Result<Option<ConnectOutcome>> {
     // Target period for this loop's render ticks, animating or not. Each active
     // (render) iteration used to sleep a flat 16ms *on top of* whatever the tick's own
@@ -62,6 +63,14 @@ pub(super) fn run_ui_flow(
     // connect-error path).
     if initial_status.is_some() {
         app.home_status = initial_status;
+    }
+    // Same toast widget as the streaming loop's frame-pacer toggle (`ui::Notification`);
+    // shown once, right as the Home screen re-appears.
+    let mut notif = crate::ui::Notification::new();
+    // Last (text, w, h) uploaded for the toast tile — see `push_notification_cmd`.
+    let mut notif_tile: Option<(String, u32, u32)> = None;
+    if let Some(msg) = initial_toast {
+        notif.show(msg);
     }
     // Rasterized-text cache (see `ui::TextCache` docs) — created once here and
     // threaded down through every render call for the rest of this UI-flow's
@@ -293,7 +302,14 @@ pub(super) fn run_ui_flow(
             dirty = true;
         }
         quit_dialog_was_active = quit_dialog_active;
-        let animating = app.tick_animations() || app.tiles_pending || !app.grid_reveal_ready || quit_dialog_active;
+        // Polled every tick like the streaming loop's toast, not gated behind
+        // `content_dirty` — its own fade needs frames regardless of anything else.
+        let notif_frame = notif.frame();
+        let animating = app.tick_animations()
+            || app.tiles_pending
+            || !app.grid_reveal_ready
+            || quit_dialog_active
+            || notif_frame.is_some();
         let log_overlay_due = log_overlay_state() != LogOverlayState::Off
             && log_overlay_last.is_none_or(|t| t.elapsed() >= Duration::from_millis(500));
         if !dirty && !animating && !log_overlay_due {
@@ -368,6 +384,7 @@ pub(super) fn run_ui_flow(
                 });
             }
         }
+        push_notification_cmd(compositor, texture_creator, fonts, &notif_frame, display_mode.w, &mut notif_tile, &mut cmds)?;
         // Quit dialog overlay, appended to this loop's single command list rather than
         // getting its own present (unlike the stream, which draws over the video plane).
         quit_dialog.draw(

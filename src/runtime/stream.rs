@@ -75,6 +75,9 @@ pub(super) fn run_inner() -> Result<()> {
     let mut controller: Option<GameController> = None;
     // Why the *last* stream attempt bounced to the menu, shown on the fresh Home screen.
     let mut menu_status: Option<String> = None;
+    // Same, but for a toast popup (e.g. the host closed the session) instead of the
+    // bottom status line — shown on the Home screen right after re-entering the menu.
+    let mut menu_toast: Option<String> = None;
 
     loop {
         let Some((connect_thread, settings)) = run_ui_flow(
@@ -88,6 +91,7 @@ pub(super) fn run_inner() -> Result<()> {
             display_mode,
             &fonts,
             menu_status.take(),
+            menu_toast.take(),
         )?
         else {
             tracing::info!("punktfunk-webos exiting cleanly");
@@ -219,6 +223,12 @@ pub(super) fn run_inner() -> Result<()> {
         // Transient toasts. `overlay_was_active` catches the fade-out edge so the canvas gets
         // wiped once; `stats_dst`/`log_dst` recomposite each frame at their own slower cadence.
         let mut notif = crate::ui::Notification::new();
+        // Last (text, w, h) uploaded for the toast tile — see `push_notification_cmd`.
+        let mut notif_tile: Option<(String, u32, u32)> = None;
+        // Edge-detects `stats.holding` (freeze-until-reanchor — see `session::video_pump`) so a
+        // packet-loss stall surfaces as a toast even with the stats overlay off, same signal the
+        // overlay's "Beat" line already reads.
+        let mut was_holding = false;
         let mut overlay_was_active = false;
         let mut stats_dst: Option<crate::ui::render::Rect> = None;
         let mut log_dst: Option<crate::ui::render::Rect> = None;
@@ -240,6 +250,11 @@ pub(super) fn run_inner() -> Result<()> {
         let mut exit_held = false;
         // Waits for close-fade to finish.
         let mut pending_outcome: Option<StreamOutcome> = None;
+        // Set when the user confirms the disconnect dialog — distinguishes that from the
+        // host ending the session or the network dropping out, so the toast below only
+        // fires for the latter. (SIGTERM/window-close also call `disconnect_quit()`, but
+        // those break with `StreamOutcome::Quit` and never reach the check below.)
+        let mut client_initiated_disconnect = false;
         let outcome = 'running: loop {
             if QUIT_REQUESTED.load(Ordering::Relaxed) {
                 tracing::warn!("SIGTERM/SIGINT received — disconnecting before exit");
@@ -288,6 +303,7 @@ pub(super) fn run_inner() -> Result<()> {
                         match disconnect.handle_event(&event, display_mode.w as u32, display_mode.h as u32, &fonts) {
                             Some(ConfirmAction::Confirmed) => {
                                 tracing::info!("disconnecting to menu");
+                                client_initiated_disconnect = true;
                                 connected.client.disconnect_quit();
                                 disconnect.dismiss();
                                 pending_outcome = Some(StreamOutcome::ReturnToMenu);
@@ -451,6 +467,18 @@ pub(super) fn run_inner() -> Result<()> {
                 overlay_last = None;
             }
             blue_held = blue_down;
+            // Connection-issue toast: fires on the rising edge of a freeze-until-reanchor hold
+            // (dropped/gapped frames — see `session::video_pump`), which is the same "network
+            // trouble" signal the stats overlay's "Beat" line reads, just edge-triggered here so
+            // it's visible without the overlay open. No matching "recovered" toast — the video
+            // itself resuming is the recovery signal.
+            let holding_now = connected.stats.holding.load(Ordering::Relaxed);
+            if holding_now && !was_holding {
+                tracing::warn!("connection issues detected (freeze-until-reanchor)");
+                notif.show("Connection issues — recovering...");
+                overlay_last = None;
+            }
+            was_holding = holding_now;
             // The dialog is navigated with the Magic Remote's pointer, so a captured stream
             // must hand the pointer back while it's up — hidden/relative there'd be nothing
             // to aim with. Recaptured on dismiss.
@@ -653,21 +681,7 @@ pub(super) fn run_inner() -> Result<()> {
                         });
                     }
                 }
-                if let Some((text, alpha)) = &notif_frame {
-                    match crate::ui::render_notification_tile(fonts.raster, fonts.value, text) {
-                        Ok(tile) => {
-                            let (tw, th) = (tile.width(), tile.height());
-                            compositor.upload(&texture_creator, Tile::Notification, &tile)?;
-                            // Top-centre: never overlaps the top-right stats or bottom log overlay.
-                            cmds.push(DrawCmd::Tex {
-                                tile: Tile::Notification,
-                                dst: crate::ui::render::Rect::new((display_mode.w - tw as i32) / 2, 24, tw, th),
-                                alpha: (alpha * 255.0) as u8,
-                            });
-                        }
-                        Err(e) => tracing::warn!("toast render failed: {e:#}"),
-                    }
-                }
+                push_notification_cmd(&mut compositor, &texture_creator, &fonts, &notif_frame, display_mode.w, &mut notif_tile, &mut cmds)?;
                 if !cmds.is_empty() {
                     canvas.set_blend_mode(sdl2::render::BlendMode::None);
                     canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
@@ -678,6 +692,15 @@ pub(super) fn run_inner() -> Result<()> {
             }
             if connected.client.is_session_ended() {
                 tracing::info!("host ended the session");
+                // `is_session_ended` covers both a graceful host close and a network
+                // drop/idle-timeout (see `NativeClient::is_session_ended`'s doc) — no
+                // signal distinguishes them, so one message covers both. But it also
+                // flips true right after *our own* `disconnect_quit()` calls above
+                // (Back/dialog, SIGTERM) — skip the toast for those, it's not news to
+                // the user who just asked to disconnect.
+                if !client_initiated_disconnect {
+                    menu_toast = Some("The host closed the connection".to_string());
+                }
                 break 'running StreamOutcome::ReturnToMenu;
             }
 
