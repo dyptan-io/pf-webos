@@ -21,9 +21,10 @@ pub const HERO_FADE_OUT: Duration = Duration::from_millis(280);
 /// arrived yet. Only paid on a cold cache — a prefetched hero is already up by then.
 pub const HERO_WAIT: Duration = Duration::from_millis(1_200);
 
-/// Least time the hero stays up once it appears, fade-in included, so a late arrival
-/// reads as a loading screen rather than a flash.
-pub const HERO_MIN_SHOW: Duration = Duration::from_millis(1_600);
+/// How long the hero stays up once it appears, fade-in included — long enough to read as
+/// a loading screen with a visible pan, not a flash. A floor, not a cap: a slower
+/// handshake keeps it up longer.
+pub const HERO_MIN_SHOW: Duration = Duration::from_secs(3);
 
 /// How much longer it holds after the handshake lands, before the fade-out starts. That
 /// and the fade-out together are the ~1s of stream that would be black regardless.
