@@ -197,11 +197,10 @@ pub(super) fn run_inner() -> Result<()> {
         } else {
             None
         };
-        // Reader owns this stream's motion, so SDL's relative mode (enabled above, before we
-        // knew whether it would) is now just a warp per report.
-        if hid_mouse.is_some() {
-            cursor.disable_sdl_relative();
-        }
+        // Flips once a HID mouse is found — `HidMouse::start` no longer scans before returning
+        // (that blocked every stream connect on the node-open cost), so presence is only known
+        // once the reader thread's own scan catches up; checked each tick below.
+        let mut hid_device_seen = false;
         // Stats overlay: refreshed ~2Hz onto the transparent stream window, over the
         // punch-through video plane via per-pixel alpha — window is never shown/hidden (that
         // crashed an earlier attempt, see docs/NOTES.md). Green button flips it live, session-only.
@@ -246,6 +245,10 @@ pub(super) fn run_inner() -> Result<()> {
                 tracing::warn!("SIGTERM/SIGINT received — disconnecting before exit");
                 connected.client.disconnect_quit();
                 break 'running StreamOutcome::Quit;
+            }
+            if !hid_device_seen && hid_mouse.as_ref().is_some_and(|hid| hid.has_device()) {
+                hid_device_seen = true;
+                cursor.disable_sdl_relative();
             }
             for event in events.poll_iter() {
                 use sdl2::event::Event;
@@ -345,7 +348,7 @@ pub(super) fn run_inner() -> Result<()> {
                             // Relative only for the remote alone: SDL's warp emulation is off
                             // whenever the evdev reader owns motion, so the remote sends
                             // absolute — also the better fit for a device the user aims.
-                            let ev = if settings.cursor_capture && hid_mouse.is_none() {
+                            let ev = if settings.cursor_capture && !hid_device_seen {
                                 mouse::move_relative_event(xrel, yrel)
                             } else {
                                 mouse::move_event(x, y, display_mode.w as u32, display_mode.h as u32)

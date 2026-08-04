@@ -46,6 +46,12 @@ const DEAD: libc::c_short = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
 
 /// `poll` wakeup cadence — bounds stop latency and hot-plug pickup delay.
 const POLL_TIMEOUT_MS: i32 = 200;
+
+/// Caps how often a burst of ready reads re-triggers `poll` — a report already coalesces every
+/// pending event, so re-draining and forwarding faster than this is pure CPU/host-injection
+/// churn, not smoother motion. A moving 1kHz mouse would otherwise make `poll` return
+/// continuously (see `reader_loop`), spinning this thread and sending at the device's own rate.
+const MOTION_INTERVAL: Duration = Duration::from_millis(2); // 500 Hz
 /// How often to rescan `/dev/input` for devices plugged in mid-session.
 const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -76,6 +82,7 @@ pub struct HidMouse {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     activity: Arc<Activity>,
+    has_device: Arc<AtomicBool>,
 }
 
 /// Last-report timestamp, shared with the main thread to tell the mouse and remote apart — SDL
@@ -101,17 +108,14 @@ impl Activity {
 }
 
 impl HidMouse {
-    /// `None` when no mouse-shaped node is readable (Magic-Remote-only TV, or jail group
-    /// mismatch) — not an error, caller keeps using SDL's pointer.
+    /// `None` only if the reader thread itself fails to spawn — a Magic-Remote-only TV (or
+    /// jail group mismatch) still gets a thread, so a mouse plugged in mid-session is picked up
+    /// by [`reader_loop`]'s own rescan; scanning here on the caller's thread would instead block
+    /// every stream (re)connect for the ~40ms/node cost the module's docs describe.
     ///
     /// `sink` runs **on the reader thread**, once per input frame, and must not block: queueing
     /// for the main loop would re-quantize motion to tick rate, the resampling this escapes.
     pub fn start(sink: impl Fn(&InputEvent) + Send + 'static) -> Option<Self> {
-        let devices = scan(&mut Vec::new());
-        if devices.is_empty() {
-            tracing::info!("no HID mouse on /dev/input — using SDL pointer for this stream");
-            return None;
-        }
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let activity = Arc::new(Activity {
@@ -120,15 +124,26 @@ impl HidMouse {
             discrete_ms: std::sync::atomic::AtomicU64::new(0),
         });
         let thread_activity = Arc::clone(&activity);
+        let has_device = Arc::new(AtomicBool::new(false));
+        let thread_has_device = Arc::clone(&has_device);
         let thread = std::thread::Builder::new()
             .name("pf-evmouse".into())
-            .spawn(move || reader_loop(devices, &sink, &thread_stop, &thread_activity))
+            .spawn(move || reader_loop(&sink, &thread_stop, &thread_activity, &thread_has_device))
             .ok()?;
         Some(Self {
             stop,
             thread: Some(thread),
             activity,
+            has_device,
         })
+    }
+
+    /// Whether the reader currently owns at least one open mouse node — `false` right after
+    /// [`start`] until its background scan completes, or permanently on a Magic-Remote-only TV.
+    /// Callers use this instead of `is_some()`/`is_none()` to tell "no HID mouse yet" apart from
+    /// "not asked for one", since the reader thread always exists once `start` returns `Some`.
+    pub fn has_device(&self) -> bool {
+        self.has_device.load(Ordering::Relaxed)
     }
 
     /// True while the mouse moved within [`IN_USE_WINDOW`] — caller should drop SDL's echo of it.
@@ -280,11 +295,20 @@ fn device_name(fd: RawFd) -> Option<String> {
     Some(String::from_utf8_lossy(&buf[..len]).into_owned())
 }
 
-fn reader_loop(mut devices: Vec<Device>, sink: &impl Fn(&InputEvent), stop: &AtomicBool, activity: &Activity) {
-    let mut seen: Vec<PathBuf> = devices.iter().map(|d| d.path.clone()).collect();
-    // Nice -10, like the video pump: at nice 0 this thread lost the CPU to boosted decode
-    // threads for up to 28ms at a stretch while a 1kHz mouse kept reporting — exactly the
-    // jitter this module exists to remove.
+fn reader_loop(sink: &impl Fn(&InputEvent), stop: &AtomicBool, activity: &Activity, has_device: &AtomicBool) {
+    // Scan at the default niceness: `open`/`ioctl` cost here is the driver's, not scheduling
+    // delay, so boosting priority wouldn't speed it up — it would just pull CPU from the video
+    // pump during exactly the busiest window (stream connect) for no benefit.
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut devices = scan(&mut seen);
+    if devices.is_empty() {
+        tracing::info!("no HID mouse on /dev/input yet — using SDL pointer until one appears");
+    } else {
+        has_device.store(true, Ordering::Relaxed);
+    }
+    // Nice -10, like the video pump, from here on: at nice 0 this thread lost the CPU to
+    // boosted decode threads for up to 28ms at a stretch while a 1kHz mouse kept reporting —
+    // exactly the jitter this module exists to remove.
     // SAFETY: plain scalar arguments; failure returns -1 and changes nothing.
     unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, -10) };
     let mut last_scan = Instant::now();
@@ -293,6 +317,7 @@ fn reader_loop(mut devices: Vec<Device>, sink: &impl Fn(&InputEvent), stop: &Ato
     // so rebuilding every iteration was a malloc/free per read burst.
     let mut fds = pollfds(&devices);
     while !stop.load(Ordering::Relaxed) {
+        let iter_start = Instant::now();
         // SAFETY: `fds` is a valid slice of `nfds` pollfds for the duration of the call.
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, POLL_TIMEOUT_MS) };
         if rc > 0 {
@@ -313,6 +338,13 @@ fn reader_loop(mut devices: Vec<Device>, sink: &impl Fn(&InputEvent), stop: &Ato
                     seen.retain(|p| *p != gone.path);
                 }
                 fds = pollfds(&devices);
+                has_device.store(!devices.is_empty(), Ordering::Relaxed);
+            }
+            // Each pass above already drained and flushed everything pending, so a mouse
+            // reporting faster than `MOTION_INTERVAL` just means going straight back into
+            // `poll` ready again — pace that instead of re-draining/re-sending at its rate.
+            if let Some(remaining) = MOTION_INTERVAL.checked_sub(iter_start.elapsed()) {
+                std::thread::sleep(remaining);
             }
         }
         // Gated on the directory's mtime, not just the interval: opening a node costs ~40ms and
@@ -327,6 +359,7 @@ fn reader_loop(mut devices: Vec<Device>, sink: &impl Fn(&InputEvent), stop: &Ato
                 if !found.is_empty() {
                     devices.extend(found);
                     fds = pollfds(&devices);
+                    has_device.store(true, Ordering::Relaxed);
                 }
             }
         }

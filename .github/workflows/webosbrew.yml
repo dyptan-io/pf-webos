@@ -96,6 +96,17 @@ jobs:
           fi
           cat "dist/${APP_ID}.manifest.json"
 
+      - name: Validate Homebrew manifest against schema
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/HomebrewPackageManifest.schema.json \
+            https://raw.githubusercontent.com/webosbrew/docs/main/schemas/HomebrewPackageManifest.schema.json
+          npx --yes ajv-cli@5 validate \
+            --spec=draft2020 \
+            -s /tmp/HomebrewPackageManifest.schema.json \
+            -d dist/*.manifest.json \
+            --strict=false
+
       - name: Upload manifest artifact
         uses: actions/upload-artifact@v7
         with:
