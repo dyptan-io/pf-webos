@@ -246,7 +246,11 @@ pub(super) fn run_inner() -> Result<()> {
                 connected.client.disconnect_quit();
                 break 'running StreamOutcome::Quit;
             }
-            if !hid_device_seen && hid_mouse.as_ref().is_some_and(|hid| hid.has_device()) {
+            if !hid_device_seen
+                && hid_mouse
+                    .as_ref()
+                    .is_some_and(crate::platform::webos::evmouse::HidMouse::has_device)
+            {
                 hid_device_seen = true;
                 cursor.disable_sdl_relative();
             }
