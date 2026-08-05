@@ -17,7 +17,18 @@ pub const HANDSHAKE: Duration = Duration::from_secs(5);
 /// back to the menu with "couldn't connect" against a host that was merely still starting.
 pub const HOST_WAIT: Duration = Duration::from_secs(185);
 
+/// The ambient reachability dot's per-host budget, for every protocol. Short on purpose: an
+/// unreachable host on a LAN fails fast (no route / refused), and one slow enough to miss this is
+/// not meaningfully "available". Not [`HANDSHAKE`] — nobody is waiting on this answer, so it is
+/// allowed to be wrong about a sluggish host rather than hold the sweep open.
+pub const PROBE: Duration = Duration::from_secs(2);
+
 /// One host request that should already have an answer: a library listing, a `/launch`, a
 /// `/serverinfo`. Not a wait for the host to become ready — that is [`HOST_WAIT`], spent by re-trying
 /// requests with this budget rather than by stretching one of them.
 pub const REQUEST: Duration = Duration::from_secs(10);
+
+/// Connect budget for the speed test's throwaway session. Longer than [`HANDSHAKE`] because the
+/// host brings up a real encode session for it, and the user opened this screen expecting to wait —
+/// but not [`HOST_WAIT`]: a host that needs minutes here has already answered the question.
+pub const SPEED_TEST: Duration = Duration::from_secs(20);

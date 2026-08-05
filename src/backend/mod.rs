@@ -61,6 +61,15 @@ pub trait HostBackend: Send + Sync {
     /// nothing here fetches a library or completes a handshake beyond what liveness needs.
     fn probe(&self, addr: &str, port: u16, timeout: std::time::Duration) -> bool;
 
+    /// Wake-on-LAN MAC(s) the host reports about itself, blocking; empty when it reports none.
+    ///
+    /// Only for protocols whose MAC does *not* arrive with discovery. punktfunk advertises it in
+    /// its mDNS TXT, so the default is "nothing to learn" — the caller keeps the record it already
+    /// has. Costs a real query, so callers must only ask for a host whose MAC is still unknown.
+    fn wake_mac(&self, _addr: &str, _query_port: u16) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Fetches the host's game library, blocking. `query_port` is already defaulted by the
     /// caller via [`Self::default_query_port`].
     ///

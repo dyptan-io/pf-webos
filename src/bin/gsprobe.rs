@@ -25,6 +25,8 @@
 
 #[path = "../services"]
 mod services {
+    // The probe spends only the HTTP budgets; the rest of the app's live in this file too.
+    #[allow(dead_code)]
     pub mod budget;
     pub mod paths;
     pub mod pinned_tls;

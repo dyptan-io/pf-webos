@@ -89,10 +89,21 @@ impl HostBackend for GameStream {
             // later.
             mgmt_port: Some(port),
             // A `GameStream` host advertises no MAC over mDNS. `/serverinfo` has one, but
-            // reading it would mean a round trip per discovery event; Wake-on-LAN for these
-            // hosts can wait for a reason to exist.
+            // reading it would mean a round trip per discovery event — so it is learned later,
+            // once, via `wake_mac`.
             mac: Vec::new(),
         })
+    }
+
+    fn wake_mac(&self, addr: &str, query_port: u16) -> Vec<String> {
+        let host = match open(addr, query_port) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!("GameStream host {addr}: MAC lookup could not open host ({e})");
+                return Vec::new();
+            }
+        };
+        reported_mac(addr, &host)
     }
 
     fn list_games(
@@ -164,6 +175,23 @@ impl HostBackend for GameStream {
 /// `/serverinfo`, so a failure here is a reachability failure.
 fn open(addr: &str, query_port: u16) -> Result<query::Host, LibraryError> {
     query::open(addr, Some(query_port)).map_err(|e| LibraryError::Unreachable(e.to_string()))
+}
+
+/// The Wake-on-LAN MAC an open host reports in `/serverinfo`, or none — a host that reports no MAC
+/// and one whose answer didn't parse are the same "nothing to wake with" to every caller, so both
+/// are logged here rather than handed back.
+pub(crate) fn reported_mac(addr: &str, host: &query::Host) -> Vec<String> {
+    match host.mac() {
+        Ok(Some(mac)) => vec![mac.to_string()],
+        Ok(None) => {
+            tracing::info!("GameStream host {addr}: no MAC in /serverinfo");
+            Vec::new()
+        }
+        Err(e) => {
+            tracing::debug!("GameStream host {addr}: MAC unreadable ({e:?})");
+            Vec::new()
+        }
+    }
 }
 
 /// Box-art fetcher over `/appasset`. Holds the host open for the life of one library's art

@@ -25,14 +25,11 @@ use ureq::unversioned::transport::{Connector as _, TcpConnector};
 
 use crate::services::pinned_tls::PinnedTlsConnector;
 
-/// How long to wait for the TCP connect itself, independent of the global request timeout —
-/// an unreachable host on a quiet LAN otherwise burns the whole request budget before saying so.
-/// Shared with punktfunk's pinned-host handshake budget: same question, same answer.
-const CONNECT_TIMEOUT: Duration = crate::services::budget::HANDSHAKE;
-
-/// Replaces the crate's 90 s pairing budget with punktfunk's park-and-wait one, so a PIN the user
-/// is slow to type and an approval the operator is slow to click get the same window.
-const PAIRING_TIMEOUT: Duration = crate::services::budget::HOST_WAIT;
+// Every timeout below comes from `services::budget`, unaliased, so this file can't drift from the
+// punktfunk side: `HANDSHAKE` for the TCP connect (an unreachable host on a quiet LAN would
+// otherwise burn the whole request budget before saying so), `REQUEST` for a call that should
+// already have an answer, and `HOST_WAIT` in place of the crate's own 90 s pairing budget.
+use crate::services::budget;
 
 /// How many times a request is re-sent after a failure that never reached the host's handler —
 /// see [`GsHttpClient::get_with_retry`].
@@ -183,7 +180,7 @@ pub struct GsHttpClient {
 impl GsHttpClient {
     fn plain(timeout: Duration) -> Self {
         let config = ureq::Agent::config_builder()
-            .timeout_connect(Some(CONNECT_TIMEOUT))
+            .timeout_connect(Some(budget::HANDSHAKE))
             .timeout_global(Some(timeout))
             .max_idle_connections(0)
             .build();
@@ -255,13 +252,13 @@ impl RequestClient for GsHttpClient {
     type Error = GsHttpError;
 
     fn with_defaults() -> Result<Self, Self::Error> {
-        Ok(Self::plain(crate::services::budget::REQUEST))
+        Ok(Self::plain(budget::REQUEST))
     }
 
     /// Used for pairing, where each phase waits on a human typing a PIN into the host's web
-    /// UI — hence [`PAIRING_TIMEOUT`] rather than the 10 s one.
+    /// UI — hence [`budget::HOST_WAIT`] rather than the 10 s one.
     fn with_defaults_long_timeout() -> Result<Self, Self::Error> {
-        Ok(Self::plain(PAIRING_TIMEOUT))
+        Ok(Self::plain(budget::HOST_WAIT))
     }
 
     fn with_certificates(
@@ -296,9 +293,9 @@ impl RequestClient for GsHttpClient {
 
         let connector = TcpConnector::default().chain(PinnedTlsConnector::new(Arc::new(cfg)));
         let config = ureq::Agent::config_builder()
-            .timeout_connect(Some(CONNECT_TIMEOUT))
-            .timeout_global(Some(crate::services::budget::REQUEST))
-            // See the note above `CONNECT_TIMEOUT`'s neighbours: no pooling.
+            .timeout_connect(Some(budget::HANDSHAKE))
+            .timeout_global(Some(budget::REQUEST))
+            // See the pooling note at the top of this file: no pooling.
             .max_idle_connections(0)
             .build();
         Ok(Self {

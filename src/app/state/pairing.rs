@@ -77,9 +77,19 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.pairing_rx = Some(rx);
         std::thread::spawn(move || {
+            // A `GameStream` host advertises no MAC over mDNS, so `entry.mac()` is always empty
+            // here — `/serverinfo` carries one, and pairing already holds an open host. Skipping it
+            // would work (the reachability sweep's `wake_mac` learns it eventually) but leaves the
+            // host unwakeable until then.
+            let mut mac = mac;
             let result = crate::backend::gamestream::query::open(&host, Some(port))
-                .and_then(|h| crate::backend::gamestream::query::pair(&h, pin))
-                .map(|()| HostTrust::ClientCertPaired)
+                .and_then(|h| {
+                    crate::backend::gamestream::query::pair(&h, pin)?;
+                    if mac.is_empty() {
+                        mac = crate::backend::gamestream::reported_mac(&host, &h);
+                    }
+                    Ok(HostTrust::ClientCertPaired)
+                })
                 .map_err(|e| crate::errors::friendly(&e));
             let _ = tx.send(PairingOutcome {
                 host,
@@ -194,7 +204,7 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.pairing_rx = Some(rx);
         std::thread::spawn(move || {
-            let result = crate::session::request_access(&host, port, identity, std::time::Duration::from_secs(185))
+            let result = crate::session::request_access(&host, port, identity, crate::services::budget::HOST_WAIT)
                 .map(HostTrust::Pinned)
                 .map_err(|e| crate::errors::friendly(&e));
             let _ = tx.send(PairingOutcome {
@@ -291,7 +301,10 @@ impl App {
                 (&identity.0, &identity.1),
                 &pin,
                 "webOS TV",
-                std::time::Duration::from_secs(30),
+                // The same window `GameStream` PIN pairing gets: both are a handshake gated on a
+                // human, and the old 30 s here was the only reason the two protocols timed out
+                // differently on the same screen.
+                crate::services::budget::HOST_WAIT,
             )
             .map(HostTrust::Pinned)
             .map_err(|e| crate::errors::pair_message(&e));

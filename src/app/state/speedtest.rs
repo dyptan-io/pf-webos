@@ -80,7 +80,7 @@ impl App {
                 port,
                 identity,
                 pin,
-                std::time::Duration::from_secs(20),
+                crate::services::budget::SPEED_TEST,
                 |partial| {
                     let _ = progress_tx.send(SpeedTestMsg::Progress(partial));
                 },
