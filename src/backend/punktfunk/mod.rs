@@ -3,7 +3,7 @@
 //! how a punktfunk host behaves.
 use mdns_sd::ResolvedService;
 
-use crate::backend::{BackendCaps, HostBackend};
+use crate::backend::{ArtFetch, BackendCaps, HostBackend};
 use crate::core::model::GameEntry;
 use crate::core::protocol::Protocol;
 use crate::services::discovery::DiscoveredHost;
@@ -23,7 +23,12 @@ impl HostBackend for Punktfunk {
         BackendCaps {
             speed_test: true,
             request_access: true,
+            unpair: false,
         }
+    }
+
+    fn default_query_port(&self) -> u16 {
+        library::DEFAULT_MGMT_PORT
     }
 
     fn discovery_service(&self) -> &'static str {
@@ -61,10 +66,47 @@ impl HostBackend for Punktfunk {
     fn list_games(
         &self,
         addr: &str,
-        mgmt_port: u16,
+        query_port: u16,
         identity: &(String, String),
         pin: Option<[u8; 32]>,
     ) -> Result<Vec<GameEntry>, LibraryError> {
-        library::fetch_games(addr, mgmt_port, identity, pin)
+        library::fetch_games(addr, query_port, identity, pin)
+    }
+
+    fn unpair(&self, _addr: &str, _query_port: u16) -> anyhow::Result<()> {
+        // The host authorizes by client certificate against a pin we hold; dropping the record is
+        // the whole of unpairing, and `App::forget_host` has already done it. Unreached in
+        // practice (that call site checks `caps().unpair` first), but `Ok` rather than a panic:
+        // "nothing left to do" is the true answer, not an unsupported operation.
+        Ok(())
+    }
+
+    fn art_fetcher(
+        &self,
+        addr: &str,
+        query_port: u16,
+        identity: &(String, String),
+        pin: Option<[u8; 32]>,
+    ) -> Result<Box<dyn ArtFetch>, LibraryError> {
+        Ok(Box::new(MtlsArt {
+            agent: library::agent(identity, pin)?,
+            addr: addr.to_string(),
+            mgmt_port: query_port,
+        }))
+    }
+}
+
+/// The mTLS art transport. One `ureq::Agent` for every cover in a library: a fresh one per
+/// cover would mean a fresh TCP+TLS handshake including client-cert auth, real avoidable cost
+/// that scales with library size.
+struct MtlsArt {
+    agent: ureq::Agent,
+    addr: String,
+    mgmt_port: u16,
+}
+
+impl ArtFetch for MtlsArt {
+    fn fetch(&self, art: &str) -> Result<Vec<u8>, LibraryError> {
+        library::fetch_art(&self.agent, &self.addr, self.mgmt_port, art)
     }
 }

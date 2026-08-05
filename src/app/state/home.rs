@@ -415,8 +415,8 @@ impl App {
         let identity = (self.identity.0.clone(), self.identity.1.clone());
         let known = self.known_hosts.iter().find(|h| h.host == host && h.port == port);
         let fingerprint = known.and_then(store::KnownHost::pin);
-        let backend = crate::backend::backend_or_punktfunk(known.map(|h| h.protocol).unwrap_or_default());
-        let mgmt_port = mgmt_port.unwrap_or(crate::services::library::DEFAULT_MGMT_PORT);
+        let backend = crate::backend::backend_for(known.map(|h| h.protocol).unwrap_or_default());
+        let mgmt_port = mgmt_port.unwrap_or_else(|| backend.default_query_port());
         tracing::debug!("library: fetching from {host}:{mgmt_port}…");
         self.games_rx = Some(crate::services::library::load_games_async(
             backend,
@@ -449,22 +449,19 @@ impl App {
                 games.sort_by_key(|g| g.title.to_lowercase());
                 tracing::info!("library: {} games from {host}:{mgmt_port}", games.len());
                 let identity = (self.identity.0.clone(), self.identity.1.clone());
-                let fingerprint = self
-                    .known_hosts
-                    .iter()
-                    .find(|h| h.host == host && h.port == port)
-                    .and_then(store::KnownHost::pin);
+                let known = self.known_hosts.iter().find(|h| h.host == host && h.port == port);
+                let fingerprint = known.and_then(store::KnownHost::pin);
+                let backend = crate::backend::backend_for(known.map(|h| h.protocol).unwrap_or_default());
                 // Covers are requested per card as the grid window reaches them (see
                 // `App::prepare_tiles`), not fetched for the whole library up front.
-                let (card_w, card_h) = self.card_size;
                 self.art_loader = Some(crate::services::art::ArtLoader::spawn(
+                    backend,
                     host,
                     port,
                     mgmt_port,
                     identity,
                     fingerprint,
-                    card_w,
-                    card_h,
+                    self.card_size,
                 ));
                 self.games = games;
                 self.games_loaded = true;
@@ -516,6 +513,15 @@ impl App {
         let Some(known) = self.known_hosts.iter().find(|h| h.host == host && h.port == port) else {
             return;
         };
+        // Streaming a `GameStream` host is P4 — `ConnectTarget` is punktfunk-shaped (it carries a
+        // pinned fingerprint, which that protocol has no equivalent of) and `session::connect`
+        // speaks only punktfunk. Say so rather than falling through `pin()`'s `None` into a
+        // silent no-op, which reads as a broken remote.
+        if known.protocol == store::Protocol::GameStream {
+            self.home_status = Some("Streaming GameStream hosts isn't supported yet.".into());
+            self.grid_dirty = true;
+            return;
+        }
         let Some(fingerprint) = known.pin() else { return };
         let (launch, title) = match self.grid_card_at(idx, columns) {
             Some(GridCard::Desktop) => (None, "Desktop".to_string()),
@@ -558,10 +564,23 @@ impl App {
             return;
         };
         let (host, port) = (h.host.clone(), h.port);
+        // Tell the host to forget us too, where the protocol has somewhere to say that
+        // (`BackendCaps::unpair`). Fire-and-forget on a worker: the record goes away either way —
+        // a host that is offline must not block Forget — and there is no UI left to report into
+        // once this modal closes. `mgmt_port` unwraps to the backend's own default.
+        let backend = crate::backend::backend_for(h.protocol);
+        if backend.caps().unpair {
+            let (addr, query_port) = (host.clone(), h.mgmt_port.unwrap_or_else(|| backend.default_query_port()));
+            std::thread::spawn(move || {
+                if let Err(e) = backend.unpair(&addr, query_port) {
+                    tracing::warn!("unpair {addr}:{query_port} failed: {e}");
+                }
+            });
+        }
         crate::services::art::clear_host_cache(&host, port);
         self.known_hosts.retain(|k| !(k.host == host && k.port == port));
         let _ = store::save_known_hosts(&self.known_hosts);
-        self.entries = self.known_hosts.iter().cloned().map(HostEntry::Known).collect();
+        self.rebuild_entries();
         if self.selected_host.as_ref() == Some(&(host, port)) {
             self.selected_host = None;
             self.games = Vec::new();

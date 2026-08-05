@@ -1,7 +1,7 @@
 //! LAN discovery via mDNS. Direct mdns-sd dep to avoid pf-client-core's FFmpeg/PipeWire.
 //!
-//! One daemon browses every `backend::ALL_BACKENDS` service type, and the type a record arrived
-//! on is what sets its protocol — hosts are never probed to find out what they speak.
+//! One daemon browses one service type per enabled backend, and the type a record arrived on is
+//! what sets its protocol — hosts are never probed to find out what they speak.
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 
 use crate::core::protocol::Protocol;
@@ -24,9 +24,12 @@ pub struct DiscoveredHost {
     pub mac: Vec<String>,
 }
 
-/// Browse continuously; returns (Receiver, `ServiceDaemon`). Thread won't exit until `ServiceDaemon::shutdown()`
-/// called explicitly — mdns-sd's `SearchStarted` events loop forever. Failure points logged via tracing.
-pub fn browse() -> Option<(std::sync::mpsc::Receiver<DiscoveredHost>, ServiceDaemon)> {
+/// Browse continuously for `backends` (see `backend::browse_backends`); returns (Receiver,
+/// `ServiceDaemon`). Thread won't exit until `ServiceDaemon::shutdown()` called explicitly —
+/// mdns-sd's `SearchStarted` events loop forever. Failure points logged via tracing.
+pub fn browse(
+    backends: Vec<&'static dyn crate::backend::HostBackend>,
+) -> Option<(std::sync::mpsc::Receiver<DiscoveredHost>, ServiceDaemon)> {
     let (tx, rx) = std::sync::mpsc::channel();
     let daemon = ServiceDaemon::new()
         .inspect_err(|e| {
@@ -40,12 +43,12 @@ pub fn browse() -> Option<(std::sync::mpsc::Receiver<DiscoveredHost>, ServiceDae
             // One receiver per service type, all fed by the one daemon, each remembering which
             // backend owns it so a resolved record is parsed by the protocol that advertised it.
             let mut browses = Vec::new();
-            for backend in crate::backend::ALL_BACKENDS {
+            for backend in backends {
                 let service = backend.discovery_service();
                 match daemon.browse(service) {
                     Ok(r) => {
                         tracing::debug!("mdns: browsing {service}");
-                        browses.push((*backend, r));
+                        browses.push((backend, r));
                     }
                     Err(e) => tracing::error!("mdns: browse({service}) failed: {e}"),
                 }

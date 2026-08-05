@@ -44,7 +44,7 @@ impl App {
         let saved = matches!(entry, HostEntry::Known(_));
         // Affordances a protocol doesn't have are *omitted*, never shown-and-failing, so adding a
         // protocol touches no view code. See `backend::BackendCaps`.
-        let caps = crate::backend::backend_or_punktfunk(entry.protocol()).caps();
+        let caps = crate::backend::backend_for(entry.protocol()).caps();
         let mut rows = vec![
             (
                 HostAction::Connect,
@@ -58,7 +58,17 @@ impl App {
             ),
             (
                 HostAction::Pair,
-                FocusRow::action(crate::ui::ICON_LOCK, "Pair with PIN…"),
+                // The same cap that decides the pairing modal's layout decides its label here:
+                // a protocol with request-access takes a PIN *from* the host, one without
+                // generates its own for the user to carry the other way.
+                FocusRow::action(
+                    crate::ui::ICON_LOCK,
+                    if caps.request_access {
+                        "Pair with PIN…"
+                    } else {
+                        "Show pairing PIN…"
+                    },
+                ),
             ),
         ];
         if caps.speed_test {
@@ -99,17 +109,19 @@ impl App {
             .map_or_else(String::new, |e| e.name().to_string())
     }
 
-    /// `address:port`, plus the pairing state — the menu's subtitle.
+    /// `address:port`, the pairing state, and the protocol where it isn't the default one — the
+    /// menu's subtitle. punktfunk hosts stay unlabelled: naming the protocol on every host would
+    /// be noise, whereas a `GameStream` host's reduced feature set is worth flagging.
     pub(crate) fn host_menu_subtitle(&self) -> String {
         self.host_menu_index
             .and_then(|i| self.entries.get(i))
             .map_or_else(String::new, |e| {
-                format!(
-                    "{}:{} · {}",
-                    e.host(),
-                    e.port(),
-                    if e.is_paired() { "paired" } else { "not paired" }
-                )
+                let paired = if e.is_paired() { "paired" } else { "not paired" };
+                let protocol = match e.protocol() {
+                    crate::core::protocol::Protocol::Punktfunk => "",
+                    crate::core::protocol::Protocol::GameStream => " · GameStream",
+                };
+                format!("{}:{} · {paired}{protocol}", e.host(), e.port())
             })
     }
 

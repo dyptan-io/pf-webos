@@ -12,12 +12,6 @@ use crate::core::protocol::Protocol;
 use crate::services::discovery::DiscoveredHost;
 use crate::services::library::LibraryError;
 
-// P1 landed the host-query and pairing half of `GameStream`, but nothing in the app calls it
-// yet — `backend_for` still returns `None` for that protocol and `src/bin/gsprobe.rs` is the
-// only caller. The allow goes when P3 gives it a `HostBackend` impl; until then the module is
-// dead code in this binary by design, and deleting the warning is cheaper than pretending
-// otherwise with a stub call site.
-#[allow(dead_code)]
 pub mod gamestream;
 pub mod punktfunk;
 
@@ -31,9 +25,12 @@ pub struct BackendCaps {
     /// Trust-on-first-use pairing with no PIN — punktfunk's "request access" park-and-approve.
     /// `GameStream` is PIN-only, and its PIN travels the other way (we display, the user types).
     pub request_access: bool,
-    // Two more caps the plan calls for arrive with the code that reads them, rather than sitting
-    // here unread: `host_abr` (false ⇒ resolve "Automatic" bitrate client-side) in P4, and
-    // `unpair` (a host-side endpoint, so an action distinct from Forget) in P3.
+    /// The host stores the pairing too, so dropping it needs a call to the host — an action
+    /// distinct from Forget, which only discards our own record. punktfunk has no such endpoint:
+    /// forgetting the pin *is* unpairing.
+    pub unpair: bool,
+    // `host_abr` (false ⇒ resolve "Automatic" bitrate client-side) arrives with the code that
+    // reads it, in P4, rather than sitting here unread.
 }
 
 /// One protocol's host behaviour.
@@ -48,8 +45,13 @@ pub trait HostBackend: Send + Sync {
     /// Turns a resolved mDNS record into a host, or `None` if it isn't usable (no IPv4, etc).
     fn parse_discovery(&self, info: &mdns_sd::ResolvedService) -> Option<DiscoveredHost>;
 
-    /// Fetches the host's game library, blocking. `mgmt_port` is already defaulted by the
-    /// caller, since the fallback port differs per protocol.
+    /// Port for library and art queries when neither mDNS nor a saved record supplied one —
+    /// punktfunk's management API and `GameStream`'s HTTP endpoint are different services on
+    /// different default ports, so the fallback can't live at the call site.
+    fn default_query_port(&self) -> u16;
+
+    /// Fetches the host's game library, blocking. `query_port` is already defaulted by the
+    /// caller via [`Self::default_query_port`].
     ///
     /// The error type is still `LibraryError` rather than a neutral one because
     /// `App::handle_library_error` switches the Wake dialog on `Unreachable` specifically — the
@@ -57,36 +59,61 @@ pub trait HostBackend: Send + Sync {
     fn list_games(
         &self,
         addr: &str,
-        mgmt_port: u16,
+        query_port: u16,
         identity: &(String, String),
         pin: Option<[u8; 32]>,
     ) -> Result<Vec<GameEntry>, LibraryError>;
+
+    /// Tells the host to forget this device, blocking. A no-op rather than an error where
+    /// [`BackendCaps::unpair`] is clear: for punktfunk, discarding our pin *is* unpairing, so
+    /// "nothing more to do" is the honest answer and Forget can call this unconditionally.
+    fn unpair(&self, addr: &str, query_port: u16) -> anyhow::Result<()>;
+
+    /// Opens a reusable cover-art fetcher for one host, blocking. Built lazily by
+    /// `services::art`'s worker on the first cover that isn't already cached, so a fully
+    /// cached library never opens a connection — which is also why the returned value carries
+    /// no `Send` bound: it is created and dropped inside that one thread.
+    fn art_fetcher(
+        &self,
+        addr: &str,
+        query_port: u16,
+        identity: &(String, String),
+        pin: Option<[u8; 32]>,
+    ) -> Result<Box<dyn ArtFetch>, LibraryError>;
+}
+
+/// One host's cover-art transport, held open across a library's worth of fetches.
+///
+/// `art` is whatever the backend put in [`GameEntry::art`] and is opaque to
+/// `services::art`: a host-relative path or absolute URL for punktfunk, a decimal app id for
+/// `GameStream`. Keeping it uninterpreted is what stops the art loader growing a protocol
+/// branch.
+pub trait ArtFetch {
+    fn fetch(&self, art: &str) -> Result<Vec<u8>, LibraryError>;
 }
 
 /// The registry. Static dispatch table, so a `Protocol` is all any screen needs to carry.
 ///
-/// `None` means "this build can't talk to that host": P3 adds the `GameStream` backend, and until
-/// then the only way to hold a `GameStream` `KnownHost` is to hand-edit `known-hosts.json`.
-/// Returning `None` rather than falling back to punktfunk keeps that a visible dead end instead
-/// of a confusing wrong-protocol connection attempt.
-pub fn backend_for(protocol: Protocol) -> Option<&'static dyn HostBackend> {
+/// Total since P3, which is why there is no fallback helper: every protocol a `KnownHost` can
+/// name has a backend, so a caller never has to decide what to do without one.
+pub fn backend_for(protocol: Protocol) -> &'static dyn HostBackend {
     match protocol {
-        Protocol::Punktfunk => Some(&punktfunk::Punktfunk),
-        Protocol::GameStream => None,
+        Protocol::Punktfunk => &punktfunk::Punktfunk,
+        Protocol::GameStream => &gamestream::GameStream,
     }
 }
 
-/// For the call paths that have no way to *report* an unsupported host — a probe whose only
-/// output is a channel, a render pass. Logs loudly and uses punktfunk, which is correct until P3
-/// because nothing can create a `GameStream` host yet. One named, documented escape hatch beats an
-/// ad-hoc `unwrap_or` at each such site.
-pub fn backend_or_punktfunk(protocol: Protocol) -> &'static dyn HostBackend {
-    backend_for(protocol).unwrap_or_else(|| {
-        tracing::error!("no backend for {protocol:?}; falling back to punktfunk");
-        &punktfunk::Punktfunk
-    })
-}
+/// Every backend this build knows. `services::discovery` iterates the enabled subset rather than
+/// hardcoding a service type.
+pub const ALL_BACKENDS: &[&dyn HostBackend] = &[&punktfunk::Punktfunk, &gamestream::GameStream];
 
-/// Every backend this build can browse for. `services::discovery` iterates these rather than
-/// hardcoding a service type, so P3's second browse is a one-line addition here.
-pub const ALL_BACKENDS: &[&dyn HostBackend] = &[&punktfunk::Punktfunk];
+/// The backends to browse for, given the `Settings::gamestream_enabled` toggle. With it off the
+/// client behaves exactly as it did before `GameStream` existed: no `_nvstream._tcp` browse at
+/// all, so a Sunshine host on the LAN is never even resolved.
+pub fn browse_backends(gamestream_enabled: bool) -> Vec<&'static dyn HostBackend> {
+    ALL_BACKENDS
+        .iter()
+        .copied()
+        .filter(|b| gamestream_enabled || b.protocol() != Protocol::GameStream)
+        .collect()
+}

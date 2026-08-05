@@ -13,9 +13,14 @@
 //!
 //! The app is a single binary crate with no library target, so the modules under test are pulled
 //! in by path rather than imported. The `#[path]`-on-an-inline-module form is what keeps their
-//! `crate::…` paths resolving exactly as they do in the app: `backend::gamestream` still finds
+//! `crate::…` paths resolving exactly as they do in the app: `gamestream::http` still finds
 //! `services::pinned_tls` here. Compiling the real modules is the whole point — a probe that
-//! reimplemented the HTTP or identity handling would prove nothing about what P3 will ship.
+//! reimplemented the HTTP or identity handling would prove nothing about what the app ships.
+//!
+//! The submodules are named one by one rather than pulled in through `backend/gamestream/mod.rs`
+//! deliberately: that file holds the `HostBackend` impl, which reaches `crate::backend`,
+//! `crate::core` and `crate::services::{discovery,library}` — the whole app. These three are the
+//! `GameStream` code that stands alone, which is why the host calls live in `query.rs`.
 
 #[path = "../services"]
 mod services {
@@ -23,13 +28,15 @@ mod services {
     pub mod pinned_tls;
 }
 
-#[path = "../backend"]
-mod backend {
-    pub mod gamestream;
+#[path = "../backend/gamestream"]
+mod gamestream {
+    pub mod http;
+    pub mod identity;
+    pub mod query;
 }
 
 use anyhow::{Context, Result};
-use backend::gamestream;
+use gamestream::query;
 use moonlight_common::AppId;
 
 fn main() -> Result<()> {
@@ -79,7 +86,7 @@ fn link_check() -> Result<()> {
 }
 
 fn info(address: &str, port: Option<u16>) -> Result<()> {
-    let host = gamestream::open(address, port)?;
+    let host = query::open(address, port)?;
     println!("name:        {}", host.host_name().unwrap_or_default());
     println!("version:     {:?}", host.version().ok());
     println!("state:       {:?}", host.state().ok());
@@ -94,22 +101,22 @@ fn info(address: &str, port: Option<u16>) -> Result<()> {
 /// into the host's web UI, so the PIN is printed before the blocking call rather than prompted
 /// for. Sunshine shows a pending-PIN box; older `GameStream` hosts show a full-screen prompt.
 fn pair(address: &str, port: Option<u16>) -> Result<()> {
-    let host = gamestream::open(address, port)?;
+    let host = query::open(address, port)?;
     if host.is_paired().unwrap_or(false) {
         println!("already paired with {address}");
         return Ok(());
     }
-    let pin = gamestream::generate_pin()?;
+    let pin = query::generate_pin()?;
     println!("PIN: {pin}");
     println!("enter it in the host's web UI (Sunshine: Troubleshooting → PIN); waiting…");
-    gamestream::pair(&host, pin)?;
+    query::pair(&host, pin)?;
     println!("paired");
     Ok(())
 }
 
 fn applist(address: &str, port: Option<u16>) -> Result<()> {
-    let host = gamestream::open(address, port)?;
-    for app in gamestream::app_list(&host)? {
+    let host = query::open(address, port)?;
+    for app in query::app_list(&host)? {
         let hdr = if app.is_hdr_supported { "  [HDR]" } else { "" };
         println!("{:>6}  {}{hdr}", app.id.0, app.title);
     }
@@ -120,8 +127,8 @@ fn applist(address: &str, port: Option<u16>) -> Result<()> {
 /// the authenticated *binary* endpoint works, which the text ones don't cover.
 fn art(address: &str, app_id: &str, port: Option<u16>) -> Result<()> {
     let id: u32 = app_id.parse().with_context(|| format!("bad app id {app_id:?}"))?;
-    let host = gamestream::open(address, port)?;
-    let bytes = gamestream::box_art(&host, AppId(id))?;
+    let host = query::open(address, port)?;
+    let bytes = query::box_art(&host, AppId(id))?;
     let path = services::paths::app_dir().join(format!("gamestream-art-{id}.png"));
     std::fs::write(&path, &bytes).with_context(|| format!("write {}", path.display()))?;
     println!("{} bytes -> {}", bytes.len(), path.display());
@@ -129,8 +136,8 @@ fn art(address: &str, app_id: &str, port: Option<u16>) -> Result<()> {
 }
 
 fn unpair(address: &str, port: Option<u16>) -> Result<()> {
-    let host = gamestream::open(address, port)?;
-    gamestream::unpair(&host)?;
+    let host = query::open(address, port)?;
+    query::unpair(&host)?;
     println!("unpaired from {address}");
     Ok(())
 }

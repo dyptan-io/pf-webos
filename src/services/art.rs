@@ -207,8 +207,12 @@ fn resize_pixmap(src: &Pixmap, w: u32, h: u32) -> Option<Pixmap> {
 
 /// `worker`'s fixed, per-host config — bundled to keep its arg count sane.
 struct WorkerConfig {
+    /// Which protocol's art transport to open — see `backend::ArtFetch`. This module knows
+    /// nothing about how a cover is fetched, only that `ArtRequest::paths` are handles the
+    /// backend understands.
+    backend: &'static dyn crate::backend::HostBackend,
     host: String,
-    mgmt_port: u16,
+    query_port: u16,
     identity: (String, String),
     fingerprint: Option<[u8; 32]>,
     dir: PathBuf,
@@ -230,23 +234,24 @@ pub struct ArtLoader {
 }
 
 impl ArtLoader {
-    /// Spawn loader. `mgmt_port` is what's dialed (separate from identity `port`).
+    /// Spawn loader. `query_port` is what's dialed (separate from identity `port`).
     /// Card dimensions determine cover stretch-to size.
     pub fn spawn(
+        backend: &'static dyn crate::backend::HostBackend,
         host: String,
         port: u16,
-        mgmt_port: u16,
+        query_port: u16,
         identity: (String, String),
         fingerprint: Option<[u8; 32]>,
-        card_w: u32,
-        card_h: u32,
+        (card_w, card_h): (u32, u32),
     ) -> Self {
         let (tx_req, rx_req) = std::sync::mpsc::channel::<ArtRequest>();
         let (tx_done, rx_done) = std::sync::mpsc::channel::<ArtLoaded>();
         let dir = cache_dir(&host, port);
         let config = WorkerConfig {
+            backend,
             host,
-            mgmt_port,
+            query_port,
             identity,
             fingerprint,
             dir,
@@ -348,21 +353,21 @@ impl ArtLoader {
 
 fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoaded>) {
     let WorkerConfig {
+        backend,
         host,
-        mgmt_port,
+        query_port,
         identity,
         fingerprint,
         dir,
         card_w,
         card_h,
     } = config;
-    let (host, mgmt_port, fingerprint, card_w, card_h) = (host.as_str(), *mgmt_port, *fingerprint, *card_w, *card_h);
+    let (host, query_port, fingerprint, card_w, card_h) = (host.as_str(), *query_port, *fingerprint, *card_w, *card_h);
     let _ = std::fs::create_dir_all(dir);
-    // One mTLS agent reused for every fetch — a fresh `ureq::Agent` per cover means a
-    // fresh TCP+TLS handshake including client-cert auth, real avoidable cost that scales
-    // with library size (see `library::agent`). Built lazily, so a fully cached library
-    // never opens a connection at all.
-    let mut agent = None;
+    // One transport reused for every fetch, so the connection (and, for punktfunk, the
+    // client-cert handshake) is paid once rather than per cover — real avoidable cost that
+    // scales with library size. Built lazily, so a fully cached library never connects at all.
+    let mut fetcher = None;
 
     // Local queue rather than straight `recv()`: a hero request gates the connecting
     // screen, so it has to jump whatever card-art backlog the grid has just queued. A
@@ -409,19 +414,19 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
         let bytes = match std::fs::read(&cached) {
             Ok(b) if !b.is_empty() => b,
             _ => {
-                if agent.is_none() {
-                    match crate::services::library::agent(identity, fingerprint) {
-                        Ok(a) => agent = Some(a),
+                if fetcher.is_none() {
+                    match backend.art_fetcher(host, query_port, identity, fingerprint) {
+                        Ok(f) => fetcher = Some(f),
                         Err(e) => {
-                            tracing::warn!("art: {} building mTLS agent failed: {e}", req.game_id);
+                            tracing::warn!("art: {} opening art transport failed: {e}", req.game_id);
                             continue;
                         }
                     }
                 }
-                let Some(a) = agent.as_ref() else { continue };
+                let Some(f) = fetcher.as_ref() else { continue };
                 let mut fetched = None;
                 for path in &req.paths {
-                    match crate::services::library::fetch_art(a, host, mgmt_port, path) {
+                    match f.fetch(path) {
                         Ok(b) => {
                             fetched = Some(b);
                             break;

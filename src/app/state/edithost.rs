@@ -66,7 +66,7 @@ impl App {
             },
         );
         let _ = store::save_known_hosts(&self.known_hosts);
-        self.entries = self.known_hosts.iter().cloned().map(HostEntry::Known).collect();
+        self.rebuild_entries();
 
         // Keep selection updated to new address
         if self.selected_host.as_ref() == Some(&(old.host.clone(), old.port)) {

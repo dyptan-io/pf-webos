@@ -81,12 +81,16 @@ tasks:
       - cargo clippy --target {{.TARGET}} --all-targets -- -D warnings
 
   package:
-    desc: Build and package dist/*.ipk, no Docker (used by CI). Thin LTO (fast); override with RELEASE_LTO=fat for optimized.
+    desc: >-
+      Build and package dist/*.ipk, no Docker (used by CI). Thin LTO (fast); override with
+      RELEASE_LTO=fat for optimized. PROBES=1 also ships `pfprobe`/`gsprobe` for on-device
+      diagnostics over SSH.
     deps: [build, toolchain:ares-package]
     cmds:
       - task: toolchain:stage-and-package
         vars:
           PKG_VERSION: '{{.PKG_VERSION}}'
+          PROBES: '{{.PROBES}}'
 
   fmt:
     desc: Format the whole crate with rustfmt (native — formatting doesn't need the cross toolchain)
@@ -119,6 +123,7 @@ tasks:
       - task: toolchain:docker-run
         vars:
           TARGET_TASK: package
+          PROBES: '{{.PROBES}}'
           RELEASE_LTO: '{{.RELEASE_LTO}}'
 
   register-device:

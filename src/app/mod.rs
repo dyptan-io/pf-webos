@@ -191,6 +191,9 @@ pub(crate) enum ModalShellKey {
     },
     Pairing {
         digits: [u8; 4],
+        /// The `GameStream` display-PIN, which is part of the shell rather than a focus tile —
+        /// nothing on that layout is focusable, so a changed PIN would otherwise not redraw.
+        shown: Option<String>,
         status: Option<String>,
         busy: bool,
         hover_close: bool,
@@ -345,6 +348,11 @@ pub struct App {
     pub pairing_focus: PairingFocus,
     pub pairing_status: Option<String>,
     pub pairing_busy: bool,
+    /// The PIN *we* generated for a `GameStream` host to display, if that's the ceremony in
+    /// flight. `Some` is what makes the modal the display-PIN layout rather than the entry one —
+    /// see `App::pairing_display_pin` and `app::view::pairing`. `None` for punktfunk, whose PIN
+    /// comes from the host and is typed into `pin_digits`.
+    pub(crate) pairing_pin_shown: Option<String>,
     /// Index into `entries` currently being paired — captured when entering
     /// `Screen::Pairing`.
     pub(crate) pairing_entry: usize,
@@ -462,10 +470,14 @@ pub(crate) struct PairingOutcome {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) name: String,
+    /// Which protocol's ceremony this was, so `drain_pairing` records the right one on a host
+    /// it may be saving for the first time (a discovered-but-unsaved row).
+    pub(crate) protocol: crate::core::protocol::Protocol,
     pub(crate) mgmt_port: Option<u16>,
     pub(crate) mac: Vec<String>,
-    /// The host's now-verified fingerprint, or a user-displayable error.
-    pub(crate) result: Result<[u8; 32], String>,
+    /// What we now trust about the host, or a user-displayable error. Not a bare fingerprint
+    /// because only punktfunk produces one — see `core::protocol::HostTrust`.
+    pub(crate) result: Result<crate::core::protocol::HostTrust, String>,
 }
 
 impl Drop for App {
@@ -476,11 +488,27 @@ impl Drop for App {
     }
 }
 
+/// The sidebar's saved-host rows. `GameStream` hosts are filtered out while the Experimental
+/// toggle is off, so turning it back off restores the pre-`GameStream` sidebar exactly — the
+/// records stay in `known-hosts.json` rather than being forgotten, since the toggle is meant to
+/// be reversible.
+fn known_entries(known_hosts: &[store::KnownHost], gamestream_enabled: bool) -> Vec<HostEntry> {
+    known_hosts
+        .iter()
+        .filter(|h| gamestream_enabled || h.protocol != store::Protocol::GameStream)
+        .cloned()
+        .map(HostEntry::Known)
+        .collect()
+}
+
 impl App {
     pub fn new(identity: (String, String)) -> Self {
         let known_hosts = store::load_known_hosts();
-        let entries = known_hosts.iter().cloned().map(HostEntry::Known).collect();
-        let (discovered, discovery_daemon) = match crate::services::discovery::browse() {
+        // Before the browse, which needs the `GameStream` toggle to know what to look for.
+        let settings = store::load_settings();
+        let entries = known_entries(&known_hosts, settings.gamestream_enabled);
+        let backends = crate::backend::browse_backends(settings.gamestream_enabled);
+        let (discovered, discovery_daemon) = match crate::services::discovery::browse(backends) {
             Some((rx, daemon)) => (rx, Some(daemon)),
             None => (std::sync::mpsc::channel().1, None),
         };
@@ -503,7 +531,7 @@ impl App {
             launch_ready: None,
             launch_anim: None,
             launch_anim_idx: None,
-            settings: store::load_settings(),
+            settings,
             settings_writer: store::SettingsWriter::spawn(),
             settings_focused: 0,
             scroll: ui::ScrollWindow::new(),
@@ -538,6 +566,7 @@ impl App {
             pairing_focus: PairingFocus::Pin,
             pairing_status: None,
             pairing_busy: false,
+            pairing_pin_shown: None,
             pairing_entry: 0,
             hover_close: false,
             identity,
@@ -589,6 +618,13 @@ impl App {
         }
         std::thread::spawn(ui::spinner_frames);
         app
+    }
+
+    /// Rebuilds the sidebar from `known_hosts`, dropping any discovered-but-unsaved rows. Every
+    /// caller that mutates `known_hosts` goes through this rather than collecting the list
+    /// itself, so the `GameStream` visibility filter can't be forgotten at one site.
+    pub(crate) fn rebuild_entries(&mut self) {
+        self.entries = known_entries(&self.known_hosts, self.settings.gamestream_enabled);
     }
 
     /// Merges freshly-discovered hosts into the entry list (known hosts keep their
@@ -1030,8 +1066,10 @@ impl App {
                 *focused = row;
                 changed
             }
+            // Nothing on the display-PIN layout is focusable, so there is no hover target.
+            Screen::Pairing if self.pairing_is_display_pin() => false,
             Screen::Pairing => {
-                let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
+                let card = self.pairing_card_rect(screen_w, screen_h, fonts);
                 if Self::pairing_request_button_rect(card, fonts).contains_point((x, y)) {
                     let changed = self.pairing_focus != PairingFocus::RequestAccess;
                     self.pairing_focus = PairingFocus::RequestAccess;
@@ -1207,7 +1245,7 @@ impl App {
         Some(match self.screen {
             Screen::Home => return None,
             Screen::Settings => self.settings_layout(screen_w, screen_h).0,
-            Screen::Pairing => Self::pairing_card_rect(screen_w, screen_h, fonts),
+            Screen::Pairing => self.pairing_card_rect(screen_w, screen_h, fonts),
             Screen::AddHost => self.address_card_rect(screen_w, screen_h, fonts),
             Screen::Wake => Self::wake_card_rect(screen_w, screen_h, self.wake.as_ref()?, fonts),
             Screen::ForgetHost => {
@@ -1360,10 +1398,12 @@ impl App {
                 self.handle_settings_event(MenuEvent::Confirm, screen_h);
                 None
             }
+            // The display-PIN layout has no button to click.
+            Screen::Pairing if self.pairing_is_display_pin() => None,
             Screen::Pairing => {
                 // The Magic Remote pointer is the most reliable input on this TV, so the
                 // "Request access" button is clickable directly: focus it and confirm.
-                let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
+                let card = self.pairing_card_rect(screen_w, screen_h, fonts);
                 if Self::pairing_request_button_rect(card, fonts).contains_point((x, y)) {
                     self.pairing_focus = PairingFocus::RequestAccess;
                     self.handle_pairing_event(MenuEvent::Confirm);
@@ -1845,6 +1885,7 @@ impl App {
             }),
             Screen::Pairing => Some(ModalShellKey::Pairing {
                 digits: self.pin_digits,
+                shown: self.pairing_pin_shown.clone(),
                 status: self.pairing_status.clone(),
                 busy: self.pairing_busy,
                 hover_close: self.hover_close,
@@ -1964,6 +2005,9 @@ impl App {
                 .as_ref()
                 .filter(|w| !w.mac.is_empty())
                 .map(|w| ModalFocusKey::WakeButton(w.focused)),
+            // The display-PIN layout draws everything into the shell — nothing is focusable, so
+            // it has no focus tile at all.
+            Screen::Pairing if self.pairing_is_display_pin() => None,
             Screen::Pairing => Some(match self.pairing_focus {
                 PairingFocus::Pin => {
                     ModalFocusKey::PairingDigit(self.pin_digit_index, self.pin_digits[self.pin_digit_index])
@@ -2064,7 +2108,7 @@ impl App {
                             self.pin_digits[self.pin_digit_index],
                         )?,
                         PairingFocus::RequestAccess => {
-                            let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
+                            let card = self.pairing_card_rect(screen_w, screen_h, fonts);
                             let btn = Self::pairing_request_button_rect(card, fonts);
                             ui::render_pairing_button_tile(
                                 text_cache,
@@ -2783,8 +2827,9 @@ impl App {
                             w.focused,
                         )
                     }),
+                    Screen::Pairing if self.pairing_is_display_pin() => None,
                     Screen::Pairing => {
-                        let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
+                        let card = self.pairing_card_rect(screen_w, screen_h, fonts);
                         Some(match self.pairing_focus {
                             PairingFocus::Pin => {
                                 let digit_y = Self::pairing_pin_row_y(card, fonts);

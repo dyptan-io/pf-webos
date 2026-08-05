@@ -109,6 +109,15 @@ tasks:
         cp -L {{.SYSROOT}}/usr/lib/libSDL2-2.0.so.0 "$STAGE_DIR/lib/libSDL2-2.0.so.0"
         {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-strip \
           "$STAGE_DIR/bin/punktfunk-webos" "$STAGE_DIR/lib/libSDL2-2.0.so.0"
+        # PROBES=1 ships the headless diagnostic CLIs (`pfprobe`, `gsprobe`) alongside the app,
+        # for running over SSH against a host. Off by default: they are half a megabyte the store
+        # package has no use for, and nothing in the app launches them.
+        if [ -n "{{.PROBES}}" ]; then
+          for probe in pfprobe gsprobe; do
+            cp "target/{{.TARGET}}/release/$probe" "$STAGE_DIR/bin/"
+            {{.NDK_DIR}}/bin/arm-webos-linux-gnueabi-strip "$STAGE_DIR/bin/$probe"
+          done
+        fi
         cp packaging/appinfo.json packaging/icon.png packaging/icon_large.png packaging/splash.png "$STAGE_DIR/"
 
         PKG_VERSION="{{.PKG_VERSION}}"
@@ -145,6 +154,6 @@ tasks:
           if ! command -v task > /dev/null 2>&1; then
             curl -sL https://taskfile.dev/install.sh | sh -s -- -d -b /opt/punktfunk-webos-tools/bin > /dev/null;
           fi &&
-          task {{.TARGET_TASK}}
+          task {{.TARGET_TASK}} PROBES={{.PROBES}}
         '
 

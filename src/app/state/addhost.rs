@@ -2,7 +2,7 @@
 use crate::app::App;
 use crate::core::screen::{HomeFocus, Screen};
 use crate::services::store::{self, KnownHost};
-use crate::ui::{HostEntry, MenuEvent};
+use crate::ui::MenuEvent;
 
 impl App {
     /// Handles menu event on add-host modal. Left/Right stand in for backspace (no dot
@@ -46,7 +46,7 @@ impl App {
             },
         );
         let _ = store::save_known_hosts(&self.known_hosts);
-        self.entries = self.known_hosts.iter().cloned().map(HostEntry::Known).collect();
+        self.rebuild_entries();
         self.home_focus = HomeFocus::Sidebar(
             self.entries
                 .iter()

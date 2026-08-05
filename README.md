@@ -10,7 +10,7 @@
 [![Downloads](https://img.shields.io/github/downloads/dyptan-io/punktfunk-webos/latest/total?color=a79ff8&label=downloads)](https://github.com/dyptan-io/punktfunk-webos/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-d2c9fb)](#license)
 
-**Native LG webOS TV client for [punktfunk](https://git.unom.io/unom/punktfunk) and GameStream — low-latency desktop & game streaming.**
+**Native LG webOS TV client for [punktfunk](https://git.unom.io/unom/punktfunk) and [Sunshine](https://github.com/LizardByte/Sunshine) — low-latency desktop & game streaming.**
 
 </div>
 

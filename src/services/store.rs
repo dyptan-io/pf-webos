@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub use crate::core::model::{
     CodecPref, ColorRangeOverride, GamepadType, KnownHost, LogLevelOverride, Settings, DESKTOP_PIN_ID,
 };
-pub use crate::core::protocol::{HostTrust, Protocol};
+pub use crate::core::protocol::Protocol;
 
 pub(crate) use crate::services::paths::app_dir;
 

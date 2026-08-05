@@ -12,7 +12,7 @@ Branch: `gamestream-seam`, not pushed. Base: `314d912`.
 | P0 armv7 build | **Done** at build level. Not run on device. |
 | P1 pairing + host queries | **Code complete, unproven.** No Sunshine host has been reached. |
 | P2 seam refactor | **Done at build level.** Traits/protocol/trust/discovery/caps, plus `session/sink.rs`. The sink has not been streamed against a host. |
-| P3 non-streaming backend | Not started. |
+| P3 non-streaming backend | **Code complete except the manual-IP fallback probe, unproven.** Backend, dual browse, display-PIN pairing, art, unpair, the `gamestream_enabled` gate. |
 | P4 streaming driver | Not started. |
 | P5 polish | Not started. |
 
@@ -61,15 +61,90 @@ Things the plan assumed that turned out otherwise. Worth trusting these over the
 - **The plan's "no new user-facing settings" is void.** There is exactly one:
   `Settings::gamestream_enabled`.
 
+## P3: what landed, and what it still needs
+
+The `HostBackend` impl and everything above it. `backend_for` is now **total**, so
+`backend_or_punktfunk` is gone; `ALL_BACKENDS` has both entries and
+`backend::browse_backends(gamestream_enabled)` is what discovery iterates.
+
+- `src/backend/gamestream/query.rs` — the old `gamestream/mod.rs`, moved. It holds everything
+  that needs only `moonlight-common` + our HTTP stack + stored identity, and `gsprobe` now names
+  `http`/`identity`/`query` one by one instead of loading `mod.rs`. **Keep `crate::backend`,
+  `crate::core` and `crate::app` out of `query.rs`** or the probe stops compiling.
+- `src/backend/gamestream/mod.rs` — the seam: `SERVICE_TYPE` (`_nvstream._tcp.local.`), the
+  `HostBackend` impl, and `GsArt`. `list_games` maps `/applist` to `GameEntry` with the decimal
+  app id as both `id` and `art.portrait`.
+- `HostBackend` gained three methods, each with a live caller: `default_query_port` (punktfunk's
+  management port and `GameStream`'s HTTP port are different services, so the fallback can't sit
+  at the call site), `unpair`, and `art_fetcher`.
+- **`services::art` no longer knows how a cover is fetched.** `backend::ArtFetch` is the
+  transport; `ArtRequest::paths` are handles the backend interprets. punktfunk's holds the
+  `ureq::Agent` (`MtlsArt`), `GameStream`'s holds an open `MoonlightHost` (`GsArt`). Still built
+  lazily inside the worker thread, so a fully cached library opens no connection — which is also
+  why `ArtFetch` has no `Send` bound.
+- **Pairing.** `Screen::Pairing` renders one of two layouts, chosen by
+  `App::pairing_is_display_pin()` (the entry's protocol, deliberately *not* whether a PIN has
+  been generated — a failed ceremony must keep its layout and error line). The display-PIN one
+  has no focusable element at all, so it returns `None` from the focus-key/focus-rect paths and
+  is skipped by both hover and click hit-tests. `open_pairing` starts the ceremony immediately
+  for `GameStream`: nothing is for the user to type here.
+- `PairingOutcome::result` is now `Result<HostTrust, String>` and it carries a `protocol`, so all
+  three ceremonies land the right trust on a host `drain_pairing` may be saving for the first
+  time.
+- **Every `entries` rebuild goes through `App::rebuild_entries`**, which applies the
+  `gamestream_enabled` filter. Five call sites collected the list themselves before; the filter
+  would have been forgotten at one of them.
+- `Settings::gamestream_enabled` is now enforced in three places: `browse_backends` (no
+  `_nvstream._tcp` browse at all when off), `known_entries` (paired `GameStream` hosts hidden,
+  not forgotten — the toggle is meant to be reversible), and it is read in `App::new` *before*
+  the browse, which is why `load_settings` moved up.
+- `task package PROBES=1` (and `docker:package`, `deploy`) now ships `pfprobe` and `gsprobe` in
+  the `.ipk`. Off by default: it takes the package from **4.1 MB to 7.3 MB**, which the store
+  build has no use for.
+
+Deviations from the plan, same rule as the other lists — don't "fix" without reading:
+
+1. **Unpair is folded into Forget, not a separate row.** The plan wanted both. A Forget that
+   leaves the host still listing this device is simply wrong, and two rows that differ only in
+   whether they also tell the host is a distinction users would have to be taught.
+   `App::forget_host` fires `backend.unpair` on a worker when `caps().unpair` is set and does not
+   wait: the local record goes either way, since a host that is offline must not block Forget.
+2. **punktfunk's `unpair` is `Ok(())`, not a panic.** Discarding our pin *is* unpairing there, so
+   "nothing left to do" is the true answer rather than an unsupported operation — even though
+   the `caps()` check means it is never reached.
+3. **`GameStream` hosts advertise no MAC**, so `DiscoveredHost::mac` is empty and the Wake row is
+   absent for them. `/serverinfo` does carry one, but reading it would cost a round trip per
+   discovery event; Wake-on-LAN for these hosts can wait for a reason to exist.
+4. **`mgmt_port` is set to the SRV port** in `parse_discovery`, so one `GameStream` record
+   carries the same port in both fields. Redundant, but it means a host saved from discovery
+   never needs protocol-specific port defaulting later.
+5. **The reduced-feature warning line is gone** from the display-PIN card (asked for
+   mid-implementation). The host menu's subtitle still appends `· GameStream`.
+
+**Still to do in P3: the manual-IP fallback probe.** It was left out on purpose. The plan assumed
+manual entry pairs on confirm, but `App::confirm_add_host` only *saves* an address — nothing
+probes, so there is no failure to fall back from. The two shapes that fit this codebase:
+
+- Probe at add-host confirm, off-thread, only when the toggle is on: if `query::open` answers at
+  47989 the record is rewritten to `GameStream` with port and `mgmt_port` 47989. Needs care so
+  the punktfunk record at 9777 is *replaced*, not left beside it.
+- Or probe at pair time: when punktfunk pairing fails on a manually-added host, try `GameStream`,
+  flip the protocol, and re-open the modal in the display-PIN layout.
+
+The first is smaller. Neither is worth writing blind — do it with a host in front of you.
+
 ## The one new setting
 
 `Settings::gamestream_enabled`, `#[serde(default)]` false, on the Experimental screen as
 `ui::EXP_ROW_GAMESTREAM` (between Frame pacer and Game mode). Runtime gate only — no crate
 feature, so there is one build and one GPL-3.0 answer.
 
-**It is not yet enforced anywhere**, because nothing GameStream-related runs yet. When P3 lands,
-it must gate at least: the `_nvstream._tcp` browse, the manual-IP fallback probe, and filtering
-GameStream `KnownHost`s out of the sidebar.
+Enforced as of P3 in `browse_backends` and `known_entries` (see the P3 section above). The third
+gate the plan calls for, the manual-IP fallback probe, arrives with that probe.
+
+Toggling it takes effect on the **next launch**, because the mDNS browse is started once in
+`App::new`. Restarting discovery live would mean tearing down and rebuilding the daemon from the
+Experimental screen; it hasn't seemed worth it for a toggle flipped once.
 
 ## Map of what landed
 
@@ -177,9 +252,12 @@ Deviations from the plan's sketch, same rule as the list above — don't "fix" w
 
 ## Next session
 
-**First, prove P1 against a real Sunshine host** — it is the cheapest way to find out whether
-the HTTP client is right, and P3 builds directly on it. `gsprobe` is not in the `.ipk`
-(see the loose ends below), so either add it to `packaging/` or run it from a dev-mode shell:
+**Nothing here has run against a host of either protocol.** P3 is written but every claim in it
+is a compile-time claim. The order below is by how much it teaches per minute spent.
+
+**1. Prove P1 with `gsprobe`, on device.** Still the cheapest way to find out whether the HTTP
+client is right, and all of P3 sits on it. `task deploy PROBES=1 TV_HOST=root@<tv-ip>` puts it in
+`/media/developer/apps/usr/palm/applications/io.dyptan.punktfunk.webos/bin/`:
 
 ```text
 gsprobe info <host>       # should print name, version, https port, paired=false
@@ -188,9 +266,25 @@ gsprobe applist <host>    # should list apps once paired
 gsprobe art <host> <id>   # writes gamestream-art-<id>.png next to the identity files
 ```
 
-Then P3 (the non-streaming backend): a `HostBackend` impl over `backend::gamestream`, the second
-mDNS browse, manual-IP fallback probing, the display-PIN pairing layout, and the
-`Settings::gamestream_enabled` gate — which is still enforced nowhere.
+If pairing fails, the three likeliest places are still ours, in order: the query-string assembly,
+the PKCS#8-vs-PKCS#1 branch in `client_key_der`, and the exact-DER server verifier — a mismatch
+there presents as a TLS handshake failure right after pairing appears to succeed.
+
+**2. Prove P3 through the UI**, with Experimental → GameStream on: the host appears in the
+sidebar from the `_nvstream._tcp` browse, `Show pairing PIN…` displays four digits and completes
+when they are typed into Sunshine, the grid fills with titles and one cover each, Connect reports
+"not supported yet", and Forget drops the host from Sunshine's paired list too. Then turn the
+toggle **off** and relaunch: the paired host must vanish from the sidebar and reappear when it
+goes back on.
+
+**3. Prove P2 has not regressed punktfunk**, which is still outstanding and is the only phase that
+can: discovery, an existing `known-hosts.json` migrating (paired hosts still paired, `fingerprint`
+keys gone after the next save), library with cover art, and **the video sink** — stream a
+punktfunk host and diff the stats overlay (feed µs, backlog, pacing delta, hold behaviour on
+induced loss) against a build of `314d912`.
+
+**4. Finish P3**: the manual-IP fallback probe (see the P3 section for the two shapes and why it
+was deferred).
 
 `session::connect`'s argument list and the `Connected { client }` narrowing are leftover
 P2-adjacent cleanups; neither blocks P3. The anchors found while exploring:
@@ -213,7 +307,6 @@ P2-adjacent cleanups; neither blocks P3. The anchors found while exploring:
 - **`README.md` and `packaging/description.html` advertise GameStream in the present tense**, but
   nothing works yet — `description.html` is the Homebrew Channel store copy. Reword to
   planned/experimental, or hold both until P4.
-- **`gsprobe` is not shipped in the `.ipk`** (neither is `pfprobe`), so P0's stated exit
-  criterion of "runs on device" cannot be met without adding it to `packaging/`. P1 now has
-  real work for it to do on-device, so this is worth fixing rather than working around.
-- The `dist/` `.ipk` at 4.29 MB was built from this branch, if you want a size baseline.
+- Size baselines from this branch: **4.1 MB** normally, **7.3 MB** with `PROBES=1`. Nothing in
+  the app references `moonlight-common`'s streaming half yet, so LTO still drops most of it — the
+  real cost lands in P4.
