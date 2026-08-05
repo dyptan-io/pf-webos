@@ -30,6 +30,18 @@ use crate::services::pinned_tls::PinnedTlsConnector;
 /// saying so.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+// Why connection pooling is off (`max_idle_connections(0)`) on both agents below.
+//
+// A pooled keep-alive socket that the host has already closed fails on the *next* request as an
+// immediate `UnexpectedEof` — "Peer disconnected" milliseconds after sending, with nothing in the
+// host's log, because the bytes went into a dead socket and never reached its handler. That is
+// what pairing did: phase 1 answered, and a later phase died in under 10 ms. GameStream hosts
+// serve each of these calls and hang up, and pairing in particular has a human-scale pause in the
+// middle of it (the PIN), which is exactly when a pooled connection goes stale.
+//
+// The cost is one TCP (and TLS) setup per request. These are a handful of one-shot calls on a LAN,
+// not a hot path — the streaming transport is UDP and unrelated.
+
 #[derive(Debug)]
 pub enum GsHttpError {
     Ureq(ureq::Error),
@@ -102,6 +114,7 @@ impl GsHttpClient {
         let config = ureq::Agent::config_builder()
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_global(Some(timeout))
+            .max_idle_connections(0)
             .build();
         Self {
             agent: Arc::new(ureq::Agent::new_with_config(config)),
@@ -182,6 +195,8 @@ impl RequestClient for GsHttpClient {
         let config = ureq::Agent::config_builder()
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_global(Some(DEFAULT_TIMEOUT))
+            // See the note above `CONNECT_TIMEOUT`'s neighbours: no pooling.
+            .max_idle_connections(0)
             .build();
         Ok(Self {
             agent: Arc::new(ureq::Agent::with_parts(config, connector, DefaultResolver::default())),

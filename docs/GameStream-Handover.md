@@ -203,28 +203,37 @@ Deviations and gaps, same rule as the other lists:
 5. **Termination reasons are logged, not shown.** `ServerTermination`'s code lands in
    `Shared::termination_code` and nothing reads it yet; the taxonomy is P5's `errors.rs` work.
 
-**Pairing has now been attempted against a real Sunshine host** (first contact of the whole
-branch), and produced two findings:
+**Pairing has now been attempted against a real Sunshine host** (192.168.1.102, with the TV at
+192.168.1.147 — first contact of the whole branch). Three findings, in the order they surfaced:
 
-1. **Fixed: no request left the TV at all.** `moonlight-common` assembles queries through its
-   `QueryBuilder` trait, and its `impl QueryBuilder for String` — the one we were passing —
+1. **Fixed and proven: no request left the TV at all.** `moonlight-common` assembles queries through
+   its `QueryBuilder` trait, and its `impl QueryBuilder for String` — the one we were passing —
    concatenates values verbatim, with a `TODO: filter for characters that need % serialization`
    where the encoding belongs. Our device name is `webOS TV`, so the space reached ureq and
-   `http::Uri` rejected it: `InvalidUriChar` on pairing phase 1. `GsHttpClient` now builds the
-   query through its own `EncodedQuery` (percent-encodes everything outside RFC 3986 unreserved),
-   which is what moonlight-qt does via `QUrlQuery` and what Sunshine decodes. **Do not "simplify"
-   this back to `String`.**
-2. **Open: `Io(UnexpectedEof, "Peer disconnected")` during a pair request.** The host closes the
-   connection rather than answering. Which phase is not yet known — every phase is `/pair`, so the
-   request log line now carries the whole URL (`phrase=…`, and http vs https) to name it. Read that
-   first, and Sunshine's own log alongside it. If it is the **HTTPS** phase, the suspect list is the
-   client identity: `ClientSecret::to_pem` is PKCS#8 (`PRIVATE KEY`), which `client_key_der`
-   handles, so a key/cert mismatch is unlikely — more likely Sunshine rejecting our client
-   certificate because its pairing state was left mid-flight by the failed attempts above, in which
-   case delete `gamestream-server-*.pem` (and unpair on the host) and retry from clean. If it is an
-   **HTTP** phase, the PIN was probably never entered inside the phase's window.
+   `http::Uri` rejected it: `InvalidUriChar` on the first phase. `GsHttpClient` now builds the query
+   through its own `EncodedQuery` (percent-encodes everything outside RFC 3986 unreserved), which is
+   what moonlight-qt does via `QUrlQuery` and what Sunshine decodes. Proven by the failure moving
+   on. **Do not "simplify" this back to `String`.**
+2. **Fixed, NOT yet verified: connection pooling.** The next failure was
+   `Io(UnexpectedEof, "Peer disconnected")` about 8 ms after the request, **with nothing in
+   Sunshine's log** — and the user had already entered the PIN, so it was not a timeout. Those three
+   facts together say the bytes went into a socket the host had already closed and never reached its
+   handler, which is what a stale pooled keep-alive connection does. Both agents now set
+   `max_idle_connections(0)`; pairing is especially exposed because it has a human-scale pause (the
+   PIN) in the middle, exactly when a pooled connection goes stale. The cost is one TCP/TLS setup
+   per request, on a handful of one-shot LAN calls. **This was deployed but the retry result is not
+   recorded here — confirm it before trusting the reasoning.**
+3. **Diagnosability.** Every pairing phase posts to `/pair`, so the failing phase was invisible. The
+   request log line now carries the whole URL; read `phrase=` (`getservercert` / `clientchallenge` /
+   `pairchallenge`) and the scheme to place any future failure. If pairing still dies:
+   - **an HTTPS phase** → the host is rejecting our client certificate. `ClientSecret::to_pem` is
+     PKCS#8 (`PRIVATE KEY`), which `client_key_der` handles, so a key/cert mismatch is unlikely;
+     more likely Sunshine's pairing state was left mid-flight by the earlier failures. Delete
+     `gamestream-server-*.pem` on the TV, unpair the TV in Sunshine, retry from clean.
+   - **an HTTP phase** → the phase's own window closed before the PIN was entered.
 
-**Nothing else has run against a host.** In likelihood order, the places to look first when it doesn't
+**Nothing else has run against a host.** In particular P4 (everything in the section below) has
+never had a frame through it, because it needs a paired host to reach. In likelihood order, the places to look first when it doesn't
 work: the `/launch` settings the host rejects (`adjust_for_server` reports these with a reason), the
 `0x8000` keycode prefix, the whole-pad state fold, and the HDR luminance conversion above.
 
