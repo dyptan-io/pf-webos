@@ -13,9 +13,21 @@ impl App {
         self.entries.len() + 2
     }
 
+    /// Position of the host's own desktop entry in `games`, if its library lists one.
+    ///
+    /// `GameStream` hosts serve the desktop as an ordinary app, with real box art and a real id.
+    /// Where one exists it *is* the desktop card — the synthetic one below would be a second card
+    /// launching the same thing.
+    pub(crate) fn desktop_game_pos(&self) -> Option<usize> {
+        self.games.iter().position(|g| g.title.eq_ignore_ascii_case("desktop"))
+    }
+
     /// Grid shape at `columns` columns; scans for pinned pins, so build once and reuse.
     pub(crate) fn grid_layout(&self, columns: usize) -> GridLayout {
-        let desktop_pinned = self.games_loaded
+        // With a real desktop entry in the library there is no synthetic card at all: it is an
+        // ordinary game, pinned (or not) through the same machinery as any other.
+        let synthetic_desktop = self.games_loaded && self.desktop_game_pos().is_none();
+        let desktop_pinned = synthetic_desktop
             && self
                 .selected_known_host()
                 .is_some_and(|h| h.is_pinned(store::DESKTOP_PIN_ID));
@@ -28,7 +40,7 @@ impl App {
         GridLayout {
             pinned_count: self.pinned_count,
             desktop_pinned,
-            desktop_in_rest: self.games_loaded && !desktop_pinned,
+            desktop_in_rest: synthetic_desktop && !desktop_pinned,
             front_count,
             pinned_rows,
             unpinned_start: pinned_rows * columns.max(1),
@@ -286,9 +298,17 @@ impl App {
         let mut pinned = Vec::new();
         let mut still_pinned = Vec::new();
         for id in &pinned_ids {
-            // Desktop isn't in `self.games`, so it's never "missing".
             if id == store::DESKTOP_PIN_ID {
-                still_pinned.push(id.clone());
+                // A host that lists its own desktop app: rewrite the pin to that entry's id, so
+                // the card pins and unpins like any other. Done once, here, rather than special-
+                // cased at every pin site — and the rewrite is saved below.
+                if let Some(pos) = self.desktop_game_pos() {
+                    still_pinned.push(self.games[pos].id.clone());
+                    pinned.push(self.games.remove(pos));
+                } else {
+                    // The synthetic card isn't in `self.games`, so it's never "missing".
+                    still_pinned.push(id.clone());
+                }
             } else if let Some(pos) = self.games.iter().position(|g| &g.id == id) {
                 pinned.push(self.games.remove(pos));
                 still_pinned.push(id.clone());
@@ -298,7 +318,8 @@ impl App {
         pinned.append(&mut self.games);
         self.games = pinned;
 
-        if still_pinned.len() != pinned_ids.len() {
+        // Not just a length check: the desktop rewrite above substitutes an id without dropping one.
+        if still_pinned != pinned_ids {
             self.known_hosts[known_idx].pinned = still_pinned;
             let _ = store::save_known_hosts(&self.known_hosts);
         }
@@ -387,6 +408,22 @@ impl App {
             }
             _ => self.open_pairing(idx),
         }
+    }
+
+    /// Drops the selected host and everything drawn from its library — the grid, its art and any
+    /// in-flight fetch. Whatever removed the host from the sidebar (Forget, or the `GameStream`
+    /// toggle going off) must call this, or its grid stays on screen with no row to go back to.
+    pub(crate) fn clear_selected_host(&mut self) {
+        self.selected_host = None;
+        self.games = Vec::new();
+        self.games_loaded = false;
+        self.pinned_count = 0;
+        self.art.clear();
+        self.art_loader = None;
+        self.games_rx = None;
+        self.home_status = None;
+        self.home_focus = HomeFocus::Sidebar(0);
+        self.grid_dirty = true;
     }
 
     /// Selects host and kicks off async library fetch; avoids blocking the UI thread (used to freeze input).
@@ -590,11 +627,7 @@ impl App {
         let _ = store::save_known_hosts(&self.known_hosts);
         self.rebuild_entries();
         if self.selected_host.as_ref() == Some(&(host, port)) {
-            self.selected_host = None;
-            self.games = Vec::new();
-            self.games_loaded = false;
-            self.home_status = None;
-            self.home_focus = HomeFocus::Sidebar(0);
+            self.clear_selected_host();
         }
         let sidebar_len = self.sidebar_len();
         if let HomeFocus::Sidebar(i) = &mut self.home_focus {

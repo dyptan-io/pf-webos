@@ -632,6 +632,32 @@ impl App {
     /// itself, so the `GameStream` visibility filter can't be forgotten at one site.
     pub(crate) fn rebuild_entries(&mut self) {
         self.entries = known_entries(&self.known_hosts, self.settings.gamestream_enabled);
+        // The sidebar layer is a cached tile keyed by nothing but this flag (see `prepare_tiles`),
+        // so a rebuilt row list that doesn't set it leaves the previous host list on screen.
+        self.sidebar_dirty = true;
+    }
+
+    /// Whether `addr` is already a punktfunk host, saved or merely discovered.
+    fn punktfunk_at(&self, addr: &str) -> bool {
+        let punktfunk = crate::core::protocol::Protocol::Punktfunk;
+        self.known_hosts
+            .iter()
+            .any(|h| h.host == addr && h.protocol == punktfunk)
+            || self
+                .entries
+                .iter()
+                .any(|e| matches!(e, HostEntry::Discovered(d) if d.addr == addr && d.protocol == punktfunk))
+    }
+
+    /// Removes any discovered-but-unsaved `GameStream` row for `addr`, reporting whether one went.
+    /// Saved records are left alone: the user paired that host deliberately.
+    fn drop_discovered_gamestream(&mut self, addr: &str) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|e| {
+            !matches!(e, HostEntry::Discovered(d)
+                if d.addr == addr && d.protocol == crate::core::protocol::Protocol::GameStream)
+        });
+        before != self.entries.len()
     }
 
     /// Merges freshly-discovered hosts into the entry list (known hosts keep their
@@ -649,6 +675,27 @@ impl App {
         // `found.host` — `DiscoveredHost` (discovery.rs) only has `addr`, `WakeState`/
         // `KnownHost` only have `host`; both hold the same kind of value (network address).
         while let Ok(found) = self.discovered.try_recv() {
+            // The browse itself is chosen once, in `App::new`, so a toggle flipped since then can
+            // still be delivering `GameStream` adverts.
+            if found.protocol == crate::core::protocol::Protocol::GameStream {
+                if !self.settings.gamestream_enabled {
+                    continue;
+                }
+                // A host advertising both protocols is one host, and punktfunk is the better half
+                // of it (full feature set). Its `GameStream` side stays reachable by adding
+                // `ip:port` by hand, which is the deliberate way to ask for it.
+                if self.punktfunk_at(&found.addr) {
+                    tracing::debug!("mdns: ignoring GameStream advert from {} (punktfunk host)", found.addr);
+                    continue;
+                }
+            }
+            // The mirror case: punktfunk resolved after its host's `GameStream` advert already
+            // added a row, which must now go.
+            if found.protocol == crate::core::protocol::Protocol::Punktfunk
+                && self.drop_discovered_gamestream(&found.addr)
+            {
+                changed = true;
+            }
             #[allow(clippy::suspicious_operation_groupings)]
             if let Some(w) = &self.wake {
                 if found.addr == w.host && found.port == w.port {
@@ -689,6 +736,11 @@ impl App {
             changed = true;
         }
         if changed {
+            // A row can have been dropped above, not just appended.
+            let sidebar_len = self.sidebar_len();
+            if let HomeFocus::Sidebar(i) = &mut self.home_focus {
+                *i = (*i).min(sidebar_len - 1);
+            }
             self.sidebar_dirty = true;
         }
         changed

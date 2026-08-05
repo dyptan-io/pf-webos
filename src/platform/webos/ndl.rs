@@ -76,7 +76,7 @@ struct NdlDataInfo {
 
 /// `NDL_VIDEO_TYPE` values this client can request (matches the codec the host's
 /// `Welcome` resolved — see `punktfunk_core::quic::CODEC_*`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NdlCodec {
     H264,
     H265,

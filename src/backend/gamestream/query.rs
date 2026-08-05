@@ -12,7 +12,14 @@ use moonlight_common::http::pair::PairPin;
 use moonlight_common::http::DEFAULT_HTTP_PORT;
 use moonlight_common::App;
 
-use super::http::GsHttpClient;
+use super::http::{api_message, GsHttpClient};
+
+/// Wraps a `moonlight-common` error into the one sentence a user can act on, logging the technical
+/// form on the way — see [`api_message`]. Every host call below goes through it, so nothing carries
+/// the crate's `{:?}`-formatted internals to a status line.
+fn failed(what: &str, e: moonlight_common::high::MoonlightClientError) -> anyhow::Error {
+    anyhow::anyhow!("{}", api_message(what, &e))
+}
 
 /// How this device names itself in the host's paired-device list.
 const DEVICE_NAME: &str = "webOS TV";
@@ -25,8 +32,8 @@ pub type Host = MoonlightHost<GsHttpClient>;
 /// Blocking: it fetches `/serverinfo` to learn the HTTPS port. `port` is the *HTTP* port
 /// (the mDNS SRV port for a discovered host); the HTTPS one comes from the response.
 pub fn open(address: &str, port: Option<u16>) -> Result<Host> {
-    let host = Host::new(address.to_string(), port.unwrap_or(DEFAULT_HTTP_PORT), None)
-        .map_err(|e| anyhow::anyhow!("open GameStream host: {e}"))?;
+    let host =
+        Host::new(address.to_string(), port.unwrap_or(DEFAULT_HTTP_PORT), None).map_err(|e| failed("open host", e))?;
 
     if let Some(server) = super::identity::load_server(address) {
         let (client_id, client_secret) = super::identity::load_or_create_client()?;
@@ -42,8 +49,7 @@ pub fn open(address: &str, port: Option<u16>) -> Result<Host> {
             }
         }
     } else {
-        host.update()
-            .map_err(|e| anyhow::anyhow!("query GameStream host {address}: {e}"))?;
+        host.update().map_err(|e| failed("query host", e))?;
     }
     Ok(host)
 }
@@ -68,7 +74,7 @@ pub fn pair(host: &Host, pin: PairPin) -> Result<()> {
         pin,
         moonlight_common::crypto::rustcrypto::RustCryptoBackend,
     )
-    .map_err(|e| anyhow::anyhow!("pair: {e}"))?;
+    .map_err(|e| failed("pairing", e))?;
 
     let (_, _, server) = host
         .identity()
@@ -83,14 +89,14 @@ pub fn pair(host: &Host, pin: PairPin) -> Result<()> {
 /// is offline (or has already forgotten us) leaves this device stuck presenting a
 /// certificate nothing accepts.
 pub fn unpair(host: &Host) -> Result<()> {
-    let result = host.unpair().map_err(|e| anyhow::anyhow!("unpair: {e}"));
+    let result = host.unpair().map_err(|e| failed("unpair", e));
     super::identity::forget_server(host.address());
     result
 }
 
 /// The host's app list. Requires a paired host.
 pub fn app_list(host: &Host) -> Result<Vec<App>> {
-    host.app_list().map_err(|e| anyhow::anyhow!("app list: {e}"))
+    host.app_list().map_err(|e| failed("app list", e))
 }
 
 /// The app the host is streaming right now, or `None` when it is idle.
@@ -100,7 +106,7 @@ pub fn app_list(host: &Host) -> Result<Vec<App>> {
 /// client needs it only to tell the user what is running, and to decide whether quitting has
 /// anything to quit.
 pub fn current_game(host: &Host) -> Result<Option<moonlight_common::AppId>> {
-    let id = host.current_game().map_err(|e| anyhow::anyhow!("current game: {e}"))?;
+    let id = host.current_game().map_err(|e| failed("current game", e))?;
     Ok((id != 0).then_some(moonlight_common::AppId(id)))
 }
 
@@ -110,11 +116,10 @@ pub fn current_game(host: &Host) -> Result<Option<moonlight_common::AppId>> {
 /// device and the host refused — the two are worth distinguishing to the user, but the endpoint
 /// does not, so the caller reports one sentence for both.
 pub fn quit_running_app(host: &mut Host) -> Result<bool> {
-    host.cancel().map_err(|e| anyhow::anyhow!("quit running app: {e}"))
+    host.cancel().map_err(|e| failed("quit running app", e))
 }
 
 /// One app's box art (JPEG/PNG bytes, undecoded — `services::art` does the decode).
 pub fn box_art(host: &Host, app_id: moonlight_common::AppId) -> Result<Vec<u8>> {
-    host.request_app_image(app_id)
-        .map_err(|e| anyhow::anyhow!("box art for app {}: {e}", app_id.0))
+    host.request_app_image(app_id).map_err(|e| failed("box art", e))
 }

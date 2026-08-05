@@ -1,10 +1,8 @@
 //! The two `GameStream`-only host asides that need a worker thread and a status line: ending the
 //! app a host is still running, and finding out whether a hand-typed address is a `GameStream`
-//! host rather than a punktfunk one.
-//!
-//! Both live here rather than in `hostmenu`/`addhost` because they share one shape — a blocking
-//! host call on a thread, a single message back, drained into `home_status` on the next tick —
-//! and neither is reachable unless `Settings::gamestream_enabled` is on.
+//! host rather than a punktfunk one. Both share one shape — a blocking host call on a thread, a
+//! single message back, drained into `home_status` on the next tick — gated on
+//! `Settings::gamestream_enabled`.
 use crate::app::App;
 use crate::core::protocol::Protocol;
 use crate::services::store;
@@ -26,6 +24,25 @@ pub(crate) struct GsProbed {
 }
 
 impl App {
+    /// Re-applies the `Settings::gamestream_enabled` gate to everything already on screen, after
+    /// the toggle moved.
+    ///
+    /// Rebuilding the sidebar is not enough on its own: with the toggle off a `GameStream` host
+    /// loses its row, but a library already fetched from it would keep filling the grid — a game
+    /// list belonging to a host the user can no longer see or go back to.
+    pub(crate) fn apply_gamestream_visibility(&mut self) {
+        self.rebuild_entries();
+        if self.settings.gamestream_enabled {
+            return;
+        }
+        let selected_gs = self
+            .selected_known_host()
+            .is_some_and(|h| h.protocol == Protocol::GameStream);
+        if selected_gs {
+            self.clear_selected_host();
+        }
+    }
+
     /// Ends whatever the host is still running. Fire-and-forget on a worker, with the outcome
     /// reported on the Home status line: the modal closes now, so there is nowhere else to put it.
     pub(crate) fn start_quit_app(&mut self, idx: usize) {
@@ -79,14 +96,11 @@ impl App {
 
     /// Probes a manually added address for a `GameStream` host, off-thread.
     ///
-    /// The plan wanted manual entry to fall back from punktfunk pairing to `GameStream` pairing,
-    /// but `confirm_add_host` only *saves* an address — nothing pairs, so there is no failure to
-    /// fall back from. So the fallback is a probe of the one port `GameStream` hosts serve: if it
-    /// answers, the record just saved is rewritten to that protocol, and the pairing modal then
-    /// picks the display-PIN layout by itself (`App::pairing_is_display_pin`).
-    ///
-    /// Nothing here probes the punktfunk side: a host that speaks neither protocol keeps the
-    /// record the user typed, which is what a wrong address should leave behind.
+    /// `confirm_add_host` only *saves* an address — nothing pairs, so there's no failure to fall
+    /// back from. Instead this probes the one port `GameStream` hosts serve; if it answers, the
+    /// record just saved is rewritten to that protocol and the pairing modal picks the
+    /// display-PIN layout by itself. A host that speaks neither protocol keeps the record as
+    /// typed.
     pub(crate) fn probe_gamestream_fallback(&mut self, host: String, port: u16) {
         if !self.settings.gamestream_enabled {
             return;

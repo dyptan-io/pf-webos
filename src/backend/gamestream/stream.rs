@@ -1,28 +1,22 @@
 //! `GameStream` streaming: `/launch` plus the crate's blocking stream driver, wired to this
 //! client's own video sink and audio device.
 //!
-//! **No hand-rolled transport.** `docs/GameStream-Plan.md`'s P4 assumed we would drive the sans-IO
-//! core ourselves — UDP sockets, the 500 ms video/audio pings, the 100 ms control ping,
-//! `poll_output` dispatch. `moonlight_common::stream::std::MoonlightStream` already is that
-//! driver: it owns the RTSP handshake, the three UDP drivers, the `ENet` control peer and their
-//! ping obligations, and calls back into [`VideoDecoder`]/[`AudioDecoder`]/[`ConnectionListener`]
-//! on its own threads. So this module is the three callback implementations plus the settings
-//! mapping, and the protocol's timing stays in the crate that has tests for it.
+//! **No hand-rolled transport.** `moonlight_common::stream::std::MoonlightStream` already drives
+//! the sans-IO core — RTSP handshake, the three UDP drivers, the `ENet` control peer, all ping
+//! obligations — calling back into [`VideoDecoder`]/[`AudioDecoder`]/[`ConnectionListener`] on its
+//! own threads. So this module is just those three callbacks plus the settings mapping.
 //!
-//! Thread shape, which is what the rest of the design follows from:
-//!
+//! Thread shape:
 //! * **video** — the crate's video thread calls [`SinkDecoder`], which owns [`NdlSink`] exactly as
-//!   punktfunk's `video_pump` thread does. NDL is loaded in `setup`, on that thread, for the same
-//!   reason `session::connect` builds the sink on the pump thread: the pacer queries the panel
-//!   refresh through SDL on construction.
-//! * **audio** — the crate's audio thread cannot touch `AudioPlayer`: `sdl2::audio::AudioQueue` is
-//!   `!Send` and lives on the main thread. So Opus frames cross to the main loop over a bounded
-//!   channel, drained by [`GsStream::pump_audio_once`] on the same tick punktfunk's software path
-//!   uses.
-//! * **control** — HDR changes arrive on the control thread and go straight to the shared
-//!   `Arc<NdlVideo>`, which has its own FFI mutex.
+//!   punktfunk's `video_pump` does; NDL loads in `setup` on that thread because the pacer queries
+//!   panel refresh through SDL on construction.
+//! * **audio** — `sdl2::audio::AudioQueue` is `!Send` and lives on the main thread, so Opus frames
+//!   cross a bounded channel, drained by [`GsStream::pump_audio_once`] each tick.
+//! * **control** — HDR changes and lightbar colours arrive on the control thread. HDR goes through
+//!   [`Shared::apply_hdr`], which the video thread also calls once NDL is loaded; the lightbar is
+//!   left in an atomic for the main loop's tick, since only the newest value matters.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -149,28 +143,100 @@ impl GsInput {
     }
 }
 
+/// The HDR state a session can be in: whether the panel should be in HDR, and the host's mastering
+/// metadata if it sent any.
+type HdrState = (bool, Option<SunshineHdrMetadata>);
+
+/// The decoder handle and the panel state that goes with it — one lock, because every operation
+/// here reads or writes both. Three separate mutexes had to be taken in a fixed order to apply one
+/// HDR change, and "wanted" could move between reading it and comparing it with "applied".
+struct Panel {
+    /// `Some` once the video callback has loaded NDL, `None` again after [`GsStream::shutdown`]
+    /// releases it — which is why this is not a `OnceLock`: dropping our handle at a known point is
+    /// what keeps a later `ndl::quit()` from racing a live one.
+    ndl: Option<Arc<NdlVideo>>,
+    /// What the session should be in. Seeded from what `/launch` negotiated, because a host need not
+    /// send an HDR control packet at all — waiting for one left the panel in SDR for the whole
+    /// stream. The control thread overwrites it if the host does send one.
+    wanted: HdrState,
+    /// What was last pushed to NDL successfully. Re-applying `NDL_DirectVideoSetHDRInfo` on every
+    /// host HDR packet re-enters panel HDR mode and drops a 120 Hz panel to 60 (see `docs/NOTES.md`
+    /// and the CX finding), so this dedupes — but only records a state that actually reached the
+    /// panel, so one that arrived before the NDL load isn't mistaken for one already applied.
+    applied: Option<HdrState>,
+}
+
 /// State the three callback threads and the main loop all touch.
 struct Shared {
-    /// Set once the video decoder has loaded NDL, so the control thread's HDR updates have
-    /// something to apply to. `Mutex` rather than `OnceLock` because it is also cleared on stop.
-    ndl: Mutex<Option<Arc<NdlVideo>>>,
-    /// Last HDR state applied to the panel. Re-applying `NDL_DirectVideoSetHDRInfo` on every host
-    /// HDR packet re-enters panel HDR mode and drops a 120 Hz panel to 60 (see
-    /// `docs/NOTES.md` and the CX finding) — so this dedupes, exactly as `session/mod.rs` does.
-    hdr_applied: Mutex<Option<SunshineHdrMetadata>>,
+    panel: Mutex<Panel>,
     /// The host ended the session (`ServerTermination`, or the control stream disconnecting).
     terminated: AtomicBool,
     /// `ServerTermination`'s reason code, 0 when the host said the user closed the app.
     termination_code: AtomicI32,
-    /// Channel count the host actually negotiated, published by the audio decoder's `setup`.
-    audio_channels: AtomicU8,
     /// The video callback has run its `stop` and released its NDL handle — see
     /// [`GsStream::shutdown`].
     video_stopped: AtomicBool,
-    /// Last lightbar colour the host asked for, coalesced: only the newest matters, and the
-    /// control thread must not block on the main loop's tick. Cleared as it is applied.
-    led: Mutex<Option<(u8, u8, u8)>>,
+    /// Last lightbar colour the host asked for, packed by [`pack_led`]: coalesced, because only the
+    /// newest matters, and an atomic rather than a `Mutex<Option<…>>` so neither the control thread
+    /// nor the main loop's tick can wait on the other for three bytes.
+    led: AtomicU32,
     color_range_override: ColorRangeOverride,
+}
+
+/// `(r, g, b)` in the low three bytes with a presence bit above them; `0` is "nothing asked for".
+/// A tuple in an atomic needs *some* encoding, and this one keeps `None` as the zero value, so the
+/// initial state and the drained state are the same thing.
+fn pack_led(r: u8, g: u8, b: u8) -> u32 {
+    1 << 24 | u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
+}
+
+fn unpack_led(packed: u32) -> Option<(u8, u8, u8)> {
+    (packed != 0).then_some(((packed >> 16) as u8, (packed >> 8) as u8, packed as u8))
+}
+
+impl Shared {
+    /// Pushes the wanted HDR state to NDL, if it isn't already there.
+    ///
+    /// Called from two places, and needs both: the video thread once NDL is loaded (the host may
+    /// never send an HDR packet, and a packet that arrived before the load had nothing to apply to)
+    /// and the control thread when the host changes it mid-stream.
+    ///
+    /// A no-op while NDL is unloaded, and deliberately records nothing then — `SinkDecoder::setup`
+    /// re-runs it after the load.
+    fn apply_hdr(&self) {
+        let Ok(mut panel) = self.panel.lock() else { return };
+        if panel.applied == Some(panel.wanted) {
+            return;
+        }
+        let (enabled, sunshine) = panel.wanted;
+        let Some(ndl) = panel.ndl.clone() else {
+            // Before the video thread's NDL load. Left unrecorded on purpose.
+            tracing::debug!("GameStream HDR enabled={enabled} deferred: NDL not loaded yet");
+            return;
+        };
+        // Metadata is not optional for HDR: `NdlVideo::set_color_info` sends *nothing* without it
+        // (`NdlHdrInfo` has no "HDR without mastering data" form), so a host that enables HDR
+        // without metadata — GFE, and Sunshine builds that omit it — would leave the panel in SDR.
+        // The panel's own defaults stand in, exactly as punktfunk's `Hello::display_hdr` does.
+        let meta = enabled.then(|| sunshine.map_or_else(crate::session::cx_display_hdr, hdr_meta));
+        let mut color = if enabled {
+            quic::ColorInfo::HDR10_BT2020_PQ
+        } else {
+            quic::ColorInfo::SDR_BT709
+        };
+        self.color_range_override.apply(&mut color);
+        match ndl.set_color_info(meta.as_ref(), color) {
+            Ok(()) => {
+                tracing::info!(
+                    "GameStream HDR applied: enabled={enabled} host_metadata={}",
+                    sunshine.is_some()
+                );
+                panel.applied = Some(panel.wanted);
+            }
+            // Unrecorded, so the next change (or the next `setup`) tries again.
+            Err(e) => tracing::warn!("NDL set_color_info: {e:#}"),
+        }
+    }
 }
 
 impl GsStream {
@@ -200,33 +266,26 @@ impl GsStream {
     }
 
     /// Applies whatever pad feedback the host has asked for since the last tick. Call it where
-    /// `session::pump_feedback_once` is called, and for the same reason: the effects land on
-    /// devices the main thread owns.
+    /// `session::pump_feedback_once` is called: the effects land on devices the main thread owns.
     ///
-    /// **Lightbar only, and that is an upstream limit rather than a choice.** `moonlight-common`'s
-    /// stream driver dispatches `ControllerSetLed`, `ControllerSetMotion`, `HdrMode` and
-    /// `ServerTermination` to its `ConnectionListener` and drops every other server-bound control
-    /// packet (`stream/std/mod.rs`, `TODO: implement other packets`) — so `ControllerRumbleData`
-    /// and `ControllerRumbleTriggers` never reach us, and there is nothing to hand SDL's
-    /// `set_rumble`. Rumble on a `GameStream` host needs those two arms added to the crate; it is
-    /// not fixable on this side of the seam.
+    /// **Lightbar only — an upstream limit, not a choice.** `moonlight-common`'s stream driver
+    /// dispatches LED/motion/HDR/termination to `ConnectionListener` and drops every other
+    /// server-bound control packet (`stream/std/mod.rs`, `TODO: implement other packets`), so
+    /// rumble packets never reach us. Fixing that needs those arms added to the crate.
     pub fn pump_feedback_once(&self, feedback: Option<&mut crate::platform::webos::dualsense::Feedback>) {
         let Some(fb) = feedback else { return };
-        let Ok(mut slot) = self.shared.led.lock() else {
+        let Some((r, g, b)) = unpack_led(self.shared.led.swap(0, Ordering::Relaxed)) else {
             return;
         };
-        let Some((r, g, b)) = slot.take() else { return };
-        drop(slot);
         // `pad: 0` — the host's controller number is per-session and this client drives one
         // physical pad's lightbar; `Feedback` ignores the field anyway.
         fb.apply(&punktfunk_core::quic::HidOutput::Led { pad: 0, r, g, b });
     }
 
-    /// Channels the host negotiated — build [`crate::platform::webos::audio::AudioPlayer`] from
-    /// this, never from the request (same rule as punktfunk's `client.audio_channels`).
-    pub fn audio_channels(&self) -> u8 {
-        self.shared.audio_channels.load(Ordering::Relaxed)
-    }
+    /// Channels to open the audio device with. Always stereo: the launch request asks for it and
+    /// `ChannelAudioDecoder::setup` fails the stream if the host negotiates anything else, so
+    /// there is no other value this can ever report.
+    pub const AUDIO_CHANNELS: u8 = 2;
 
     /// The host ended the session, or the transport dropped.
     pub fn is_session_ended(&self) -> bool {
@@ -266,8 +325,8 @@ impl GsStream {
         }
         // Our own handle goes last: while any `Arc<NdlVideo>` lives, the decoder stays loaded, so
         // releasing it only here is what keeps `play` from racing the unload.
-        if let Ok(mut slot) = self.shared.ndl.lock() {
-            drop(slot.take());
+        if let Ok(mut panel) = self.shared.panel.lock() {
+            drop(panel.ndl.take());
         }
         clean
     }
@@ -276,13 +335,13 @@ impl GsStream {
 /// Connects, launches (or resumes) the app, and starts the stream. Blocking — call it on the
 /// connect thread, like `session::connect`.
 pub fn connect(spec: GsConnectSpec) -> Result<GsStream> {
-    let host = query::open(&spec.addr, Some(spec.query_port)).context("open GameStream host")?;
+    let host = query::open(&spec.addr, Some(spec.query_port))?;
     if !host.is_paired().unwrap_or(false) {
         anyhow::bail!("this host hasn't been paired yet");
     }
 
     let app_id = resolve_app_id(&host, spec.app_id.as_deref())?;
-    let hdr = spec.hdr_enabled && spec.codec != CodecPref::H264;
+    let want_hdr = spec.hdr_enabled && spec.codec != CodecPref::H264;
     let mut settings = MoonlightStreamSettings {
         width: spec.width,
         height: spec.height,
@@ -302,12 +361,16 @@ pub fn connect(spec: GsConnectSpec) -> Result<GsStream> {
         streaming_remotely: StreamingConfig::Local,
         // "Optimize game settings": let the host set the game's resolution to the stream's.
         sops: true,
-        hdr,
-        supported_video_formats: supported_formats(spec.codec, hdr),
-        color_space: if hdr { ColorSpace::Rec2020 } else { ColorSpace::Rec709 },
+        hdr: want_hdr,
+        supported_video_formats: supported_formats(spec.codec, want_hdr),
+        color_space: if want_hdr {
+            ColorSpace::Rec2020
+        } else {
+            ColorSpace::Rec709
+        },
         color_range: match spec.color_range_override {
             // HDR is always limited range; the override only speaks for SDR.
-            _ if hdr => ColorRange::Limited,
+            _ if want_hdr => ColorRange::Limited,
             ColorRangeOverride::Full => ColorRange::Full,
             ColorRangeOverride::Limited | ColorRangeOverride::Auto => ColorRange::Limited,
         },
@@ -335,6 +398,13 @@ pub fn connect(spec: GsConnectSpec) -> Result<GsStream> {
             host.server_codec_mode_support().map_err(gs_err)?,
         )
         .context("stream settings unsupported by this host")?;
+    // What the host agreed to, which is not always what was asked: `adjust_for_server` clears HDR
+    // on a host without Main10. Everything downstream (the panel push, the Game-mode pick, the
+    // stats overlay) has to follow the negotiation, or an SDR stream gets an HDR infoframe.
+    let hdr = settings.hdr;
+    if hdr != want_hdr {
+        tracing::info!("GameStream host adjusted HDR to {hdr}");
+    }
 
     let crypto = RustCryptoBackend;
     let aes_key = AesKey::new_random(&crypto).map_err(|e| anyhow::anyhow!("aes key: {e}"))?;
@@ -347,8 +417,7 @@ pub fn connect(spec: GsConnectSpec) -> Result<GsStream> {
             aes_iv,
             MoonlightStream::launch_query_parameters(),
         )
-        .map_err(gs_err)
-        .context("launch")?;
+        .map_err(gs_err)?;
     tracing::info!(
         "GameStream launch ok: {}x{}@{} hdr={hdr} bitrate={} kbps app={} rtsp={:?}",
         settings.width,
@@ -362,14 +431,16 @@ pub fn connect(spec: GsConnectSpec) -> Result<GsStream> {
     let stats = Arc::new(StreamStats::default());
     stats.pacing_enabled.store(spec.video_pacing, Ordering::Relaxed);
     let shared = Arc::new(Shared {
-        ndl: Mutex::new(None),
-        hdr_applied: Mutex::new(None),
+        // `wanted` is what `/launch` negotiated; `set_hdr_mode` refines it if the host sends one.
+        panel: Mutex::new(Panel {
+            ndl: None,
+            wanted: (hdr, None),
+            applied: None,
+        }),
         terminated: AtomicBool::new(false),
         termination_code: AtomicI32::new(0),
-        // Until the host says otherwise, what we asked for.
-        audio_channels: AtomicU8::new(2),
         video_stopped: AtomicBool::new(false),
-        led: Mutex::new(None),
+        led: AtomicU32::new(0),
         color_range_override: spec.color_range_override,
     });
     let (audio_tx, audio_rx) = mpsc::sync_channel(AUDIO_QUEUE_FRAMES);
@@ -385,7 +456,6 @@ pub fn connect(spec: GsConnectSpec) -> Result<GsStream> {
     };
     let audio = ChannelAudioDecoder {
         tx: audio_tx,
-        shared: shared.clone(),
         dropped: 0,
     };
     let listener = Listener { shared: shared.clone() };
@@ -466,8 +536,10 @@ fn default_bitrate_kbps(width: u32, height: u32, fps: u32) -> u32 {
     u32::try_from(scaled).unwrap_or(u32::MAX)
 }
 
+/// The user-facing sentence for a failed host call; the technical form goes to the log — see
+/// `http::api_message`.
 fn gs_err(e: moonlight_common::high::MoonlightClientError) -> anyhow::Error {
-    anyhow::anyhow!("{e}")
+    anyhow::anyhow!("{}", crate::backend::gamestream::http::api_message("launch", &e))
 }
 
 /// The crate's video callback, over this client's [`NdlSink`].
@@ -521,9 +593,19 @@ impl VideoDecoder for SinkDecoder {
             setup.height,
             setup.redraw_rate,
         );
-        if let Ok(mut slot) = self.shared.ndl.lock() {
-            *slot = Some(ndl.clone());
+        if let Ok(mut panel) = self.shared.panel.lock() {
+            panel.ndl = Some(ndl.clone());
+            // The *negotiated* format decides HDR, same rule as `session::connect`: `NdlHdrInfo`'s
+            // fields are HEVC SEI syntax, so no other codec can carry HDR on this platform.
+            if codec != NdlCodec::H265 && panel.wanted.0 {
+                tracing::info!("GameStream negotiated {codec:?}, which cannot carry HDR — staying SDR");
+                panel.wanted = (false, None);
+            }
         }
+        // Now, not on the first host HDR packet: a host that sends none would otherwise stream HDR
+        // content at a panel still in SDR, and one that sent its packet during the NDL load had
+        // nothing to apply to. Same point in the sequence as `session::connect`'s own colour push.
+        self.shared.apply_hdr();
         self.sink = Some(NdlSink::new(
             VideoPlayer::new(ndl),
             self.stats.clone(),
@@ -596,7 +678,6 @@ fn pts_ns(unit: &VideoDecodeUnit<&[u8]>) -> u64 {
 /// The crate's audio callback: hands Opus frames to the main thread, which owns the SDL device.
 struct ChannelAudioDecoder {
     tx: mpsc::SyncSender<Vec<u8>>,
-    shared: Arc<Shared>,
     /// Frames dropped because the main loop wasn't draining; logged in `stop` rather than per
     /// frame, since a stalled main thread does not need a log flood on top.
     dropped: u64,
@@ -611,14 +692,13 @@ impl AudioDecoder for ChannelAudioDecoder {
             stream_config.coupled_streams,
             stream_config.samples_per_frame,
         );
-        let channels = u8::try_from(audio_config.channel_count).unwrap_or(2);
-        if channels != 2 {
+        let channels = u8::try_from(audio_config.channel_count).unwrap_or(0);
+        if channels != GsStream::AUDIO_CHANNELS {
             // The launch request asked for stereo, so this is a host ignoring it. Failing here
             // stops the stream with a reason instead of playing noise through a stereo decoder.
             tracing::error!("GameStream host negotiated {channels} channels; only stereo is supported");
             return -1;
         }
-        self.shared.audio_channels.store(channels, Ordering::Relaxed);
         0
     }
 
@@ -655,41 +735,16 @@ struct Listener {
 impl ConnectionListener for Listener {
     fn set_hdr_mode(&mut self, enabled: bool, sunshine: Option<SunshineHdrMetadata>) {
         tracing::info!("GameStream HDR mode: enabled={enabled} metadata={}", sunshine.is_some());
-        // Dedupe before touching NDL: see `Shared::hdr_applied`.
-        let Ok(mut applied) = self.shared.hdr_applied.lock() else {
-            return;
-        };
-        let wanted = enabled.then_some(sunshine).flatten();
-        if *applied == wanted {
-            return;
+        if let Ok(mut panel) = self.shared.panel.lock() {
+            panel.wanted = (enabled, enabled.then_some(sunshine).flatten());
         }
-        *applied = wanted;
-        let Ok(slot) = self.shared.ndl.lock() else {
-            return;
-        };
-        let Some(ndl) = slot.as_ref() else {
-            return;
-        };
-        // `set_color_info` is a no-op without metadata, which is the wanted behaviour for
-        // HDR-off: an SDR stream must not emit an HDR infoframe at all (see `ndl.rs`).
-        let meta = wanted.map(hdr_meta);
-        let mut color = if enabled {
-            quic::ColorInfo::HDR10_BT2020_PQ
-        } else {
-            quic::ColorInfo::SDR_BT709
-        };
-        self.shared.color_range_override.apply(&mut color);
-        if let Err(e) = ndl.set_color_info(meta.as_ref(), color) {
-            tracing::warn!("NDL set_color_info: {e:#}");
-        }
+        self.shared.apply_hdr();
     }
 
     fn controller_set_led(&mut self, controller_number: u16, r: u8, g: u8, b: u8) {
         // Queued rather than applied here: the DualSense report goes out on the main thread's
         // device (see `GsStream::pump_feedback_once`), and the control thread must not wait on it.
-        if let Ok(mut slot) = self.shared.led.lock() {
-            *slot = Some((r, g, b));
-        }
+        self.shared.led.store(pack_led(r, g, b), Ordering::Relaxed);
         tracing::debug!("GameStream pad {controller_number} LED {r:02x}{g:02x}{b:02x}");
     }
 
@@ -732,6 +787,16 @@ fn hdr_meta(m: SunshineHdrMetadata) -> quic::HdrMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The atomic replaced a `Mutex<Option<(u8, u8, u8)>>`, so the encoding is worth pinning:
+    /// zero has to mean "nothing asked for", including for a genuine black lightbar request.
+    #[test]
+    fn led_packing_round_trips_and_reserves_zero() {
+        assert_eq!(unpack_led(0), None);
+        assert_eq!(unpack_led(pack_led(0, 0, 0)), Some((0, 0, 0)));
+        assert_eq!(unpack_led(pack_led(1, 2, 3)), Some((1, 2, 3)));
+        assert_eq!(unpack_led(pack_led(255, 128, 7)), Some((255, 128, 7)));
+    }
 
     /// The Automatic bitrate is the one number no host tells us, so its shape is worth pinning:
     /// Moonlight's 60 Hz anchors, scaled linearly above that.

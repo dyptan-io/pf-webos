@@ -35,17 +35,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_RETRIES: u32 = 2;
 const RETRY_DELAY: Duration = Duration::from_millis(400);
 
-// Why connection pooling is off (`max_idle_connections(0)`) on both agents below.
-//
-// A pooled keep-alive socket that the host has already closed fails on the *next* request as an
-// immediate `UnexpectedEof` — "Peer disconnected" milliseconds after sending, with nothing in the
-// host's log, because the bytes went into a dead socket and never reached its handler. That is
-// what pairing did: phase 1 answered, and a later phase died in under 10 ms. GameStream hosts
-// serve each of these calls and hang up, and pairing in particular has a human-scale pause in the
-// middle of it (the PIN), which is exactly when a pooled connection goes stale.
-//
-// The cost is one TCP (and TLS) setup per request. These are a handful of one-shot calls on a LAN,
-// not a hot path — the streaming transport is UDP and unrelated.
+// Pooling is off (`max_idle_connections(0)`) on both agents below: a pooled socket the host has
+// already closed fails the next request as an immediate `UnexpectedEof` with nothing in the
+// host's log — this is what broke pairing, whose PIN pause is exactly when a pooled connection
+// goes stale. One extra TCP/TLS setup per request is cheap on these one-shot LAN calls.
 
 #[derive(Debug)]
 pub enum GsHttpError {
@@ -65,6 +58,75 @@ impl std::fmt::Display for GsHttpError {
 }
 
 impl std::error::Error for GsHttpError {}
+
+impl GsHttpError {
+    /// The host's own `<status_message>`, when it rejected a call and said why.
+    ///
+    /// This is the only part of a failed call worth putting on screen: it is the host's own wording
+    /// ("Invalid PIN", "Already paired"), whereas everything wrapped around it names Rust types.
+    fn host_message(&self) -> Option<&str> {
+        match self {
+            Self::Parse(ParseError::InvalidXmlStatusCode { message }) => message.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// One plain sentence for a call that never got an answer.
+    fn transport_message(&self) -> &'static str {
+        match self {
+            Self::Ureq(ureq::Error::Tls(_) | ureq::Error::Rustls(_)) => {
+                "The host didn't accept this device — pair with it again."
+            }
+            Self::Tls(_) => "This device's pairing certificate couldn't be used.",
+            Self::Ureq(_) => "The host couldn't be reached.",
+            Self::Parse(_) => "The host's answer wasn't understood.",
+        }
+    }
+}
+
+/// One plain sentence for a failed host call, with the technical form logged rather than shown.
+///
+/// `moonlight-common`'s own `Display` is not showable: `MoonlightClientError::Backend` formats its
+/// inner error with `{:?}`, so a host rejecting a pairing reached the screen as
+/// `pair: pairing: request: Parse(InvalidXmlStatusCode { message: Some("Invalid PIN") })`. The
+/// host's `message` inside that is the whole of what a user can act on, so it is pulled out and
+/// everything else goes to the log.
+pub fn api_message(what: &str, err: &moonlight_common::high::MoonlightClientError) -> String {
+    use moonlight_common::high::MoonlightClientError as E;
+    use moonlight_common::http::pair::client::ClientPairingError as P;
+
+    // `{err:?}` rather than `{err}`: Debug is where the boxed inner errors survive intact, and this
+    // line is the only remaining record of them.
+    tracing::warn!("GameStream {what} failed: {err:?}");
+
+    // A boxed backend error is our own `GsHttpError`, so the host's message is reachable.
+    let backend = match err {
+        E::Backend(inner) | E::Pairing(P::Crypto(inner)) => inner.downcast_ref::<GsHttpError>(),
+        _ => None,
+    };
+    if let Some(inner) = backend {
+        return inner
+            .host_message()
+            .map_or_else(|| inner.transport_message().to_string(), str::to_string);
+    }
+    match err {
+        E::NotPaired => "This host hasn't been paired yet.".into(),
+        E::Offline => "The host isn't responding.".into(),
+        E::Unauthenticated => "The host didn't accept this device — pair with it again.".into(),
+        E::Poisoned(_) => "Something went wrong talking to the host.".into(),
+        // The crate's wording here is a developer's ("failed to pair because the pin was
+        // incorrect"), and these three are the ones a user actually hits.
+        E::Pairing(P::FailedWrongPin) => "The host says that PIN was wrong.".into(),
+        E::Pairing(P::FailedAlreadyInProgress) => {
+            "Another device is pairing with this host — try again shortly.".into()
+        }
+        E::Pairing(P::Failed) => "The host refused the pairing.".into(),
+        // `StreamConfigError` names an unsupported setting, which is worth passing through: it is
+        // the only thing that says *which* request the host can't meet.
+        E::StreamConfig(_) | E::Moonlight(_) => format!("{err}"),
+        E::Pairing(P::Crypto(_)) | E::Backend(_) => "The host couldn't be reached.".into(),
+    }
+}
 
 impl From<ureq::Error> for GsHttpError {
     fn from(e: ureq::Error) -> Self {
@@ -158,15 +220,9 @@ impl GsHttpClient {
         Ok(E::Response::from_str(&body)?)
     }
 
-    /// A GET that survives a transient connect or handshake failure.
-    ///
-    /// Worth the two extra attempts because of what one lost request costs here: pairing's last
-    /// phase is an HTTPS call, and a pairing that dies there cannot be retried without the user
-    /// fetching a fresh PIN from the host — while the host has already accepted the certificate,
-    /// leaving the two sides disagreeing about whether they are paired.
-    ///
-    /// Retrying is safe for every endpoint: a request that never completed its handshake was not
-    /// served, and these are all GETs.
+    /// A GET that survives a transient connect or handshake failure. Worth it because pairing's
+    /// last phase is HTTPS: dying there leaves the host thinking it paired while the user has to
+    /// fetch a fresh PIN. Safe for every endpoint — an unfinished handshake was never served.
     fn get_with_retry(&self, url: &str) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         let mut attempt = 0;
         loop {
@@ -182,12 +238,13 @@ impl GsHttpClient {
     }
 }
 
-/// Errors that mean nothing was served — a connect or handshake failure, not a response.
+/// Errors that mean nothing was served — a connect failure, not a response.
+///
+/// TLS errors are deliberately *not* here: the one that actually happens is the host rejecting our
+/// client certificate because it dropped this device, which no retry fixes — it is the
+/// `is_encryption` signal, and retrying only delays it by [`RETRY_DELAY`] twice.
 fn is_transport(e: &ureq::Error) -> bool {
-    matches!(
-        e,
-        ureq::Error::ConnectionFailed | ureq::Error::Io(_) | ureq::Error::Tls(_) | ureq::Error::Rustls(_)
-    )
+    matches!(e, ureq::Error::ConnectionFailed | ureq::Error::Io(_))
 }
 
 impl RequestClient for GsHttpClient {
@@ -277,15 +334,11 @@ impl RequestClient for GsHttpClient {
 
 /// A query string that percent-encodes its values.
 ///
-/// **Not just a nicety — pairing does not work without it.** `moonlight-common` builds queries
-/// through the [`QueryBuilder`] trait, and its own `impl QueryBuilder for String` concatenates
-/// values verbatim (with a `TODO: filter for characters that need % serialization` where the
-/// encoding should be). Our device name is `webOS TV`, so `devicename=webOS TV` reached ureq, whose
-/// `http::Uri` parse rejected the space: `InvalidUriChar`, on pairing phase 1, before a single byte
-/// went to the host. Every other client encodes here too (moonlight-qt goes through `QUrlQuery`),
-/// and Sunshine URL-decodes, so this is the interoperable behaviour rather than a workaround.
-///
-/// Keys are appended as-is: they are all `&'static str` literals in the crate's endpoints.
+/// **Required, not cosmetic.** `moonlight-common`'s own `impl QueryBuilder for String` concatenates
+/// values verbatim (its `TODO: filter for characters that need % serialization` is unimplemented),
+/// so our `devicename=webOS TV` reached ureq's `http::Uri` parser as an unencoded space and failed
+/// with `InvalidUriChar` before pairing sent a byte. moonlight-qt encodes too (via `QUrlQuery`) and
+/// Sunshine URL-decodes, so this matches the interoperable behaviour.
 #[derive(Default)]
 struct EncodedQuery(String);
 
@@ -388,7 +441,28 @@ impl rustls::client::danger::ServerCertVerifier for ExactCertVerify {
 mod tests {
     use moonlight_common::http::{QueryBuilder as _, QueryParam};
 
-    use super::EncodedQuery;
+    use super::{api_message, EncodedQuery, GsHttpError};
+    use moonlight_common::high::MoonlightClientError;
+    use moonlight_common::http::ParseError;
+
+    /// The whole point of `api_message`: the host's own words reach the user, and the Rust type
+    /// names around them do not.
+    #[test]
+    fn host_status_message_is_what_surfaces() {
+        let rejected = GsHttpError::Parse(ParseError::InvalidXmlStatusCode {
+            message: Some("Invalid PIN".to_string()),
+        });
+        let err = MoonlightClientError::Backend(Box::new(rejected));
+        assert_eq!(api_message("pairing", &err), "Invalid PIN");
+    }
+
+    /// A host that rejected without saying why must still not leak the enum into the status line.
+    #[test]
+    fn a_message_less_rejection_falls_back_to_a_sentence() {
+        let rejected = GsHttpError::Parse(ParseError::InvalidXmlStatusCode { message: None });
+        let err = MoonlightClientError::Backend(Box::new(rejected));
+        assert_eq!(api_message("pairing", &err), "The host's answer wasn't understood.");
+    }
 
     /// The bug this type exists for: an unencoded space in `devicename` made ureq's URI parse
     /// reject every pairing request with `InvalidUriChar`.

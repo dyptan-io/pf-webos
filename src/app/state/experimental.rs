@@ -31,6 +31,7 @@ impl App {
                 let from = self.settings.gamestream_enabled;
                 self.settings.gamestream_enabled = !from;
                 self.switch_anim = Some((Instant::now(), from, self.experimental_focused));
+                self.apply_gamestream_visibility();
             }
             (ui::EXP_ROW_GAME_MODE, MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
                 let from = self.settings.game_mode;

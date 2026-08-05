@@ -195,7 +195,7 @@ fn ndl_audio_config(resolved_channels: u8) -> Option<crate::platform::webos::ndl
 
 /// Default HDR10 mastering metadata for the LG CX OLED panel.
 /// Sent in `Hello::display_hdr`; refined per-content by `next_hdr_meta`.
-fn cx_display_hdr() -> quic::HdrMeta {
+pub(crate) fn cx_display_hdr() -> quic::HdrMeta {
     quic::HdrMeta {
         // G, B, R order (ST.2086), 1/50000 chromaticity units — BT.2020 primaries.
         display_primaries: [[8_500, 39_850], [6_550, 2_300], [35_400, 14_600]],

@@ -395,7 +395,7 @@ pub fn experimental_rows(settings: &Settings, rooted: bool) -> Vec<FocusRow> {
     // the client discovers, pairs with and streams from punktfunk hosts only.
     rows.push(FocusRow {
         icon: ICON_TV,
-        label: "GameStream hosts".into(),
+        label: "GameStream".into(),
         value: if settings.gamestream_enabled {
             "On".into()
         } else {
@@ -405,11 +405,7 @@ pub fn experimental_rows(settings: &Settings, rooted: bool) -> Vec<FocusRow> {
         fraction: 0.0,
         danger: false,
         menu: None,
-        subtext: Some(RowSubtext::hint(if settings.gamestream_enabled {
-            "Sunshine and forks; reduced feature set"
-        } else {
-            "punktfunk hosts only"
-        })),
+        subtext: Some(RowSubtext::hint("Support Sunshine and forks")),
     });
     // Driving the TV's Game picture/sound modes needs the Homebrew Channel's root helper — the
     // public bus is denied `settingsservice` outright (see `platform::webos::game_mode`). So the

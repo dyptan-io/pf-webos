@@ -1,14 +1,9 @@
 //! One live stream, whichever protocol it speaks.
 //!
-//! `docs/GameStream-Plan.md` puts a `StreamSession` trait here. An enum is used instead, for one
-//! reason: every method below has exactly two implementations that are both in this build, so a
-//! trait would buy dynamic dispatch and a `Box` while *losing* the compiler's totality check —
-//! adding a third protocol should fail to compile at each site that has to think about it, which is
-//! what the `Screen` enum's eight dispatch sites already do for screens. There is also nothing to
-//! abstract over: the two `shutdown`s have genuinely different teardown orders.
-//!
-//! The verbs are named after the punktfunk ones the streaming loop already called
-//! (`disconnect_quit`, `is_session_ended`, `shutdown`), so the loop reads unchanged.
+//! An enum, not a trait: both implementations always exist in this build, so a trait would buy
+//! dynamic dispatch while losing the compiler's totality check on a third protocol — the same
+//! reason `Screen` is an enum. Verbs are named after the punktfunk ones the streaming loop already
+//! called (`disconnect_quit`, `is_session_ended`, `shutdown`), so the loop reads unchanged.
 
 use std::sync::Arc;
 
@@ -79,7 +74,7 @@ impl StreamHandle {
         match self {
             Self::Punktfunk(c) if c.audio_offloaded => None,
             Self::Punktfunk(c) => Some(c.client.audio_channels),
-            Self::GameStream(s) => Some(s.audio_channels()),
+            Self::GameStream(_) => Some(GsStream::AUDIO_CHANNELS),
         }
     }
 

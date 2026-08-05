@@ -70,12 +70,9 @@ pub fn pair_message(err: &PunktfunkError) -> String {
 }
 
 /// Why a `GameStream` session ended, from the `ServerTermination` reason code the control stream
-/// carried (`backend::gamestream::stream::Shared::termination_code`).
-///
-/// The codes are NVST `HRESULT`-shaped `u32`s that arrive widened to `i32`, so they read as large
-/// negatives; the constants are written as the host sends them. Only the three Moonlight itself
-/// names have a distinct meaning — everything else is "unexpected", and the host's log is the only
-/// place with the cause, so the code is printed rather than guessed at.
+/// carried. Codes are NVST `HRESULT`-shaped `u32`s widened to `i32` (hence the large negatives);
+/// only the three Moonlight names have a distinct meaning, everything else prints the raw code
+/// since only the host's log has the cause.
 pub fn gamestream_end_message(code: i32) -> String {
     /// `NVST_DISCONN_SERVER_TERMINATED_CLOSED` — the app exited, or the user stopped the session
     /// on the host.
