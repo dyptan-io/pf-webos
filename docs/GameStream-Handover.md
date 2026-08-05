@@ -13,7 +13,7 @@ Branch: `gamestream-seam`, not pushed. Base: `314d912`.
 | P1 pairing + host queries | **Code complete, unproven.** No Sunshine host has been reached. |
 | P2 seam refactor | **Done at build level.** Traits/protocol/trust/discovery/caps, plus `session/sink.rs`. The sink has not been streamed against a host. |
 | P3 non-streaming backend | **Code complete except the manual-IP fallback probe, unproven.** Backend, dual browse, display-PIN pairing, art, unpair, the `gamestream_enabled` gate. |
-| P4 streaming driver | Not started. |
+| P4 streaming driver | **Code complete, unproven.** No hand-rolled driver was needed — see below. |
 | P5 polish | Not started. |
 
 ## What is verified, and how
@@ -60,6 +60,8 @@ Things the plan assumed that turned out otherwise. Worth trusting these over the
   real cost only shows up in P3/P4.
 - **The plan's "no new user-facing settings" is void.** There is exactly one:
   `Settings::gamestream_enabled`.
+- **P4 needs no hand-rolled stream driver.** `moonlight_common::stream::std::MoonlightStream` is
+  one already; see the P4 section.
 
 ## P3: what landed, and what it still needs
 
@@ -132,6 +134,73 @@ probes, so there is no failure to fall back from. The two shapes that fit this c
   flip the protocol, and re-open the modal in the display-PIN layout.
 
 The first is smaller. Neither is worth writing blind — do it with a host in front of you.
+
+## P4: what landed, and what it still needs
+
+**The plan's central assumption for this phase was wrong, in our favour.** It budgeted a driver
+thread over the sans-IO core: UDP sockets, the 500 ms video/audio ping obligation, the 100 ms
+control ping, `poll_output` dispatch. `moonlight_common::stream::std::MoonlightStream` **is** that
+driver — RTSP handshake, three `SyncUdpDriver`s, the `ENet` control peer, all ping obligations, on
+its own threads — and it calls back into `VideoDecoder` / `AudioDecoder` / `ConnectionListener`.
+So none of that was written here. `src/backend/gamestream/stream.rs` is the three callbacks plus
+the settings mapping, and the protocol's timing stays in the crate that has tests for it.
+
+- **Video** (`SinkDecoder`) owns an `NdlSink`, built in `setup` on the crate's video thread —
+  the same reason `session::connect` builds punktfunk's on the pump thread (the pacer queries the
+  panel refresh through SDL). `submit_decode_unit` concatenates the buffer chain into one Annex B
+  access unit, derives the loss flag from a hole in `frame_number`, and answers
+  `SinkResult::NeedKeyframe` with `DecodeResult::NeedIdr`. So the whole pacing/hold/backpressure
+  path is shared with punktfunk, which is what P2's sink seam was for.
+- **Audio** is software Opus, and cannot be decoded on the crate's audio thread:
+  `sdl2::audio::AudioQueue` is `!Send` and lives on the main thread. Frames cross a bounded
+  `sync_channel` (`try_send`, so a stalled main loop can't back the audio driver up) and are drained
+  by `GsStream::pump_audio_once` on the same tick the punktfunk path uses. **Stereo only** — the
+  software decoder's layout comes from punktfunk's `layout_for` (5 ms framing); `GameStream`'s
+  surround configs need `OpusMultistreamConfig::from_surround_param`'s mapping, so `/launch` asks
+  for stereo and `AudioDecoder::setup` refuses anything else rather than playing noise.
+- **HDR** arrives on the control thread and goes straight to the shared `Arc<NdlVideo>`. It is
+  **deduped** (`Shared::hdr_applied`): re-applying `NDL_DirectVideoSetHDRInfo` re-enters panel HDR
+  mode and drops a 120 Hz panel to 60 — the CX finding in `docs/NOTES.md`. Note the **luminance
+  unit conversion** in `hdr_meta`: `GameStream` sends max display luminance in whole nits, our
+  `HdrMeta` (and NDL behind it) is 1/10000 cd/m². Passing it through unscaled would claim the
+  content was mastered at 0.08 nits.
+- **Input** (`gamestream/input.rs`) is a re-packing, not a re-mapping: punktfunk's input plane was
+  modelled on `GameStream`'s, so button bits, stick range, trigger range, mouse button ids and
+  wheel units are already identical. The two real differences are the `0x8000` keycode prefix and
+  whole-pad gamepad state — hence the per-pad accumulator, the `ControllerConnect` before a pad's
+  first state, and the modifier fold off the key stream. Three unit tests cover exactly those.
+- **`runtime::stream_handle::StreamHandle`** is the seam the streaming loop now talks to, and it is
+  an **enum, not the plan's `StreamSession` trait** — both implementations are in this build, so an
+  enum keeps the compiler's totality check at each site rather than trading it for dynamic
+  dispatch, and the two `shutdown`s have genuinely different teardown orders. `InputSender` is the
+  one piece that is cloned out of it, for the HID-mouse reader thread.
+- **`ConnectTarget` gained `protocol`** and its `fingerprint` became `Option`: only punktfunk has a
+  host key to pin. `runtime::spawn_connect` dispatches on the protocol; the hero-handover timing in
+  `ui_flow.rs` is untouched, because `/launch` happens inside the `GameStream` connect exactly as
+  the plan asked.
+
+Deviations and gaps, same rule as the other lists:
+
+1. **No stream encryption** (`EncryptionFlags::NONE`). Optional on the video/audio planes, and this
+   armv7 SoC has no hardware AES — the same reason punktfunk sessions ask for ChaCha20. Revisit only
+   with a measurement.
+2. **The Automatic bitrate is resolved client-side**, because `caps().host_abr` is false: Moonlight's
+   60 Hz anchors (720p 10 / 1080p 20 / 1440p 40 / 4K 80 Mbps) scaled linearly in frame rate. This is
+   the one figure no host tells us, so it has a test.
+3. **`shutdown` waits on a flag, not a join.** The crate owns its threads, so teardown stops the
+   stream, waits up to 2 s for the video callback's `stop` (which drops the sink's `Arc<NdlVideo>`),
+   then releases our own handle — the last one, so `NdlVideo::drop`'s process-global unload cannot
+   race a `play` still in flight. `false` skips `ndl::quit()`, same contract as punktfunk's.
+4. **Pad feedback is not wired.** Rumble, triggers, LEDs and motion all arrive on the
+   `ConnectionListener` and are P5; `StreamHandle::pump_feedback_once` is a no-op for `GameStream`.
+   The overlay's Drop/FEC figures print `n/a` for the same reason — the protocol exposes no such
+   counter to a client, and a zero would read as "no loss".
+5. **Termination reasons are logged, not shown.** `ServerTermination`'s code lands in
+   `Shared::termination_code` and nothing reads it yet; the taxonomy is P5's `errors.rs` work.
+
+**None of it has run against a host.** In likelihood order, the places to look first when it doesn't
+work: the `/launch` settings the host rejects (`adjust_for_server` reports these with a reason), the
+`0x8000` keycode prefix, the whole-pad state fold, and the HDR luminance conversion above.
 
 ## The one new setting
 
@@ -283,8 +352,14 @@ keys gone after the next save), library with cover art, and **the video sink** �
 punktfunk host and diff the stats overlay (feed µs, backlog, pacing delta, hold behaviour on
 induced loss) against a build of `314d912`.
 
-**4. Finish P3**: the manual-IP fallback probe (see the P3 section for the two shapes and why it
-was deferred).
+**4. Prove P4**: with a paired Sunshine host, launch a title from the grid. Watch for
+`GameStream launch ok`, then `NDL loaded for GameStream`, then a picture; check the stats overlay's
+resolution/codec header and that Feed µs and the measured Mbps move. Then keyboard, mouse (both
+captured and remote-pointer), and a pad — the pad is the one with real translation risk. HDR last,
+and watch the panel's refresh rate: the dedupe in `set_hdr_mode` is what keeps 120 Hz.
+
+**5. Finish P3**: the manual-IP fallback probe (see the P3 section for the two shapes and why it
+was deferred), and P5's pad feedback + termination messages (see the P4 list).
 
 `session::connect`'s argument list and the `Connected { client }` narrowing are leftover
 P2-adjacent cleanups; neither blocks P3. The anchors found while exploring:
