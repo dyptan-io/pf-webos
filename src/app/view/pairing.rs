@@ -22,14 +22,19 @@ const PAIRING_BUTTON_H: u32 = 64;
 const PAIRING_MARGIN: i32 = 40;
 
 /// The display-PIN modal's subtitle (also used for height measurement, like `PAIRING_SUBTITLE`).
-pub(crate) const DISPLAY_PIN_SUBTITLE: &str = "This host pairs the other way round.";
+///
+/// It carries the instruction too. The card had the same thing said twice in two places and two
+/// alignments — a left-aligned subtitle saying the ceremony is inverted, then a centred caption
+/// above the digits saying where to type them. One left-aligned paragraph in the header is the
+/// shape every other modal already uses.
+pub(crate) const DISPLAY_PIN_SUBTITLE: &str =
+    "This host pairs the other way round. Enter this PIN on the host (Sunshine: Troubleshooting → PIN).";
 
 /// The captions between the card's rows. Constants because the layout has to measure them: they
 /// wrap to the card's inner column like every other modal's body text, so how many lines each
 /// takes decides where the row below it starts.
 const PAIRING_BUTTON_CAPTION: &str = "Then approve this TV on the host.";
 const PAIRING_PIN_CAPTION: &str = "Enter the PIN shown on the host.";
-const DISPLAY_PIN_CAPTION: &str = "Enter this PIN on the host (Sunshine: Troubleshooting → PIN).";
 
 /// Line spacing within a wrapped caption, matching the status line's.
 const CAPTION_LINE_GAP: i32 = 6;
@@ -38,7 +43,6 @@ const CAPTION_LINE_GAP: i32 = 6;
 /// [`PairingLayout`]: there is no button and no "or" rule to place, and it gains a warning line
 /// the entry layout has no room for.
 pub(crate) struct DisplayPinLayout {
-    pub(crate) caption_y: i32,
     pub(crate) pin_y: i32,
     pub(crate) status_y: i32,
     pub(crate) content: Rect,
@@ -78,11 +82,9 @@ impl App {
             0,
         );
         let header_end = ui::modal_header_end_y(fonts.raster, fonts.label, fonts.value, card, DISPLAY_PIN_SUBTITLE);
-        let caption_y = header_end + 26;
-        let pin_y = caption_y + Self::caption_h(fonts, content.width(), DISPLAY_PIN_CAPTION) + 16;
+        let pin_y = header_end + 26;
         let status_y = pin_y + ui::PAIRING_DIGIT_H as i32 + 22;
         DisplayPinLayout {
-            caption_y,
             pin_y,
             status_y,
             content,
@@ -238,16 +240,6 @@ impl App {
             ui::WHITE,
             DISPLAY_PIN_SUBTITLE,
             ui::MUTED,
-        )?;
-
-        Self::draw_centred_caption(
-            painter,
-            text_cache,
-            fonts.raster,
-            fonts.value,
-            l.content,
-            l.caption_y,
-            DISPLAY_PIN_CAPTION,
         )?;
 
         // Placeholders until the PIN exists — a card with an empty row where four digits belong

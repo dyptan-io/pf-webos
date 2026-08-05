@@ -131,7 +131,11 @@ impl GsHttpClient {
         E::Response: TextResponse<Err = ParseError>,
     {
         let url = Self::url::<E>(use_https, &info, hostport, req);
-        tracing::debug!("gamestream request: {} {}", E::path(), hostport);
+        // The query, not just the path: every pairing phase is `/pair`, and *which* phase failed is
+        // the whole diagnosis (`phrase=getservercert` / `clientchallenge` / `pairchallenge`, and
+        // whether it went over HTTP or HTTPS). Debug-level, and the values here are the pairing
+        // salt/challenge — public by design, since the PIN is what makes them secret.
+        tracing::debug!("gamestream request: {url}");
         let body = self.agent.get(&url).call()?.body_mut().read_to_string()?;
         Ok(E::Response::from_str(&body)?)
     }

@@ -84,7 +84,12 @@ The `HostBackend` impl and everything above it. `backend_for` is now **total**, 
   `ureq::Agent` (`MtlsArt`), `GameStream`'s holds an open `MoonlightHost` (`GsArt`). Still built
   lazily inside the worker thread, so a fully cached library opens no connection — which is also
   why `ArtFetch` has no `Send` bound.
-- **Pairing.** `Screen::Pairing` renders one of two layouts, chosen by
+- **Pairing.** The display-PIN card says everything once, in the header: its subtitle carries the
+  instruction ("…Enter this PIN on the host (Sunshine: Troubleshooting → PIN)") rather than
+  repeating it as a second, centred caption above the digits. The remaining captions on the
+  enter-PIN card wrap to the inner column like every other modal's body text, and both layouts
+  measure them, so the rows below start in the right place whatever they wrap to.
+- `Screen::Pairing` renders one of two layouts, chosen by
   `App::pairing_is_display_pin()` (the entry's protocol, deliberately *not* whether a PIN has
   been generated — a failed ceremony must keep its layout and error line). The display-PIN one
   has no focusable element at all, so it returns `None` from the focus-key/focus-rect paths and
@@ -198,7 +203,28 @@ Deviations and gaps, same rule as the other lists:
 5. **Termination reasons are logged, not shown.** `ServerTermination`'s code lands in
    `Shared::termination_code` and nothing reads it yet; the taxonomy is P5's `errors.rs` work.
 
-**None of it has run against a host.** In likelihood order, the places to look first when it doesn't
+**Pairing has now been attempted against a real Sunshine host** (first contact of the whole
+branch), and produced two findings:
+
+1. **Fixed: no request left the TV at all.** `moonlight-common` assembles queries through its
+   `QueryBuilder` trait, and its `impl QueryBuilder for String` — the one we were passing —
+   concatenates values verbatim, with a `TODO: filter for characters that need % serialization`
+   where the encoding belongs. Our device name is `webOS TV`, so the space reached ureq and
+   `http::Uri` rejected it: `InvalidUriChar` on pairing phase 1. `GsHttpClient` now builds the
+   query through its own `EncodedQuery` (percent-encodes everything outside RFC 3986 unreserved),
+   which is what moonlight-qt does via `QUrlQuery` and what Sunshine decodes. **Do not "simplify"
+   this back to `String`.**
+2. **Open: `Io(UnexpectedEof, "Peer disconnected")` during a pair request.** The host closes the
+   connection rather than answering. Which phase is not yet known — every phase is `/pair`, so the
+   request log line now carries the whole URL (`phrase=…`, and http vs https) to name it. Read that
+   first, and Sunshine's own log alongside it. If it is the **HTTPS** phase, the suspect list is the
+   client identity: `ClientSecret::to_pem` is PKCS#8 (`PRIVATE KEY`), which `client_key_der`
+   handles, so a key/cert mismatch is unlikely — more likely Sunshine rejecting our client
+   certificate because its pairing state was left mid-flight by the failed attempts above, in which
+   case delete `gamestream-server-*.pem` (and unpair on the host) and retry from clean. If it is an
+   **HTTP** phase, the PIN was probably never entered inside the phase's window.
+
+**Nothing else has run against a host.** In likelihood order, the places to look first when it doesn't
 work: the `/launch` settings the host rejects (`adjust_for_server` reports these with a reason), the
 `0x8000` keycode prefix, the whole-pad state fold, and the HDR luminance conversion above.
 
