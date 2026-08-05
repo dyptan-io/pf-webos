@@ -27,6 +27,11 @@ impl App {
                 self.settings.video_pacing = !from;
                 self.switch_anim = Some((Instant::now(), from, self.experimental_focused));
             }
+            (ui::EXP_ROW_GAMESTREAM, MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
+                let from = self.settings.gamestream_enabled;
+                self.settings.gamestream_enabled = !from;
+                self.switch_anim = Some((Instant::now(), from, self.experimental_focused));
+            }
             (ui::EXP_ROW_GAME_MODE, MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
                 let from = self.settings.game_mode;
                 self.settings.game_mode = !from;

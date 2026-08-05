@@ -378,7 +378,7 @@ impl App {
     pub(crate) fn confirm_sidebar_host(&mut self, idx: usize) {
         let entry = self.entries[idx].clone();
         match entry {
-            HostEntry::Known(h) if h.fingerprint.is_some() => {
+            HostEntry::Known(h) if h.is_paired() => {
                 let (host, port, mgmt_port) = (h.host, h.port, h.mgmt_port);
                 // Re-confirming the already-active host refreshes its library too — a
                 // user clicking it is asking to see the current game list, e.g. after
@@ -413,14 +413,13 @@ impl App {
         self.grid_scroll_target = 0;
 
         let identity = (self.identity.0.clone(), self.identity.1.clone());
-        let fingerprint = self
-            .known_hosts
-            .iter()
-            .find(|h| h.host == host && h.port == port)
-            .and_then(|h| h.fingerprint);
+        let known = self.known_hosts.iter().find(|h| h.host == host && h.port == port);
+        let fingerprint = known.and_then(store::KnownHost::pin);
+        let backend = crate::backend::backend_or_punktfunk(known.map(|h| h.protocol).unwrap_or_default());
         let mgmt_port = mgmt_port.unwrap_or(crate::services::library::DEFAULT_MGMT_PORT);
         tracing::debug!("library: fetching from {host}:{mgmt_port}…");
         self.games_rx = Some(crate::services::library::load_games_async(
+            backend,
             host,
             port,
             mgmt_port,
@@ -454,7 +453,7 @@ impl App {
                     .known_hosts
                     .iter()
                     .find(|h| h.host == host && h.port == port)
-                    .and_then(|h| h.fingerprint);
+                    .and_then(store::KnownHost::pin);
                 // Covers are requested per card as the grid window reaches them (see
                 // `App::prepare_tiles`), not fetched for the whole library up front.
                 let (card_w, card_h) = self.card_size;
@@ -517,7 +516,7 @@ impl App {
         let Some(known) = self.known_hosts.iter().find(|h| h.host == host && h.port == port) else {
             return;
         };
-        let Some(fingerprint) = known.fingerprint else { return };
+        let Some(fingerprint) = known.pin() else { return };
         let (launch, title) = match self.grid_card_at(idx, columns) {
             Some(GridCard::Desktop) => (None, "Desktop".to_string()),
             Some(GridCard::Game(game)) => (Some(game.id.clone()), game.title.clone()),

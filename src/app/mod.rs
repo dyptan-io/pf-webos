@@ -226,6 +226,7 @@ pub(crate) enum ModalShellKey {
     Experimental {
         video_pacing: bool,
         game_mode: bool,
+        gamestream: bool,
         hover_close: bool,
     },
     /// Fixed warning copy + two buttons; only the close (X) hover varies.
@@ -570,7 +571,7 @@ impl App {
             if let Some(h) = app
                 .known_hosts
                 .iter()
-                .find(|h| h.host == host && h.port == port && h.fingerprint.is_some())
+                .find(|h| h.host == host && h.port == port && h.is_paired())
             {
                 let (host, port, mgmt_port) = (h.host.clone(), h.port, h.mgmt_port);
                 app.select_host(host, port, mgmt_port);
@@ -1884,6 +1885,7 @@ impl App {
             Screen::Experimental => Some(ModalShellKey::Experimental {
                 video_pacing: self.settings.video_pacing,
                 game_mode: self.settings.game_mode,
+                gamestream: self.settings.gamestream_enabled,
                 hover_close: self.hover_close,
             }),
             Screen::SendLogs => Some(ModalShellKey::SendLogs {
@@ -2002,6 +2004,7 @@ impl App {
                 self.experimental_focused,
                 self.settings.video_pacing,
                 self.settings.game_mode,
+                self.settings.gamestream_enabled,
             )),
             Screen::SendLogs => Some(ModalFocusKey::SendLogsButton(self.send_logs_focused)),
             // Neither has a single focused widget: the address form is one always-active

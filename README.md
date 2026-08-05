@@ -10,7 +10,7 @@
 [![Downloads](https://img.shields.io/github/downloads/dyptan-io/punktfunk-webos/latest/total?color=a79ff8&label=downloads)](https://github.com/dyptan-io/punktfunk-webos/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-d2c9fb)](#license)
 
-**Native LG webOS TV client for [punktfunk](https://git.unom.io/unom/punktfunk) — low-latency desktop & game streaming.**
+**Native LG webOS TV client for [punktfunk](https://git.unom.io/unom/punktfunk) and GameStream — low-latency desktop & game streaming.**
 
 </div>
 
@@ -46,6 +46,19 @@ video decode, and webOS packaging.
 > **Controller feedback needs webOS 6.0+.** Rumble, DualSense triggers, haptics and lightbar all
 > rely on the kernel's `hid-playstation` driver, which LG ships only on webOS 6.0+ (C1 and later).
 > On webOS 5.x (e.g. the CX) the pad still works as an *input*, but no feedback reaches it.
+
+## GameStream compatibility
+
+Support GameStream hosts
+([Sunshine](https://github.com/LizardByte/Sunshine) and forks), discovered over
+mDNS as `_nvstream._tcp`.
+
+Off by default, behind **Settings → Experimental → GameStream**.
+
+GameStream support is built on
+[moonlight-common-rust](https://github.com/MrCreativ3001/moonlight-common-rust), which is
+GPL-3.0. Linking it means release builds that include GameStream support are distributed
+under GPL-3.0 as a whole; the punktfunk-only source in this repository remains MIT/Apache-2.0.
 
 <details>
 <summary><b>Screenshots</b></summary>

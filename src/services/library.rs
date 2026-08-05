@@ -83,7 +83,9 @@ pub fn agent(identity: &(String, String), pin: Option<[u8; 32]>) -> Result<ureq:
 }
 
 /// Fetch the host's library (errors pre-classified for UI: 401/403→NotPaired, etc).
-fn fetch_games(
+/// `pub(crate)` for `backend::punktfunk`, which is the only caller that should reach it —
+/// everything else goes through `HostBackend::list_games`.
+pub(crate) fn fetch_games(
     addr: &str,
     mgmt_port: u16,
     identity: &(String, String),
@@ -112,6 +114,7 @@ pub struct GamesLoaded {
 /// Spawns background thread to run `fetch_games` (avoids UI freeze from network blocking).
 /// Safe to switch hosts before finish: receiver drop causes thread's send to fail.
 pub fn load_games_async(
+    backend: &'static dyn crate::backend::HostBackend,
     host: String,
     port: u16,
     mgmt_port: u16,
@@ -122,7 +125,7 @@ pub fn load_games_async(
     std::thread::Builder::new()
         .name("punktfunk-webos-library".into())
         .spawn(move || {
-            let result = fetch_games(&host, mgmt_port, &identity, fingerprint);
+            let result = backend.list_games(&host, mgmt_port, &identity, fingerprint);
             let _ = tx.send(GamesLoaded {
                 host,
                 port,

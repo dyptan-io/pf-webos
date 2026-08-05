@@ -7,6 +7,8 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 #[cfg(target_os = "linux")]
 mod app;
+// Protocol seam: `core` + `services` only, no SDL2/webOS, so it stays ungated.
+mod backend;
 mod core;
 mod errors;
 mod logger;

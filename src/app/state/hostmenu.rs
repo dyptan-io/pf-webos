@@ -42,6 +42,9 @@ impl App {
             return Vec::new();
         };
         let saved = matches!(entry, HostEntry::Known(_));
+        // Affordances a protocol doesn't have are *omitted*, never shown-and-failing, so adding a
+        // protocol touches no view code. See `backend::BackendCaps`.
+        let caps = crate::backend::backend_or_punktfunk(entry.protocol()).caps();
         let mut rows = vec![
             (
                 HostAction::Connect,
@@ -57,11 +60,13 @@ impl App {
                 HostAction::Pair,
                 FocusRow::action(crate::ui::ICON_LOCK, "Pair with PIN…"),
             ),
-            (
+        ];
+        if caps.speed_test {
+            rows.push((
                 HostAction::SpeedTest,
                 FocusRow::action(crate::ui::ICON_SIGNAL, "Test network speed…"),
-            ),
-        ];
+            ));
+        }
         if !entry.mac().is_empty() {
             // The one row with a ⋯: Confirm wakes now, the button holds the per-host
             // wake settings (`Screen::WakeSettings`). Same affordance and the same

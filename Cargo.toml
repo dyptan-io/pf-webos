@@ -37,6 +37,16 @@ tracing-appender = "0.2"
 # bytes not wire bytes, a decode ceiling that latched at the choke rate) and probe throughput
 # measured over the client's own receive interval — all client-side, so the bump is the fix.
 punktfunk-core = { git = "https://git.unom.io/unom/punktfunk", tag = "v0.24.0", features = ["quic"] }
+# GameStream protocol (HTTP + pairing + sans-IO stream core). Pinned SHA: unpublished and
+# API-churning, so a tag would not be stable. `default-features = false` drops its `ureq`
+# feature (which also drags hyper) — we drive its `RequestClient` trait with our own ureq
+# stack instead, keeping one HTTP implementation. GPL-3.0-or-later, so the shipped .ipk is
+# GPL-3.0 as a whole — see README. Always linked; GameStream is gated at runtime by
+# `Settings::gamestream_enabled` (Experimental screen), not at compile time.
+moonlight-common = { git = "https://github.com/MrCreativ3001/moonlight-common-rust", rev = "45d59bd5b0f3e6a195a36a5dd9127be0a4a49060", default-features = false, features = [
+    "std",
+    "rustcrypto",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # mDNS LAN discovery; direct dep (not via pf-client-core — see session.rs docs).

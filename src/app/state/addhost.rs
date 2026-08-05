@@ -34,13 +34,15 @@ impl App {
                 name: host.clone(),
                 host: host.clone(),
                 port,
-                fingerprint: None,
                 mgmt_port: None,
                 mac: Vec::new(),
                 // upsert_known_host keeps an existing record's wol_auto
                 wol_auto: false,
                 // upsert_known_host keeps an existing record's pins
                 pinned: vec![store::DESKTOP_PIN_ID.to_string()],
+                // Defaults: punktfunk protocol and unpaired trust. `upsert_known_host` keeps
+                // an existing record's trust, so re-adding a paired host doesn't unpair it.
+                ..store::KnownHost::default()
             },
         );
         let _ = store::save_known_hosts(&self.known_hosts);

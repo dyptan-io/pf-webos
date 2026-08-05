@@ -12,9 +12,19 @@ impl App {
         self.pairing_entry = idx;
         self.pin_digits = [0; 4];
         self.pin_digit_index = 0;
-        // Request access is the default: it is the path that always works, whereas the
-        // PIN additionally needs the host's pairing page open and armed.
-        self.pairing_focus = PairingFocus::RequestAccess;
+        // Request access is the default *where the protocol has it*: it is the path that always
+        // works, whereas the PIN additionally needs the host's pairing page open and armed. A
+        // protocol without it (GameStream is PIN-only) must not open focused on a button it
+        // doesn't offer — see `backend::BackendCaps::request_access`.
+        let request_access = self
+            .entries
+            .get(idx)
+            .is_some_and(|e| crate::backend::backend_or_punktfunk(e.protocol()).caps().request_access);
+        self.pairing_focus = if request_access {
+            PairingFocus::RequestAccess
+        } else {
+            PairingFocus::Pin
+        };
         self.pairing_status = None;
         self.screen = Screen::Pairing;
     }
@@ -141,7 +151,10 @@ impl App {
                         name: outcome.name,
                         host: outcome.host.clone(),
                         port: outcome.port,
-                        fingerprint: Some(fingerprint),
+                        // This flow is punktfunk's, so the trust is a pinned host leaf. The
+                        // GameStream display-PIN flow lands its own `ClientCertPaired` in P3.
+                        protocol: store::Protocol::Punktfunk,
+                        trust: store::HostTrust::Pinned(fingerprint),
                         mgmt_port: outcome.mgmt_port,
                         mac: outcome.mac,
                         // Preserved across a re-add by `upsert_known_host`; off for a genuinely new host.
@@ -149,6 +162,7 @@ impl App {
                         // Only reaches a genuinely new host — `upsert_known_host` keeps an
                         // existing record's pins.
                         pinned: vec![store::DESKTOP_PIN_ID.to_string()],
+                        ..KnownHost::default()
                     },
                 );
                 let _ = store::save_known_hosts(&self.known_hosts);

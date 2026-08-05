@@ -135,8 +135,19 @@ impl App {
         let mgmt_port = known
             .and_then(|h| h.mgmt_port)
             .unwrap_or(crate::services::library::DEFAULT_MGMT_PORT);
-        let fingerprint = known.and_then(|h| h.fingerprint);
-        crate::services::library::load_games_async(host.to_string(), port, mgmt_port, identity.clone(), fingerprint)
+        let fingerprint = known.and_then(crate::services::store::KnownHost::pin);
+        // An unknown host (nothing in `known_hosts`) can only be punktfunk — the manual-IP and
+        // discovery paths both record a protocol before anything probes.
+        let protocol = known.map(|h| h.protocol).unwrap_or_default();
+        let backend = crate::backend::backend_or_punktfunk(protocol);
+        crate::services::library::load_games_async(
+            backend,
+            host.to_string(),
+            port,
+            mgmt_port,
+            identity.clone(),
+            fingerprint,
+        )
     }
 
     /// Handles Wake modal events: direction moves between "Wake"/"Cancel" buttons.

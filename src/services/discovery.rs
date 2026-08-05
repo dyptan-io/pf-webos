@@ -1,11 +1,23 @@
-//! LAN discovery via mDNS (_punktfunk._udp). Direct mdns-sd dep to avoid pf-client-core's FFmpeg/PipeWire.
+//! LAN discovery via mDNS. Direct mdns-sd dep to avoid pf-client-core's FFmpeg/PipeWire.
+//!
+//! One daemon browses every `backend::ALL_BACKENDS` service type, and the type a record arrived
+//! on is what sets its protocol — hosts are never probed to find out what they speak.
 use mdns_sd::{ServiceDaemon, ServiceEvent};
+
+use crate::core::protocol::Protocol;
+
+/// How long the round-robin below sleeps after a pass that found nothing on any browse. Only
+/// paces the idle loop: a pass that found anything goes straight round again.
+const BROWSE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
 pub struct DiscoveredHost {
     pub name: String,
     pub addr: String,
     pub port: u16,
+    /// Set from the mDNS service type this record arrived on, by the owning backend's
+    /// `parse_discovery`.
+    pub protocol: Protocol,
     /// Management API port from mDNS (None → `library::DEFAULT_MGMT_PORT`).
     pub mgmt_port: Option<u16>,
     /// Wake-on-LAN MACs from mDNS (learned while awake, persisted to `KnownHost`).
@@ -25,49 +37,61 @@ pub fn browse() -> Option<(std::sync::mpsc::Receiver<DiscoveredHost>, ServiceDae
     std::thread::Builder::new()
         .name("punktfunk-webos-mdns".into())
         .spawn(move || {
-            let receiver = match daemon.browse("_punktfunk._udp.local.") {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("mdns: browse(_punktfunk._udp.local.) failed: {e}");
-                    return;
-                }
-            };
-            tracing::debug!("mdns: browsing _punktfunk._udp.local.");
-            while let Ok(event) = receiver.recv() {
-                let info = match event {
-                    ServiceEvent::ServiceResolved(info) => info,
-                    other => {
-                        tracing::debug!("mdns: {other:?}");
-                        continue;
+            // One receiver per service type, all fed by the one daemon, each remembering which
+            // backend owns it so a resolved record is parsed by the protocol that advertised it.
+            let mut browses = Vec::new();
+            for backend in crate::backend::ALL_BACKENDS {
+                let service = backend.discovery_service();
+                match daemon.browse(service) {
+                    Ok(r) => {
+                        tracing::debug!("mdns: browsing {service}");
+                        browses.push((*backend, r));
                     }
-                };
-                // IPv4 only (same as other clients)
-                let Some(addr) = info
-                    .get_addresses_v4()
-                    .iter()
-                    .next()
-                    .map(std::string::ToString::to_string)
-                else {
-                    tracing::warn!("mdns: resolved {} with no IPv4 address, skipping", info.get_fullname());
-                    continue;
-                };
-                let props = info.get_properties();
-                let host = DiscoveredHost {
-                    name: info.get_fullname().split('.').next().unwrap_or("?").to_string(),
-                    addr,
-                    port: info.get_port(),
-                    mgmt_port: props.get_property_val_str("mgmt").and_then(|v| v.parse().ok()),
-                    mac: props
-                        .get_property_val_str("mac")
-                        .unwrap_or("")
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect(),
-                };
-                tracing::info!("mdns: resolved {} at {}:{}", host.name, host.addr, host.port);
-                if tx.send(host).is_err() {
-                    break; // receiver gone — stop browsing
+                    Err(e) => tracing::error!("mdns: browse({service}) failed: {e}"),
+                }
+            }
+            if browses.is_empty() {
+                return;
+            }
+            // Round-robin rather than a blocking `recv`: with more than one browse, blocking on
+            // the first would starve the others.
+            'outer: loop {
+                let mut idle = true;
+                for (backend, receiver) in &browses {
+                    // `try_recv` + an explicit idle sleep rather than `recv_timeout`: naming
+                    // `RecvTimeoutError`'s variants would make `flume` a direct dependency, and
+                    // `mdns-sd` re-exports `Receiver` but not its error types. Disconnection is
+                    // asked of the receiver instead, which is on the re-exported type.
+                    let Ok(event) = receiver.try_recv() else {
+                        if receiver.is_disconnected() {
+                            break 'outer; // daemon gone; nothing will ever arrive again
+                        }
+                        continue; // empty: try the next browse
+                    };
+                    idle = false;
+                    let info = match event {
+                        ServiceEvent::ServiceResolved(info) => info,
+                        other => {
+                            tracing::debug!("mdns: {other:?}");
+                            continue;
+                        }
+                    };
+                    let Some(host) = backend.parse_discovery(&info) else {
+                        continue;
+                    };
+                    tracing::info!(
+                        "mdns: resolved {} at {}:{} ({:?})",
+                        host.name,
+                        host.addr,
+                        host.port,
+                        host.protocol
+                    );
+                    if tx.send(host).is_err() {
+                        break 'outer; // receiver gone — stop browsing
+                    }
+                }
+                if idle {
+                    std::thread::sleep(BROWSE_POLL);
                 }
             }
             tracing::debug!("mdns: receiver loop ended, shutting down");

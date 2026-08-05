@@ -32,7 +32,7 @@ impl App {
         }
     }
 
-    /// Rewrite address in-place, keeping identity (fingerprint, `mgmt_port`, MAC). No-op if partial.
+    /// Rewrite address in-place, keeping identity (protocol, trust, `mgmt_port`, MAC). No-op if partial.
     pub(crate) fn confirm_edit_host(&mut self) {
         if !self.add_host.is_complete() {
             return;
@@ -56,11 +56,13 @@ impl App {
                 name: old.name.clone(),
                 host: host.clone(),
                 port,
-                fingerprint: old.fingerprint,
+                protocol: old.protocol,
+                trust: old.trust,
                 mgmt_port: old.mgmt_port,
                 mac: old.mac.clone(),
                 wol_auto: old.wol_auto,
                 pinned: old.pinned.clone(),
+                ..store::KnownHost::default()
             },
         );
         let _ = store::save_known_hosts(&self.known_hosts);
