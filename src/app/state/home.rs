@@ -513,16 +513,20 @@ impl App {
         let Some(known) = self.known_hosts.iter().find(|h| h.host == host && h.port == port) else {
             return;
         };
-        // Streaming a `GameStream` host is P4 — `ConnectTarget` is punktfunk-shaped (it carries a
-        // pinned fingerprint, which that protocol has no equivalent of) and `session::connect`
-        // speaks only punktfunk. Say so rather than falling through `pin()`'s `None` into a
-        // silent no-op, which reads as a broken remote.
-        if known.protocol == store::Protocol::GameStream {
-            self.home_status = Some("Streaming GameStream hosts isn't supported yet.".into());
-            self.grid_dirty = true;
+        // Only punktfunk has a host key to pin, and there it is also the pair state: no pin means
+        // the host was never paired, so there is nothing to connect with. `GameStream` carries its
+        // trust as the registered client certificate instead, which `query::open` restores.
+        let protocol = known.protocol;
+        let fingerprint = known.pin();
+        if protocol == store::Protocol::Punktfunk && fingerprint.is_none() {
             return;
         }
-        let Some(fingerprint) = known.pin() else { return };
+        // `GameStream` serves launches from the same port it serves queries from, which discovery
+        // stored in both fields — but a hand-added host has only `port`, so fall back to it.
+        let port = match protocol {
+            store::Protocol::GameStream => known.mgmt_port.unwrap_or(port),
+            store::Protocol::Punktfunk => port,
+        };
         let (launch, title) = match self.grid_card_at(idx, columns) {
             Some(GridCard::Desktop) => (None, "Desktop".to_string()),
             Some(GridCard::Game(game)) => (Some(game.id.clone()), game.title.clone()),
@@ -546,6 +550,7 @@ impl App {
         self.launch_ready = Some(ConnectTarget {
             host,
             port,
+            protocol,
             fingerprint,
             launch,
         });
@@ -570,7 +575,10 @@ impl App {
         // once this modal closes. `mgmt_port` unwraps to the backend's own default.
         let backend = crate::backend::backend_for(h.protocol);
         if backend.caps().unpair {
-            let (addr, query_port) = (host.clone(), h.mgmt_port.unwrap_or_else(|| backend.default_query_port()));
+            let (addr, query_port) = (
+                host.clone(),
+                h.mgmt_port.unwrap_or_else(|| backend.default_query_port()),
+            );
             std::thread::spawn(move || {
                 if let Err(e) = backend.unpair(&addr, query_port) {
                     tracing::warn!("unpair {addr}:{query_port} failed: {e}");

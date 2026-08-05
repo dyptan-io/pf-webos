@@ -145,18 +145,17 @@ pub(super) fn run_inner() -> Result<()> {
         let mut cursor = cursor::Cursor::new(sdl.mouse());
         cursor.set_captured(settings.cursor_capture);
 
-        // Skipped when NDL took the Opus stream — a second unfed audio device would still
-        // claim a PulseAudio sink.
-        let mut audio_player = if connected.audio_offloaded {
-            None
-        } else {
-            match crate::platform::webos::audio::AudioPlayer::new(&sdl_audio, connected.client.audio_channels) {
+        // `None` when the session decodes audio somewhere other than here (punktfunk's NDL Opus
+        // offload) — a second unfed audio device would still claim a PulseAudio sink.
+        let mut audio_player = match connected.audio_channels() {
+            None => None,
+            Some(channels) => match crate::platform::webos::audio::AudioPlayer::new(&sdl_audio, channels) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     // Same no-crash policy as the connect above, plus the video teardown a
                     // loaded decoder now needs.
                     tracing::error!("audio player init failed: {e:#}");
-                    connected.client.disconnect_quit();
+                    connected.disconnect_quit();
                     if connected.shutdown() {
                         crate::platform::webos::ndl::quit();
                     } else {
@@ -166,7 +165,7 @@ pub(super) fn run_inner() -> Result<()> {
                     menu_status = Some(format!("Couldn't start audio: {e:#}"));
                     continue;
                 }
-            }
+            },
         };
         if let Some(player) = &audio_player {
             tracing::info!(
@@ -179,7 +178,7 @@ pub(super) fn run_inner() -> Result<()> {
         // Experimental: Game picture/sound mode, app-plane stand-in for HDMI ALLM. Best-effort;
         // reverted on stream exit. See `game_mode`.
         let restore_tv_modes = if settings.game_mode {
-            crate::platform::webos::game_mode::enter(connected.hdr)
+            crate::platform::webos::game_mode::enter(connected.hdr())
         } else {
             Vec::new()
         };
@@ -209,11 +208,11 @@ pub(super) fn run_inner() -> Result<()> {
         // since `disconnect.is_open()` isn't readable from that thread.
         let forward_hid = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let hid_mouse = if settings.cursor_capture {
-            let client = Arc::clone(&connected.client);
+            let input = connected.input();
             let gate = Arc::clone(&forward_hid);
             crate::platform::webos::evmouse::HidMouse::start(move |ev| {
                 if gate.load(Ordering::Relaxed) {
-                    let _ = session::send_input(&client, ev);
+                    input.send(ev);
                 }
             })
         } else {
@@ -276,7 +275,7 @@ pub(super) fn run_inner() -> Result<()> {
         let outcome = 'running: loop {
             if QUIT_REQUESTED.load(Ordering::Relaxed) {
                 tracing::warn!("SIGTERM/SIGINT received — disconnecting before exit");
-                connected.client.disconnect_quit();
+                connected.disconnect_quit();
                 break 'running StreamOutcome::Quit;
             }
             if !hid_device_seen
@@ -299,7 +298,7 @@ pub(super) fn run_inner() -> Result<()> {
                 };
                 match event {
                     Event::Quit { .. } => {
-                        connected.client.disconnect_quit();
+                        connected.disconnect_quit();
                         break 'running StreamOutcome::Quit;
                     }
                     Event::ControllerDeviceAdded { which, .. } if controller.is_none() => {
@@ -322,7 +321,7 @@ pub(super) fn run_inner() -> Result<()> {
                             Some(ConfirmAction::Confirmed) => {
                                 tracing::info!("disconnecting to menu");
                                 client_initiated_disconnect = true;
-                                connected.client.disconnect_quit();
+                                connected.disconnect_quit();
                                 disconnect.dismiss();
                                 pending_outcome = Some(StreamOutcome::ReturnToMenu);
                             }
@@ -333,7 +332,7 @@ pub(super) fn run_inner() -> Result<()> {
                     // Scancode keys are real game input — forward only, never open the dialog.
                     Event::KeyDown { scancode: Some(sc), .. } => {
                         if let Some(ev) = keyboard::key_event(sc, true) {
-                            let _ = session::send_input(&connected.client, &ev);
+                            connected.send_input(&ev);
                         }
                     }
                     // Magic Remote Back has no scancode — forwarded as Esc. A held Back never
@@ -345,7 +344,7 @@ pub(super) fn run_inner() -> Result<()> {
                         ..
                     } if crate::platform::webos::input::menu_event_for_key(k) == Some(MenuEvent::Back) => {
                         if let Some(ev) = keyboard::key_event(sdl2::keyboard::Scancode::Escape, true) {
-                            let _ = session::send_input(&connected.client, &ev);
+                            connected.send_input(&ev);
                         }
                     }
                     Event::KeyUp {
@@ -354,12 +353,12 @@ pub(super) fn run_inner() -> Result<()> {
                         ..
                     } if crate::platform::webos::input::menu_event_for_key(k) == Some(MenuEvent::Back) => {
                         if let Some(ev) = keyboard::key_event(sdl2::keyboard::Scancode::Escape, false) {
-                            let _ = session::send_input(&connected.client, &ev);
+                            connected.send_input(&ev);
                         }
                     }
                     Event::KeyUp { scancode: Some(sc), .. } => {
                         if let Some(ev) = keyboard::key_event(sc, false) {
-                            let _ = session::send_input(&connected.client, &ev);
+                            connected.send_input(&ev);
                         }
                     }
                     Event::ControllerButtonDown { button, .. } => {
@@ -367,16 +366,16 @@ pub(super) fn run_inner() -> Result<()> {
                         // Still forwarded: the hold requirement is what keeps game input and
                         // the shortcut apart.
                         let ev = gamepad::button_event(button, true, 0);
-                        let _ = session::send_input(&connected.client, &ev);
+                        connected.send_input(&ev);
                     }
                     Event::ControllerButtonUp { button, .. } => {
                         chord.set(button, false);
                         let ev = gamepad::button_event(button, false, 0);
-                        let _ = session::send_input(&connected.client, &ev);
+                        connected.send_input(&ev);
                     }
                     Event::ControllerAxisMotion { axis, value, .. } => {
                         let ev = gamepad::axis_event(axis, value, 0);
-                        let _ = session::send_input(&connected.client, &ev);
+                        connected.send_input(&ev);
                     }
                     // Magic Remote pointer mode surfaces as plain SDL2 mouse events, forwarded
                     // to the host instead of driving local UI focus (see `mouse.rs`).
@@ -391,28 +390,28 @@ pub(super) fn run_inner() -> Result<()> {
                             } else {
                                 mouse::move_event(x, y, display_mode.w as u32, display_mode.h as u32)
                             };
-                            let _ = session::send_input(&connected.client, &ev);
+                            connected.send_input(&ev);
                         }
                     }
                     Event::MouseButtonDown { mouse_btn, .. } if !hid_clicks => {
                         if let Some(ev) = mouse::button_event(mouse_btn, true) {
-                            let _ = session::send_input(&connected.client, &ev);
+                            connected.send_input(&ev);
                         }
                     }
                     Event::MouseButtonUp { mouse_btn, .. } if !hid_clicks => {
                         if let Some(ev) = mouse::button_event(mouse_btn, false) {
-                            let _ = session::send_input(&connected.client, &ev);
+                            connected.send_input(&ev);
                         }
                     }
                     Event::MouseWheel { x, y, .. } if !hid_clicks => {
                         if y != 0 {
                             if let Some(ev) = scroll_acc.scroll_event(y, false) {
-                                let _ = session::send_input(&connected.client, &ev);
+                                connected.send_input(&ev);
                             }
                         }
                         if x != 0 {
                             if let Some(ev) = scroll_acc.scroll_event(x, true) {
-                                let _ = session::send_input(&connected.client, &ev);
+                                connected.send_input(&ev);
                             }
                         }
                     }
@@ -474,8 +473,8 @@ pub(super) fn run_inner() -> Result<()> {
                     crate::platform::webos::input::WEBOS_BLUE_SCANCODE,
                 );
             if blue_down && !blue_held {
-                let now_on = !connected.stats.pacing_enabled.load(Ordering::Relaxed);
-                connected.stats.pacing_enabled.store(now_on, Ordering::Relaxed);
+                let now_on = !connected.stats().pacing_enabled.load(Ordering::Relaxed);
+                connected.stats().pacing_enabled.store(now_on, Ordering::Relaxed);
                 tracing::info!("frame pacing {} (Blue button)", if now_on { "on" } else { "off" });
                 notif.show(if now_on {
                     "Frame pacing enabled"
@@ -490,7 +489,7 @@ pub(super) fn run_inner() -> Result<()> {
             // trouble" signal the stats overlay's "Beat" line reads, just edge-triggered here so
             // it's visible without the overlay open. No matching "recovered" toast — the video
             // itself resuming is the recovery signal.
-            let holding_now = connected.stats.holding.load(Ordering::Relaxed);
+            let holding_now = connected.stats().holding.load(Ordering::Relaxed);
             if holding_now && !was_holding {
                 tracing::warn!("connection issues detected (freeze-until-reanchor)");
                 notif.show("Connection issues — recovering...");
@@ -540,10 +539,10 @@ pub(super) fn run_inner() -> Result<()> {
             }
             // Offloaded audio drains on its own dedicated thread instead (`session::ndl_audio_pump`).
             if let Some(player) = &mut audio_player {
-                session::pump_audio_once(&connected.client, player);
+                connected.pump_audio_once(player);
             }
             // Unconditional so both feedback planes keep draining with no pad attached.
-            session::pump_feedback_once(&connected.client, controller.as_mut(), ds_feedback.as_mut());
+            connected.pump_feedback_once(controller.as_mut(), ds_feedback.as_mut());
             // Skipped while the dialog owns the canvas. Stats/log share one clear/execute/present
             // so neither erases the other's tile.
             //
@@ -581,8 +580,8 @@ pub(super) fn run_inner() -> Result<()> {
                 // Content stays on a 500ms cadence even when a toast fade runs the loop faster.
                 if stats_enabled && stats_built_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(500)) {
                     stats_built_at = Some(Instant::now());
-                    let frames = connected.stats.frames.load(Ordering::Relaxed);
-                    let bytes = connected.stats.bytes.load(Ordering::Relaxed);
+                    let frames = connected.stats().frames.load(Ordering::Relaxed);
+                    let bytes = connected.stats().bytes.load(Ordering::Relaxed);
                     let dt = overlay_prev_at.elapsed().as_secs_f32().max(0.001);
                     let fps = (frames.saturating_sub(overlay_prev_frames)) as f32 / dt;
                     // Measured, vs. negotiated `resolved_bitrate_kbps`.
@@ -590,9 +589,9 @@ pub(super) fn run_inner() -> Result<()> {
                     overlay_prev_frames = frames;
                     overlay_prev_bytes = bytes;
                     overlay_prev_at = Instant::now();
-                    let mode = connected.client.mode();
-                    let feed_ms = connected.stats.feed_us.load(Ordering::Relaxed) as f32 / 1000.0;
-                    let holding = connected.stats.holding.load(Ordering::Relaxed);
+                    let info = connected.overlay_info();
+                    let feed_ms = connected.stats().feed_us.load(Ordering::Relaxed) as f32 / 1000.0;
+                    let holding = connected.stats().holding.load(Ordering::Relaxed);
                     // CPU% (one core) + RSS, only read while the overlay is up.
                     let cpu_mem_line = session::process_cpu_mem().map(|(cpu_ticks, mem_bytes)| {
                         // No baseline on the first sample, so CPU shows from the 2nd on.
@@ -612,50 +611,43 @@ pub(super) fn run_inner() -> Result<()> {
                     let mut lines = vec![
                         format!(
                             "{}x{}@{} {}{}",
-                            mode.width,
-                            mode.height,
-                            mode.refresh_hz,
-                            session::codec_name(connected.client.codec),
-                            if connected.client.color.is_hdr() { " HDR" } else { "" },
+                            info.width,
+                            info.height,
+                            info.refresh_hz,
+                            info.codec,
+                            if info.hdr { " HDR" } else { "" },
                         ),
                         format!("Video {fps:.1} fps · {frames} frames"),
                         {
                             // NDL's undecoded/unpresented depth: rising means decode is behind,
                             // flat-near-zero while stuttering means the problem is upstream.
-                            let backlog = connected.stats.render_backlog.load(Ordering::Relaxed);
+                            let backlog = connected.stats().render_backlog.load(Ordering::Relaxed);
                             let backlog = if backlog < 0 {
                                 "n/a".to_string()
                             } else {
                                 backlog.to_string()
                             };
+                            // "n/a" rather than 0 where the protocol has no such counter — a zero
+                            // would read as "no loss", which is a different claim.
+                            let or_na = |v: Option<u64>| v.map_or_else(|| "n/a".to_string(), |v| v.to_string());
                             format!(
                                 "Drop {} · FEC {} · hold {} · buf {backlog}",
-                                connected.client.frames_dropped(),
-                                connected.client.fec_recovered_shards(),
+                                or_na(info.frames_dropped),
+                                or_na(info.fec_recovered),
                                 if holding { "yes" } else { "no" },
                             )
                         },
-                        {
-                            // The encoder's CURRENT target, not the session-start negotiation:
-                            // on Automatic the ABR re-targets mid-session (and the host can
-                            // re-pick on a pipeline rebuild), which is exactly what you watch
-                            // when the picture is soft. `0` = a host too old to report one.
-                            let target_kbps = match connected.client.current_bitrate_kbps() {
-                                0 => connected.client.resolved_bitrate_kbps,
-                                live => live,
-                            };
-                            format!(
-                                "Feed {feed_ms:.1} ms · {:.0}/{} Mbps",
-                                actual_kbps / 1000.0,
-                                target_kbps / 1000,
-                            )
-                        },
+                        format!(
+                            "Feed {feed_ms:.1} ms · {:.0}/{} Mbps",
+                            actual_kbps / 1000.0,
+                            info.target_kbps / 1000,
+                        ),
                     ];
                     if let Some(line) = cpu_mem_line {
                         lines.push(line);
                     }
-                    if connected.stats.pacing_enabled.load(Ordering::Relaxed) {
-                        let delta_ms = connected.stats.pacing_delta_ns.load(Ordering::Relaxed) as f32 / 1_000_000.0;
+                    if connected.stats().pacing_enabled.load(Ordering::Relaxed) {
+                        let delta_ms = connected.stats().pacing_delta_ns.load(Ordering::Relaxed) as f32 / 1_000_000.0;
                         lines.push(format!("Pace {delta_ms:+.1} ms"));
                     }
                     match crate::ui::render_stats_overlay_tile(
@@ -726,7 +718,7 @@ pub(super) fn run_inner() -> Result<()> {
                     canvas.present();
                 }
             }
-            if connected.client.is_session_ended() {
+            if connected.is_session_ended() {
                 tracing::info!("host ended the session");
                 // `is_session_ended` covers both a graceful host close and a network
                 // drop/idle-timeout (see `NativeClient::is_session_ended`'s doc) — no

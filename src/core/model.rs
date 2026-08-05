@@ -7,7 +7,11 @@ use crate::core::protocol::{HostTrust, Protocol};
 pub struct ConnectTarget {
     pub host: String,
     pub port: u16,
-    pub fingerprint: [u8; 32],
+    /// Which protocol to stream over — `runtime::spawn_connect` dispatches on it.
+    pub protocol: Protocol,
+    /// The pinned host fingerprint, for a protocol that has one. `None` for `GameStream`, whose
+    /// trust is the registered client certificate (see [`HostTrust`]).
+    pub fingerprint: Option<[u8; 32]>,
     /// Library entry id to launch, or `None` for desktop.
     pub launch: Option<String>,
 }

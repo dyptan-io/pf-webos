@@ -34,7 +34,7 @@ impl ColorRangeOverride {
     /// the decoder; `Auto` leaves the host-signalled value untouched. NDL's native
     /// HDR-info struct has no range field so this is a no-op there — see
     /// `ndl.rs` `set_color_info`.
-    fn apply(self, color: &mut quic::ColorInfo) {
+    pub(crate) fn apply(self, color: &mut quic::ColorInfo) {
         match self {
             Self::Full => color.full_range = 1,
             Self::Limited => color.full_range = 0,

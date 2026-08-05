@@ -18,7 +18,7 @@ use crate::ui::render::{DrawCmd, TileId as Tile};
 use crate::ui::MenuEvent;
 
 /// `ConnectOutcome`: connect thread (started early to overlap animation) + settings.
-type ConnectOutcome = (std::thread::JoinHandle<Result<session::Connected>>, store::Settings);
+type ConnectOutcome = (std::thread::JoinHandle<Result<StreamHandle>>, store::Settings);
 
 /// Resolves a `GamepadType::Auto` preference against the attached controller, for this
 /// session only.
@@ -42,16 +42,66 @@ fn resolve_gamepad_type(
     settings
 }
 
-/// Start `session::connect` on its own thread. Caller joins after animation (or immediately).
-#[allow(clippy::too_many_arguments)]
+/// Start the connect on its own thread, dispatched by protocol. Caller joins after animation (or
+/// immediately).
 fn spawn_connect(
     identity: (String, String),
-    host: String,
-    port: u16,
-    fp: Option<[u8; 32]>,
-    launch: Option<String>,
+    target: crate::app::ConnectTarget,
     settings: store::Settings,
-) -> Result<std::thread::JoinHandle<Result<session::Connected>>> {
+    gamepad_attached: bool,
+) -> Result<std::thread::JoinHandle<Result<StreamHandle>>> {
+    match target.protocol {
+        store::Protocol::Punktfunk => spawn_connect_punktfunk(identity, target, settings),
+        store::Protocol::GameStream => spawn_connect_gamestream(target, settings, gamepad_attached),
+    }
+}
+
+/// `GameStream`: `/launch` and the stream driver both live behind
+/// `backend::gamestream::stream::connect`, so the hero-handover timing in `run_ui_flow` sees the
+/// same "one blocking connect on one thread" shape it always did.
+fn spawn_connect_gamestream(
+    target: crate::app::ConnectTarget,
+    settings: store::Settings,
+    gamepad_attached: bool,
+) -> Result<std::thread::JoinHandle<Result<StreamHandle>>> {
+    use crate::backend::gamestream::stream::{connect, GsConnectSpec};
+    std::thread::Builder::new()
+        .name("punktfunk-webos-connect".into())
+        .spawn(move || {
+            tracing::info!(
+                "GameStream: requesting {}x{}@{} from {}:{}",
+                settings.width,
+                settings.height,
+                settings.refresh_hz,
+                target.host,
+                target.port,
+            );
+            connect(GsConnectSpec {
+                addr: target.host,
+                query_port: target.port,
+                app_id: target.launch,
+                width: settings.width,
+                height: settings.height,
+                refresh_hz: settings.refresh_hz,
+                bitrate_kbps: settings.bitrate_kbps,
+                hdr_enabled: settings.hdr_enabled,
+                codec: settings.codec,
+                color_range_override: settings.color_range_override,
+                video_pacing: settings.video_pacing,
+                gamepad_type: settings.gamepad_type,
+                gamepad_attached,
+            })
+            .map(StreamHandle::GameStream)
+        })
+        .context("spawn connect thread")
+}
+
+fn spawn_connect_punktfunk(
+    identity: (String, String),
+    target: crate::app::ConnectTarget,
+    settings: store::Settings,
+) -> Result<std::thread::JoinHandle<Result<StreamHandle>>> {
+    let (host, port, fp, launch) = (target.host, target.port, target.fingerprint, target.launch);
     std::thread::Builder::new()
         .name("punktfunk-webos-connect".into())
         .spawn(move || {
@@ -92,6 +142,7 @@ fn spawn_connect(
                 settings.gamepad_type,
                 settings.cursor_capture,
             )
+            .map(StreamHandle::Punktfunk)
         })
         .context("spawn connect thread")
 }
@@ -287,7 +338,9 @@ enum StreamOutcome {
 
 mod input;
 mod stream;
+mod stream_handle;
 mod ui_flow;
 use input::*;
 use stream::run_inner;
+use stream_handle::StreamHandle;
 use ui_flow::run_ui_flow;

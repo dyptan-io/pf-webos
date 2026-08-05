@@ -20,7 +20,12 @@ use crate::services::library::LibraryError;
 
 pub mod http;
 pub mod identity;
+pub mod input;
 pub mod query;
+/// Gated like `platform`/`session` in `main.rs`: this one drives the video sink and NDL, so it is
+/// the only part of the backend that can't typecheck on a non-webOS host.
+#[cfg(target_os = "linux")]
+pub mod stream;
 
 /// mDNS service type `GameStream` hosts advertise. The SRV port on a record of this type is the
 /// host's *HTTP* port; the HTTPS one is only knowable from `/serverinfo`.
