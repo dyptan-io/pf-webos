@@ -637,6 +637,29 @@ impl App {
         app
     }
 
+    /// Tears down the mDNS browse and starts a new one for the currently enabled backends, so the
+    /// running service-type set matches `Settings::gamestream_enabled`. The browse set is chosen
+    /// once per daemon (`services::discovery::browse`), so without this the `_nvstream._tcp`
+    /// browse thread outlives the toggle going off and never appears when it goes on.
+    pub(crate) fn restart_discovery(&mut self) {
+        if let Some(daemon) = self.discovery_daemon.take() {
+            // The browse workers' receivers error out on shutdown, which ends their threads and
+            // closes the aggregate channel — the old `discovered` receiver is replaced below
+            // either way, so nothing is left draining it.
+            let _ = daemon.shutdown();
+        }
+        let backends = crate::backend::browse_backends(self.settings.gamestream_enabled);
+        match crate::services::discovery::browse(backends) {
+            Some((rx, daemon)) => {
+                self.discovered = rx;
+                self.discovery_daemon = Some(daemon);
+            }
+            // A daemon that won't start leaves discovery off for the rest of the session, same as
+            // at startup; an empty receiver just never yields.
+            None => self.discovered = std::sync::mpsc::channel().1,
+        }
+    }
+
     /// Rebuilds the sidebar from `known_hosts`, dropping any discovered-but-unsaved rows. Every
     /// caller that mutates `known_hosts` goes through this rather than collecting the list
     /// itself, so the `GameStream` visibility filter can't be forgotten at one site.

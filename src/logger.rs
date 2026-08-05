@@ -286,6 +286,17 @@ impl<S> Filter<S> for RingBufferFilter {
         })
     }
 }
+    
+/// `moonlight-common` logs per-packet: every keepalive ping, every RTSP body, every batched
+/// keyboard/gamepad input, every enet event. At `debug` that buries our own lines and churns
+/// the log rotation, so the whole crate is capped at `info` — it still reports stream
+/// start/stop, IDR requests and every warning. Raise this only while debugging `GameStream`
+/// itself.
+fn noise_filter() -> tracing_subscriber::filter::Targets {
+    tracing_subscriber::filter::Targets::new()
+        .with_target("moonlight_common", LevelFilter::INFO)
+        .with_default(LevelFilter::TRACE)
+}
 
 /// In-memory ring for log-tail overlay (independent of file/TCP sink).
 /// Formats before lock, holds only for bounded push/pop; zero I/O in render path.
@@ -341,12 +352,17 @@ pub fn init_subscriber(app_dir: &Path) -> Result<tracing_appender::non_blocking:
         .with_writer(writer)
         .with_ansi(false)
         .with_target(false)
-        .with_filter(filter);
+        .with_filter(filter)
+        .with_filter(noise_filter());
     // `RingBufferLayer` is gated by its own `RingBufferFilter` via `.with_filter`
     // (see that type's docs) so an inactive overlay can't silence `fmt_layer`.
     tracing_subscriber::registry()
         .with(fmt_layer)
-        .with(RingBufferLayer.with_filter(RingBufferFilter))
+        .with(
+            RingBufferLayer
+                .with_filter(RingBufferFilter)
+                .with_filter(noise_filter()),
+        )
         .init();
     Ok(guard)
 }

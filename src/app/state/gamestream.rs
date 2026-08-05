@@ -117,12 +117,21 @@ impl App {
     ///
     /// Rebuilding the sidebar is not enough on its own: with the toggle off a `GameStream` host
     /// loses its row, but a library already fetched from it would keep filling the grid — a game
-    /// list belonging to a host the user can no longer see or go back to.
+    /// list belonging to a host the user can no longer see or go back to. The browse itself has to
+    /// move too, or the toggle would only ever hide rows the client is still spending a thread and
+    /// mDNS traffic to find.
     pub(crate) fn apply_gamestream_visibility(&mut self) {
+        self.restart_discovery();
         self.refilter_entries();
         if self.settings.gamestream_enabled {
+            // Nothing is parked yet (the fresh browse hasn't resolved anything), but a host that
+            // resolves next is only shadowed once its punktfunk side has been probed.
+            self.refresh_gamestream_shadowing();
             return;
         }
+        // Parked rows belong to a protocol that is no longer browsed for, so they can never be
+        // un-parked by a later sweep — dropping them is what stops the toggle leaking them back.
+        self.shadowed_gamestream.clear();
         let selected_gs = self
             .selected_known_host()
             .is_some_and(|h| h.protocol == Protocol::GameStream);
