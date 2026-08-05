@@ -10,7 +10,7 @@ Branch: `gamestream-seam`, not pushed. Base: `314d912`.
 | Phase | State |
 | --- | --- |
 | P0 armv7 build | **Done** at build level. Not run on device. |
-| P1 pairing + host queries | **Code complete, unproven.** No Sunshine host has been reached. |
+| P1 pairing + host queries | **In progress against a real host.** Two client-side bugs found and fixed (query encoding, connection pooling); pairing has not completed yet. See "What is verified". |
 | P2 seam refactor | **Done at build level.** Traits/protocol/trust/discovery/caps, plus `session/sink.rs`. The sink has not been streamed against a host. |
 | P3 non-streaming backend | **Code complete except the manual-IP fallback probe, unproven.** Backend, dual browse, display-PIN pairing, art, unpair, the `gamestream_enabled` gate. |
 | P4 streaming driver | **Code complete, unproven.** No hand-rolled driver was needed — see below. |
@@ -19,15 +19,18 @@ Branch: `gamestream-seam`, not pushed. Base: `314d912`.
 ## What is verified, and how
 
 Cross-target `task docker:check` and `task docker:lint` are green for
-`armv7-unknown-linux-gnueabi`. Nothing has run on hardware — there is no `TV_HOST` in `.env`, and
-Docker only cross-compiles.
+`armv7-unknown-linux-gnueabi`, and the three `gamestream::input` translation tests plus the
+`EncodedQuery` one pass. `TV_HOST` **is** set in `.env` now (192.168.1.147) and a Sunshine host is on
+the LAN at 192.168.1.102, so `task deploy PROBES=1 TELEMETRY=auto` is the loop to use — everything
+below that says "unproven" can be tested.
 
 `gsprobe` was built and run for real, but only natively in the aarch64 container: the link
 check prints the parsed `ServerVersion` and crypto backend, and `gsprobe info` against an
 unroutable address fails cleanly with `Ureq(Timeout(Connect))`. That exercises argument
 handling, the HTTP client construction and the error path — nothing that needs a host.
 
-**No host, of either protocol, has been talked to.** The changes that most need a real run:
+**A Sunshine host has now been talked to** (see the pairing findings below); **no punktfunk host
+has**, so every P2 claim is still a compile-time claim. The changes that most need a real run:
 
 - Discovery still finds punktfunk hosts (the browse loop was rewritten from a blocking `recv` to
   a round-robin `try_recv`).
@@ -37,11 +40,9 @@ handling, the HTTP client construction and the error path — nothing that needs
 - **The video sink.** Every frame now goes through `session::sink::NdlSink` instead of inline
   pump code. Stream a punktfunk host and diff the stats overlay (feed µs, backlog, pacing delta,
   hold behaviour on induced loss) against a build of `314d912`. Compile-clean is not evidence.
-- **All of P1.** `gsprobe pair` against a Sunshine host is the phase's exit criterion and has
-  not been run. The three places our own code could be wrong, in order of likelihood: the
-  query-string assembly (upstream builds it through `hyper::Uri`, we assemble the string), the
-  PKCS#8-vs-PKCS#1 private-key branch in `client_key_der`, and the exact-DER server verifier —
-  a mismatch there presents as a TLS handshake failure right after pairing appears to succeed.
+- **P1 through to a completed pairing.** Two of the three predicted suspects were wrong and the
+  first one was right in an unexpected way — the query-string assembly, but the *encoding* under it
+  rather than the assembly. Details and what to do next:
 
 ## Corrections to the plan
 
