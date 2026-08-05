@@ -3,14 +3,14 @@
 State of the work described in `docs/GameStream-Plan.md`. Read the plan first; this file only
 records what is *done*, what was *learned*, and what the next session should pick up.
 
-Branch: `gamestream-seam`, one commit, not pushed. Base: `314d912`.
+Branch: `gamestream-seam`, not pushed. Base: `314d912`.
 
 ## Status by phase
 
 | Phase | State |
 | --- | --- |
 | P0 armv7 build | **Done** at build level. Not run on device. |
-| P1 pairing + host queries | Not started. |
+| P1 pairing + host queries | **Code complete, unproven.** No Sunshine host has been reached. |
 | P2 seam refactor | **Done at build level.** Traits/protocol/trust/discovery/caps, plus `session/sink.rs`. The sink has not been streamed against a host. |
 | P3 non-streaming backend | Not started. |
 | P4 streaming driver | Not started. |
@@ -22,7 +22,12 @@ Cross-target `task docker:check` and `task docker:lint` are green for
 `armv7-unknown-linux-gnueabi`. Nothing has run on hardware — there is no `TV_HOST` in `.env`, and
 Docker only cross-compiles.
 
-**Nothing in this branch has been exercised at runtime.** The changes that most need a real run:
+`gsprobe` was built and run for real, but only natively in the aarch64 container: the link
+check prints the parsed `ServerVersion` and crypto backend, and `gsprobe info` against an
+unroutable address fails cleanly with `Ureq(Timeout(Connect))`. That exercises argument
+handling, the HTTP client construction and the error path — nothing that needs a host.
+
+**No host, of either protocol, has been talked to.** The changes that most need a real run:
 
 - Discovery still finds punktfunk hosts (the browse loop was rewritten from a blocking `recv` to
   a round-robin `try_recv`).
@@ -32,6 +37,11 @@ Docker only cross-compiles.
 - **The video sink.** Every frame now goes through `session::sink::NdlSink` instead of inline
   pump code. Stream a punktfunk host and diff the stats overlay (feed µs, backlog, pacing delta,
   hold behaviour on induced loss) against a build of `314d912`. Compile-clean is not evidence.
+- **All of P1.** `gsprobe pair` against a Sunshine host is the phase's exit criterion and has
+  not been run. The three places our own code could be wrong, in order of likelihood: the
+  query-string assembly (upstream builds it through `hyper::Uri`, we assemble the string), the
+  PKCS#8-vs-PKCS#1 private-key branch in `client_key_der`, and the exact-DER server verifier —
+  a mismatch there presents as a TLS handshake failure right after pairing appears to succeed.
 
 ## Corrections to the plan
 
@@ -82,9 +92,41 @@ GameStream `KnownHost`s out of the sidebar.
 - `src/app/state/hostmenu.rs` — speed-test row gated on `caps().speed_test`.
 - `src/app/state/pairing.rs` — default focus avoids the request-access button when
   `!caps().request_access`.
-- `src/bin/gsprobe.rs` — P0 probe.
+- `src/bin/gsprobe.rs` — the probe CLI: `info` / `pair` / `applist` / `art` / `unpair`, plus the
+  bare P0 link check when run with no arguments.
+- `src/backend/gamestream/mod.rs` — `open`/`pair`/`unpair`/`app_list`/`box_art` over
+  `moonlight_common::high::std::MoonlightHost`. No `HostBackend` impl yet (P3).
+- `src/backend/gamestream/http.rs` — `GsHttpClient`, our `RequestClient` over ureq + rustls.
+- `src/backend/gamestream/identity.rs` — the RSA client identity and the per-host server
+  certificate, in their own files beside punktfunk's.
+- `src/services/pinned_tls.rs` — the ureq TLS transport, lifted verbatim out of
+  `services::library` so both protocols share it. Each supplies its own verifier.
+- `src/services/paths.rs` — `app_dir()`, moved out of `store` so `gsprobe` can pull in one leaf
+  module instead of the persistence layer.
 - `src/session/sink.rs` — `VideoSink`/`FrameFlags`/`SinkResult`, `NdlSink`, and `VideoPlayer`
   (moved out of `session/mod.rs`). See the sink section below.
+
+## P1 notes
+
+- **We implement `RequestClient` ourselves** (`backend/gamestream/http.rs`). The crate ships a
+  ureq implementation, but it is behind a feature that also pulls in `hyper` (its URL builder
+  returns a `hyper::Uri`), and it calls `.disable_verification(true)` under a
+  `TODO: THIS MUST BE CHANGED`. Ours pins the server certificate by exact DER equality — there
+  is no name or chain to check on a `GameStream` host — while still verifying handshake
+  signatures, so a replay of the host's public certificate doesn't get through.
+- **`gsprobe` reaches app modules with `#[path]` on inline `mod` blocks.** The crate has no
+  library target, so a `src/bin/*.rs` cannot `use` the app's modules. The `#[path = "../backend"]
+  mod backend { pub mod gamestream; }` form keeps their internal `crate::…` paths resolving
+  unchanged, which is what makes the probe exercise the *shipping* code rather than a copy.
+  If a library target ever appears, this collapses to plain imports.
+- **`MoonlightHost` is used as-is.** It already caches `/serverinfo` and `/applist`, holds the
+  client behind a mutex, and drives the five pairing phases. Wrapping it in our own state would
+  duplicate that for nothing; P3's `HostBackend` impl should hold one per host.
+- **The client identity is stored, not derived.** RSA-2048 keygen takes seconds on this CPU, so
+  `identity::load_or_create_client` must never run on the UI thread — P3 needs it off-thread
+  behind the pairing modal, the same way `App::try_request_access` already works.
+- **`gsprobe art` writes the file rather than printing bytes.** The binary `/appasset` endpoint
+  is the only authenticated non-XML path; the text endpoints wouldn't catch a break in it.
 
 ## Deliberate deviations from the plan's design
 
@@ -135,8 +177,23 @@ Deviations from the plan's sketch, same rule as the list above — don't "fix" w
 
 ## Next session
 
-`session::connect`'s argument list and the `Connected { client }` narrowing are the remaining
-P2-adjacent cleanups; neither blocks P1 or P3. The anchors found while exploring:
+**First, prove P1 against a real Sunshine host** — it is the cheapest way to find out whether
+the HTTP client is right, and P3 builds directly on it. `gsprobe` is not in the `.ipk`
+(see the loose ends below), so either add it to `packaging/` or run it from a dev-mode shell:
+
+```text
+gsprobe info <host>       # should print name, version, https port, paired=false
+gsprobe pair <host>       # prints a PIN; type it into Sunshine's web UI
+gsprobe applist <host>    # should list apps once paired
+gsprobe art <host> <id>   # writes gamestream-art-<id>.png next to the identity files
+```
+
+Then P3 (the non-streaming backend): a `HostBackend` impl over `backend::gamestream`, the second
+mDNS browse, manual-IP fallback probing, the display-PIN pairing layout, and the
+`Settings::gamestream_enabled` gate — which is still enforced nowhere.
+
+`session::connect`'s argument list and the `Connected { client }` narrowing are leftover
+P2-adjacent cleanups; neither blocks P3. The anchors found while exploring:
 
 - `session::connect` is 15 positional args (`session/mod.rs:265-281`), sole caller
   `runtime::spawn_connect` (`runtime/mod.rs:47-97`). A `ConnectSpec` struct would collapse both
@@ -157,7 +214,6 @@ P2-adjacent cleanups; neither blocks P1 or P3. The anchors found while exploring
   nothing works yet — `description.html` is the Homebrew Channel store copy. Reword to
   planned/experimental, or hold both until P4.
 - **`gsprobe` is not shipped in the `.ipk`** (neither is `pfprobe`), so P0's stated exit
-  criterion of "runs on device" cannot be met without adding it to `packaging/`. The decision
-  taken was to trust the clean cross-link and let P1 exercise the dependency against a real
-  Sunshine host.
+  criterion of "runs on device" cannot be met without adding it to `packaging/`. P1 now has
+  real work for it to do on-device, so this is worth fixing rather than working around.
 - The `dist/` `.ipk` at 4.29 MB was built from this branch, if you want a size baseline.

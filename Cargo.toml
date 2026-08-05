@@ -47,6 +47,10 @@ moonlight-common = { git = "https://github.com/MrCreativ3001/moonlight-common-ru
     "std",
     "rustcrypto",
 ] }
+# PEM container type in `moonlight-common`'s `RequestClient` signatures — we implement that
+# trait (`backend::gamestream::http`), so the type is unavoidable in our own API. Same major
+# as the one it resolves, so there is one `pem` in the tree.
+pem = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # mDNS LAN discovery; direct dep (not via pf-client-core — see session.rs docs).

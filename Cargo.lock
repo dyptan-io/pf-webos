@@ -1436,6 +1436,7 @@ dependencies = [
  "mdns-sd",
  "moonlight-common",
  "opus",
+ "pem",
  "punktfunk-core",
  "rustls",
  "sdl2",

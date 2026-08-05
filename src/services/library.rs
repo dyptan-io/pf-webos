@@ -4,14 +4,13 @@
 //! A trimmed port of `pf-client-core::library` (same wire shape, same mTLS pinning
 //! verifier) rather than a dependency on that crate — see `session.rs`'s module docs
 //! for why this client doesn't pull in `pf-client-core` at all.
-use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ureq::unversioned::resolver::DefaultResolver;
-use ureq::unversioned::transport::{
-    Buffers, ConnectionDetails, Connector, Either, LazyBuffers, NextTimeout, TcpConnector, Transport, TransportAdapter,
-};
+use ureq::unversioned::transport::{Connector as _, TcpConnector};
+
+use crate::services::pinned_tls::PinnedTlsConnector;
 
 pub use crate::core::model::GameEntry;
 
@@ -72,9 +71,9 @@ pub fn agent(identity: &(String, String), pin: Option<[u8; 32]>) -> Result<ureq:
         .with_client_auth_cert(vec![cert], key)
         .map_err(|e| bad("client auth", &e))?;
 
-    // WHY: ureq's TlsConfig doesn't hook custom fingerprint pinning. Custom Connector
-    // (PinnedTlsConnector below) wraps cfg for pinning, chained onto TcpConnector.
-    let connector = TcpConnector::default().chain(PinnedTlsConnector { config: Arc::new(cfg) });
+    // WHY: ureq's TlsConfig doesn't hook custom fingerprint pinning, so the config above
+    // (with `PinVerify` installed) goes through `services::pinned_tls` instead.
+    let connector = TcpConnector::default().chain(PinnedTlsConnector::new(Arc::new(cfg)));
     let config = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(5)))
         .timeout_global(Some(Duration::from_secs(10)))
@@ -182,88 +181,6 @@ fn classify(e: ureq::Error) -> LibraryError {
             rustls::CertificateError::ApplicationVerificationFailure,
         )) => LibraryError::PinMismatch,
         other => LibraryError::Unreachable(other.to_string()),
-    }
-}
-
-/// Wraps a chained (TCP) transport in TLS using a caller-supplied `rustls::ClientConfig`
-/// verbatim — modeled directly on ureq 3.x's own (crate-private) `RustlsConnector`
-/// (`ureq` crate, `src/tls/rustls.rs`), minus its `TlsConfig`-driven `build_config` step,
-/// since that step has no way to install `PinVerify`'s fingerprint-pinning verifier.
-struct PinnedTlsConnector {
-    config: Arc<rustls::ClientConfig>,
-}
-
-impl std::fmt::Debug for PinnedTlsConnector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PinnedTlsConnector").finish()
-    }
-}
-
-impl<In: Transport> Connector<In> for PinnedTlsConnector {
-    type Out = Either<In, PinnedTlsTransport>;
-
-    fn connect(&self, details: &ConnectionDetails, chained: Option<In>) -> Result<Option<Self::Out>, ureq::Error> {
-        let Some(transport) = chained else {
-            panic!("PinnedTlsConnector requires a chained transport");
-        };
-        if !details.needs_tls() || transport.is_tls() {
-            return Ok(Some(Either::A(transport)));
-        }
-
-        let name: rustls::pki_types::ServerName<'_> = details
-            .uri
-            .authority()
-            .expect("uri authority for tls")
-            .host()
-            .try_into()
-            .map_err(|_| ureq::Error::Tls("invalid DNS name"))?;
-        let conn = rustls::ClientConnection::new(self.config.clone(), name.to_owned())?;
-        let stream = rustls::StreamOwned {
-            conn,
-            sock: TransportAdapter::new(transport.boxed()),
-        };
-        let buffers = LazyBuffers::new(details.config.input_buffer_size(), details.config.output_buffer_size());
-        Ok(Some(Either::B(PinnedTlsTransport { buffers, stream })))
-    }
-}
-
-struct PinnedTlsTransport {
-    buffers: LazyBuffers,
-    stream: rustls::StreamOwned<rustls::ClientConnection, TransportAdapter>,
-}
-
-impl std::fmt::Debug for PinnedTlsTransport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PinnedTlsTransport").finish()
-    }
-}
-
-impl Transport for PinnedTlsTransport {
-    fn buffers(&mut self) -> &mut dyn Buffers {
-        &mut self.buffers
-    }
-
-    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
-        self.stream.get_mut().set_timeout(timeout);
-        let output = &self.buffers.output()[..amount];
-        self.stream.write_all(output)?;
-        Ok(())
-    }
-
-    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
-        self.stream.get_mut().set_timeout(timeout);
-        let input = self.buffers.input_append_buf();
-        let amount = self.stream.read(input)?;
-        self.buffers.input_appended(amount);
-        Ok(amount > 0)
-    }
-
-    fn is_open(&mut self) -> bool {
-        self.stream.get_mut().get_mut().is_open()
-    }
-
-    fn is_tls(&self) -> bool {
-        true
     }
 }
 

@@ -1,14 +1,72 @@
-//! Headless `GameStream` probe CLI (mirrors `pfprobe.rs`). Run on-device over SSH to confirm the
-//! `moonlight-common` dependency links and runs on webOS armv7 — the P0 gate of
-//! `docs/GameStream-Plan.md`. Grows into pairing/`serverinfo`/`applist` coverage in P1.
-//! Usage: gsprobe
+//! Headless `GameStream` probe CLI (mirrors `pfprobe.rs`). Run on-device over SSH to exercise
+//! the `moonlight-common` dependency against a real Sunshine host — P0 (does it link and run on
+//! webOS armv7) and P1 (pairing and host queries) of `docs/GameStream-Plan.md`.
+//!
+//! ```text
+//! gsprobe                          # P0: prove the crate linked
+//! gsprobe info    <host> [port]    # /serverinfo
+//! gsprobe pair    <host> [port]    # display a PIN, wait for the host's web UI
+//! gsprobe applist <host> [port]    # /applist (requires pairing)
+//! gsprobe art     <host> <app-id> [port]
+//! gsprobe unpair  <host> [port]
+//! ```
+//!
+//! The app is a single binary crate with no library target, so the modules under test are pulled
+//! in by path rather than imported. The `#[path]`-on-an-inline-module form is what keeps their
+//! `crate::…` paths resolving exactly as they do in the app: `backend::gamestream` still finds
+//! `services::pinned_tls` here. Compiling the real modules is the whole point — a probe that
+//! reimplemented the HTTP or identity handling would prove nothing about what P3 will ship.
 
-use anyhow::Result;
-use moonlight_common::crypto::rustcrypto::RustCryptoBackend;
-use moonlight_common::http::{DEFAULT_HTTPS_PORT, DEFAULT_HTTP_PORT};
-use moonlight_common::ServerVersion;
+#[path = "../services"]
+mod services {
+    pub mod paths;
+    pub mod pinned_tls;
+}
+
+#[path = "../backend"]
+mod backend {
+    pub mod gamestream;
+}
+
+use anyhow::{Context, Result};
+use backend::gamestream;
+use moonlight_common::AppId;
 
 fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_target(false)
+        .init();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    match argv.as_slice() {
+        [] => link_check(),
+        ["info", host, rest @ ..] => info(host, port(rest)?),
+        ["pair", host, rest @ ..] => pair(host, port(rest)?),
+        ["applist", host, rest @ ..] => applist(host, port(rest)?),
+        ["art", host, app_id, rest @ ..] => art(host, app_id, port(rest)?),
+        ["unpair", host, rest @ ..] => unpair(host, port(rest)?),
+        _ => anyhow::bail!("usage: gsprobe [info|pair|applist|art|unpair] <host> [args] — see the module docs"),
+    }
+}
+
+fn port(rest: &[&str]) -> Result<Option<u16>> {
+    match rest {
+        [] => Ok(None),
+        [p] => Ok(Some(p.parse().with_context(|| format!("bad port {p:?}"))?)),
+        _ => anyhow::bail!("too many arguments"),
+    }
+}
+
+/// P0: no host needed. Naming the types is what proves the pure-Rust AES/RSA path linked —
+/// the half of the dependency with no C fallback to fall back on.
+fn link_check() -> Result<()> {
+    use moonlight_common::crypto::rustcrypto::RustCryptoBackend;
+    use moonlight_common::http::{DEFAULT_HTTPS_PORT, DEFAULT_HTTP_PORT};
+    use moonlight_common::ServerVersion;
+
     // Sunshine reports 7.1.431 with a negative mini-patch; the parse is what tells us the
     // crate's version/server-type logic survived the cross-build with the right int widths.
     let version = ServerVersion::new(7, 1, 431, -1);
@@ -16,9 +74,63 @@ fn main() -> Result<()> {
         "moonlight-common ok: server_type={:?} version={}.{}.{} http={DEFAULT_HTTP_PORT} https={DEFAULT_HTTPS_PORT}",
         version.server_type, version.major, version.minor, version.patch
     );
-
-    // Naming the crypto backend proves the pure-Rust AES/RSA path linked, which is the half of
-    // the dependency that has no C fallback for us to fall back on.
     println!("crypto backend: {}", std::any::type_name::<RustCryptoBackend>());
+    Ok(())
+}
+
+fn info(address: &str, port: Option<u16>) -> Result<()> {
+    let host = gamestream::open(address, port)?;
+    println!("name:        {}", host.host_name().unwrap_or_default());
+    println!("version:     {:?}", host.version().ok());
+    println!("state:       {:?}", host.state().ok());
+    println!("https port:  {:?}", host.https_port().ok());
+    println!("paired:      {}", host.is_paired().unwrap_or(false));
+    println!("current app: {:?}", host.current_game().ok());
+    println!("mac:         {:?}", host.mac().ok().flatten());
+    Ok(())
+}
+
+/// The flow is inverted from punktfunk's: this side generates the PIN and the *user* types it
+/// into the host's web UI, so the PIN is printed before the blocking call rather than prompted
+/// for. Sunshine shows a pending-PIN box; older `GameStream` hosts show a full-screen prompt.
+fn pair(address: &str, port: Option<u16>) -> Result<()> {
+    let host = gamestream::open(address, port)?;
+    if host.is_paired().unwrap_or(false) {
+        println!("already paired with {address}");
+        return Ok(());
+    }
+    let pin = gamestream::generate_pin()?;
+    println!("PIN: {pin}");
+    println!("enter it in the host's web UI (Sunshine: Troubleshooting → PIN); waiting…");
+    gamestream::pair(&host, pin)?;
+    println!("paired");
+    Ok(())
+}
+
+fn applist(address: &str, port: Option<u16>) -> Result<()> {
+    let host = gamestream::open(address, port)?;
+    for app in gamestream::app_list(&host)? {
+        let hdr = if app.is_hdr_supported { "  [HDR]" } else { "" };
+        println!("{:>6}  {}{hdr}", app.id.0, app.title);
+    }
+    Ok(())
+}
+
+/// Writes the art next to the identity files rather than printing it — the point is to confirm
+/// the authenticated *binary* endpoint works, which the text ones don't cover.
+fn art(address: &str, app_id: &str, port: Option<u16>) -> Result<()> {
+    let id: u32 = app_id.parse().with_context(|| format!("bad app id {app_id:?}"))?;
+    let host = gamestream::open(address, port)?;
+    let bytes = gamestream::box_art(&host, AppId(id))?;
+    let path = services::paths::app_dir().join(format!("gamestream-art-{id}.png"));
+    std::fs::write(&path, &bytes).with_context(|| format!("write {}", path.display()))?;
+    println!("{} bytes -> {}", bytes.len(), path.display());
+    Ok(())
+}
+
+fn unpair(address: &str, port: Option<u16>) -> Result<()> {
+    let host = gamestream::open(address, port)?;
+    gamestream::unpair(&host)?;
+    println!("unpaired from {address}");
     Ok(())
 }

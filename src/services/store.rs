@@ -9,9 +9,7 @@ pub use crate::core::model::{
 };
 pub use crate::core::protocol::{HostTrust, Protocol};
 
-pub(crate) fn app_dir() -> PathBuf {
-    std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from)
-}
+pub(crate) use crate::services::paths::app_dir;
 
 fn identity_paths() -> (PathBuf, PathBuf) {
     let dir = app_dir();

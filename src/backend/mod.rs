@@ -12,6 +12,13 @@ use crate::core::protocol::Protocol;
 use crate::services::discovery::DiscoveredHost;
 use crate::services::library::LibraryError;
 
+// P1 landed the host-query and pairing half of `GameStream`, but nothing in the app calls it
+// yet — `backend_for` still returns `None` for that protocol and `src/bin/gsprobe.rs` is the
+// only caller. The allow goes when P3 gives it a `HostBackend` impl; until then the module is
+// dead code in this binary by design, and deleting the warning is cheaper than pretending
+// otherwise with a stub call site.
+#[allow(dead_code)]
+pub mod gamestream;
 pub mod punktfunk;
 
 /// Which optional host features a protocol actually has. Screens use this to *omit* affordances,
