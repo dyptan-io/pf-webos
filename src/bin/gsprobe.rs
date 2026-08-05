@@ -40,7 +40,10 @@ use gamestream::query;
 use moonlight_common::AppId;
 
 fn main() -> Result<()> {
+    // Debug by default: `tracing-subscriber` is built without `env-filter` here, so `RUST_LOG`
+    // does nothing and the default INFO ceiling would hide the per-request lines this exists for.
     tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .with_target(false)

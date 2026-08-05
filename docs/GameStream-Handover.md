@@ -10,7 +10,7 @@ Branch: `gamestream-seam`, not pushed. Base: `314d912`.
 | Phase | State |
 | --- | --- |
 | P0 armv7 build | **Done** at build level. Not run on device. |
-| P1 pairing + host queries | **In progress against a real host.** Two client-side bugs found and fixed (query encoding, connection pooling); pairing has not completed yet. See "What is verified". |
+| P1 pairing + host queries | **Working against a real host.** Pairing completes, `applist` and box art work. Three client-side bugs found and fixed (query encoding, connection pooling, TLS resumption). See "What is verified". |
 | P2 seam refactor | **Done at build level.** Traits/protocol/trust/discovery/caps, plus `session/sink.rs`. The sink has not been streamed against a host. |
 | P3 non-streaming backend | **Code complete except the manual-IP fallback probe, unproven.** Backend, dual browse, display-PIN pairing, art, unpair, the `gamestream_enabled` gate. |
 | P4 streaming driver | **Code complete, unproven.** No hand-rolled driver was needed — see below. |
@@ -24,10 +24,10 @@ Cross-target `task docker:check` and `task docker:lint` are green for
 the LAN at 192.168.1.102, so `task deploy PROBES=1 TELEMETRY=auto` is the loop to use — everything
 below that says "unproven" can be tested.
 
-`gsprobe` was built and run for real, but only natively in the aarch64 container: the link
-check prints the parsed `ServerVersion` and crypto backend, and `gsprobe info` against an
-unroutable address fails cleanly with `Ureq(Timeout(Connect))`. That exercises argument
-handling, the HTTP client construction and the error path — nothing that needs a host.
+`gsprobe` has been run **on the TV against the live Sunshine host**: `info`, `pair`, `applist` and
+`art` all succeed there. It logs at debug unconditionally, because `tracing-subscriber` is built
+here without `env-filter` and so ignores `RUST_LOG` — an empty trace from a probe run used to look
+like a silent failure.
 
 **A Sunshine host has now been talked to** (see the pairing findings below); **no punktfunk host
 has**, so every P2 claim is still a compile-time claim. The changes that most need a real run:
@@ -40,14 +40,13 @@ has**, so every P2 claim is still a compile-time claim. The changes that most ne
 - **The video sink.** Every frame now goes through `session::sink::NdlSink` instead of inline
   pump code. Stream a punktfunk host and diff the stats overlay (feed µs, backlog, pacing delta,
   hold behaviour on induced loss) against a build of `314d912`. Compile-clean is not evidence.
-- **P1 through to a completed pairing** — see the section below. Two of the three predicted
-  suspects were wrong, and the one that was right was right for an unexpected reason: the
-  query-string assembly, but the *encoding* under it rather than the assembly itself.
+- **Pairing from scratch with resumption disabled** — the pairing that completed did so one build
+  earlier, on the retry path. See the P1 section below.
 
 ## P1: pairing against a real host
 
-**Pairing has now been attempted against a real Sunshine host** (192.168.1.102, with the TV at
-192.168.1.147 — first contact of the whole branch). Three findings, in the order they surfaced:
+**Pairing works against a real Sunshine host** (192.168.1.102, with the TV at 192.168.1.147). Five
+findings, in the order they surfaced — every one of them client-side:
 
 1. **Fixed and proven: no request left the TV at all.** `moonlight-common` assembles queries through
    its `QueryBuilder` trait, and its `impl QueryBuilder for String` — the one we were passing —
@@ -57,26 +56,56 @@ has**, so every P2 claim is still a compile-time claim. The changes that most ne
    through its own `EncodedQuery` (percent-encodes everything outside RFC 3986 unreserved), which is
    what moonlight-qt does via `QUrlQuery` and what Sunshine decodes. Proven by the failure moving
    on. **Do not "simplify" this back to `String`.**
-2. **Fixed, NOT yet verified: connection pooling.** The next failure was
+2. **Fixed: connection pooling.** The next failure was
    `Io(UnexpectedEof, "Peer disconnected")` about 8 ms after the request, **with nothing in
    Sunshine's log** — and the user had already entered the PIN, so it was not a timeout. Those three
    facts together say the bytes went into a socket the host had already closed and never reached its
    handler, which is what a stale pooled keep-alive connection does. Both agents now set
    `max_idle_connections(0)`; pairing is especially exposed because it has a human-scale pause (the
    PIN) in the middle, exactly when a pooled connection goes stale. The cost is one TCP/TLS setup
-   per request, on a handful of one-shot LAN calls. **This was deployed but the retry result is not
-   recorded here — confirm it before trusting the reasoning.**
+   per request, on a handful of one-shot LAN calls. The `UnexpectedEof` has not come back in any run
+   since, though the failure it uncovered next (below) is what actually took the branch forward.
 3. **Diagnosability.** Every pairing phase posts to `/pair`, so the failing phase was invisible. The
    request log line now carries the whole URL; read `phrase=` (`getservercert` / `clientchallenge` /
-   `pairchallenge`) and the scheme to place any future failure. If pairing still dies:
-   - **an HTTPS phase** → the host is rejecting our client certificate. `ClientSecret::to_pem` is
-     PKCS#8 (`PRIVATE KEY`), which `client_key_der` handles, so a key/cert mismatch is unlikely;
-     more likely Sunshine's pairing state was left mid-flight by the earlier failures. Delete
-     `gamestream-server-*.pem` on the TV, unpair the TV in Sunshine, retry from clean.
-   - **an HTTP phase** → the phase's own window closed before the PIN was entered.
+   `pairchallenge`) and the scheme to place any future failure. That line is what identified the
+   next failure as phase 5.
+4. **Fixed and proven: Sunshine cannot resume a TLS session.** With pooling off, the failure became
+   `AlertReceived(InternalError)` on the phase-5 HTTPS call (`phrase=pairchallenge`) — the *only*
+   HTTPS request in the handshake, sent right after phase 4 registers the client certificate. The
+   alert comes from the host, and it is not about the certificate: the identical request with the
+   identical certificate succeeds from the TV (`curl`) and from a desktop rustls client seconds
+   later, and Sunshine had already accepted us (`/pair?phrase=pairchallenge` → `<paired>1</paired>`)
+   while the TV had written no `gamestream-server-*.pem`. What Sunshine actually rejects is
+   **resumption**: it hands out TLS 1.3 session tickets and then answers a resuming ClientHello with
+   a fatal `internal_error`. Because nothing here pools connections, every HTTPS request after the
+   first in a process tried to resume — two cached tickets, two dead handshakes, success only on the
+   third attempt, which is the exact pattern the on-device trace showed for phase 5, `/serverinfo`
+   and `/applist` alike. `with_certificates` now sets
+   `cfg.resumption = rustls::client::Resumption::disabled()`. Proven: with it, `gsprobe applist` and
+   a box-art fetch run with zero retries; without it, two per request.
 
-**Nothing else has run against a host.** In particular P4 (everything in the section below) has
-never had a frame through it, because it needs a paired host to reach.
+   Two traps this cost time on, worth not repeating: `openssl s_client` and `curl` **cannot**
+   reproduce it, because neither resumes — every hand-run reproduction attempt passed. And the
+   symptom looks like a certificate problem, so the client-cert profile (`Profile::Root`, CA:TRUE
+   with no `digitalSignature`), the key encoding, and the TLS version were all investigated and are
+   all fine: Sunshine verifies the client certificate at the *HTTP* layer and answers an unknown one
+   with a 401 body, never a TLS alert.
+5. **Insurance, deliberately kept: `get_with_retry`.** Two retries 400 ms apart, only for errors
+   where nothing was served (connect/handshake). Not the fix — resumption is — but pairing is the
+   one flow whose failure costs the user a trip to the host for a fresh PIN, and it can leave the
+   two sides disagreeing about whether they are paired, so one lost handshake should not end it.
+
+**Pairing now completes** (`gsprobe pair` → `paired`, `gamestream-server-192.168.1.102.pem`
+written), and `applist` and box art work against the live host. The pairing run happened one build
+before resumption was disabled, so it went through on the retry path; the from-scratch pairing run
+with the resumption fix in place is the one thing still owed. Everything else about P4 (the section
+below) still has never had a frame through it.
+
+**Running `gsprobe` over SSH: mind the file owner.** It runs as root, the app runs as uid 6703, and
+both use the same app directory — a `gamestream-server-*.pem` written by the probe makes the app
+fail with `Permission denied` on its next pairing. `chown 6703:5000` anything the probe leaves, or
+delete it. Also copy the probe to `/tmp/gsprobe` rather than relying on the one in the package:
+webOS reinstalls the app behind your back and the app directory's `bin/` loses it.
 
 ## Corrections to the plan
 

@@ -30,6 +30,11 @@ use crate::services::pinned_tls::PinnedTlsConnector;
 /// saying so.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many times a request is re-sent after a failure that never reached the host's handler —
+/// see [`GsHttpClient::get_with_retry`].
+const HANDSHAKE_RETRIES: u32 = 2;
+const RETRY_DELAY: Duration = Duration::from_millis(400);
+
 // Why connection pooling is off (`max_idle_connections(0)`) on both agents below.
 //
 // A pooled keep-alive socket that the host has already closed fails on the *next* request as an
@@ -149,9 +154,40 @@ impl GsHttpClient {
         // whether it went over HTTP or HTTPS). Debug-level, and the values here are the pairing
         // salt/challenge — public by design, since the PIN is what makes them secret.
         tracing::debug!("gamestream request: {url}");
-        let body = self.agent.get(&url).call()?.body_mut().read_to_string()?;
+        let body = self.get_with_retry(&url)?.body_mut().read_to_string()?;
         Ok(E::Response::from_str(&body)?)
     }
+
+    /// A GET that survives a transient connect or handshake failure.
+    ///
+    /// Worth the two extra attempts because of what one lost request costs here: pairing's last
+    /// phase is an HTTPS call, and a pairing that dies there cannot be retried without the user
+    /// fetching a fresh PIN from the host — while the host has already accepted the certificate,
+    /// leaving the two sides disagreeing about whether they are paired.
+    ///
+    /// Retrying is safe for every endpoint: a request that never completed its handshake was not
+    /// served, and these are all GETs.
+    fn get_with_retry(&self, url: &str) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        let mut attempt = 0;
+        loop {
+            match self.agent.get(url).call() {
+                Err(e) if attempt < HANDSHAKE_RETRIES && is_transport(&e) => {
+                    attempt += 1;
+                    tracing::warn!("gamestream request failed at the transport ({e}); retry {attempt}");
+                    std::thread::sleep(RETRY_DELAY);
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
+/// Errors that mean nothing was served — a connect or handshake failure, not a response.
+fn is_transport(e: &ureq::Error) -> bool {
+    matches!(
+        e,
+        ureq::Error::ConnectionFailed | ureq::Error::Io(_) | ureq::Error::Tls(_) | ureq::Error::Rustls(_)
+    )
 }
 
 impl RequestClient for GsHttpClient {
@@ -176,7 +212,7 @@ impl RequestClient for GsHttpClient {
         // Ring provider, matching `services::library` and punktfunk-core's QUIC.
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let expected = rustls::pki_types::CertificateDer::from(server_certificate.contents().to_vec());
-        let cfg = rustls::ClientConfig::builder_with_provider(provider)
+        let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(|e| bad("tls config", &e))?
             .dangerous()
@@ -190,6 +226,11 @@ impl RequestClient for GsHttpClient {
                 client_key_der(client_private_key)?,
             )
             .map_err(|e| bad("client auth", &e))?;
+        // Sunshine cannot resume a session it issued a ticket for: the resuming handshake dies on a
+        // fatal `internal_error` alert. Since nothing here reuses a connection either (see the
+        // pooling note above), every request after the first tried to resume and failed — which is
+        // what broke pairing, whose last phase is the second HTTPS call in the handshake.
+        cfg.resumption = rustls::client::Resumption::disabled();
 
         let connector = TcpConnector::default().chain(PinnedTlsConnector::new(Arc::new(cfg)));
         let config = ureq::Agent::config_builder()
@@ -230,7 +271,7 @@ impl RequestClient for GsHttpClient {
     {
         let url = Self::url::<E>(true, &info, hostport, req);
         tracing::debug!("gamestream request (binary): {} {}", E::path(), hostport);
-        Ok(self.agent.get(&url).call()?.body_mut().read_to_vec()?)
+        Ok(self.get_with_retry(&url)?.body_mut().read_to_vec()?)
     }
 }
 
