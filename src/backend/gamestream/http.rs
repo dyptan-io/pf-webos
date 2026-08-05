@@ -239,13 +239,17 @@ impl GsHttpClient {
     }
 }
 
-/// Errors that mean nothing was served — a connect failure, not a response.
+/// Errors worth re-sending: a connection that was established and then broke before serving
+/// anything, which is what a stale pooled socket or a mid-handshake drop looks like.
 ///
-/// TLS errors are deliberately *not* here: the one that actually happens is the host rejecting our
-/// client certificate because it dropped this device, which no retry fixes — it is the
-/// `is_encryption` signal, and retrying only delays it by [`RETRY_DELAY`] twice.
+/// `ConnectionFailed` is deliberately *not* here, and neither is a connect timeout. Nothing was
+/// listening — the host is off or unreachable, no retry changes that, and retrying tripled how long
+/// a dead host took to fail (3 × [`budget::HANDSHAKE`] plus delays) where the punktfunk side spends
+/// one handshake and reports it. TLS errors are out for the same reason: the one that happens is
+/// the host rejecting our client certificate because it dropped this device, which is the
+/// `is_encryption` signal.
 fn is_transport(e: &ureq::Error) -> bool {
-    matches!(e, ureq::Error::ConnectionFailed | ureq::Error::Io(_))
+    matches!(e, ureq::Error::Io(_))
 }
 
 impl RequestClient for GsHttpClient {

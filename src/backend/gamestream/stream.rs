@@ -567,20 +567,22 @@ fn launch_and_connect(
     })
 }
 
-/// Whether a failed `/launch` (or `/resume`) is worth re-sending: only when nothing was served or
-/// the request budget ran out. A host that replied — "Invalid PIN", an unsupported mode — replied
-/// for good.
+/// Whether a failed `/launch` (or `/resume`) is worth re-sending: only when the host took the
+/// request and never finished answering, which is what a host still bringing up the display and the
+/// app looks like. A host that replied — "Invalid PIN", an unsupported mode — replied for good.
+///
+/// A refused connection is *not* retryable, even though it also means nothing was served: reaching
+/// here at all means `/serverinfo` just answered, so the host serving `/launch` has gone away rather
+/// than not arrived yet. Retrying that parked the user on a black scrim for the whole
+/// `budget::HOST_WAIT` where a punktfunk host reports it after one handshake.
 fn launch_unanswered(err: &moonlight_common::high::MoonlightClientError) -> bool {
     use moonlight_common::high::MoonlightClientError as E;
-    use moonlight_common::http::client::RequestError as _;
 
     match err {
-        E::Offline => true,
-        // A boxed backend error is our own, so `is_connect` answers most of this; a timed-out
-        // request is the other way a still-starting host never answers.
-        E::Backend(inner) => inner
-            .downcast_ref::<super::http::GsHttpError>()
-            .is_some_and(|e| e.is_connect() || matches!(e, super::http::GsHttpError::Ureq(ureq::Error::Timeout(_)))),
+        E::Backend(inner) => matches!(
+            inner.downcast_ref::<super::http::GsHttpError>(),
+            Some(super::http::GsHttpError::Ureq(ureq::Error::Timeout(_)))
+        ),
         _ => false,
     }
 }
