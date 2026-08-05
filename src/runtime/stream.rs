@@ -722,12 +722,13 @@ pub(super) fn run_inner() -> Result<()> {
                 tracing::info!("host ended the session");
                 // `is_session_ended` covers both a graceful host close and a network
                 // drop/idle-timeout (see `NativeClient::is_session_ended`'s doc) — no
-                // signal distinguishes them, so one message covers both. But it also
-                // flips true right after *our own* `disconnect_quit()` calls above
-                // (Back/dialog, SIGTERM) — skip the toast for those, it's not news to
-                // the user who just asked to disconnect.
+                // signal distinguishes them on punktfunk, so one message covers both;
+                // `GameStream` has the host's reason code and says more where it can (see
+                // `StreamHandle::end_message`). But this also flips true right after *our
+                // own* `disconnect_quit()` calls above (Back/dialog, SIGTERM) — skip the
+                // toast for those, it's not news to the user who just asked to disconnect.
                 if !client_initiated_disconnect {
-                    menu_toast = Some("The host closed the connection".to_string());
+                    menu_toast = Some(connected.end_message());
                 }
                 break 'running StreamOutcome::ReturnToMenu;
             }

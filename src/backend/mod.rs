@@ -29,8 +29,13 @@ pub struct BackendCaps {
     /// distinct from Forget, which only discards our own record. punktfunk has no such endpoint:
     /// forgetting the pin *is* unpairing.
     pub unpair: bool,
-    // `host_abr` (false ⇒ resolve "Automatic" bitrate client-side) arrives with the code that
-    // reads it, in P4, rather than sitting here unread.
+    /// The host keeps running the app after this client leaves, so ending it is a separate
+    /// action ([`HostBackend::quit_app`]). A punktfunk host's session *is* the connection —
+    /// there is nothing left behind to quit.
+    pub quit_app: bool,
+    // `host_abr` (false ⇒ resolve "Automatic" bitrate client-side) is read inside
+    // `backend::gamestream::stream` rather than through this struct: the decision is made where
+    // `/launch` is built, and no screen asks.
 }
 
 /// One protocol's host behaviour.
@@ -68,6 +73,10 @@ pub trait HostBackend: Send + Sync {
     /// [`BackendCaps::unpair`] is clear: for punktfunk, discarding our pin *is* unpairing, so
     /// "nothing more to do" is the honest answer and Forget can call this unconditionally.
     fn unpair(&self, addr: &str, query_port: u16) -> anyhow::Result<()>;
+
+    /// Ends the app the host is running, blocking. `false` = there was nothing to end (see
+    /// `gamestream::query::quit_running_app`). Only called where [`BackendCaps::quit_app`] is set.
+    fn quit_app(&self, addr: &str, query_port: u16) -> anyhow::Result<bool>;
 
     /// Opens a reusable cover-art fetcher for one host, blocking. Built lazily by
     /// `services::art`'s worker on the first cover that isn't already cached, so a fully

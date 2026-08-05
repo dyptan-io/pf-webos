@@ -167,6 +167,9 @@ struct Shared {
     /// The video callback has run its `stop` and released its NDL handle — see
     /// [`GsStream::shutdown`].
     video_stopped: AtomicBool,
+    /// Last lightbar colour the host asked for, coalesced: only the newest matters, and the
+    /// control thread must not block on the main loop's tick. Cleared as it is applied.
+    led: Mutex<Option<(u8, u8, u8)>>,
     color_range_override: ColorRangeOverride,
 }
 
@@ -196,6 +199,29 @@ impl GsStream {
         }
     }
 
+    /// Applies whatever pad feedback the host has asked for since the last tick. Call it where
+    /// `session::pump_feedback_once` is called, and for the same reason: the effects land on
+    /// devices the main thread owns.
+    ///
+    /// **Lightbar only, and that is an upstream limit rather than a choice.** `moonlight-common`'s
+    /// stream driver dispatches `ControllerSetLed`, `ControllerSetMotion`, `HdrMode` and
+    /// `ServerTermination` to its `ConnectionListener` and drops every other server-bound control
+    /// packet (`stream/std/mod.rs`, `TODO: implement other packets`) — so `ControllerRumbleData`
+    /// and `ControllerRumbleTriggers` never reach us, and there is nothing to hand SDL's
+    /// `set_rumble`. Rumble on a `GameStream` host needs those two arms added to the crate; it is
+    /// not fixable on this side of the seam.
+    pub fn pump_feedback_once(&self, feedback: Option<&mut crate::platform::webos::dualsense::Feedback>) {
+        let Some(fb) = feedback else { return };
+        let Ok(mut slot) = self.shared.led.lock() else {
+            return;
+        };
+        let Some((r, g, b)) = slot.take() else { return };
+        drop(slot);
+        // `pad: 0` — the host's controller number is per-session and this client drives one
+        // physical pad's lightbar; `Feedback` ignores the field anyway.
+        fb.apply(&punktfunk_core::quic::HidOutput::Led { pad: 0, r, g, b });
+    }
+
     /// Channels the host negotiated — build [`crate::platform::webos::audio::AudioPlayer`] from
     /// this, never from the request (same rule as punktfunk's `client.audio_channels`).
     pub fn audio_channels(&self) -> u8 {
@@ -205,6 +231,14 @@ impl GsStream {
     /// The host ended the session, or the transport dropped.
     pub fn is_session_ended(&self) -> bool {
         self.shared.terminated.load(Ordering::Relaxed) || self.stream.is_stopped()
+    }
+
+    /// The sentence to show when the session ended by itself, from the host's own reason code.
+    /// Unlike punktfunk — where nothing distinguishes a graceful close from a network drop —
+    /// `GameStream` sends a `ServerTermination` reason, so a DRM stop or a host encoder failure
+    /// can say what it was instead of "the host closed the connection".
+    pub fn end_message(&self) -> String {
+        crate::errors::gamestream_end_message(self.shared.termination_code.load(Ordering::Relaxed))
     }
 
     /// Ask the host to end the session and stop the driver threads. Named to match
@@ -335,6 +369,7 @@ pub fn connect(spec: GsConnectSpec) -> Result<GsStream> {
         // Until the host says otherwise, what we asked for.
         audio_channels: AtomicU8::new(2),
         video_stopped: AtomicBool::new(false),
+        led: Mutex::new(None),
         color_range_override: spec.color_range_override,
     });
     let (audio_tx, audio_rx) = mpsc::sync_channel(AUDIO_QUEUE_FRAMES);
@@ -611,8 +646,8 @@ impl AudioDecoder for ChannelAudioDecoder {
     }
 }
 
-/// The crate's control-stream callback. Rumble and the other pad feedback are P5 (see the plan);
-/// what matters here is HDR and knowing the session ended.
+/// The crate's control-stream callback: HDR, the lightbar, and knowing the session ended. Rumble
+/// is absent because the crate never delivers it — see [`GsStream::pump_feedback_once`].
 struct Listener {
     shared: Arc<Shared>,
 }
@@ -647,6 +682,26 @@ impl ConnectionListener for Listener {
         if let Err(e) = ndl.set_color_info(meta.as_ref(), color) {
             tracing::warn!("NDL set_color_info: {e:#}");
         }
+    }
+
+    fn controller_set_led(&mut self, controller_number: u16, r: u8, g: u8, b: u8) {
+        // Queued rather than applied here: the DualSense report goes out on the main thread's
+        // device (see `GsStream::pump_feedback_once`), and the control thread must not wait on it.
+        if let Ok(mut slot) = self.shared.led.lock() {
+            *slot = Some((r, g, b));
+        }
+        tracing::debug!("GameStream pad {controller_number} LED {r:02x}{g:02x}{b:02x}");
+    }
+
+    fn controller_set_motion_event_state(
+        &mut self,
+        controller_number: u16,
+        motion_type: moonlight_common::stream::control::MotionType,
+        report_rate_hz: u16,
+    ) {
+        // Logged, not honoured: this client sends no motion events, so a host asking for them at
+        // a rate is asking for something no `InputEvent` here carries.
+        tracing::debug!("GameStream pad {controller_number} wants {motion_type:?} at {report_rate_hz} Hz — not sent");
     }
 
     fn connection_terminated(&mut self, error_code: i32) {

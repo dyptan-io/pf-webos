@@ -7,6 +7,7 @@ pub(crate) mod diagnostics;
 mod edithost;
 mod experimental;
 mod forget;
+pub(crate) mod gamestream;
 mod home;
 pub(crate) mod hostmenu;
 mod pairing;

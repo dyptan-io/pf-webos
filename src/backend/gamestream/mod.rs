@@ -48,6 +48,9 @@ impl HostBackend for GameStream {
             // PIN-only, and the PIN travels the other way — see `App::open_pairing`.
             request_access: false,
             unpair: true,
+            // The host keeps the session (and the game) running after this client disconnects,
+            // which is also why a second connect resumes rather than relaunches.
+            quit_app: true,
         }
     }
 
@@ -127,6 +130,16 @@ impl HostBackend for GameStream {
 
     fn unpair(&self, addr: &str, query_port: u16) -> anyhow::Result<()> {
         query::unpair(&query::open(addr, Some(query_port))?)
+    }
+
+    fn quit_app(&self, addr: &str, query_port: u16) -> anyhow::Result<bool> {
+        let mut host = query::open(addr, Some(query_port))?;
+        // Idle hosts need no round trip to `/cancel`, and asking anyway would report "nothing was
+        // ended" for a host that is merely someone else's — `current_game` separates the two.
+        if query::current_game(&host)?.is_none() {
+            return Ok(false);
+        }
+        query::quit_running_app(&mut host)
     }
 
     fn art_fetcher(

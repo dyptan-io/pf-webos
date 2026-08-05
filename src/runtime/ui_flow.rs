@@ -176,6 +176,8 @@ pub(super) fn run_ui_flow(
         dirty |= app.drain_pairing();
         dirty |= app.drain_speed_test();
         dirty |= app.drain_send_logs();
+        dirty |= app.drain_quit_app();
+        dirty |= app.drain_gamestream_probe();
         app.tick_reachability();
         dirty |= app.drain_reachability();
         dirty |= app.tick_wake();

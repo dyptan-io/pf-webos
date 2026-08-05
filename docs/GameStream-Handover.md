@@ -14,7 +14,7 @@ Branch: `gamestream-seam`, not pushed. Base: `314d912`.
 | P2 seam refactor | **Done at build level.** Traits/protocol/trust/discovery/caps, plus `session/sink.rs`. The sink has not been streamed against a host. |
 | P3 non-streaming backend | **Code complete except the manual-IP fallback probe, unproven.** Backend, dual browse, display-PIN pairing, art, unpair, the `gamestream_enabled` gate. |
 | P4 streaming driver | **Code complete, unproven.** No hand-rolled driver was needed — see below. |
-| P5 polish | Not started. |
+| P5 polish | **Code complete for what the dependency allows, unproven.** Termination messages, the lightbar, `<currentgame>` + Close-running-app, the manual-IP fallback probe. Rumble is blocked upstream and surround is deferred — see the P5 section. |
 
 ## What is verified, and how
 
@@ -192,17 +192,19 @@ Deviations from the plan, same rule as the other lists — don't "fix" without r
 5. **The reduced-feature warning line is gone** from the display-PIN card (asked for
    mid-implementation). The host menu's subtitle still appends `· GameStream`.
 
-**Still to do in P3: the manual-IP fallback probe.** It was left out on purpose. The plan assumed
-manual entry pairs on confirm, but `App::confirm_add_host` only *saves* an address — nothing
-probes, so there is no failure to fall back from. The two shapes that fit this codebase:
+**The manual-IP fallback probe has landed** (`App::probe_gamestream_fallback`,
+`src/app/state/gamestream.rs`), as the first of the two shapes this section used to weigh: a probe
+at add-host confirm rather than at pair time. `confirm_add_host` still saves the punktfunk record
+the typed address means; the probe then opens `query::open` at 47989 off-thread and, if the host
+answers, **rewrites that record in place** — protocol, `port` and `mgmt_port` — so there is never a
+second row for the same address. Notes worth keeping:
 
-- Probe at add-host confirm, off-thread, only when the toggle is on: if `query::open` answers at
-  47989 the record is rewritten to `GameStream` with port and `mgmt_port` 47989. Needs care so
-  the punktfunk record at 9777 is *replaced*, not left beside it.
-- Or probe at pair time: when punktfunk pairing fails on a manually-added host, try `GameStream`,
-  flip the protocol, and re-open the modal in the display-PIN layout.
-
-The first is smaller. Neither is worth writing blind — do it with a host in front of you.
+- A probe that finds nothing sends nothing: a wrong address stays exactly as typed, which is what
+  a wrong address should leave behind. Only the punktfunk→`GameStream` direction is probed.
+- The record's name is only replaced when the user has none of their own (`confirm_add_host` names
+  a manual record after its address).
+- The rewrite is dropped if the record has since been forgotten or edited — the later action wins.
+- Gated on `Settings::gamestream_enabled`, which is the third of the three gates the plan asked for.
 
 ## P4: what landed, and what it still needs
 
@@ -260,17 +262,58 @@ Deviations and gaps, same rule as the other lists:
    stream, waits up to 2 s for the video callback's `stop` (which drops the sink's `Arc<NdlVideo>`),
    then releases our own handle — the last one, so `NdlVideo::drop`'s process-global unload cannot
    race a `play` still in flight. `false` skips `ndl::quit()`, same contract as punktfunk's.
-4. **Pad feedback is not wired.** Rumble, triggers, LEDs and motion all arrive on the
-   `ConnectionListener` and are P5; `StreamHandle::pump_feedback_once` is a no-op for `GameStream`.
-   The overlay's Drop/FEC figures print `n/a` for the same reason — the protocol exposes no such
-   counter to a client, and a zero would read as "no loss".
-5. **Termination reasons are logged, not shown.** `ServerTermination`'s code lands in
-   `Shared::termination_code` and nothing reads it yet; the taxonomy is P5's `errors.rs` work.
+4. **Pad feedback is the lightbar and nothing else** — see the P5 section for why that is upstream's
+   limit rather than a decision. The overlay's Drop/FEC figures still print `n/a`: the protocol
+   exposes no such counter to a client, and a zero would read as "no loss".
+5. **Termination reasons are shown as of P5.** `Shared::termination_code` now feeds
+   `GsStream::end_message` → `errors::gamestream_end_message`.
 
 **None of P4 has had a frame through it** — it needs a paired host to reach, and pairing is still
 open (see the P1 section). In likelihood order, the places to look first when it doesn't work: the
 `/launch` settings the host rejects (`adjust_for_server` reports those with a reason), the `0x8000`
 keycode prefix, the whole-pad state fold, and the HDR luminance conversion above.
+
+## P5: what landed, and what the dependency refuses
+
+- **Termination messages.** `errors::gamestream_end_message` turns the host's `ServerTermination`
+  reason into a sentence, and `StreamHandle::end_message` is what the streaming loop now toasts
+  instead of the hardcoded "The host closed the connection" (punktfunk still gets exactly that
+  string, since nothing there separates a graceful close from a drop). Three codes have a real
+  meaning — graceful, `VFP_PROTECTED_CONTENT` (DRM on screen), `VIDEO_ENCODER_CONVERT_INPUT_FRAME_FAILED`
+  — and everything else prints the code, because the host's log is the only place with the cause.
+  **The trap:** the reasons are NVST `HRESULT`s (`0x80030023`), delivered widened to `i32`, so they
+  arrive negative. A match on positive literals silently never fires and every close reads as
+  "unexpected"; the constants are written `0x8003_0023_u32 as i32` for that reason.
+  A code of `0` means the control stream disconnected without sending a termination packet at all,
+  which is indistinguishable from a graceful close and takes the same sentence.
+- **`<currentgame>` and Close-running-app.** A `GameStream` host keeps running the game after this
+  client leaves; that is also why a second connect resumes rather than relaunches, which
+  `MoonlightHost::start_stream` already handles by reading `<currentgame>` and posting `/resume`
+  instead of `/launch`. So **no Resume action exists, deliberately** — Connect *is* Resume, and a
+  second row for it would be a distinction users would have to be taught. What was missing is the
+  other direction: `HostAction::QuitApp` ("Close running app") on the host menu, gated on the new
+  `BackendCaps::quit_app` and on the host being paired (`/cancel` authorizes by client certificate).
+  `HostBackend::quit_app` checks `<currentgame>` first, so an idle host is answered without a
+  `/cancel` round trip and "nothing was running" is distinguishable from "that session is another
+  device's" — which `/cancel` itself does not tell us, hence one sentence covering both.
+  Fire-and-forget on a worker with the outcome on the Home status line, like Forget: the modal
+  closes immediately and there is nowhere else to report into. `gsprobe quit <host>` is the same
+  call without the UI.
+- **Pad feedback is the lightbar only, and that is upstream's limit.** `moonlight-common`'s stream
+  driver dispatches `HdrMode`, `ControllerSetLed`, `ControllerSetMotion` and `ServerTermination` to
+  its `ConnectionListener` and drops every other server-bound control packet
+  (`stream/std/mod.rs`, `TODO: implement other packets`). `ControllerRumbleData` and
+  `ControllerRumbleTriggers` are *parsed* by the crate but never delivered, so there is nothing to
+  hand SDL's `set_rumble` — **rumble on a `GameStream` host needs those two arms added to the
+  crate**, and cannot be fixed on this side of the seam. What is wired: the LED is queued on the
+  control thread (coalesced, newest wins) and applied by `GsStream::pump_feedback_once` on the main
+  thread, which owns the DualSense device; a motion-event request is logged and ignored, since this
+  client sends no motion events for it to have asked about.
+- **The webOS 5.1 `surroundParams` quirk is not implemented, and should not be yet.** It only
+  matters for 5.1/7.1, and `GameStream` audio here is stereo-only by construction (see the P4 audio
+  note): the software decoder's layout comes from punktfunk's `layout_for`, and surround needs
+  `OpusMultistreamConfig::from_surround_param`'s mapping. Do the mapping first; the quirk is a
+  detail of the `/launch` request that follows it.
 
 ## The one new setting
 
@@ -303,13 +346,17 @@ Experimental screen; it hasn't seemed worth it for a toggle flipped once.
   read; `DiscoveredHost` gains `protocol`.
 - `src/services/library.rs` — `load_games_async` takes a `&'static dyn HostBackend`;
   `fetch_games` is now `pub(crate)` for the backend.
-- `src/app/state/hostmenu.rs` — speed-test row gated on `caps().speed_test`.
+- `src/app/state/hostmenu.rs` — speed-test row gated on `caps().speed_test`, "Close running app"
+  on `caps().quit_app`.
+- `src/app/state/gamestream.rs` — the two `GameStream`-only host asides that need a worker and a
+  status line: `start_quit_app`/`drain_quit_app` and
+  `probe_gamestream_fallback`/`drain_gamestream_probe`.
 - `src/app/state/pairing.rs` — default focus avoids the request-access button when
   `!caps().request_access`.
 - `src/bin/gsprobe.rs` — the probe CLI: `info` / `pair` / `applist` / `art` / `unpair`, plus the
   bare P0 link check when run with no arguments.
-- `src/backend/gamestream/mod.rs` — `open`/`pair`/`unpair`/`app_list`/`box_art` over
-  `moonlight_common::high::std::MoonlightHost`. No `HostBackend` impl yet (P3).
+- `src/backend/gamestream/query.rs` — `open`/`pair`/`unpair`/`app_list`/`box_art`/`current_game`/
+  `quit_running_app` over `moonlight_common::high::std::MoonlightHost`.
 - `src/backend/gamestream/http.rs` — `GsHttpClient`, our `RequestClient` over ureq + rustls.
 - `src/backend/gamestream/identity.rs` — the RSA client identity and the per-host server
   certificate, in their own files beside punktfunk's.
@@ -349,9 +396,11 @@ Do not "fix" these without reading the reasoning.
 1. **`HostBackend` is narrower than the plan's version.** Only methods with a live caller exist:
    `protocol`, `caps`, `discovery_service`, `parse_discovery`, `list_games`. A trait method with
    one implementor and no caller is unverifiable scaffolding. `connect`, `pair`, `unpair`,
-   `probe` and `fetch_art` should be added *with* their consumers. Same reasoning trimmed
-   `BackendCaps` to `speed_test` and `request_access`; `host_abr` and `unpair` are noted in a
-   comment where they'll go.
+   `probe` and `fetch_art` should be added *with* their consumers. The same rule governs
+   `BackendCaps`: `speed_test`, `request_access`, `unpair` and `quit_app` are there because a screen
+   reads each one. `host_abr` never became a cap — the only code that cares is
+   `gamestream::stream`, where `/launch` is built, so it decides there rather than publishing a flag
+   nothing else reads.
 2. **`list_games` returns `LibraryError`, not a neutral error.** This leaks `services::library`
    into the trait. It has to, for now: `App::handle_library_error` opens the Wake dialog on
    `LibraryError::Unreachable` specifically, so flattening to `anyhow` would silently lose the
@@ -428,8 +477,12 @@ resolution/codec header and that Feed µs and the measured Mbps move. Then keybo
 captured and remote-pointer), and a pad — the pad is the one with real translation risk. HDR last,
 and watch the panel's refresh rate: the dedupe in `set_hdr_mode` is what keeps 120 Hz.
 
-**5. Finish P3**: the manual-IP fallback probe (see the P3 section for the two shapes and why it
-was deferred), and P5's pad feedback + termination messages (see the P4 list).
+**5. Prove P5**, all of it written and none of it run: `gsprobe quit <host>` against a running game;
+the host menu's "Close running app" on a paired host and on an idle one (two different sentences);
+the toast a host-side quit produces while streaming (it should name the reason, not just "closed");
+the lightbar on a DualSense (webOS 6.0+ only — a CX has no `hid-playstation`); and the manual-IP
+fallback probe, by typing a Sunshine host's address into Add host and watching the row become a
+`GameStream` one.
 
 `session::connect`'s argument list and the `Connected { client }` narrowing are leftover
 P2-adjacent cleanups; neither blocks P3. The anchors found while exploring:
@@ -449,9 +502,10 @@ P2-adjacent cleanups; neither blocks P3. The anchors found while exploring:
 
 ## Loose ends unrelated to the refactor
 
-- **`README.md` and `packaging/description.html` advertise GameStream in the present tense**, but
-  nothing works yet — `description.html` is the Homebrew Channel store copy. Reword to
-  planned/experimental, or hold both until P4.
+- **`README.md` and `packaging/description.html` no longer overclaim.** The README says
+  experimental and unverified-end-to-end, names the partial parity (no speed test, no Wake-on-LAN,
+  stereo only, no rumble) and says GFE is unsupported. The store copy (`description.html`) keeps
+  naming Sunshine beside punktfunk — that one is deliberate and was left as it is.
 - Size baselines from this branch: **4.1 MB** normally, **7.3 MB** with `PROBES=1`. Nothing in
   the app references `moonlight-common`'s streaming half yet, so LTO still drops most of it — the
   real cost lands in P4.

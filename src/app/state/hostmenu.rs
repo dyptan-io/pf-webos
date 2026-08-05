@@ -15,6 +15,7 @@ pub(crate) enum HostAction {
     Connect,
     Pair,
     SpeedTest,
+    QuitApp,
     Wake,
     Edit,
     Forget,
@@ -75,6 +76,16 @@ impl App {
             rows.push((
                 HostAction::SpeedTest,
                 FocusRow::action(crate::ui::ICON_SIGNAL, "Test network speed…"),
+            ));
+        }
+        // Only for a paired host: `/cancel` authorizes by client certificate, so on an unpaired one
+        // the row could only ever fail. Whether anything *is* running would take a round trip, and
+        // the menu is built synchronously each frame — so the row is always offered and the
+        // outcome says which it was (see `App::start_quit_app`).
+        if caps.quit_app && entry.is_paired() {
+            rows.push((
+                HostAction::QuitApp,
+                FocusRow::action(crate::ui::ICON_CLOSE, "Close running app"),
             ));
         }
         if !entry.mac().is_empty() {
@@ -176,6 +187,7 @@ impl App {
                 self.open_pairing(idx);
             }
             HostAction::SpeedTest => self.open_speed_test(idx),
+            HostAction::QuitApp => self.start_quit_app(idx),
             HostAction::Wake => {
                 let Some(entry) = self.entries.get(idx) else { return };
                 let (host, port) = (entry.host().to_string(), entry.port());

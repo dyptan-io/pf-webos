@@ -325,6 +325,11 @@ pub struct App {
     pub(crate) reachable: std::collections::HashMap<(String, u16), bool>,
     pub(crate) reach_rx: Option<std::sync::mpsc::Receiver<crate::app::state::reach::Reachability>>,
     pub(crate) reach_last: Option<Instant>,
+    /// Delivers the "close what the host is running" worker's one status line; `None` when none is
+    /// in flight. See `app::state::gamestream`.
+    pub(crate) quit_app_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// Delivers a manually added address's `GameStream` probe, and only when it found one.
+    pub(crate) gs_probe_rx: Option<std::sync::mpsc::Receiver<crate::app::state::gamestream::GsProbed>>,
     /// Whether webOS's on-screen keyboard is currently up, polled from
     /// `SDL_IsScreenKeyboardShown` each tick by `main.rs` — it moves the address form out
     /// from under the panel (see `App::keyboard_modal_card`).
@@ -556,6 +561,8 @@ impl App {
             reachable: Self::new_reachability(),
             reach_rx: None,
             reach_last: None,
+            quit_app_rx: None,
+            gs_probe_rx: None,
             keyboard_shown: false,
             about_lines: Vec::new(),
             about_wrapped: None,

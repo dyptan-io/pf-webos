@@ -91,8 +91,9 @@ impl StreamHandle {
         }
     }
 
-    /// Drains the host→client pad feedback planes. `GameStream`'s rumble arrives on the control
-    /// stream's listener instead and is P5 (see the plan), so there is nothing to drain there yet.
+    /// Drains the host→client pad feedback planes. `GameStream` carries its feedback on the
+    /// control stream's listener, and the crate only delivers the lightbar there — so no pad
+    /// rumble on that protocol, for the upstream reason `GsStream::pump_feedback_once` documents.
     pub(crate) fn pump_feedback_once(
         &self,
         controller: Option<&mut sdl2::controller::GameController>,
@@ -100,7 +101,7 @@ impl StreamHandle {
     ) {
         match self {
             Self::Punktfunk(c) => session::pump_feedback_once(&c.client, controller, feedback),
-            Self::GameStream(_) => {}
+            Self::GameStream(s) => s.pump_feedback_once(feedback),
         }
     }
 
@@ -108,6 +109,16 @@ impl StreamHandle {
         match self {
             Self::Punktfunk(c) => c.client.is_session_ended(),
             Self::GameStream(s) => s.is_session_ended(),
+        }
+    }
+
+    /// The sentence for the menu toast when the session ended on its own. punktfunk has no signal
+    /// that separates a graceful close from a drop, so it keeps one sentence for both;
+    /// `GameStream`'s host sends a reason code (see `GsStream::end_message`).
+    pub(crate) fn end_message(&self) -> String {
+        match self {
+            Self::Punktfunk(_) => "The host closed the connection".to_string(),
+            Self::GameStream(s) => s.end_message(),
         }
     }
 

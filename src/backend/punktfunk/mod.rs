@@ -24,6 +24,9 @@ impl HostBackend for Punktfunk {
             speed_test: true,
             request_access: true,
             unpair: false,
+            // A punktfunk session lives for as long as the connection does, so there is never a
+            // leftover app on the host to end.
+            quit_app: false,
         }
     }
 
@@ -79,6 +82,13 @@ impl HostBackend for Punktfunk {
         // practice (that call site checks `caps().unpair` first), but `Ok` rather than a panic:
         // "nothing left to do" is the true answer, not an unsupported operation.
         Ok(())
+    }
+
+    fn quit_app(&self, _addr: &str, _query_port: u16) -> anyhow::Result<bool> {
+        // Disconnecting ends the session, so nothing outlives it to be quit. `Ok(false)` — "there
+        // was nothing to end" — for the same reason `unpair` returns `Ok(())`: it is the true
+        // answer, not an unsupported operation. Unreached; `caps().quit_app` is false.
+        Ok(false)
     }
 
     fn art_fetcher(

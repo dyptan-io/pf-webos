@@ -46,6 +46,10 @@ impl App {
             },
         );
         let _ = store::save_known_hosts(&self.known_hosts);
+        // The record above is punktfunk, because that is what a bare address means here. If the
+        // address turns out to be a `GameStream` host, the probe rewrites it — see
+        // `App::probe_gamestream_fallback`, which is a no-op unless the toggle is on.
+        self.probe_gamestream_fallback(host.clone(), port);
         self.rebuild_entries();
         self.home_focus = HomeFocus::Sidebar(
             self.entries

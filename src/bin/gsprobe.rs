@@ -9,6 +9,7 @@
 //! gsprobe applist <host> [port]    # /applist (requires pairing)
 //! gsprobe art     <host> <app-id> [port]
 //! gsprobe unpair  <host> [port]
+//! gsprobe quit    <host> [port]    # /cancel whatever the host is running
 //! ```
 //!
 //! The app is a single binary crate with no library target, so the modules under test are pulled
@@ -58,7 +59,10 @@ fn main() -> Result<()> {
         ["applist", host, rest @ ..] => applist(host, port(rest)?),
         ["art", host, app_id, rest @ ..] => art(host, app_id, port(rest)?),
         ["unpair", host, rest @ ..] => unpair(host, port(rest)?),
-        _ => anyhow::bail!("usage: gsprobe [info|pair|applist|art|unpair] <host> [args] — see the module docs"),
+        ["quit", host, rest @ ..] => quit(host, port(rest)?),
+        _ => {
+            anyhow::bail!("usage: gsprobe [info|pair|applist|art|unpair|quit] <host> [args] — see the module docs")
+        }
     }
 }
 
@@ -122,6 +126,21 @@ fn applist(address: &str, port: Option<u16>) -> Result<()> {
     for app in query::app_list(&host)? {
         let hdr = if app.is_hdr_supported { "  [HDR]" } else { "" };
         println!("{:>6}  {}{hdr}", app.id.0, app.title);
+    }
+    Ok(())
+}
+
+/// Ends the host's running session — the same call the host menu's "Close running app" makes, and
+/// the way to check `<currentgame>` handling without a stream: run it while a game is up, then
+/// `gsprobe info` should report `current app: Some(0)`.
+fn quit(address: &str, port: Option<u16>) -> Result<()> {
+    let mut host = query::open(address, port)?;
+    match query::current_game(&host)? {
+        None => println!("nothing running on {address}"),
+        Some(app) => {
+            println!("running app {}; cancelling…", app.0);
+            println!("cancelled: {}", query::quit_running_app(&mut host)?);
+        }
     }
     Ok(())
 }

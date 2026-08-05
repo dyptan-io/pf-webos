@@ -69,6 +69,41 @@ pub fn pair_message(err: &PunktfunkError) -> String {
     }
 }
 
+/// Why a `GameStream` session ended, from the `ServerTermination` reason code the control stream
+/// carried (`backend::gamestream::stream::Shared::termination_code`).
+///
+/// The codes are NVST `HRESULT`-shaped `u32`s that arrive widened to `i32`, so they read as large
+/// negatives; the constants are written as the host sends them. Only the three Moonlight itself
+/// names have a distinct meaning — everything else is "unexpected", and the host's log is the only
+/// place with the cause, so the code is printed rather than guessed at.
+pub fn gamestream_end_message(code: i32) -> String {
+    /// `NVST_DISCONN_SERVER_TERMINATED_CLOSED` — the app exited, or the user stopped the session
+    /// on the host.
+    const GRACEFUL: i32 = 0x8003_0023_u32 as i32;
+    /// `NVST_DISCONN_SERVER_VFP_PROTECTED_CONTENT`.
+    const PROTECTED_CONTENT: i32 = 0x800e_9302_u32 as i32;
+    /// `NVST_DISCONN_SERVER_VIDEO_ENCODER_CONVERT_INPUT_FRAME_FAILED`.
+    const ENCODER_FAILED: i32 = 0x800e_9403_u32 as i32;
+
+    match code {
+        // 0 is also what a control stream that simply disconnected leaves behind, having sent no
+        // termination packet at all — indistinguishable from a graceful close, and the same
+        // sentence covers both.
+        0 | GRACEFUL => "The host closed the connection.".into(),
+        PROTECTED_CONTENT => "The host stopped streaming because something on screen is protected content — \
+             DRM-protected video can't be captured."
+            .into(),
+        ENCODER_FAILED => "The host's video encoder failed — lower the resolution or frame rate, or check the \
+             host's GPU driver."
+            .into(),
+        other => format!(
+            "The host ended the session unexpectedly (code 0x{:08x}) — the host's own log has the \
+             cause.",
+            other as u32
+        ),
+    }
+}
+
 /// Extract `PunktfunkError` from anyhow chain for user-facing messages.
 pub fn friendly(err: &anyhow::Error) -> String {
     err.downcast_ref::<PunktfunkError>()

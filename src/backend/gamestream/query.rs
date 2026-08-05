@@ -93,6 +93,26 @@ pub fn app_list(host: &Host) -> Result<Vec<App>> {
     host.app_list().map_err(|e| anyhow::anyhow!("app list: {e}"))
 }
 
+/// The app the host is streaming right now, or `None` when it is idle.
+///
+/// `<currentgame>` is why launching a title that is already running resumes it instead of failing:
+/// `MoonlightHost::start_stream` reads this and posts `/resume` rather than `/launch`. So this
+/// client needs it only to tell the user what is running, and to decide whether quitting has
+/// anything to quit.
+pub fn current_game(host: &Host) -> Result<Option<moonlight_common::AppId>> {
+    let id = host.current_game().map_err(|e| anyhow::anyhow!("current game: {e}"))?;
+    Ok((id != 0).then_some(moonlight_common::AppId(id)))
+}
+
+/// Ends the host's running session, whoever started it (`/cancel`).
+///
+/// `false` means nothing was ended: either the host was idle, or the session belongs to another
+/// device and the host refused — the two are worth distinguishing to the user, but the endpoint
+/// does not, so the caller reports one sentence for both.
+pub fn quit_running_app(host: &mut Host) -> Result<bool> {
+    host.cancel().map_err(|e| anyhow::anyhow!("quit running app: {e}"))
+}
+
 /// One app's box art (JPEG/PNG bytes, undecoded — `services::art` does the decode).
 pub fn box_art(host: &Host, app_id: moonlight_common::AppId) -> Result<Vec<u8>> {
     host.request_app_image(app_id)
