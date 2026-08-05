@@ -1,4 +1,5 @@
 pub mod art;
+pub mod budget;
 pub mod discovery;
 pub mod library;
 pub mod paths;

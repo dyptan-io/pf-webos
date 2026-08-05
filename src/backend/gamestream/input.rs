@@ -260,7 +260,7 @@ impl InputTranslator {
 fn controller_type_for(gamepad_type: GamepadType) -> ControllerType {
     match gamepad_type {
         GamepadType::Auto => ControllerType::Unknown,
-        GamepadType::Xbox360 | GamepadType::XboxOne => ControllerType::Xbox,
+        GamepadType::XboxOne => ControllerType::Xbox,
         GamepadType::DualSense | GamepadType::DualSenseEdge | GamepadType::DualShock4 => ControllerType::PlayStation,
         GamepadType::SwitchPro => ControllerType::Nintendo,
     }
@@ -306,7 +306,7 @@ mod tests {
     /// until a host ignores every key.
     #[test]
     fn key_carries_the_gamestream_prefix() {
-        let mut t = InputTranslator::new(GamepadType::Xbox360);
+        let mut t = InputTranslator::new(GamepadType::XboxOne);
         let mut out = Vec::new();
         // VK_A.
         t.translate(&ev(InputKind::KeyDown, 0x41, 0, 0), &mut out);
@@ -319,7 +319,7 @@ mod tests {
     /// A pad must be announced before its first state, and only once.
     #[test]
     fn first_pad_event_announces_then_states() {
-        let mut t = InputTranslator::new(GamepadType::Xbox360);
+        let mut t = InputTranslator::new(GamepadType::XboxOne);
         let mut out = Vec::new();
         t.translate(&ev(InputKind::GamepadButton, gamepad::BTN_A, 1, 0), &mut out);
         assert!(matches!(
@@ -338,7 +338,7 @@ mod tests {
     /// the first.
     #[test]
     fn buttons_accumulate_across_events() {
-        let mut t = InputTranslator::new(GamepadType::Xbox360);
+        let mut t = InputTranslator::new(GamepadType::XboxOne);
         let mut out = Vec::new();
         t.translate(&ev(InputKind::GamepadButton, gamepad::BTN_A, 1, 0), &mut out);
         out.clear();

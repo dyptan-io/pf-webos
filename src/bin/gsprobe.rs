@@ -25,6 +25,7 @@
 
 #[path = "../services"]
 mod services {
+    pub mod budget;
     pub mod paths;
     pub mod pinned_tls;
 }

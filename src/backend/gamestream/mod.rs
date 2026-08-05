@@ -58,6 +58,19 @@ impl HostBackend for GameStream {
         DEFAULT_HTTP_PORT
     }
 
+    /// A TCP connect to the HTTP port, not a `/serverinfo` fetch: this runs every sweep for
+    /// every row, and a listening port is all the dot claims. Sunshine binds it whenever it is
+    /// running, so it also distinguishes "machine up, host software down" — which is exactly
+    /// what the shadowing rule needs.
+    fn probe(&self, addr: &str, port: u16, timeout: std::time::Duration) -> bool {
+        let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(addr, port)) else {
+            return false;
+        };
+        addrs
+            .into_iter()
+            .any(|a| std::net::TcpStream::connect_timeout(&a, timeout).is_ok())
+    }
+
     fn discovery_service(&self) -> &'static str {
         SERVICE_TYPE
     }

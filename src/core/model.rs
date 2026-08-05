@@ -148,12 +148,15 @@ pub enum ColorRangeOverride {
 #[serde(rename_all = "lowercase")]
 pub enum GamepadType {
     /// Mirror whichever controller is attached, falling back to the host's own choice (an
-    /// Xbox 360 pad) when the pad isn't one this client recognizes — see
+    /// Xbox pad) when the pad isn't one this client recognizes — see
     /// `gamepad::detect_type`. Resolved per session, so the stored preference stays "match my
     /// pad" rather than freezing to whatever was plugged in once.
     #[default]
     Auto,
-    Xbox360,
+    /// The host's Xbox pad — `GameStream`'s only non-PlayStation/Nintendo kind, and punktfunk's
+    /// `XboxOne`. The alias keeps a settings file written when this client also offered a
+    /// separate Xbox 360 pick loadable: the two differed only in the virtual pad's name.
+    #[serde(alias = "xbox360")]
     XboxOne,
     DualShock4,
     /// Adaptive triggers, lightbar, touchpad, motion — see [`crate::platform::webos::dualsense`].
@@ -169,7 +172,6 @@ impl GamepadType {
         use punktfunk_core::config::GamepadPref as P;
         match self {
             Self::Auto => P::Auto,
-            Self::Xbox360 => P::Xbox360,
             Self::XboxOne => P::XboxOne,
             Self::DualShock4 => P::DualShock4,
             Self::DualSense => P::DualSense,

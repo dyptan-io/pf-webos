@@ -26,7 +26,7 @@ use moonlight_common::stream::audio::{AudioConfig, AudioDecoder, AudioFrame, Opu
 use moonlight_common::stream::connection::ConnectionListener;
 use moonlight_common::stream::control::ActiveGamepads;
 use moonlight_common::stream::proto::control::input_batcher::ClientInputEvent;
-use moonlight_common::stream::std::MoonlightStream;
+use moonlight_common::stream::std::{MoonlightStream, MoonlightStreamError};
 use moonlight_common::stream::video::{
     ColorRange, ColorSpace, DecodeResult, FrameType, SunshineHdrMetadata, VideoDecodeUnit, VideoDecoder, VideoFormats,
     VideoSetup,
@@ -59,6 +59,10 @@ const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// what the software path does anyway (see `audio::SOFT_QUEUED_LAG_MS`).
 const AUDIO_QUEUE_FRAMES: usize = 32;
 
+/// Delay between connect attempts while waiting out `budget::HOST_WAIT`. Long enough that a booting
+/// host isn't hammered, short enough that the stream starts promptly once it is ready.
+const RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Everything [`connect`] needs. A struct rather than the 15 positional arguments
 /// `session::connect` grew — the plan wants that collapsed there too.
 pub struct GsConnectSpec {
@@ -81,6 +85,9 @@ pub struct GsConnectSpec {
     /// Whether a controller is attached, so the host builds a virtual pad at launch instead of
     /// waiting for the first `ControllerConnect`.
     pub gamepad_attached: bool,
+    /// How long to keep re-trying a host that answers but isn't ready to stream. Decided at the
+    /// runtime seam, where punktfunk's equivalent budget is also chosen — see `budget::HOST_WAIT`.
+    pub host_wait: Duration,
 }
 
 /// A live `GameStream` session.
@@ -403,18 +410,103 @@ pub fn connect(spec: GsConnectSpec) -> Result<GsStream> {
         tracing::info!("GameStream host adjusted HDR to {hdr}");
     }
 
+    let bitrate_kbps = settings.bitrate;
+    // A host answers `/serverinfo` well before it can start a session — see `budget::HOST_WAIT`.
+    let deadline = std::time::Instant::now() + spec.host_wait;
+    let started = loop {
+        match launch_and_connect(&host, app_id, &settings, hdr, &spec) {
+            Ok(started) => break started,
+            Err(Failure::Final(e)) => return Err(e),
+            Err(Failure::Starting(e)) => {
+                // No room for another attempt: report the last failure rather than sleep out the
+                // rest of the budget on a try that can't finish inside it.
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left < RETRY_INTERVAL {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    "GameStream connect failed ({e:#}) — retrying, {}s of budget left",
+                    left.as_secs()
+                );
+                std::thread::sleep(RETRY_INTERVAL);
+            }
+        }
+    };
+
+    Ok(GsStream {
+        input: Arc::new(GsInput {
+            stream: started.stream.clone(),
+            state: Mutex::new(InputState {
+                translator: InputTranslator::new(spec.gamepad_type),
+                out: Vec::new(),
+            }),
+        }),
+        stream: started.stream,
+        stats: started.stats,
+        shared: started.shared,
+        audio_rx: started.audio_rx,
+        hdr,
+        codec: if spec.codec == CodecPref::H264 {
+            NdlCodec::H264
+        } else {
+            NdlCodec::H265
+        },
+        width: spec.width,
+        height: spec.height,
+        refresh_hz: spec.refresh_hz,
+        bitrate_kbps,
+    })
+}
+
+/// One [`launch_and_connect`] failure, split by whether waiting could fix it.
+enum Failure {
+    /// What a host that is still starting produces: nothing was served, or the handshake never
+    /// completed.
+    Starting(anyhow::Error),
+    /// The host answered with a reason — an unsupported setting, a dropped pairing. Retrying it
+    /// would only park the user on a black scrim for the whole budget.
+    Final(anyhow::Error),
+}
+
+/// A started session's parts, before [`GsStream`] wraps them.
+struct Started {
+    stream: Arc<MoonlightStream>,
+    stats: Arc<StreamStats>,
+    shared: Arc<Shared>,
+    audio_rx: mpsc::Receiver<Vec<u8>>,
+}
+
+/// Everything the retry loop in [`connect`] repeats: `/launch` (or `/resume`) and the stream setup.
+/// The per-attempt state is built here because the crate takes the decoders by value — a failed
+/// attempt's are gone, and the next one needs its own.
+fn launch_and_connect(
+    host: &query::Host,
+    app_id: AppId,
+    settings: &MoonlightStreamSettings,
+    hdr: bool,
+    spec: &GsConnectSpec,
+) -> Result<Started, Failure> {
     let crypto = RustCryptoBackend;
-    let aes_key = AesKey::new_random(&crypto).map_err(|e| anyhow::anyhow!("aes key: {e}"))?;
-    let aes_iv = AesIv::new_random(&crypto).map_err(|e| anyhow::anyhow!("aes iv: {e}"))?;
+    let key = |what: &str, e: &dyn std::fmt::Display| Failure::Final(anyhow::anyhow!("{what}: {e}"));
+    let aes_key = AesKey::new_random(&crypto).map_err(|e| key("aes key", &e))?;
+    let aes_iv = AesIv::new_random(&crypto).map_err(|e| key("aes iv", &e))?;
     let config = host
         .start_stream(
             app_id,
-            &settings,
+            settings,
             aes_key,
             aes_iv,
             MoonlightStream::launch_query_parameters(),
         )
-        .map_err(gs_err)?;
+        .map_err(|e| {
+            let starting = launch_unanswered(&e);
+            let e = gs_err(e);
+            if starting {
+                Failure::Starting(e)
+            } else {
+                Failure::Final(e)
+            }
+        })?;
     tracing::info!(
         "GameStream launch ok: {}x{}@{} hdr={hdr} bitrate={} kbps app={} rtsp={:?}",
         settings.width,
@@ -457,35 +549,53 @@ pub fn connect(spec: GsConnectSpec) -> Result<GsStream> {
     };
     let listener = Listener { shared: shared.clone() };
 
-    let bitrate_kbps = settings.bitrate;
-    let stream = MoonlightStream::connect(config, settings, video, audio, listener, Arc::new(crypto) as _)
-        .map_err(|e| anyhow::anyhow!("start GameStream stream: {e}"))?;
+    let stream = MoonlightStream::connect(config, settings.clone(), video, audio, listener, Arc::new(crypto) as _)
+        .map_err(|e| {
+            let error = anyhow::anyhow!("start GameStream stream: {e}");
+            if setup_unanswered(&e) && shared.panel.lock().is_ok_and(|p| p.ndl.is_none()) {
+                Failure::Starting(error)
+            } else {
+                Failure::Final(error)
+            }
+        })?;
     tracing::info!("GameStream host features: {:?}", stream.host_features());
-    let stream = Arc::new(stream);
-
-    Ok(GsStream {
-        input: Arc::new(GsInput {
-            stream: stream.clone(),
-            state: Mutex::new(InputState {
-                translator: InputTranslator::new(spec.gamepad_type),
-                out: Vec::new(),
-            }),
-        }),
-        stream,
+    Ok(Started {
+        stream: Arc::new(stream),
         stats,
         shared,
         audio_rx,
-        hdr,
-        codec: if spec.codec == CodecPref::H264 {
-            NdlCodec::H264
-        } else {
-            NdlCodec::H265
-        },
-        width: spec.width,
-        height: spec.height,
-        refresh_hz: spec.refresh_hz,
-        bitrate_kbps,
     })
+}
+
+/// Whether a failed `/launch` (or `/resume`) is worth re-sending: only when nothing was served or
+/// the request budget ran out. A host that replied — "Invalid PIN", an unsupported mode — replied
+/// for good.
+fn launch_unanswered(err: &moonlight_common::high::MoonlightClientError) -> bool {
+    use moonlight_common::high::MoonlightClientError as E;
+    use moonlight_common::http::client::RequestError as _;
+
+    match err {
+        E::Offline => true,
+        // A boxed backend error is our own, so `is_connect` answers most of this; a timed-out
+        // request is the other way a still-starting host never answers.
+        E::Backend(inner) => inner
+            .downcast_ref::<super::http::GsHttpError>()
+            .is_some_and(|e| e.is_connect() || matches!(e, super::http::GsHttpError::Ureq(ureq::Error::Timeout(_)))),
+        _ => false,
+    }
+}
+
+/// Same question for the stream setup: a handshake that timed out or lost its socket, as opposed to
+/// a host that rejected the session.
+///
+/// The caller pairs this with "did this attempt load NDL": a setup that got as far as the video
+/// stream already ran `SinkDecoder::setup`, and that decoder handle went down with the crate's
+/// thread with nothing left to unload it — a second attempt would load one on top of it.
+fn setup_unanswered(err: &MoonlightStreamError) -> bool {
+    matches!(
+        err,
+        MoonlightStreamError::ConnectionTimeout | MoonlightStreamError::Io(_) | MoonlightStreamError::Proto(_)
+    )
 }
 
 /// `/applist` entry to launch. `None` means Desktop, which on a `GameStream` host is an ordinary

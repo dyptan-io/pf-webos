@@ -43,13 +43,14 @@ impl App {
             return Vec::new();
         };
         let saved = matches!(entry, HostEntry::Known(_));
+        let paired = entry.is_paired();
         // Affordances a protocol doesn't have are *omitted*, never shown-and-failing, so adding a
         // protocol touches no view code. See `backend::BackendCaps`.
         let caps = crate::backend::backend_for(entry.protocol()).caps();
         let mut rows = vec![
             (
                 HostAction::Connect,
-                if entry.is_paired() {
+                if paired {
                     FocusRow::action(crate::ui::ICON_TV, "Connect")
                 } else {
                     // The hint goes in the value column like every other Action row's,
@@ -72,7 +73,10 @@ impl App {
                 ),
             ),
         ];
-        if caps.speed_test {
+        // Both this and "Wake host" below need a paired host: the probe runs over the real
+        // data plane (so it needs the host to accept this client's certificate), and waking a
+        // host we can't then connect to is a dead end.
+        if caps.speed_test && paired {
             rows.push((
                 HostAction::SpeedTest,
                 FocusRow::action(crate::ui::ICON_SIGNAL, "Test network speed…"),
@@ -82,13 +86,13 @@ impl App {
         // the row could only ever fail. Whether anything *is* running would take a round trip, and
         // the menu is built synchronously each frame — so the row is always offered and the
         // outcome says which it was (see `App::start_quit_app`).
-        if caps.quit_app && entry.is_paired() {
+        if caps.quit_app && paired {
             rows.push((
                 HostAction::QuitApp,
                 FocusRow::action(crate::ui::ICON_CLOSE, "Close running app"),
             ));
         }
-        if !entry.mac().is_empty() {
+        if paired && !entry.mac().is_empty() {
             // The one row with a ⋯: Confirm wakes now, the button holds the per-host
             // wake settings (`Screen::WakeSettings`). Same affordance and the same
             // Right-to-reach-it gesture as a sidebar host row's. Always built

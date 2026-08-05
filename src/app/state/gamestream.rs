@@ -24,6 +24,94 @@ pub(crate) struct GsProbed {
 }
 
 impl App {
+    /// Whether a discovered `GameStream` row for `addr` should stay hidden, because the same
+    /// machine also speaks punktfunk *and* that side is usable right now.
+    ///
+    /// punktfunk is the better half of a host that offers both (full feature set), so pairing
+    /// with its `GameStream` side is only worth offering when the punktfunk one can't be
+    /// reached. "Can't be reached" means a probe that actually came back negative — an
+    /// unprobed host is assumed up, so a freshly resolved advert doesn't flash a second row
+    /// before the first sweep lands. A *saved* `GameStream` host is never shadowed: the user
+    /// paired it deliberately, and its row carries its own online dot.
+    pub(crate) fn gamestream_shadowed(&self, addr: &str) -> bool {
+        self.ports_at(addr, Protocol::Punktfunk)
+            .into_iter()
+            .any(|port| self.reachable.get(&(addr.to_string(), port)) != Some(&false))
+    }
+
+    /// Parks a discovered `GameStream` host instead of giving it a row, keeping the list free of
+    /// duplicates. See [`Self::refresh_gamestream_shadowing`] for when it comes back out.
+    pub(crate) fn park_gamestream(&mut self, host: crate::services::discovery::DiscoveredHost) {
+        if !self
+            .shadowed_gamestream
+            .iter()
+            .any(|d| d.addr == host.addr && d.port == host.port)
+        {
+            self.shadowed_gamestream.push(host);
+        }
+    }
+
+    /// Moves discovered `GameStream` rows between the sidebar and `shadowed_gamestream` so the
+    /// list matches [`Self::gamestream_shadowed`] — called after discovery and after every
+    /// reachability sweep, since either can change the answer. Returns whether the sidebar moved.
+    ///
+    /// The caller owns the focus re-anchoring, so a drain that also appended rows re-anchors once
+    /// rather than twice off two different starting lengths.
+    pub(crate) fn refresh_gamestream_shadowing(&mut self) -> bool {
+        if !self.settings.gamestream_enabled {
+            // Nothing to promote into a sidebar that isn't showing `GameStream` at all, and the
+            // parked rows are stale the moment the toggle goes off.
+            self.shadowed_gamestream.clear();
+            // The rows themselves are `refilter_entries`' business, so nothing here changed.
+            return false;
+        }
+        // Both passes decide before mutating: `gamestream_shadowed` reads `entries` itself.
+        let park: Vec<(String, u16)> = self
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                HostEntry::Discovered(d) if d.protocol == Protocol::GameStream => Some((d.addr.clone(), d.port)),
+                _ => None,
+            })
+            .filter(|(addr, _)| self.gamestream_shadowed(addr))
+            .collect();
+        let mut parked = Vec::new();
+        self.entries.retain(|e| match e {
+            HostEntry::Discovered(d)
+                if d.protocol == Protocol::GameStream && park.iter().any(|(a, p)| a == &d.addr && *p == d.port) =>
+            {
+                parked.push(d.clone());
+                false
+            }
+            _ => true,
+        });
+        for d in parked {
+            self.park_gamestream(d);
+        }
+        // The other direction: the punktfunk side went away, so these are worth offering again.
+        let unpark: Vec<crate::services::discovery::DiscoveredHost> = self
+            .shadowed_gamestream
+            .iter()
+            .filter(|d| !self.gamestream_shadowed(&d.addr))
+            .cloned()
+            .collect();
+        self.shadowed_gamestream
+            .retain(|d| !unpark.iter().any(|u| u.addr == d.addr && u.port == d.port));
+        let mut unparked = 0;
+        for d in unpark {
+            // Anything paired or added by hand meanwhile already has a row of its own.
+            if !self.host_listed(&d.addr, d.port) {
+                self.entries.push(HostEntry::Discovered(d));
+                unparked += 1;
+            }
+        }
+        let changed = !park.is_empty() || unparked > 0;
+        if changed {
+            self.sidebar_dirty = true;
+        }
+        changed
+    }
+
     /// Re-applies the `Settings::gamestream_enabled` gate to everything already on screen, after
     /// the toggle moved.
     ///
@@ -31,7 +119,7 @@ impl App {
     /// loses its row, but a library already fetched from it would keep filling the grid — a game
     /// list belonging to a host the user can no longer see or go back to.
     pub(crate) fn apply_gamestream_visibility(&mut self) {
-        self.rebuild_entries();
+        self.refilter_entries();
         if self.settings.gamestream_enabled {
             return;
         }

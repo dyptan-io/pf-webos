@@ -34,6 +34,10 @@ impl HostBackend for Punktfunk {
         library::DEFAULT_MGMT_PORT
     }
 
+    fn probe(&self, addr: &str, port: u16, timeout: std::time::Duration) -> bool {
+        punktfunk_core::client::NativeClient::probe(addr, port, timeout)
+    }
+
     fn discovery_service(&self) -> &'static str {
         SERVICE_TYPE
     }

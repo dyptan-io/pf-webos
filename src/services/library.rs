@@ -5,7 +5,6 @@
 //! verifier) rather than a dependency on that crate — see `session.rs`'s module docs
 //! for why this client doesn't pull in `pf-client-core` at all.
 use std::sync::Arc;
-use std::time::Duration;
 
 use ureq::unversioned::resolver::DefaultResolver;
 use ureq::unversioned::transport::{Connector as _, TcpConnector};
@@ -75,8 +74,8 @@ pub fn agent(identity: &(String, String), pin: Option<[u8; 32]>) -> Result<ureq:
     // (with `PinVerify` installed) goes through `services::pinned_tls` instead.
     let connector = TcpConnector::default().chain(PinnedTlsConnector::new(Arc::new(cfg)));
     let config = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(5)))
-        .timeout_global(Some(Duration::from_secs(10)))
+        .timeout_connect(Some(crate::services::budget::HANDSHAKE))
+        .timeout_global(Some(crate::services::budget::REQUEST))
         .build();
     Ok(ureq::Agent::with_parts(config, connector, DefaultResolver::default()))
 }

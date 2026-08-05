@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use moonlight_common::http::client::blocking_client::RequestClient;
-use moonlight_common::http::client::{RequestError, DEFAULT_LONG_TIMEOUT, DEFAULT_TIMEOUT};
+use moonlight_common::http::client::RequestError;
 use moonlight_common::http::{ClientInfo, Endpoint, ParseError, QueryBuilderError, Request as _, TextResponse};
 use pem::Pem;
 use ureq::unversioned::resolver::DefaultResolver;
@@ -26,9 +26,13 @@ use ureq::unversioned::transport::{Connector as _, TcpConnector};
 use crate::services::pinned_tls::PinnedTlsConnector;
 
 /// How long to wait for the TCP connect itself, independent of the global request timeout —
-/// an unreachable host on a quiet LAN otherwise burns the whole 10 s (or 90 s) budget before
-/// saying so.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// an unreachable host on a quiet LAN otherwise burns the whole request budget before saying so.
+/// Shared with punktfunk's pinned-host handshake budget: same question, same answer.
+const CONNECT_TIMEOUT: Duration = crate::services::budget::HANDSHAKE;
+
+/// Replaces the crate's 90 s pairing budget with punktfunk's park-and-wait one, so a PIN the user
+/// is slow to type and an approval the operator is slow to click get the same window.
+const PAIRING_TIMEOUT: Duration = crate::services::budget::HOST_WAIT;
 
 /// How many times a request is re-sent after a failure that never reached the host's handler —
 /// see [`GsHttpClient::get_with_retry`].
@@ -251,13 +255,13 @@ impl RequestClient for GsHttpClient {
     type Error = GsHttpError;
 
     fn with_defaults() -> Result<Self, Self::Error> {
-        Ok(Self::plain(DEFAULT_TIMEOUT))
+        Ok(Self::plain(crate::services::budget::REQUEST))
     }
 
     /// Used for pairing, where each phase waits on a human typing a PIN into the host's web
-    /// UI — hence the crate's 90 s budget rather than the 10 s one.
+    /// UI — hence [`PAIRING_TIMEOUT`] rather than the 10 s one.
     fn with_defaults_long_timeout() -> Result<Self, Self::Error> {
-        Ok(Self::plain(DEFAULT_LONG_TIMEOUT))
+        Ok(Self::plain(PAIRING_TIMEOUT))
     }
 
     fn with_certificates(
@@ -293,7 +297,7 @@ impl RequestClient for GsHttpClient {
         let connector = TcpConnector::default().chain(PinnedTlsConnector::new(Arc::new(cfg)));
         let config = ureq::Agent::config_builder()
             .timeout_connect(Some(CONNECT_TIMEOUT))
-            .timeout_global(Some(DEFAULT_TIMEOUT))
+            .timeout_global(Some(crate::services::budget::REQUEST))
             // See the note above `CONNECT_TIMEOUT`'s neighbours: no pooling.
             .max_idle_connections(0)
             .build();

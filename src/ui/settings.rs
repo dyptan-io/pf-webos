@@ -454,12 +454,11 @@ pub fn codec_label(pref: CodecPref) -> &'static str {
 
 /// Controller types offered, in display order. `Automatic` first (the default, and what an
 /// existing install already has); the rest are ordered by how likely a TV user is to own one.
-pub const GAMEPAD_TYPES: [GamepadType; 7] = [
+pub const GAMEPAD_TYPES: [GamepadType; 6] = [
     GamepadType::Auto,
     GamepadType::DualSense,
     GamepadType::DualSenseEdge,
     GamepadType::DualShock4,
-    GamepadType::Xbox360,
     GamepadType::XboxOne,
     GamepadType::SwitchPro,
 ];
@@ -467,8 +466,7 @@ pub const GAMEPAD_TYPES: [GamepadType; 7] = [
 pub fn gamepad_label(t: GamepadType) -> &'static str {
     match t {
         GamepadType::Auto => "Automatic",
-        GamepadType::Xbox360 => "Xbox 360",
-        GamepadType::XboxOne => "Xbox One",
+        GamepadType::XboxOne => "Xbox",
         GamepadType::DualShock4 => "DualShock 4",
         GamepadType::DualSense => "DualSense",
         GamepadType::DualSenseEdge => "DualSense Edge",

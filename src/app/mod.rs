@@ -328,6 +328,11 @@ pub struct App {
     pub(crate) reachable: std::collections::HashMap<(String, u16), bool>,
     pub(crate) reach_rx: Option<std::sync::mpsc::Receiver<crate::app::state::reach::Reachability>>,
     pub(crate) reach_last: Option<Instant>,
+    /// `GameStream` hosts mDNS found that are currently hidden because the same machine also
+    /// answers punktfunk — see `App::refresh_gamestream_shadowing`. Held rather than dropped so
+    /// the row can appear the moment the punktfunk side goes away, without waiting out another
+    /// browse cycle.
+    pub(crate) shadowed_gamestream: Vec<crate::services::discovery::DiscoveredHost>,
     /// Delivers the "close what the host is running" worker's one status line; `None` when none is
     /// in flight. See `app::state::gamestream`.
     pub(crate) quit_app_rx: Option<std::sync::mpsc::Receiver<String>>,
@@ -565,6 +570,7 @@ impl App {
             reachable: Self::new_reachability(),
             reach_rx: None,
             reach_last: None,
+            shadowed_gamestream: Vec::new(),
             quit_app_rx: None,
             gs_probe_rx: None,
             keyboard_shown: false,
@@ -635,17 +641,87 @@ impl App {
     /// caller that mutates `known_hosts` goes through this rather than collecting the list
     /// itself, so the `GameStream` visibility filter can't be forgotten at one site.
     pub(crate) fn rebuild_entries(&mut self) {
-        self.entries = known_entries(&self.known_hosts, self.settings.gamestream_enabled);
+        self.set_entries(known_entries(&self.known_hosts, self.settings.gamestream_enabled));
+    }
+
+    /// Re-applies the `GameStream` visibility filter, keeping the discovered-but-unsaved rows
+    /// that survive it. Unlike [`Self::rebuild_entries`] — where a save/forget has made the
+    /// discovered rows stale — a toggle says nothing about the punktfunk hosts mDNS already
+    /// found, and re-finding them would mean waiting out another browse cycle.
+    pub(crate) fn refilter_entries(&mut self) {
+        let mut entries = known_entries(&self.known_hosts, self.settings.gamestream_enabled);
+        // Appended after the known ones, which is where `drain_discovery` keeps them.
+        entries.extend(
+            self.entries
+                .iter()
+                .filter(|e| matches!(e, HostEntry::Discovered(_)) && self.protocol_visible(e.protocol()))
+                .cloned(),
+        );
+        self.set_entries(entries);
+    }
+
+    /// The one place the sidebar row list is replaced: keeps focus on the row the user is on and
+    /// marks the layer dirty, neither of which any caller should have to remember.
+    fn set_entries(&mut self, entries: Vec<HostEntry>) {
+        let before = self.entries.len();
+        self.entries = entries;
+        self.reanchor_sidebar_focus(before);
         // The sidebar layer is a cached tile keyed by nothing but this flag (see `prepare_tiles`),
         // so a rebuilt row list that doesn't set it leaves the previous host list on screen.
         self.sidebar_dirty = true;
     }
 
-    /// Whether `addr` has a discovered-but-unsaved row speaking `protocol`.
-    fn discovered_at(&self, addr: &str, protocol: crate::core::protocol::Protocol) -> bool {
-        self.entries
+    /// Whether rows speaking `protocol` are shown at all — the `GameStream` toggle, asked in the
+    /// one form every filter here needs.
+    pub(crate) fn protocol_visible(&self, protocol: crate::core::protocol::Protocol) -> bool {
+        self.settings.gamestream_enabled || protocol != crate::core::protocol::Protocol::GameStream
+    }
+
+    /// Keeps sidebar focus on the row the user is actually on after the host list changed
+    /// length (`before` is what it was). Focus is a flat index over hosts + "Add host" +
+    /// "Settings", and the two utility rows are identified purely by their index — see
+    /// `compose_sidebar_focus`, which only draws the bottom-pinned highlight for
+    /// `entries.len() + 1` — so leaving a stale index there puts "Settings" mid-list.
+    fn reanchor_sidebar_focus(&mut self, before: usize) {
+        let now = self.entries.len();
+        let (HomeFocus::Sidebar(i) | HomeFocus::SidebarMenu(i)) = self.home_focus else {
+            return; // grid focus doesn't index the sidebar
+        };
+        if now == before {
+            return;
+        }
+        // A ⋯ belongs to a host row, so it survives only while that row does.
+        if matches!(self.home_focus, HomeFocus::SidebarMenu(_)) && i < now {
+            return;
+        }
+        // Past the hosts are the two utility rows, which move with the list's length; a host
+        // index only needs clamping into what's left.
+        let i = if i >= before { i - before + now } else { i.min(now) };
+        self.home_focus = HomeFocus::Sidebar(i);
+    }
+
+    /// Whether `addr:port` already has a sidebar row, saved or merely discovered.
+    pub(crate) fn host_listed(&self, addr: &str, port: u16) -> bool {
+        self.known_hosts.iter().any(|h| h.host == addr && h.port == port)
+            || self
+                .entries
+                .iter()
+                .any(|e| matches!(e, HostEntry::Discovered(d) if d.addr == addr && d.port == port))
+    }
+
+    /// The port of every row at `addr` speaking `protocol` — saved or merely discovered. With
+    /// `addr` they key into `reachable`, which is how `App::gamestream_shadowed` asks whether a
+    /// machine's other protocol is answering.
+    pub(crate) fn ports_at(&self, addr: &str, protocol: crate::core::protocol::Protocol) -> Vec<u16> {
+        self.known_hosts
             .iter()
-            .any(|e| matches!(e, HostEntry::Discovered(d) if d.addr == addr && d.protocol == protocol))
+            .filter(|h| h.host == addr && h.protocol == protocol)
+            .map(|h| h.port)
+            .chain(self.entries.iter().filter_map(|e| match e {
+                HostEntry::Discovered(d) if d.addr == addr && d.protocol == protocol => Some(d.port),
+                _ => None,
+            }))
+            .collect()
     }
 
     /// Merges freshly-discovered hosts into the entry list (known hosts keep their
@@ -656,6 +732,7 @@ impl App {
     /// actually changed — `main.rs`'s render loop uses this to skip a redraw when a
     /// discovery tick found nothing new (see its dirty-flag docs).
     pub fn drain_discovery(&mut self) -> bool {
+        let before = self.entries.len();
         let mut changed = false;
         let mut mac_learned = false;
         let mut woke = None;
@@ -665,35 +742,16 @@ impl App {
         while let Ok(found) = self.discovered.try_recv() {
             // The browse itself is chosen once, in `App::new`, so a toggle flipped since then can
             // still be delivering `GameStream` adverts.
-            if found.protocol == crate::core::protocol::Protocol::GameStream {
-                if !self.settings.gamestream_enabled {
-                    continue;
-                }
-                // A host advertising both protocols is one host, and punktfunk is the better half
-                // of it (full feature set). Its `GameStream` side stays reachable by adding
-                // `ip:port` by hand, which is the deliberate way to ask for it.
-                let punktfunk = crate::core::protocol::Protocol::Punktfunk;
-                if self
-                    .known_hosts
-                    .iter()
-                    .any(|h| h.host == found.addr && h.protocol == punktfunk)
-                    || self.discovered_at(&found.addr, punktfunk)
-                {
-                    tracing::debug!("mdns: ignoring GameStream advert from {} (punktfunk host)", found.addr);
-                    continue;
-                }
+            if !self.protocol_visible(found.protocol) {
+                continue;
             }
-            // The mirror case: punktfunk resolved after its host's `GameStream` advert already
-            // added a row, which must now go. Saved records are left alone: the user paired
-            // that host deliberately.
-            if found.protocol == crate::core::protocol::Protocol::Punktfunk
-                && self.discovered_at(&found.addr, crate::core::protocol::Protocol::GameStream)
-            {
-                self.entries.retain(|e| {
-                    !matches!(e, HostEntry::Discovered(d)
-                        if d.addr == found.addr && d.protocol == crate::core::protocol::Protocol::GameStream)
-                });
-                changed = true;
+            // A host advertising both protocols is one host, and punktfunk is the better half of
+            // it — so its `GameStream` side is parked, not dropped, and appears if that half stops
+            // answering. See `App::refresh_gamestream_shadowing`.
+            if found.protocol == crate::core::protocol::Protocol::GameStream && self.gamestream_shadowed(&found.addr) {
+                tracing::debug!("mdns: parking GameStream advert from {} (punktfunk up)", found.addr);
+                self.park_gamestream(found);
+                continue;
             }
             #[allow(clippy::suspicious_operation_groupings)]
             if let Some(w) = &self.wake {
@@ -712,17 +770,7 @@ impl App {
                     mac_learned = true;
                 }
             }
-            #[allow(clippy::suspicious_operation_groupings)]
-            let already_known = self
-                .known_hosts
-                .iter()
-                .any(|h| h.host == found.addr && h.port == found.port);
-            if !already_known
-                && !self
-                    .entries
-                    .iter()
-                    .any(|e| matches!(e, HostEntry::Discovered(d) if d.addr == found.addr && d.port == found.port))
-            {
+            if !self.host_listed(&found.addr, found.port) {
                 self.entries.push(HostEntry::Discovered(found));
                 changed = true;
             }
@@ -734,12 +782,12 @@ impl App {
             self.wake_succeeded(host, port, mgmt_port, "mDNS");
             changed = true;
         }
+        // A punktfunk host can have resolved only now, which parks the `GameStream` row this
+        // same drain (or an earlier one) added for the same machine.
+        changed |= self.refresh_gamestream_shadowing();
         if changed {
-            // A row can have been dropped above, not just appended.
-            let sidebar_len = self.sidebar_len();
-            if let HomeFocus::Sidebar(i) = &mut self.home_focus {
-                *i = (*i).min(sidebar_len - 1);
-            }
+            // Rows were appended and can have been parked, so the utility rows have moved.
+            self.reanchor_sidebar_focus(before);
             self.sidebar_dirty = true;
         }
         changed

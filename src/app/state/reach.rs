@@ -27,7 +27,13 @@ impl App {
             return;
         }
         self.reach_last = Some(Instant::now());
-        let targets: Vec<(String, u16)> = self.entries.iter().map(|e| (e.host().to_string(), e.port())).collect();
+        // Probed through the entry's own backend: a `GameStream` host would fail a punktfunk
+        // handshake and read as offline forever.
+        let targets: Vec<(crate::core::protocol::Protocol, String, u16)> = self
+            .entries
+            .iter()
+            .map(|e| (e.protocol(), e.host().to_string(), e.port()))
+            .collect();
         if targets.is_empty() {
             return;
         }
@@ -38,8 +44,8 @@ impl App {
         // indicator. Each send failing (the receiver replaced by a newer sweep, or the app
         // gone) just ends the sweep early.
         std::thread::spawn(move || {
-            for (host, port) in targets {
-                let online = punktfunk_core::client::NativeClient::probe(&host, port, REACH_TIMEOUT);
+            for (protocol, host, port) in targets {
+                let online = crate::backend::backend_for(protocol).probe(&host, port, REACH_TIMEOUT);
                 if tx.send(Reachability { host, port, online }).is_err() {
                     return;
                 }
@@ -73,6 +79,13 @@ impl App {
         }
         if changed {
             self.sidebar_dirty = true;
+        }
+        // A punktfunk host that just went offline un-shadows its machine's `GameStream` side,
+        // and one that came back re-shadows it — which moves the sidebar's utility rows.
+        let before = self.entries.len();
+        if self.refresh_gamestream_shadowing() {
+            self.reanchor_sidebar_focus(before);
+            changed = true;
         }
         changed
     }

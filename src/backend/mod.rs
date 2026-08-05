@@ -55,6 +55,12 @@ pub trait HostBackend: Send + Sync {
     /// different default ports, so the fallback can't live at the call site.
     fn default_query_port(&self) -> u16;
 
+    /// Whether the host answers on `port` right now, blocking for at most `timeout`. Feeds the
+    /// sidebar's online dot (`app::state::reach`) and the `GameStream` shadowing rule
+    /// (`App::refresh_gamestream_shadowing`), so it has to be as cheap as a probe can be —
+    /// nothing here fetches a library or completes a handshake beyond what liveness needs.
+    fn probe(&self, addr: &str, port: u16, timeout: std::time::Duration) -> bool;
+
     /// Fetches the host's game library, blocking. `query_port` is already defaulted by the
     /// caller via [`Self::default_query_port`].
     ///

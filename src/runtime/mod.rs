@@ -90,6 +90,9 @@ fn spawn_connect_gamestream(
                 video_pacing: settings.video_pacing,
                 gamepad_type: settings.gamepad_type,
                 gamepad_attached,
+                // A `GameStream` host is always paired, so there is no approval to park on: this is
+                // the "answered but still starting" budget, spent only once it has answered.
+                host_wait: crate::services::budget::HOST_WAIT,
             })
             .map(StreamHandle::GameStream)
         })
@@ -127,14 +130,12 @@ fn spawn_connect_punktfunk(
                 identity,
                 fp,
                 launch,
-                // 185s applies only to a host that isn't pinned yet: it parks the TOFU
-                // connection until its operator approves. A pinned host has nothing to
-                // approve, so a long budget there just means an unreachable/powered-off TV
-                // sits on the black launch scrim — fail fast and report it instead.
+                // Only an unpinned host parks (until its operator approves); a pinned one is either
+                // reachable now or off, and a long budget there just holds the black launch scrim.
                 if fp.is_some() {
-                    Duration::from_secs(5)
+                    crate::services::budget::HANDSHAKE
                 } else {
-                    Duration::from_secs(185)
+                    crate::services::budget::HOST_WAIT
                 },
                 settings.codec,
                 settings.color_range_override,
