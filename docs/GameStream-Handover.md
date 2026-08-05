@@ -11,7 +11,7 @@ Branch: `gamestream-seam`, one commit, not pushed. Base: `314d912`.
 | --- | --- |
 | P0 armv7 build | **Done** at build level. Not run on device. |
 | P1 pairing + host queries | Not started. |
-| P2 seam refactor | **Half done.** Traits/protocol/trust/discovery/caps landed; `session/sink.rs` not started. |
+| P2 seam refactor | **Done at build level.** Traits/protocol/trust/discovery/caps, plus `session/sink.rs`. The sink has not been streamed against a host. |
 | P3 non-streaming backend | Not started. |
 | P4 streaming driver | Not started. |
 | P5 polish | Not started. |
@@ -29,6 +29,9 @@ Docker only cross-compiles.
 - An existing `known-hosts.json` migrates — paired hosts must still show as paired, and the file
   must lose its `fingerprint` keys on the next save.
 - Pairing, library fetch with cover art, and a stream all still work.
+- **The video sink.** Every frame now goes through `session::sink::NdlSink` instead of inline
+  pump code. Stream a punktfunk host and diff the stats overlay (feed µs, backlog, pacing delta,
+  hold behaviour on induced loss) against a build of `314d912`. Compile-clean is not evidence.
 
 ## Corrections to the plan
 
@@ -80,6 +83,8 @@ GameStream `KnownHost`s out of the sidebar.
 - `src/app/state/pairing.rs` — default focus avoids the request-access button when
   `!caps().request_access`.
 - `src/bin/gsprobe.rs` — P0 probe.
+- `src/session/sink.rs` — `VideoSink`/`FrameFlags`/`SinkResult`, `NdlSink`, and `VideoPlayer`
+  (moved out of `session/mod.rs`). See the sink section below.
 
 ## Deliberate deviations from the plan's design
 
@@ -102,31 +107,36 @@ Do not "fix" these without reading the reasoning.
    `backend_or_punktfunk`, which logs at error level first. Delete that helper once P3 makes
    `backend_for` total.
 
-## Next session: finish P2
+## The video sink (P2's second half)
 
-The remaining half, and the only part that can regress punktfunk streaming.
+`session/sink.rs` now owns everything between "an access unit arrived" and "NDL has been fed":
+host-PTS anchoring, the reconciled `PtsPacer`, backpressure metering, freeze-until-reanchor, and
+keyframe-request throttling. `video_pump` kept only the protocol-shaped parts — pulling frames,
+deciding what counts as loss, and *how* a keyframe is asked for. It shrank by ~170 lines.
 
-Extract into `session/sink.rs`, out of `video_pump` (`src/session/mod.rs:840-1082`): host-PTS
-anchoring, the refresh-rate-reconciled `PtsPacer`, backpressure metering, hold-until-reanchor,
-and keyframe-request throttling. Target shape from the plan:
+Deviations from the plan's sketch, same rule as the list above — don't "fix" without reading:
 
-```rust
-trait VideoSink { fn submit(&self, au: &[u8], pts_ns: i64, flags: FrameFlags) -> SinkResult; }
-```
+- **`submit` takes `&mut self`, not `&self`.** All the state it carries (pacer, anchor, hold
+  deadline, throttle) is per-frame mutable and single-threaded by construction — the sink is
+  owned by the pump thread. `&self` would only buy interior mutability nobody needs.
+- **`pts_ns` is `u64`, not the plan's `i64`.** That's what core hands over, and negative host
+  PTS has no meaning; `HostPtsAnchor::map` already floors at 0.
+- **`FrameFlags` carries `index`.** Purely so the sink's warn/info lines can name the frame the
+  way the inline code did. It is documented as logs-only.
+- **`VideoSink` has `holding()` and `backlog()` beyond `submit`.** Both have live callers (the
+  pump's 2 s heartbeat) — the "no unverifiable scaffolding" rule from the trait list above.
+- **The keyframe throttle is per-sink config** (`SinkConfig::keyframe_min_interval`), not a
+  constant. punktfunk passes `KEYFRAME_REQUEST_MIN_INTERVAL` (100 ms); GameStream should pass
+  ~1000 ms, because IDR requests share the ENet control channel with gamepad input, so an
+  unthrottled request loop directly inflates input latency.
+- **`NdlSink` is built inside the video thread**, not at the `connect` call site: the pacer
+  queries the panel refresh rate through SDL on construction, and that query was on the video
+  thread before.
 
-implemented **once** over `NdlVideo` + `PtsPacer` + `StreamStats`, so there is exactly one place
-that talks to NDL and both protocols inherit the pacing work. `SinkResult::NeedKeyframe` is the
-seam that serves both: punktfunk's pump calls `request_keyframe()`, GameStream returns
-`DecodeResult::NeedIdr`.
+## Next session
 
-Note while doing it: `KEYFRAME_REQUEST_MIN_INTERVAL` (`session/mod.rs:753`, 100 ms) must become
-per-backend — roughly 1000 ms for GameStream, because IDR requests share the ENet control channel
-with gamepad input, so an unthrottled request loop directly inflates input latency.
-
-**Verify by streaming a punktfunk host and diffing the stats overlay against a build of
-`314d912`.** Compile-clean is not evidence here.
-
-Useful anchors found while exploring, for whoever does this:
+`session::connect`'s argument list and the `Connected { client }` narrowing are the remaining
+P2-adjacent cleanups; neither blocks P1 or P3. The anchors found while exploring:
 
 - `session::connect` is 15 positional args (`session/mod.rs:265-281`), sole caller
   `runtime::spawn_connect` (`runtime/mod.rs:47-97`). A `ConnectSpec` struct would collapse both

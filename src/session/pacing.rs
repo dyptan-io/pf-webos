@@ -46,7 +46,7 @@ const PACE_MIN_STEP_NS: u64 = 1_000_000;
 /// first frame of a run: `base = player_anchor + (host_pts - host_anchor)`. Keeps the
 /// pacer's drift-clamp reference on host frame cadence instead of feed-time wall-clock,
 /// so network jitter doesn't leak into the clamp target (see
-/// [`crate::session::VideoPlayer::pace_base_ns`]). Same anchoring as SS4S's
+/// [`crate::session::sink::VideoPlayer::pace_base_ns`]). Same anchoring as SS4S's
 /// `ndl_player.c::SS4S_NDL_webOS5_NextVideoPts`. Reset alongside [`PtsPacer`] after a
 /// freeze-until-reanchor hold, where both timelines jump.
 pub struct HostPtsAnchor {
@@ -81,7 +81,7 @@ impl HostPtsAnchor {
 
 /// Smooths the PTS fed to the decoder against delivery jitter — an "ideal" value
 /// advances by a fixed frame interval each call, clamped to a small drift window around
-/// the real (unpaced) reference (see [`crate::session::VideoPlayer::pace_base_ns`]).
+/// the real (unpaced) reference (see [`crate::session::sink::VideoPlayer::pace_base_ns`]).
 /// Changes only *what* timestamp is attached, never *when* `play()` runs, so a burst of
 /// frames landing together still gets spaced one interval apart. Same technique as
 /// aurora-tv's `SS4S_SMOOTH_PACING`.

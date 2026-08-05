@@ -1,13 +1,15 @@
 //! Connects to a punktfunk host and drives the video/audio hardware pipelines.
 //!
-//! Video runs on a dedicated thread ([`video_pump`]) behind a [`VideoPlayer`] wrapper
-//! over the NDL `DirectMedia` backend (the sole video backend).
+//! Video runs on a dedicated thread ([`video_pump`]), which pulls access units off the
+//! transport and hands them to a [`sink::VideoSink`] — everything from PTS pacing down to
+//! the NDL `DirectMedia` backend (the sole video backend) lives behind that seam.
 //!
 //! Audio takes one of two paths: software-decoded audio is drained from the main
 //! thread ([`pump_audio_once`]) because `sdl2::audio::AudioQueue` is `!Send`; the
 //! NDL-offloaded path has its own drain thread ([`ndl_audio_pump`]), decoupled from
 //! both the main loop and the video pump.
 pub mod pacing;
+pub mod sink;
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +25,9 @@ use punktfunk_core::quic;
 
 use crate::platform::webos::ndl::{NdlCodec, NdlVideo};
 use crate::services::store::{CodecPref, ColorRangeOverride};
-use crate::session::pacing::{HostPtsAnchor, PtsPacer};
+use crate::session::sink::{
+    FrameFlags, NdlSink, SinkConfig, SinkResult, VideoPlayer, VideoSink, KEYFRAME_REQUEST_MIN_INTERVAL,
+};
 
 impl ColorRangeOverride {
     /// Force the VUI `full_range` flag per the user override before it's handed to
@@ -36,58 +40,6 @@ impl ColorRangeOverride {
             Self::Limited => color.full_range = 0,
             Self::Auto => {}
         }
-    }
-}
-
-/// Video-decode backend (NDL `DirectMedia` — the only one). Arc'd because the audio-offload
-/// path shares the handle with `ndl_audio_pump`; NDL unloads process-globally, so unload
-/// waits for both threads (`Arc::drop`).
-struct VideoPlayer(Arc<NdlVideo>);
-
-impl VideoPlayer {
-    /// Feed access unit; return (result, `feed_duration`) for ABR latency reporting.
-    /// `pts_ns` must already be in NDL's PTS clock domain (see [`Self::pace_base_ns`]).
-    fn play(&self, au: &[u8], pts_ns: u64) -> (anyhow::Result<()>, Duration) {
-        let t = Instant::now();
-        let result = self.0.play(au, pts_ns);
-        (result, t.elapsed())
-    }
-
-    /// Unpaced PTS reference for `frame` in NDL's clock domain, smoothed by [`PtsPacer`]
-    /// before it reaches [`Self::play`]. NDL has no PTS clock of its own (see
-    /// `NdlVideo::elapsed_ns`); with `anchor` present the host PTS is mapped onto NDL's
-    /// player clock ([`HostPtsAnchor`]) so the reference tracks host frame cadence instead
-    /// of feed-time wall-clock, keeping delivery jitter out of the pacer's drift-clamp
-    /// anchor. Without `anchor` (pacing off) NDL falls back to raw player time.
-    fn pace_base_ns(&self, frame_pts_ns: u64, anchor: Option<&mut HostPtsAnchor>) -> u64 {
-        let player_clock_ns = self.0.elapsed_ns();
-        match anchor {
-            Some(a) => a.map(frame_pts_ns, player_clock_ns),
-            None => player_clock_ns,
-        }
-    }
-
-    fn flush(&self) -> anyhow::Result<()> {
-        self.0.flush()
-    }
-
-    fn set_color_info(&self, meta: Option<&quic::HdrMeta>, color: quic::ColorInfo) -> anyhow::Result<()> {
-        self.0.set_color_info(meta, color)
-    }
-
-    /// Whether the backend decodes audio itself.
-    fn audio_offloaded(&self) -> bool {
-        self.0.audio_offloaded()
-    }
-
-    /// Shared NDL handle when audio-offloaded; None on a video-only load.
-    fn ndl_audio_handle(&self) -> Option<Arc<NdlVideo>> {
-        self.0.audio_offloaded().then(|| self.0.clone())
-    }
-
-    /// NDL render-buffer backlog (None if the query fails).
-    fn render_buffer_length(&self) -> Option<i32> {
-        self.0.render_buffer_length()
     }
 }
 
@@ -376,7 +328,7 @@ pub fn connect(
         resolved_mode.width,
         resolved_mode.height,
     );
-    let player = VideoPlayer(Arc::new(ndl));
+    let player = VideoPlayer::new(Arc::new(ndl));
 
     // An on-device sweep value for NDL's undocumented frame-drop threshold, if one has
     // been dropped in (see `store::dev_override_ndl_drop_threshold`). Never set by
@@ -443,13 +395,21 @@ pub fn connect(
     let ndl_audio = player.ndl_audio_handle();
     let video_client = client.clone();
     let video_stop = stop.clone();
+    let sink_cfg = SinkConfig {
+        stream_hz: resolved_mode.refresh_hz,
+        report_decode_latency: client.wants_decode_latency(),
+        keyframe_min_interval: KEYFRAME_REQUEST_MIN_INTERVAL,
+    };
     let video_stats = stats.clone();
     let video_thread = std::thread::Builder::new()
         .name("punktfunk-webos-video".into())
         .spawn(move || {
+            // Built here, not on the caller's thread: the pacer queries the panel refresh
+            // rate through SDL on construction, and that stayed on the video thread before.
+            let sink = NdlSink::new(player, video_stats.clone(), sink_cfg);
             video_pump(
                 video_client,
-                player,
+                sink,
                 video_stop,
                 video_stats,
                 is_hdr,
@@ -749,16 +709,6 @@ pub fn run_speed_probe(
     }
 }
 
-/// Throttle for keyframe requests during hold or decode errors.
-const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(100);
-/// Freeze duration after which we resume even without a clean re-anchor.
-const HOLD_GIVE_UP: Duration = Duration::from_secs(2);
-/// Feed calls slower than this suggest decoder backpressure rather than network loss.
-const FEED_BACKPRESSURE_WARN: Duration = Duration::from_millis(20);
-/// How often the pump refreshes NDL's render-buffer depth for the ABR decode signal —
-/// three samples per 750 ms report window; see the fold in [`video_pump`].
-const BACKLOG_POLL: Duration = Duration::from_millis(250);
-
 /// Suffix identifying a `GStreamer` pad-task thread (`"<element-name>:<pad-name>"`,
 /// truncated to the kernel's 15-char `comm` limit) — the NDL vendor `.so` builds its
 /// internal decode pipeline out of `GStreamer` elements, each with its own pad-task
@@ -839,7 +789,7 @@ fn spawn_vendor_decode_thread_renicer() {
 
 fn video_pump(
     client: Arc<NativeClient>,
-    player: VideoPlayer,
+    mut sink: NdlSink,
     stop: Arc<AtomicBool>,
     stats: Arc<StreamStats>,
     is_hdr: bool,
@@ -872,38 +822,7 @@ fn video_pump(
     );
     spawn_vendor_decode_thread_renicer();
 
-    let wants_decode_latency = client.wants_decode_latency();
-    // The decode figure reported to core's ABR controller. NDL's `play` is
-    // decode-AND-present in one opaque call, so `feed_elapsed` alone is *submission*
-    // time — a decoder quietly falling behind buffers frames internally and the feed
-    // stays fast, which left the controller's decode-rise signal (`abr::DECODE_RISE_US`,
-    // built precisely for "the decoder saturates before the link does") effectively
-    // blind on this client. The render-buffer backlog IS that standing decode queue, so
-    // it's folded in as `backlog × frame_period`. Polled on a cadence rather than every
-    // frame — three samples per 750 ms ABR report window is plenty, and assuming an NDL
-    // query is cheap enough for per-frame use is exactly the mistake docs/NOTES.md warns
-    // against; between polls the cached depth is reused.
-    let stream_hz = client.mode().refresh_hz.max(1);
-    let frame_period_us = 1_000_000 / u64::from(stream_hz);
-    // Always instantiated — the Blue button can flip pacing on mid-stream, so the state must
-    // exist even when it starts off. Pacer interval reconciles against the panel's measured
-    // refresh (`reconciled_pace_interval_ns`); ABR backlog folding above stays on the stream
-    // rate (host's actual cadence). `host_anchor` is the NDL host-PTS→player-clock mapping,
-    // reset in lockstep with the pacer.
-    let mut pacer = PtsPacer::new(crate::session::pacing::reconciled_pace_interval_ns(stream_hz));
-    let mut host_anchor = HostPtsAnchor::new();
-    // Previous-frame pacing state, so an off→on flip can re-anchor cleanly.
-    let mut pacing_was_on = stats.pacing_enabled.load(Ordering::Relaxed);
-    let mut backlog_cached: u64 = 0;
-    let mut last_backlog_poll: Option<Instant> = None;
     let mut last_dropped_seen = client.frames_dropped();
-    let mut last_keyframe_request: Option<Instant> = None;
-    // Freeze-until-reanchor: while `holding`, frames are skipped rather than fed —
-    // the punch-through plane keeps the last good picture. Resumes on IDR / LTR-RFI
-    // recovery anchor, or after HOLD_GIVE_UP. `hold_started` is not reset on
-    // cascading gaps so the give-up deadline can't be pushed out indefinitely.
-    let mut holding = false;
-    let mut hold_started: Option<Instant> = None;
     let mut frames_received: u64 = 0;
     let mut last_heartbeat = Instant::now();
 
@@ -915,7 +834,7 @@ fn video_pump(
                 stats.bytes.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
                 if last_heartbeat.elapsed() >= Duration::from_secs(2) {
                     last_heartbeat = Instant::now();
-                    let backlog = player.render_buffer_length();
+                    let backlog = sink.backlog();
                     stats.render_backlog.store(backlog.unwrap_or(-1), Ordering::Relaxed);
                     // `backlog` separates "the decoder is behind" from "frames are
                     // arriving late" — indistinguishable before this, since play()
@@ -928,7 +847,8 @@ fn video_pump(
                     // plain sideloaded run with no telemetry listener. Half a line per
                     // second is affordable; a second round trip to reproduce is not.
                     tracing::debug!(
-                        "video: {frames_received} frames, holding={holding}, dropped={}, backlog={}",
+                        "video: {frames_received} frames, holding={}, dropped={}, backlog={}",
+                        sink.holding(),
                         client.frames_dropped(),
                         backlog.map_or_else(|| "n/a".to_string(), |b| b.to_string()),
                     );
@@ -940,105 +860,27 @@ fn video_pump(
                 if dropped {
                     last_dropped_seen = dropped_now;
                 }
-                if (gap || dropped) && !holding {
-                    holding = true;
-                    stats.holding.store(true, Ordering::Relaxed);
-                    hold_started = Some(Instant::now());
-                    tracing::warn!(
-                        "loss (gap={gap} dropped={dropped}, frame {}) — freezing",
-                        frame.frame_index
-                    );
-                    let _ = player.flush();
+                if (gap || dropped) && !sink.holding() {
+                    // Which of the two fired is the protocol-specific half of the freeze
+                    // the sink logs next — a sequence hole vs. a frame the transport itself
+                    // gave up on point at different faults.
+                    tracing::warn!("loss: gap={gap} dropped={dropped} (frame {})", frame.frame_index);
                 }
-                if holding && last_keyframe_request.is_none_or(|t| t.elapsed() >= KEYFRAME_REQUEST_MIN_INTERVAL) {
-                    if let Err(e) = client.request_keyframe() {
-                        tracing::warn!("request_keyframe: {e:#}");
-                    }
-                    last_keyframe_request = Some(Instant::now());
-                }
-
-                let is_reanchor =
-                    frame.flags & u32::from(FLAG_SOF) != 0 || frame.flags & USER_FLAG_RECOVERY_ANCHOR != 0;
-                let gave_up = hold_started.is_some_and(|t| t.elapsed() >= HOLD_GIVE_UP);
-                if holding && !is_reanchor && !gave_up {
-                    // Still frozen — drop this concealed frame, but fall through to the
-                    // HDR poll below instead of `continue`ing past it.
-                } else {
-                    if holding {
-                        tracing::info!(
-                            "resuming after {:.0}ms (frame {}, flags=0x{:x}, reanchor={is_reanchor}, gave_up={gave_up})",
-                            hold_started.map_or(0.0, |t| t.elapsed().as_secs_f32() * 1000.0),
-                            frame.frame_index,
-                            frame.flags,
-                        );
-                        // The real timeline just jumped (freeze then reanchor/give-up) —
-                        // nothing about the pre-hold accumulator is worth continuing.
-                        pacer.reset();
-                        host_anchor.reset();
-                    }
-                    holding = false;
-                    stats.holding.store(false, Ordering::Relaxed);
-                    hold_started = None;
-
-                    // Live pacing toggle (Blue button): re-anchor on the off→on edge so the
-                    // pacer picks up from the current frame rather than a stale grid.
-                    let pacing_on = stats.pacing_enabled.load(Ordering::Relaxed);
-                    if pacing_on && !pacing_was_on {
-                        pacer.reset();
-                        host_anchor.reset();
-                    }
-                    pacing_was_on = pacing_on;
-
-                    let base_ns = player.pace_base_ns(frame.pts_ns, pacing_on.then_some(&mut host_anchor));
-                    let pts_ns = if pacing_on {
-                        let paced = pacer.next(base_ns);
-                        stats
-                            .pacing_delta_ns
-                            .store(paced as i64 - base_ns as i64, Ordering::Relaxed);
-                        paced
-                    } else {
-                        stats.pacing_delta_ns.store(0, Ordering::Relaxed);
-                        base_ns
-                    };
-                    let (play_result, feed_elapsed) = player.play(&frame.data, pts_ns);
-                    stats.feed_us.store(
-                        u32::try_from(feed_elapsed.as_micros()).unwrap_or(u32::MAX),
-                        Ordering::Relaxed,
-                    );
-
-                    if feed_elapsed >= FEED_BACKPRESSURE_WARN {
-                        tracing::warn!(
-                            "NDL slow: {:.1}ms (frame {}, pts {:.2}ms)",
-                            feed_elapsed.as_secs_f32() * 1000.0,
-                            frame.frame_index,
-                            pts_ns as f64 / 1_000_000.0,
-                        );
-                    }
-                    if wants_decode_latency && play_result.is_ok() {
-                        if last_backlog_poll.is_none_or(|t| t.elapsed() >= BACKLOG_POLL) {
-                            last_backlog_poll = Some(Instant::now());
-                            backlog_cached = player
-                                .render_buffer_length()
-                                .and_then(|b| u64::try_from(b).ok())
-                                .unwrap_or(0);
+                let flags = FrameFlags {
+                    reanchor: frame.flags & u32::from(FLAG_SOF) != 0 || frame.flags & USER_FLAG_RECOVERY_ANCHOR != 0,
+                    loss: gap || dropped,
+                    index: u64::from(frame.frame_index),
+                };
+                match sink.submit(&frame.data, frame.pts_ns, flags) {
+                    SinkResult::Presented { decode_us } => {
+                        if let Some(us) = decode_us {
+                            client.report_decode_us(us);
                         }
-                        let decode_us = u64::try_from(feed_elapsed.as_micros())
-                            .unwrap_or(u64::MAX)
-                            .saturating_add(backlog_cached.saturating_mul(frame_period_us));
-                        client.report_decode_us(u32::try_from(decode_us).unwrap_or(u32::MAX));
                     }
-                    if let Err(e) = play_result {
-                        tracing::warn!(
-                            "NDL error (frame {}, pts {:.2}ms): {e:#}",
-                            frame.frame_index,
-                            pts_ns as f64 / 1_000_000.0,
-                        );
-                        if last_keyframe_request.is_none_or(|t| t.elapsed() >= KEYFRAME_REQUEST_MIN_INTERVAL) {
-                            let _ = client.request_keyframe();
-                            let _ = player.flush();
-                            last_keyframe_request = Some(Instant::now());
-                            holding = true;
-                            hold_started.get_or_insert_with(Instant::now);
+                    SinkResult::Held => {}
+                    SinkResult::NeedKeyframe => {
+                        if let Err(e) = client.request_keyframe() {
+                            tracing::warn!("request_keyframe: {e:#}");
                         }
                     }
                 }
@@ -1073,7 +915,7 @@ fn video_pump(
                 );
                 let mut color = client.color;
                 color_range_override.apply(&mut color);
-                if let Err(e) = player.set_color_info(Some(&meta), color) {
+                if let Err(e) = sink.set_color_info(Some(&meta), color) {
                     tracing::warn!("NDL set_color_info: {e:#}");
                 }
             }
