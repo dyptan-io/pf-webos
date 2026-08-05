@@ -24,6 +24,16 @@ const PAIRING_MARGIN: i32 = 40;
 /// The display-PIN modal's subtitle (also used for height measurement, like `PAIRING_SUBTITLE`).
 pub(crate) const DISPLAY_PIN_SUBTITLE: &str = "This host pairs the other way round.";
 
+/// The captions between the card's rows. Constants because the layout has to measure them: they
+/// wrap to the card's inner column like every other modal's body text, so how many lines each
+/// takes decides where the row below it starts.
+const PAIRING_BUTTON_CAPTION: &str = "Then approve this TV on the host.";
+const PAIRING_PIN_CAPTION: &str = "Enter the PIN shown on the host.";
+const DISPLAY_PIN_CAPTION: &str = "Enter this PIN on the host (Sunshine: Troubleshooting → PIN).";
+
+/// Line spacing within a wrapped caption, matching the status line's.
+const CAPTION_LINE_GAP: i32 = 6;
+
 /// The display-PIN card's y-positions. A separate layout rather than a variant of
 /// [`PairingLayout`]: there is no button and no "or" rule to place, and it gains a warning line
 /// the entry layout has no room for.
@@ -45,9 +55,9 @@ impl App {
         let header_end = ui::modal_header_end_y(fonts.raster, fonts.label, fonts.value, card, PAIRING_SUBTITLE);
         let button = Rect::new(content.x(), header_end + 26, content.width(), PAIRING_BUTTON_H);
         let button_caption_y = button.y() + button.height() as i32 + 12;
-        let or_y = button_caption_y + fonts.raster.height(fonts.value) + 20;
+        let or_y = button_caption_y + Self::caption_h(fonts, content.width(), PAIRING_BUTTON_CAPTION) + 20;
         let pin_caption_y = or_y + fonts.raster.height(fonts.value) + 20;
-        let pin_y = pin_caption_y + fonts.raster.height(fonts.value) + 14;
+        let pin_y = pin_caption_y + Self::caption_h(fonts, content.width(), PAIRING_PIN_CAPTION) + 14;
         let status_y = pin_y + ui::PAIRING_DIGIT_H as i32 + 22;
         PairingLayout {
             button,
@@ -69,7 +79,7 @@ impl App {
         );
         let header_end = ui::modal_header_end_y(fonts.raster, fonts.label, fonts.value, card, DISPLAY_PIN_SUBTITLE);
         let caption_y = header_end + 26;
-        let pin_y = caption_y + fonts.raster.height(fonts.value) + 16;
+        let pin_y = caption_y + Self::caption_h(fonts, content.width(), DISPLAY_PIN_CAPTION) + 16;
         let status_y = pin_y + ui::PAIRING_DIGIT_H as i32 + 22;
         DisplayPinLayout {
             caption_y,
@@ -155,7 +165,7 @@ impl App {
             fonts.value,
             l.content,
             l.button_caption_y,
-            "Then approve this TV on the host.",
+            PAIRING_BUTTON_CAPTION,
         )?;
 
         ui::draw_or_divider(painter, text_cache, fonts.raster, fonts.value, l.content, l.or_y, "or")?;
@@ -167,7 +177,7 @@ impl App {
             fonts.value,
             l.content,
             l.pin_caption_y,
-            "Enter the PIN shown on the host.",
+            PAIRING_PIN_CAPTION,
         )?;
         for (i, digit) in self.pin_digits.iter().enumerate() {
             let rect = ui::pairing_digit_rect(card, l.pin_y, i);
@@ -237,7 +247,7 @@ impl App {
             fonts.value,
             l.content,
             l.caption_y,
-            "Enter this PIN on the host (Sunshine: Troubleshooting → PIN).",
+            DISPLAY_PIN_CAPTION,
         )?;
 
         // Placeholders until the PIN exists — a card with an empty row where four digits belong
@@ -280,7 +290,16 @@ impl App {
         Ok(())
     }
 
-    /// Centred caption line (option labels on either side of "or" rule).
+    /// Height one caption occupies, wrapped to `content_w` — what the row below it is placed from.
+    fn caption_h(fonts: &ui::Fonts, content_w: u32, text: &str) -> i32 {
+        let lines = ui::wrap_text(fonts.raster, fonts.value, text, content_w).len().max(1) as i32;
+        lines * fonts.raster.height(fonts.value) + (lines - 1) * CAPTION_LINE_GAP
+    }
+
+    /// Centred caption (the option labels either side of the "or" rule, and the display-PIN
+    /// instruction). Wrapped to the card's inner column like every other modal's body text —
+    /// unwrapped, the longest of them ran past the card edge on a narrower card. Each line is
+    /// centred individually, so the block stays symmetric.
     fn draw_centred_caption(
         painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
@@ -290,17 +309,21 @@ impl App {
         y: i32,
         text: &str,
     ) -> Result<()> {
-        let w = raster.measure(font, text).0 as i32;
-        ui::draw_text(
-            painter,
-            text_cache,
-            raster,
-            font,
-            text,
-            content.x() + (content.width() as i32 - w) / 2,
-            y,
-            ui::MUTED,
-        )?;
+        let mut cursor_y = y;
+        for line in ui::wrap_text(raster, font, text, content.width()) {
+            let w = raster.measure(font, &line).0 as i32;
+            ui::draw_text(
+                painter,
+                text_cache,
+                raster,
+                font,
+                &line,
+                content.x() + (content.width() as i32 - w) / 2,
+                cursor_y,
+                ui::MUTED,
+            )?;
+            cursor_y += raster.height(font) + CAPTION_LINE_GAP;
+        }
         Ok(())
     }
 }

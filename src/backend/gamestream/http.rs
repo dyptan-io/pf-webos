@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use moonlight_common::http::client::blocking_client::RequestClient;
 use moonlight_common::http::client::{RequestError, DEFAULT_LONG_TIMEOUT, DEFAULT_TIMEOUT};
-use moonlight_common::http::{ClientInfo, Endpoint, ParseError, Request as _, TextResponse};
+use moonlight_common::http::{ClientInfo, Endpoint, ParseError, QueryBuilderError, Request as _, TextResponse};
 use pem::Pem;
 use ureq::unversioned::resolver::DefaultResolver;
 use ureq::unversioned::transport::{Connector as _, TcpConnector};
@@ -111,12 +111,12 @@ impl GsHttpClient {
     /// `<scheme>://<hostport><path>?<query>`. `hostport` arrives from `MoonlightHost` already
     /// formatted; IPv6 literals need the brackets a bare `format!` wouldn't add.
     fn url<E: Endpoint>(use_https: bool, client_info: &ClientInfo, hostport: &str, request: &E::Request) -> String {
-        let mut query = String::new();
-        // `String`'s QueryBuilder impl is infallible, so neither append can fail.
+        let mut query = EncodedQuery::default();
+        // `EncodedQuery`'s `append` is infallible, so neither of these can fail.
         let _ = client_info.append_query_params(&mut query);
         let _ = request.append_query_params(&mut query);
         let scheme = if use_https { "https" } else { "http" };
-        format!("{scheme}://{hostport}{}?{query}", E::path())
+        format!("{scheme}://{hostport}{}?{}", E::path(), query.0)
     }
 
     fn text<E>(
@@ -215,6 +215,42 @@ impl RequestClient for GsHttpClient {
     }
 }
 
+/// A query string that percent-encodes its values.
+///
+/// **Not just a nicety — pairing does not work without it.** `moonlight-common` builds queries
+/// through the [`QueryBuilder`] trait, and its own `impl QueryBuilder for String` concatenates
+/// values verbatim (with a `TODO: filter for characters that need % serialization` where the
+/// encoding should be). Our device name is `webOS TV`, so `devicename=webOS TV` reached ureq, whose
+/// `http::Uri` parse rejected the space: `InvalidUriChar`, on pairing phase 1, before a single byte
+/// went to the host. Every other client encodes here too (moonlight-qt goes through `QUrlQuery`),
+/// and Sunshine URL-decodes, so this is the interoperable behaviour rather than a workaround.
+///
+/// Keys are appended as-is: they are all `&'static str` literals in the crate's endpoints.
+#[derive(Default)]
+struct EncodedQuery(String);
+
+impl moonlight_common::http::QueryBuilder for EncodedQuery {
+    fn append(&mut self, param: moonlight_common::http::QueryParam) -> Result<(), QueryBuilderError> {
+        if !self.0.is_empty() {
+            self.0.push('&');
+        }
+        self.0.push_str(param.key);
+        self.0.push('=');
+        for byte in param.value.bytes() {
+            // RFC 3986 unreserved. Everything else is escaped, including `+`, which a decoder is
+            // free to read as a space.
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                self.0.push(char::from(byte));
+            } else {
+                use std::fmt::Write as _;
+                // Writing to a `String` cannot fail.
+                let _ = write!(self.0, "%{byte:02X}");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The PEM tag decides the key encoding: `moonlight-common`'s own generator emits PKCS#8
 /// (`PRIVATE KEY`), but an identity written by another Moonlight client — which is a
 /// supported thing to drop in, since the host keys pairing to the certificate — is usually
@@ -285,5 +321,30 @@ impl rustls::client::danger::ServerCertVerifier for ExactCertVerify {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use moonlight_common::http::{QueryBuilder as _, QueryParam};
+
+    use super::EncodedQuery;
+
+    /// The bug this type exists for: an unencoded space in `devicename` made ureq's URI parse
+    /// reject every pairing request with `InvalidUriChar`.
+    #[test]
+    fn values_are_percent_encoded() {
+        let mut q = EncodedQuery::default();
+        q.append(QueryParam {
+            key: "devicename",
+            value: "webOS TV",
+        })
+        .unwrap();
+        q.append(QueryParam {
+            key: "salt",
+            value: "0a1b",
+        })
+        .unwrap();
+        assert_eq!(q.0, "devicename=webOS%20TV&salt=0a1b");
     }
 }
