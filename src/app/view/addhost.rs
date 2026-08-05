@@ -6,7 +6,7 @@ use crate::ui::render::Rect;
 use crate::ui::{self, Painter};
 use anyhow::Result;
 
-const ADD_HOST_SUBTITLE: &str = "Enter the host's IP address.";
+const ADD_HOST_SUBTITLE: &str = "Enter the host's IP address. Right adds an optional port.";
 
 impl App {
     /// Screen-specific subtitle to avoid layout overflow.

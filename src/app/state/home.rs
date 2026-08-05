@@ -581,17 +581,27 @@ impl App {
             Some(GridCard::Game(game)) => (Some(game.id.clone()), game.title.clone()),
             None => return,
         };
-        // The loading screen's backdrop. Requested here as well as on focus, since a card
-        // can be confirmed before the focus prefetch got round to it; Desktop has no art,
-        // so it keeps the plain fade to black.
-        let mut expected = false;
-        if let Some(game) = launch.as_ref().and_then(|id| self.games.iter().find(|g| &g.id == id)) {
-            expected = game.art.hero.is_some() || game.art.header.is_some();
-            if let Some(loader) = &mut self.art_loader {
+        // The loading screen's backdrop. Desktop has no art, so it keeps the plain fade to
+        // black — as does a game with none, which hands straight over to the stream. Armed
+        // before the art is handed over, so `Hero::accept` recognises a cache hit as belonging
+        // to this launch even if the focus prefetch never ran.
+        let game = launch.as_ref().and_then(|id| self.games.iter().find(|g| &g.id == id));
+        self.hero.arm(launch.clone());
+        if let (Some(game), Some(loader)) = (game, &mut self.art_loader) {
+            // The disk is only touched when the focus prefetch hasn't already decoded this
+            // hero — re-reading it would be several MB of nothing, and that is the common case.
+            let in_hand = self.hero.image_for(&game.id).is_some()
+                || loader
+                    .cached_hero(&game.id)
+                    .is_some_and(|image| self.hero.accept(game.id.clone(), image));
+            if !in_hand && (game.art.hero.is_some() || game.art.header.is_some()) {
+                // Asked for here as well as on focus, since a card can be confirmed before the
+                // prefetch got round to it. The fetch overlaps the connect, and only *this*
+                // case — art that isn't on this TV yet — is worth holding the hand-off for.
                 loader.request_hero(game);
+                self.hero.await_art();
             }
         }
-        self.hero.arm(launch.clone(), expected);
         tracing::debug!("launch: connecting to {host}:{port} now, zoom runs in parallel");
         // Stays up through the zoom and the connect; `run_inner` owns the screen from there.
         self.home_status = Some(format!("Starting {title}…"));

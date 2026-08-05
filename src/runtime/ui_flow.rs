@@ -111,8 +111,9 @@ pub(super) fn run_ui_flow(
     // running by then, so this just carries its handle out of the loop for
     // `run_inner` to join once the launch animation finishes.
     let mut connect_handle: Option<ConnectOutcome> = None;
-    // When the connect thread was first seen finished — the hero linger runs off this.
-    let mut connect_done_at: Option<Instant> = None;
+    // Whether the connect thread has been seen finished. Latched, since `is_finished` is only
+    // polled while the loading screen is up.
+    let mut connect_done = false;
     // Yellow button log overlay works here too (see streaming loop).
     let mut yellow_held = false;
     let mut home_held = false;
@@ -214,11 +215,9 @@ pub(super) fn run_ui_flow(
         // landed (`run_inner`'s join then returns immediately), the decoder presenting (so
         // its reveal wait is satisfied too), and the hold and fade-out done.
         if let Some(t) = app.launch_anim {
-            if connect_done_at.is_none() && connect_handle.as_ref().is_none_or(|(h, _)| h.is_finished()) {
-                connect_done_at = Some(Instant::now());
-            }
+            connect_done |= connect_handle.as_ref().is_none_or(|(h, _)| h.is_finished());
             let presenting = crate::platform::webos::ndl::playing();
-            if app.hero.handover_ready(t.elapsed(), connect_done_at, presenting) {
+            if app.hero.handover_ready(t.elapsed(), connect_done, presenting) {
                 break 'ui;
             }
         }

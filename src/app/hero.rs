@@ -19,8 +19,8 @@ pub(crate) struct Hero {
     wanted: Option<String>,
     /// Id whose hero belongs on the connecting screen. `None` for Desktop.
     target: Option<String>,
-    /// Whether the launching game has wide art at all: the menu loop waits a moment for
-    /// art still in flight, but must not delay a game that will never have any.
+    /// Whether this launch's hero is still in flight: the menu loop waits a moment for art on
+    /// its way, but must not delay a launch with nothing to wait for.
     expected: bool,
     /// Id currently uploaded as `TileId::Hero`. Uploaded only once a launch starts —
     /// browsing must not put a multi-MB texture on the GPU.
@@ -41,11 +41,17 @@ impl Hero {
         }
     }
 
-    /// Arms the loading screen for a launch of `target` (`None` = Desktop), `expected`
-    /// saying whether that game has wide art to wait for.
-    pub(crate) fn arm(&mut self, target: Option<String>, expected: bool) {
+    /// Arms the loading screen for a launch of `target` (`None` = Desktop). Nothing is waited
+    /// for unless [`Self::await_art`] says so.
+    pub(crate) fn arm(&mut self, target: Option<String>) {
         self.target = target;
-        self.expected = expected;
+        self.expected = false;
+    }
+
+    /// Says this launch's hero is still being fetched, so the hand-off gives it a moment to
+    /// land. A game with none, or one whose hero is already in hand, must not spend that moment.
+    pub(crate) fn await_art(&mut self) {
+        self.expected = true;
     }
 
     /// Takes a freshly decoded image, and reports whether it was kept. A `false` means the
@@ -104,7 +110,7 @@ impl Hero {
 
     /// This frame's opacity factor, 0..=1: the fade-in, less the fade-out once that starts.
     pub(crate) fn opacity(&self) -> f32 {
-        let out = self.fade_out.map_or(0.0, |t| ui::anim_frac(Some(t), ui::HERO_FADE_OUT));
+        let out = self.fade_out.map_or(0.0, |t| ui::anim_frac(Some(t), ui::HERO_FADE));
         ui::anim_frac(self.since, ui::HERO_FADE) * (1.0 - out)
     }
 
@@ -117,16 +123,11 @@ impl Hero {
     /// Whether the loading screen is finished, so the streaming loop can take the screen.
     /// Also what starts the fade-out, once everything else it waits on is satisfied.
     ///
-    /// `presenting` is the decoder reporting live frames. The backdrop waits for it, so
-    /// the fade-out is the last thing that happens before the plane is uncovered rather
-    /// than leaving black in between — with no hero this is not consulted at all, and the
-    /// plain fade to black hands over exactly as it always did.
-    pub(crate) fn handover_ready(
-        &mut self,
-        launch_elapsed: Duration,
-        connect_done: Option<Instant>,
-        presenting: bool,
-    ) -> bool {
+    /// `presenting` is the decoder reporting live frames. The backdrop waits for it, so the
+    /// fade-out is the last thing that happens before the plane is uncovered rather than leaving
+    /// black in between — with no hero this is not consulted at all, and the plain fade to black
+    /// hands over exactly as it always did.
+    pub(crate) fn handover_ready(&mut self, launch_elapsed: Duration, connected: bool, presenting: bool) -> bool {
         if launch_elapsed < ui::LAUNCH_FADE {
             return false;
         }
@@ -139,25 +140,19 @@ impl Hero {
             // Nothing on screen: hand over at the end of the fade, as it always did. A game
             // that *has* wide art gets a grace period first — on a cold cache the hero can
             // still be a fetch away, and would otherwise land just after the hand-off.
-            return !self.expected || launch_elapsed >= ui::LAUNCH_FADE + ui::HERO_WAIT;
+            return !self.expected || launch_elapsed >= ui::LAUNCH_FADE + ui::STREAM_REVEAL_WAIT;
         }
-        // Held until the stream is genuinely up: a beat past the handshake (the stream's
-        // own first frames are black anyway) and until the decoder presents, so the
-        // fade-out runs straight into live video. Also for its own minimum, so a late
-        // arrival isn't cut mid-fade-in.
-        let Some(done) = connect_done else { return false };
-        let stream_up = presenting || done.elapsed() >= ui::STREAM_REVEAL_WAIT;
-        stream_up && done.elapsed() >= ui::HERO_LINGER && self.shown_for(ui::HERO_MIN_SHOW) && self.faded_out()
-    }
-
-    /// Whether the backdrop has been up (fade-in included) for at least `least`.
-    fn shown_for(&self, least: Duration) -> bool {
-        self.since.is_some_and(|t| t.elapsed() >= least)
+        // Held until the stream is genuinely up: the handshake landed *and* the decoder is
+        // presenting, so the fade-out runs straight into live video. Deliberately un-timed — a
+        // player that isn't ready yet is what this screen exists for, so it keeps panning rather
+        // than cut to a stream opening on black. Plus its own minimum, so a hero that arrived
+        // late isn't cut mid-fade.
+        connected && presenting && self.since.is_some_and(|t| t.elapsed() >= ui::HERO_MIN_SHOW) && self.faded_out()
     }
 
     /// Starts the fade-out (idempotent) and reports whether it has finished.
     fn faded_out(&mut self) -> bool {
         let since = *self.fade_out.get_or_insert_with(Instant::now);
-        since.elapsed() >= ui::HERO_FADE_OUT
+        since.elapsed() >= ui::HERO_FADE
     }
 }

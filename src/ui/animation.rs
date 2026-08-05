@@ -9,30 +9,21 @@ pub const LAUNCH_FADE: Duration = Duration::from_millis(600);
 /// well past any plausible handshake so a real load only ever shows a slow drift.
 pub const HERO_PAN: Duration = Duration::from_secs(75);
 
-/// The hero's own fade-in, slower than `LAUNCH_FADE`: the card zoom is a reaction to a
-/// button press and has to feel immediate, while this is a scene settling in.
-pub const HERO_FADE: Duration = Duration::from_millis(1_100);
+/// The hero's fade, in and back out to black again. Slower than `LAUNCH_FADE`: the card zoom is
+/// a reaction to a button press and has to feel immediate, while this is a scene settling in —
+/// and leaving it settles out on the same curve it arrived on.
+pub const HERO_FADE: Duration = Duration::from_millis(1_300);
 
-/// The hero's fade-out, run just before the stream is uncovered. Quick — it is a
-/// hand-off, not a transition, and every frame of it delays live video.
-pub const HERO_FADE_OUT: Duration = Duration::from_millis(280);
+/// How long the hero stays up once it appears, [`HERO_FADE`] included. A floor, not a cap: a
+/// slower handshake keeps it up longer. Long enough to read as a loading screen with a visible
+/// pan rather than a flash. Only ever paid by a game that has wide art — with no hero to hold,
+/// the hand-off is unchanged.
+pub const HERO_MIN_SHOW: Duration = Duration::from_millis(2_700);
 
-/// How long past the launch fade a game with wide art waits for a hero that hasn't
-/// arrived yet. Only paid on a cold cache — a prefetched hero is already up by then.
-pub const HERO_WAIT: Duration = Duration::from_millis(2_200);
-
-/// How long the hero stays up once it appears, fade-in included — long enough to read as
-/// a loading screen with a visible pan, not a flash. A floor, not a cap: a slower
-/// handshake keeps it up longer.
-pub const HERO_MIN_SHOW: Duration = Duration::from_secs(3);
-
-/// How much longer it holds after the handshake lands, before the fade-out starts. That
-/// and the fade-out together are the ~1s of stream that would be black regardless.
-pub const HERO_LINGER: Duration = Duration::from_millis(700);
-
-/// Longest anything waits for the decoder to report that it is presenting before
-/// uncovering the video plane regardless — both the hero's fade-out (`app::hero`) and, for
-/// the launches that have no hero to hold, `runtime::stream`'s reveal.
+/// Longest a launch waits for one thing that may never arrive, spent on a screen the user is
+/// watching. Two of those, on the same budget: the decoder reporting that it presents
+/// (`runtime::stream`'s reveal, for the launches with no hero to hold), and a hero still being
+/// fetched off the host (`app::hero`, before it gives up and hands over without one).
 pub const STREAM_REVEAL_WAIT: Duration = Duration::from_millis(1_500);
 
 /// Longest the loading screen runs before handing over regardless of the connect thread.

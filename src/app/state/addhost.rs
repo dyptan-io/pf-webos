@@ -5,12 +5,13 @@ use crate::services::store::{self, KnownHost};
 use crate::ui::MenuEvent;
 
 impl App {
-    /// Handles menu event on add-host modal. Left/Right stand in for backspace (no dot
-    /// key on remote); Confirm once four octets typed.
+    /// Handles menu event on add-host modal. Left/Right stand in for backspace and
+    /// "next field" (no dot or colon key on the remote) — Right past the fourth octet
+    /// opens the optional port. Confirm once the address is complete.
     pub fn handle_add_host_event(&mut self, ev: MenuEvent) {
         match ev {
             MenuEvent::Left => self.add_host.backspace(),
-            MenuEvent::Right => self.add_host.advance_octet(),
+            MenuEvent::Right => self.add_host.advance_field(),
             MenuEvent::Up | MenuEvent::Down | MenuEvent::Secondary => {}
             MenuEvent::Confirm => self.confirm_add_host(),
             MenuEvent::Back => self.screen = Screen::Home,
@@ -28,10 +29,16 @@ impl App {
             return;
         }
         let (host, port) = self.add_host.host_and_port();
+        // Non-default port in the name, so two ports on one address stay tellable apart.
+        let name = if port == crate::ui::FIXED_HOST_PORT {
+            host.clone()
+        } else {
+            format!("{host}:{port}")
+        };
         store::upsert_known_host(
             &mut self.known_hosts,
             KnownHost {
-                name: host.clone(),
+                name,
                 host: host.clone(),
                 port,
                 mgmt_port: None,

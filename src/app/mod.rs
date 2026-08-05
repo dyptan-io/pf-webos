@@ -3369,9 +3369,9 @@ impl App {
     }
 
     /// The connecting screen's hero backdrop: fade in/out, slow pan, and its dimming
-    /// scrim. Fading rather than cutting at both ends, over the same black the launch
-    /// faded to, so a hero arriving mid-handshake eases in and live video arrives out of
-    /// black rather than from a lit image.
+    /// scrim. Fading rather than cutting at both ends, over the same black the launch faded
+    /// to, so a hero arriving mid-handshake eases in and live video arrives out of black
+    /// rather than from a lit image.
     fn compose_hero(&self, screen_w: u32, screen_h: u32, cmds: &mut ui::render::DrawList) {
         let Some((id, hero)) = self.hero.visible() else { return };
         let f = self.hero.opacity();

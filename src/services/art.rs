@@ -90,11 +90,14 @@ const HERO_BYTES_SUFFIX: &str = ".hero";
 /// 200-game library, on a TV with no disk to spare. At this budget roughly 80 covers stay
 /// resident, which is far more than the grid window, and a miss costs one LAN fetch.
 const CARD_CACHE_BUDGET: u64 = 56 * 1024 * 1024;
-/// Per-host disk budget for hero art. ~2.7 MB per decoded hero at [`MAX_HERO_WIDTH`], so this
-/// keeps the last ~8 launched. Its own budget rather than a share of the card one because the
-/// two compete on nothing: a full grid of covers must not evict the hero of the game being
-/// launched, and one launch must not evict the visible grid.
-const HERO_CACHE_BUDGET: u64 = 24 * 1024 * 1024;
+/// Per-host disk budget for hero art. ~3.7 MB per hero (a ~2.7 MB decoded `.hero.raw` at
+/// [`MAX_HERO_WIDTH`] plus the encoded bytes beside it), so this keeps the last dozen or so.
+/// Its own budget rather than a share of the card one because the two compete on nothing: a
+/// full grid of covers must not evict the hero of the game being launched, and one launch
+/// must not evict the visible grid. Sized against *browsing* rather than launching, since a
+/// hero is prefetched for every card the focus settles on: at ~6 entries, scrolling one shelf
+/// evicted the hero of the game the user then launched.
+const HERO_CACHE_BUDGET: u64 = 48 * 1024 * 1024;
 /// Card writes between prunes. Pruning walks the host's directory, so doing it per cover would
 /// put a `read_dir` on every grid fetch; heroes are few and large enough to prune every time.
 const CARD_PRUNE_EVERY: u32 = 24;
@@ -148,20 +151,38 @@ fn write_raw(path: &std::path::Path, magic: u32, width: u32, height: u32, pixels
 /// Read raw cache, if present and written with this magic (and so this pixel convention —
 /// card pixels are premultiplied, hero pixels straight, and the two must never be
 /// mistaken for each other).
+///
+/// Header first, then the payload into its own exactly-sized buffer: the pixels are all but
+/// 12 bytes of the file, so reading the lot and shifting it down over the header would be a
+/// multi-MB memmove — and a hero is read this way on the launch path (`cached_hero`). A
+/// mismatched magic or size costs only the header read.
 fn read_raw(path: &std::path::Path, magic: u32) -> Option<(u32, u32, Vec<u8>)> {
-    let mut buf = std::fs::read(path).ok()?;
-    if u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?) != magic {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 12];
+    file.read_exact(&mut header).ok()?;
+    if u32::from_le_bytes(header[0..4].try_into().ok()?) != magic {
         return None;
     }
-    let width = u32::from_le_bytes(buf.get(4..8)?.try_into().ok()?);
-    let height = u32::from_le_bytes(buf.get(8..12)?.try_into().ok()?);
-    if buf.len() - 12 != width as usize * height as usize * 4 {
+    let width = u32::from_le_bytes(header[4..8].try_into().ok()?);
+    let height = u32::from_le_bytes(header[8..12].try_into().ok()?);
+    let len = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    // Against the file's own length, before allocating for it: a truncated (or absurd)
+    // header must not turn into a multi-MB reservation.
+    if file.metadata().ok()?.len() != (len + 12) as u64 {
         return None;
     }
-    // Shift the payload down over the header rather than copying it out: the pixels are the
-    // whole file, and this way the read's allocation is the one handed on.
-    buf.drain(..12);
-    Some((width, height, buf))
+    let mut pixels = Vec::with_capacity(len);
+    file.read_to_end(&mut pixels).ok()?;
+    (pixels.len() == len).then_some((width, height, pixels))
+}
+
+/// A hero straight out of the decoded-pixel cache, or `None` if it isn't cached (or was
+/// written by an older build). One file read, no decode and no fetch, which is what makes it
+/// safe to call on the UI thread.
+fn read_hero_raw(path: &std::path::Path) -> Option<HeroImage> {
+    let (width, height, pixels) = read_raw(path, HERO_CACHE_MAGIC)?;
+    Some(HeroImage { width, height, pixels })
 }
 
 /// Which budget a cached file counts against. Heroes are matched first: `x.hero.raw` ends with
@@ -262,6 +283,9 @@ pub struct ArtLoader {
     /// back and forth over a card must not re-queue its much larger hero either, and the two
     /// are forgotten independently.
     requested: [HashSet<String>; ART_KINDS],
+    /// This host's cache directory, so [`Self::cached_hero`] can read it without going
+    /// through the worker — the worker's own copy is in its `WorkerConfig`.
+    dir: PathBuf,
 }
 
 impl ArtLoader {
@@ -285,7 +309,7 @@ impl ArtLoader {
             query_port,
             identity,
             fingerprint,
-            dir,
+            dir: dir.clone(),
             card_w,
             card_h,
         };
@@ -297,6 +321,7 @@ impl ArtLoader {
             tx: tx_req,
             rx: rx_done,
             requested: Default::default(),
+            dir,
         }
     }
 
@@ -358,6 +383,18 @@ impl ArtLoader {
                 .map(str::to_string)
                 .collect()
         });
+    }
+
+    /// `game_id`'s hero out of the disk cache, on the calling thread. For the launch itself:
+    /// going through the worker for an image that is already decoded on disk would put it
+    /// behind whatever card art that thread is mid-fetch on, which is how a hero that *was*
+    /// cached still managed to arrive after the hand-off.
+    ///
+    /// A hit counts as a request, so nothing queues the same image a second time.
+    pub fn cached_hero(&mut self, game_id: &str) -> Option<HeroImage> {
+        let image = read_hero_raw(&raw_cache_path(&self.dir, game_id, ArtKind::Hero))?;
+        self.requested[ArtKind::Hero as usize].insert(game_id.to_string());
+        Some(image)
     }
 
     /// Forgets that `game_id`'s hero was requested, so it can be asked for again. Needed
@@ -444,9 +481,9 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
                         pixmap: sized,
                     }
                 }),
-            ArtKind::Hero => read_raw(&raw_cached, HERO_CACHE_MAGIC).map(|(width, height, pixels)| ArtLoaded::Hero {
+            ArtKind::Hero => read_hero_raw(&raw_cached).map(|image| ArtLoaded::Hero {
                 game_id: req.game_id.clone(),
-                image: HeroImage { width, height, pixels },
+                image,
             }),
         };
         if let Some(loaded) = cached_raw {
@@ -594,6 +631,26 @@ mod tests {
         assert_eq!(cache_class(&dir.join("123.raw")), Some(ArtKind::Card));
         assert_eq!(cache_class(&dir.join("123")), Some(ArtKind::Card));
         assert_eq!(cache_class(&dir.join("123.hero.raw.tmp")), None);
+    }
+
+    /// The gate that decides whether a hero is fetched again: the worker (and `cached_hero`)
+    /// only skip the host when this round-trips, so a header written one way and read another
+    /// shows up as re-downloaded art rather than as a failure.
+    #[test]
+    fn a_written_hero_is_read_back_from_cache() {
+        let dir = std::env::temp_dir().join("pf-art-hero-roundtrip");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = raw_cache_path(&dir, "game 1", ArtKind::Hero);
+        let pixels: Vec<u8> = (0..2u32 * 3 * 4).map(|b| b as u8).collect();
+        write_raw(&path, HERO_CACHE_MAGIC, 2, 3, &pixels);
+
+        let image = read_hero_raw(&path).expect("hero cache should read back");
+        assert_eq!((image.width, image.height), (2, 3));
+        assert_eq!(image.pixels, pixels);
+        // A card's magic must not read as a hero: the two disagree on premultiplication.
+        assert!(read_raw(&path, RAW_CACHE_MAGIC).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Each host gets its own directory, so one host's library can't crowd out another's.

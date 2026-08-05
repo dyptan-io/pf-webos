@@ -12,7 +12,7 @@ impl App {
         let Some(HostEntry::Known(h)) = self.entries.get(idx) else {
             return;
         };
-        self.add_host = AddHostState::from_ip(&h.host);
+        self.add_host = AddHostState::from_host_port(&h.host, h.port);
         self.edit_host_index = Some(idx);
         self.host_menu_index = None;
         self.screen = Screen::EditHost;
@@ -22,7 +22,7 @@ impl App {
     pub(crate) fn handle_edit_host_event(&mut self, ev: MenuEvent) {
         match ev {
             MenuEvent::Left => self.add_host.backspace(),
-            MenuEvent::Right => self.add_host.advance_octet(),
+            MenuEvent::Right => self.add_host.advance_field(),
             MenuEvent::Confirm => self.confirm_edit_host(),
             MenuEvent::Back => {
                 self.edit_host_index = None;

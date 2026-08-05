@@ -3,9 +3,9 @@ use std::sync::Arc;
 use super::*;
 
 /// How long the finished menu frame is held waiting for NDL `PLAYING` before uncovering the
-/// video plane regardless. Shared with the hero loading screen, which waits on the same
-/// signal for the same reason (`ui::STREAM_REVEAL_WAIT`) — so when a hero held the screen
-/// this wait is already satisfied and returns immediately.
+/// video plane regardless. The hero loading screen waits on the same signal, and without a
+/// timeout (`app::hero::handover_ready`) — so when a hero held the screen this wait is already
+/// satisfied and returns immediately.
 const NDL_REVEAL_TIMEOUT: Duration = crate::ui::STREAM_REVEAL_WAIT;
 
 pub(super) fn run_inner() -> Result<()> {
