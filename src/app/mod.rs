@@ -252,6 +252,9 @@ pub struct App {
     pub(crate) pinned_count: usize,
     /// Host answered library fetch (gates Desktop card).
     pub(crate) games_loaded: bool,
+    /// Cached `games` position of the host's own desktop entry — recomputed with the
+    /// library and its pin order, since `grid_layout` needs it several times per redraw.
+    pub(crate) desktop_pos: Option<usize>,
     pub(crate) games_rx: Option<std::sync::mpsc::Receiver<crate::services::library::GamesLoaded>>,
     pub home_status: Option<String>,
     /// Cover art pixmaps by game id.
@@ -355,7 +358,7 @@ pub struct App {
     pub pairing_busy: bool,
     /// The PIN *we* generated for a `GameStream` host to display, if that's the ceremony in
     /// flight. `Some` is what makes the modal the display-PIN layout rather than the entry one —
-    /// see `App::pairing_display_pin` and `app::view::pairing`. `None` for punktfunk, whose PIN
+    /// see `App::pairing_is_display_pin` and `app::view::pairing`. `None` for punktfunk, whose PIN
     /// comes from the host and is typed into `pin_digits`.
     pub(crate) pairing_pin_shown: Option<String>,
     /// Index into `entries` currently being paired — captured when entering
@@ -528,6 +531,7 @@ impl App {
             games: Vec::new(),
             pinned_count: 0,
             games_loaded: false,
+            desktop_pos: None,
             games_rx: None,
             home_status: None,
             art: std::collections::HashMap::new(),
@@ -637,27 +641,11 @@ impl App {
         self.sidebar_dirty = true;
     }
 
-    /// Whether `addr` is already a punktfunk host, saved or merely discovered.
-    fn punktfunk_at(&self, addr: &str) -> bool {
-        let punktfunk = crate::core::protocol::Protocol::Punktfunk;
-        self.known_hosts
+    /// Whether `addr` has a discovered-but-unsaved row speaking `protocol`.
+    fn discovered_at(&self, addr: &str, protocol: crate::core::protocol::Protocol) -> bool {
+        self.entries
             .iter()
-            .any(|h| h.host == addr && h.protocol == punktfunk)
-            || self
-                .entries
-                .iter()
-                .any(|e| matches!(e, HostEntry::Discovered(d) if d.addr == addr && d.protocol == punktfunk))
-    }
-
-    /// Removes any discovered-but-unsaved `GameStream` row for `addr`, reporting whether one went.
-    /// Saved records are left alone: the user paired that host deliberately.
-    fn drop_discovered_gamestream(&mut self, addr: &str) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|e| {
-            !matches!(e, HostEntry::Discovered(d)
-                if d.addr == addr && d.protocol == crate::core::protocol::Protocol::GameStream)
-        });
-        before != self.entries.len()
+            .any(|e| matches!(e, HostEntry::Discovered(d) if d.addr == addr && d.protocol == protocol))
     }
 
     /// Merges freshly-discovered hosts into the entry list (known hosts keep their
@@ -684,16 +672,27 @@ impl App {
                 // A host advertising both protocols is one host, and punktfunk is the better half
                 // of it (full feature set). Its `GameStream` side stays reachable by adding
                 // `ip:port` by hand, which is the deliberate way to ask for it.
-                if self.punktfunk_at(&found.addr) {
+                let punktfunk = crate::core::protocol::Protocol::Punktfunk;
+                if self
+                    .known_hosts
+                    .iter()
+                    .any(|h| h.host == found.addr && h.protocol == punktfunk)
+                    || self.discovered_at(&found.addr, punktfunk)
+                {
                     tracing::debug!("mdns: ignoring GameStream advert from {} (punktfunk host)", found.addr);
                     continue;
                 }
             }
             // The mirror case: punktfunk resolved after its host's `GameStream` advert already
-            // added a row, which must now go.
+            // added a row, which must now go. Saved records are left alone: the user paired
+            // that host deliberately.
             if found.protocol == crate::core::protocol::Protocol::Punktfunk
-                && self.drop_discovered_gamestream(&found.addr)
+                && self.discovered_at(&found.addr, crate::core::protocol::Protocol::GameStream)
             {
+                self.entries.retain(|e| {
+                    !matches!(e, HostEntry::Discovered(d)
+                        if d.addr == found.addr && d.protocol == crate::core::protocol::Protocol::GameStream)
+                });
                 changed = true;
             }
             #[allow(clippy::suspicious_operation_groupings)]

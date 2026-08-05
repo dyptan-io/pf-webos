@@ -18,15 +18,17 @@ impl App {
     /// `GameStream` hosts serve the desktop as an ordinary app, with real box art and a real id.
     /// Where one exists it *is* the desktop card — the synthetic one below would be a second card
     /// launching the same thing.
-    pub(crate) fn desktop_game_pos(&self) -> Option<usize> {
-        self.games.iter().position(|g| g.title.eq_ignore_ascii_case("desktop"))
+    fn find_desktop_game_pos(&self) -> Option<usize> {
+        self.games
+            .iter()
+            .position(|g| crate::core::model::is_desktop_title(&g.title))
     }
 
     /// Grid shape at `columns` columns; scans for pinned pins, so build once and reuse.
     pub(crate) fn grid_layout(&self, columns: usize) -> GridLayout {
         // With a real desktop entry in the library there is no synthetic card at all: it is an
         // ordinary game, pinned (or not) through the same machinery as any other.
-        let synthetic_desktop = self.games_loaded && self.desktop_game_pos().is_none();
+        let synthetic_desktop = self.games_loaded && self.desktop_pos.is_none();
         let desktop_pinned = synthetic_desktop
             && self
                 .selected_known_host()
@@ -286,6 +288,13 @@ impl App {
     /// `known_hosts`' persisted pins for games the host no longer lists — otherwise
     /// a removed game keeps counting toward `MAX_PINNED_GAMES` forever.
     pub(crate) fn reorder_games_by_pin(&mut self) {
+        self.reorder_games_by_pin_inner();
+        // Reordering moves the desktop entry, so the cache is refreshed here — the only
+        // place `games`' order changes after a fetch.
+        self.desktop_pos = self.find_desktop_game_pos();
+    }
+
+    fn reorder_games_by_pin_inner(&mut self) {
         let Some(known_idx) = self
             .selected_host
             .as_ref()
@@ -302,7 +311,8 @@ impl App {
                 // A host that lists its own desktop app: rewrite the pin to that entry's id, so
                 // the card pins and unpins like any other. Done once, here, rather than special-
                 // cased at every pin site — and the rewrite is saved below.
-                if let Some(pos) = self.desktop_game_pos() {
+                // Live scan, not `desktop_pos`: the loop above is removing entries as it goes.
+                if let Some(pos) = self.find_desktop_game_pos() {
                     still_pinned.push(self.games[pos].id.clone());
                     pinned.push(self.games.remove(pos));
                 } else {
@@ -417,6 +427,7 @@ impl App {
         self.selected_host = None;
         self.games = Vec::new();
         self.games_loaded = false;
+        self.desktop_pos = None;
         self.pinned_count = 0;
         self.art.clear();
         self.art_loader = None;
@@ -439,6 +450,7 @@ impl App {
         self.games = Vec::new();
         self.pinned_count = 0;
         self.games_loaded = false;
+        self.desktop_pos = None;
         self.art.clear();
         // Dropping the loader stops its worker (its request channel closes), so a host
         // switch abandons in-flight fetches for the previous library.

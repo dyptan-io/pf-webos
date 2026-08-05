@@ -231,6 +231,12 @@ fn ensure_init(app_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The app id NDL is initialised with. Overridable for dev builds installed under another id —
+/// NDL keys its session on the caller's app id, so a mismatch fails the load.
+pub fn app_id() -> String {
+    std::env::var("APPID").unwrap_or_else(|_| "io.dyptan.punktfunk.webos".into())
+}
+
 /// One loaded NDL video decode session. Dropping unloads it (not `NDL_DirectMediaQuit`).
 pub struct NdlVideo {
     /// PTS in ms since load (NDL's local clock, not wall-clock or host capture clock).

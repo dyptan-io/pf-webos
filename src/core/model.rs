@@ -58,6 +58,13 @@ pub const MAX_PINNED_GAMES: usize = 5;
 /// Pin ID for "Desktop" card (stored in pinned like games; counts toward `MAX_PINNED_GAMES`).
 pub const DESKTOP_PIN_ID: &str = "__desktop__";
 
+/// Whether a host-supplied app title names that host's own desktop. `GameStream` hosts serve
+/// the desktop as an ordinary app, and its title is all that identifies it — one predicate so
+/// the grid and the launch path can't disagree about which entry that is.
+pub fn is_desktop_title(title: &str) -> bool {
+    title.eq_ignore_ascii_case("desktop")
+}
+
 impl KnownHost {
     /// The punktfunk mTLS pin, or `None` for an unpaired or `GameStream` host — what every
     /// `services::library` / `services::art` / `session::connect` caller actually wants.

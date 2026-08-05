@@ -5,10 +5,9 @@
 //! freeze-until-reanchor, and keyframe-request throttling. Protocol pumps keep only the
 //! parts that are protocol-shaped — pulling frames, and *how* a keyframe is asked for.
 //!
-//! There is exactly one implementation ([`NdlSink`]); the trait exists so a second protocol
-//! inherits the pacing work rather than reimplementing it. The seam that serves both is
-//! [`SinkResult::NeedKeyframe`]: punktfunk's pump answers it with
-//! `NativeClient::request_keyframe`, `GameStream` with `DecodeResult::NeedIdr`.
+//! The seam that serves both protocols is [`SinkResult::NeedKeyframe`]: punktfunk's pump
+//! answers it with `NativeClient::request_keyframe`, `GameStream` with
+//! `DecodeResult::NeedIdr`.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -28,12 +27,6 @@ const FEED_BACKPRESSURE_WARN: Duration = Duration::from_millis(20);
 /// three samples per 750 ms ABR report window; see [`NdlSink::decode_us`].
 const BACKLOG_POLL: Duration = Duration::from_millis(250);
 
-/// punktfunk's keyframe-request throttle: the request travels on its own QUIC control
-/// stream, so a tight interval costs nothing but the request itself. `GameStream` will want
-/// roughly 1000 ms instead — IDR requests share the `ENet` control channel with gamepad
-/// input, so an unthrottled request loop directly inflates input latency.
-pub const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(100);
-
 /// What the pump knows about a frame that the sink can't work out for itself.
 pub struct FrameFlags {
     /// This frame can restart decoding on its own (IDR, or an LTR recovery anchor).
@@ -45,7 +38,7 @@ pub struct FrameFlags {
     pub index: u64,
 }
 
-/// Outcome of one [`VideoSink::submit`].
+/// Outcome of one [`NdlSink::submit`].
 pub enum SinkResult {
     /// Fed to the decoder. `decode_us` is the latency figure for the host's ABR
     /// controller, present only when the sink was built with `report_decode_latency`.
@@ -55,18 +48,6 @@ pub enum SinkResult {
     /// Skipped or failed, and the throttle allows asking the host for a keyframe now.
     /// The caller sends it however its protocol does.
     NeedKeyframe,
-}
-
-pub trait VideoSink {
-    /// Present one access unit, or decide not to. `pts_ns` is the host's capture-clock
-    /// PTS; the sink maps and paces it into the decoder's own clock domain.
-    fn submit(&mut self, au: &[u8], pts_ns: u64, flags: FrameFlags) -> SinkResult;
-
-    /// Whether a freeze-until-reanchor hold is currently active (stats/logging).
-    fn holding(&self) -> bool;
-
-    /// Decoder backlog depth, or `None` if the backend can't report one.
-    fn backlog(&self) -> Option<i32>;
 }
 
 /// Video-decode backend (NDL `DirectMedia` — the only one). Arc'd because the audio-offload
@@ -132,7 +113,7 @@ pub struct SinkConfig {
     /// Whether the host asked for decode-latency reports (its ABR controller).
     pub report_decode_latency: bool,
     /// Minimum spacing between [`SinkResult::NeedKeyframe`] results — see
-    /// [`KEYFRAME_REQUEST_MIN_INTERVAL`] for why this is per-protocol.
+    /// each protocol's own constant for why this is per-protocol.
     pub keyframe_min_interval: Duration,
 }
 
@@ -155,9 +136,9 @@ pub struct NdlSink {
     last_keyframe_request: Option<Instant>,
     /// Freeze-until-reanchor: while holding, frames are skipped rather than fed — the
     /// punch-through plane keeps the last good picture. Resumes on IDR / LTR-RFI recovery
-    /// anchor, or after [`HOLD_GIVE_UP`]. `hold_started` is not reset on cascading gaps so
-    /// the give-up deadline can't be pushed out indefinitely.
-    holding: bool,
+    /// anchor, or after [`HOLD_GIVE_UP`]. `Some` for exactly as long as the hold lasts (see
+    /// [`Self::holding`]), and not reset on cascading gaps so the give-up deadline can't be
+    /// pushed out indefinitely.
     hold_started: Option<Instant>,
 }
 
@@ -176,7 +157,6 @@ impl NdlSink {
             backlog_cached: 0,
             last_backlog_poll: None,
             last_keyframe_request: None,
-            holding: false,
             hold_started: None,
         }
     }
@@ -197,7 +177,6 @@ impl NdlSink {
     }
 
     fn begin_hold(&mut self) {
-        self.holding = true;
         self.stats.holding.store(true, Ordering::Relaxed);
         self.hold_started.get_or_insert_with(Instant::now);
     }
@@ -226,26 +205,36 @@ impl NdlSink {
             .saturating_add(self.backlog_cached.saturating_mul(self.frame_period_us));
         u32::try_from(decode_us).unwrap_or(u32::MAX)
     }
-}
 
-impl VideoSink for NdlSink {
-    fn submit(&mut self, au: &[u8], pts_ns: u64, flags: FrameFlags) -> SinkResult {
-        if flags.loss && !self.holding {
+    /// Whether a freeze-until-reanchor hold is currently active (stats/logging).
+    pub fn holding(&self) -> bool {
+        self.hold_started.is_some()
+    }
+
+    /// Decoder backlog depth, or `None` if the backend can't report one.
+    pub fn backlog(&self) -> Option<i32> {
+        self.player.render_buffer_length()
+    }
+
+    /// Present one access unit, or decide not to. `pts_ns` is the host's capture-clock
+    /// PTS; the sink maps and paces it into the decoder's own clock domain.
+    pub fn submit(&mut self, au: &[u8], pts_ns: u64, flags: FrameFlags) -> SinkResult {
+        if flags.loss && !self.holding() {
             self.begin_hold();
             tracing::warn!("loss (frame {}) — freezing", flags.index);
             let _ = self.player.flush();
         }
-        let mut need_keyframe = self.holding && self.take_keyframe_slot();
+        let mut need_keyframe = self.holding() && self.take_keyframe_slot();
 
         let gave_up = self.hold_started.is_some_and(|t| t.elapsed() >= HOLD_GIVE_UP);
-        if self.holding && !flags.reanchor && !gave_up {
+        if self.holding() && !flags.reanchor && !gave_up {
             return if need_keyframe {
                 SinkResult::NeedKeyframe
             } else {
                 SinkResult::Held
             };
         }
-        if self.holding {
+        if self.holding() {
             tracing::info!(
                 "resuming after {:.0}ms (frame {}, reanchor={}, gave_up={gave_up})",
                 self.hold_started.map_or(0.0, |t| t.elapsed().as_secs_f32() * 1000.0),
@@ -257,7 +246,6 @@ impl VideoSink for NdlSink {
             self.pacer.reset();
             self.host_anchor.reset();
         }
-        self.holding = false;
         self.stats.holding.store(false, Ordering::Relaxed);
         self.hold_started = None;
 
@@ -318,13 +306,5 @@ impl VideoSink for NdlSink {
         } else {
             SinkResult::Presented { decode_us }
         }
-    }
-
-    fn holding(&self) -> bool {
-        self.holding
-    }
-
-    fn backlog(&self) -> Option<i32> {
-        self.player.render_buffer_length()
     }
 }

@@ -35,7 +35,10 @@ pub(crate) struct Hero {
 impl Hero {
     /// Notes whose hero is worth keeping — the focused card, whose art is prefetched.
     pub(crate) fn want(&mut self, game_id: &str) {
-        self.wanted = Some(game_id.to_string());
+        // Called per tile-prep pass, so the usual no-op case allocates nothing.
+        if self.wanted.as_deref() != Some(game_id) {
+            self.wanted = Some(game_id.to_string());
+        }
     }
 
     /// Arms the loading screen for a launch of `target` (`None` = Desktop), `expected`
@@ -105,9 +108,10 @@ impl Hero {
         ui::anim_frac(self.since, ui::HERO_FADE) * (1.0 - out)
     }
 
-    /// Whether an uploaded hero is on screen as the connecting backdrop.
+    /// Whether an uploaded hero is on screen as the connecting backdrop. `since` is only ever
+    /// written by `mark_uploaded`, so it implies `uploaded`.
     pub(crate) fn showing(&self) -> bool {
-        self.since.is_some() && self.uploaded.is_some()
+        self.since.is_some()
     }
 
     /// Whether the loading screen is finished, so the streaming loop can take the screen.

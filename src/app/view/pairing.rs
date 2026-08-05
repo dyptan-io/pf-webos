@@ -91,8 +91,11 @@ impl App {
         }
     }
 
-    /// Card rect, sized from whichever layout is in play plus room for up-to-two-line status.
-    pub(crate) fn pairing_card_rect_for(display_pin: bool, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Rect {
+    /// The active pairing card, sized from whichever layout is in play plus room for an
+    /// up-to-two-line status. Every geometry caller goes through this, so the layout choice
+    /// is made in exactly one place.
+    pub(crate) fn pairing_card_rect(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Rect {
+        let display_pin = self.pairing_is_display_pin();
         Self::simple_modal_card(screen_w, screen_h, |probe| {
             let status_room = 2 * (fonts.raster.height(fonts.value) + 6);
             let status_y = if display_pin {
@@ -102,12 +105,6 @@ impl App {
             };
             (status_y + status_room + 26) as u32
         })
-    }
-
-    /// The active pairing card. Every geometry caller goes through this rather than
-    /// `pairing_card_rect_for` so the layout choice is made in exactly one place.
-    pub(crate) fn pairing_card_rect(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Rect {
-        Self::pairing_card_rect_for(self.pairing_is_display_pin(), screen_w, screen_h, fonts)
     }
 
     /// Request access button rect.
@@ -245,7 +242,8 @@ impl App {
         // Placeholders until the PIN exists — a card with an empty row where four digits belong
         // reads as a broken modal rather than as one still starting up.
         let shown: Vec<char> = self
-            .pairing_display_pin()
+            .pairing_pin_shown
+            .as_deref()
             .map_or_else(|| "····".chars().collect(), |pin| pin.chars().collect());
         for (i, ch) in shown.iter().enumerate().take(self.pin_digits.len()) {
             let rect = ui::pairing_digit_rect(card, l.pin_y, i);

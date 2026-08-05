@@ -1,7 +1,7 @@
 //! Connects to a punktfunk host and drives the video/audio hardware pipelines.
 //!
 //! Video runs on a dedicated thread ([`video_pump`]), which pulls access units off the
-//! transport and hands them to a [`sink::VideoSink`] — everything from PTS pacing down to
+//! transport and hands them to a [`sink::NdlSink`] — everything from PTS pacing down to
 //! the NDL `DirectMedia` backend (the sole video backend) lives behind that seam.
 //!
 //! Audio takes one of two paths: software-decoded audio is drained from the main
@@ -25,9 +25,7 @@ use punktfunk_core::quic;
 
 use crate::platform::webos::ndl::{NdlCodec, NdlVideo};
 use crate::services::store::{CodecPref, ColorRangeOverride};
-use crate::session::sink::{
-    FrameFlags, NdlSink, SinkConfig, SinkResult, VideoPlayer, VideoSink, KEYFRAME_REQUEST_MIN_INTERVAL,
-};
+use crate::session::sink::{FrameFlags, NdlSink, SinkConfig, SinkResult, VideoPlayer};
 
 impl ColorRangeOverride {
     /// Force the VUI `full_range` flag per the user override before it's handed to
@@ -116,7 +114,13 @@ pub fn clock_ticks_per_sec() -> u64 {
 /// cadence, but the FFI calls they make between checks (NDL `play`/`play_audio`, and the
 /// QUIC-close worker `NativeClient::drop` joins internally) have no timeout of their own — an
 /// intermittently wedged vendor call must not freeze the whole app on the caller's thread.
-const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Also the ceiling `GsStream::shutdown` waits on (a different mechanism, same rationale).
+pub const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// punktfunk's keyframe-request throttle: the request travels on its own QUIC control stream, so a
+/// tight interval costs nothing but the request itself. `GameStream` throttles far harder — see
+/// `backend::gamestream::stream`'s own constant.
+const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Joins `handle` from a watcher thread so a hang inside it can't block the caller past
 /// `timeout`. Returns `false` (and leaks the watcher, still waiting on the real join) if it
@@ -313,10 +317,8 @@ pub fn connect(
     let fps = resolved_mode.refresh_hz.max(1);
     let codec =
         NdlCodec::from_wire(client.codec).with_context(|| format!("unsupported codec 0x{:02x}", client.codec))?;
-    let app_id = std::env::var("APPID").unwrap_or_else(|_| "io.dyptan.punktfunk.webos".into());
-
     let ndl = NdlVideo::load(
-        &app_id,
+        &crate::platform::webos::ndl::app_id(),
         resolved_mode.width as i32,
         resolved_mode.height as i32,
         codec,

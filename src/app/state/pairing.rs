@@ -41,16 +41,10 @@ impl App {
 
     /// Whether the modal is the display-PIN layout: we generate the PIN and the user types it
     /// into the host, rather than the reverse. Keyed off the host's protocol rather than off
-    /// [`Self::pairing_display_pin`] being `Some`, so a failed ceremony keeps its layout (and its
+    /// `pairing_pin_shown` being `Some`, so a failed ceremony keeps its layout (and its
     /// error line) instead of flipping to punktfunk's digit row.
     pub(crate) fn pairing_is_display_pin(&self) -> bool {
         self.entries.get(self.pairing_entry).map(crate::ui::HostEntry::protocol) == Some(Protocol::GameStream)
-    }
-
-    /// The PIN to show, once generated. `None` while it hasn't been (or couldn't be) — the
-    /// layout draws placeholders and the status line says what went wrong.
-    pub(crate) fn pairing_display_pin(&self) -> Option<&str> {
-        self.pairing_pin_shown.as_deref()
     }
 
     /// Generates a PIN, shows it, and runs the five-phase handshake off-thread.

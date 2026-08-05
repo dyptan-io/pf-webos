@@ -15,7 +15,7 @@ use moonlight_common::AppId;
 use crate::backend::{ArtFetch, BackendCaps, HostBackend};
 use crate::core::model::{Artwork, GameEntry};
 use crate::core::protocol::Protocol;
-use crate::services::discovery::DiscoveredHost;
+use crate::services::discovery::{self, DiscoveredHost};
 use crate::services::library::LibraryError;
 
 pub mod http;
@@ -63,18 +63,10 @@ impl HostBackend for GameStream {
     }
 
     fn parse_discovery(&self, info: &ResolvedService) -> Option<DiscoveredHost> {
-        let addr = info
-            .get_addresses_v4()
-            .iter()
-            .next()
-            .map(std::string::ToString::to_string);
-        let Some(addr) = addr else {
-            tracing::warn!("mdns: resolved {} with no IPv4 address, skipping", info.get_fullname());
-            return None;
-        };
+        let (addr, name) = discovery::addr_and_name(info)?;
         let port = info.get_port();
         Some(DiscoveredHost {
-            name: info.get_fullname().split('.').next().unwrap_or("?").to_string(),
+            name,
             addr,
             port,
             protocol: self.protocol(),

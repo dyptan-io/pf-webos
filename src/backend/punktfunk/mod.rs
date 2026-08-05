@@ -6,7 +6,7 @@ use mdns_sd::ResolvedService;
 use crate::backend::{ArtFetch, BackendCaps, HostBackend};
 use crate::core::model::GameEntry;
 use crate::core::protocol::Protocol;
-use crate::services::discovery::DiscoveredHost;
+use crate::services::discovery::{self, DiscoveredHost};
 use crate::services::library::{self, LibraryError};
 
 /// mDNS service type punktfunk hosts advertise.
@@ -39,19 +39,10 @@ impl HostBackend for Punktfunk {
     }
 
     fn parse_discovery(&self, info: &ResolvedService) -> Option<DiscoveredHost> {
-        // IPv4 only (same as other clients).
-        let addr = info
-            .get_addresses_v4()
-            .iter()
-            .next()
-            .map(std::string::ToString::to_string);
-        let Some(addr) = addr else {
-            tracing::warn!("mdns: resolved {} with no IPv4 address, skipping", info.get_fullname());
-            return None;
-        };
+        let (addr, name) = discovery::addr_and_name(info)?;
         let props = info.get_properties();
         Some(DiscoveredHost {
-            name: info.get_fullname().split('.').next().unwrap_or("?").to_string(),
+            name,
             addr,
             port: info.get_port(),
             protocol: self.protocol(),

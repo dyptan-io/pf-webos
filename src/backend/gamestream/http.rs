@@ -269,12 +269,13 @@ impl RequestClient for GsHttpClient {
         // Ring provider, matching `services::library` and punktfunk-core's QUIC.
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let expected = rustls::pki_types::CertificateDer::from(server_certificate.contents().to_vec());
-        let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
+        let mut cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .map_err(|e| bad("tls config", &e))?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(ExactCertVerify {
                 expected: expected.into_owned(),
+                provider,
             }))
             .with_client_auth_cert(
                 vec![rustls::pki_types::CertificateDer::from(
@@ -382,6 +383,9 @@ fn client_key_der(key: &Pem) -> Result<rustls::pki_types::PrivateKeyDer<'static>
 #[derive(Debug)]
 struct ExactCertVerify {
     expected: rustls::pki_types::CertificateDer<'static>,
+    /// The same provider the `ClientConfig` was built with — held so the signature-verification
+    /// hooks below don't construct one per call (they run 2-4 times per request).
+    provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
 impl rustls::client::danger::ServerCertVerifier for ExactCertVerify {
@@ -408,12 +412,7 @@ impl rustls::client::danger::ServerCertVerifier for ExactCertVerify {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
     }
 
     fn verify_tls13_signature(
@@ -422,18 +421,11 @@ impl rustls::client::danger::ServerCertVerifier for ExactCertVerify {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        self.provider.signature_verification_algorithms.supported_schemes()
     }
 }
 

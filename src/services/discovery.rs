@@ -6,10 +6,6 @@ use mdns_sd::{ServiceDaemon, ServiceEvent};
 
 use crate::core::protocol::Protocol;
 
-/// How long the round-robin below sleeps after a pass that found nothing on any browse. Only
-/// paces the idle loop: a pass that found anything goes straight round again.
-const BROWSE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
-
 #[derive(Clone, Debug)]
 pub struct DiscoveredHost {
     pub name: String,
@@ -22,6 +18,21 @@ pub struct DiscoveredHost {
     pub mgmt_port: Option<u16>,
     /// Wake-on-LAN MACs from mDNS (learned while awake, persisted to `KnownHost`).
     pub mac: Vec<String>,
+}
+
+/// IPv4 address and short instance name from a resolved record — the two fields every backend's
+/// `parse_discovery` needs, extracted identically. IPv4 only (same as other clients).
+pub fn addr_and_name(info: &mdns_sd::ResolvedService) -> Option<(String, String)> {
+    let Some(addr) = info
+        .get_addresses_v4()
+        .iter()
+        .next()
+        .map(std::string::ToString::to_string)
+    else {
+        tracing::warn!("mdns: resolved {} with no IPv4 address, skipping", info.get_fullname());
+        return None;
+    };
+    Some((addr, info.get_fullname().split('.').next().unwrap_or("?").to_string()))
 }
 
 /// Browse continuously for `backends` (see `backend::browse_backends`); returns (Receiver,
@@ -40,62 +51,56 @@ pub fn browse(
     std::thread::Builder::new()
         .name("punktfunk-webos-mdns".into())
         .spawn(move || {
-            // One receiver per service type, all fed by the one daemon, each remembering which
+            // One thread per service type, each blocking on its own receiver and forwarding into
+            // the shared channel: a blocking `recv` costs nothing while idle, where one loop
+            // polling several receivers would have to wake up forever. Each remembers which
             // backend owns it so a resolved record is parsed by the protocol that advertised it.
-            let mut browses = Vec::new();
+            let mut workers = Vec::new();
             for backend in backends {
                 let service = backend.discovery_service();
-                match daemon.browse(service) {
-                    Ok(r) => {
-                        tracing::debug!("mdns: browsing {service}");
-                        browses.push((backend, r));
-                    }
-                    Err(e) => tracing::error!("mdns: browse({service}) failed: {e}"),
-                }
-            }
-            if browses.is_empty() {
-                return;
-            }
-            // Round-robin rather than a blocking `recv`: with more than one browse, blocking on
-            // the first would starve the others.
-            'outer: loop {
-                let mut idle = true;
-                for (backend, receiver) in &browses {
-                    // `try_recv` + an explicit idle sleep rather than `recv_timeout`: naming
-                    // `RecvTimeoutError`'s variants would make `flume` a direct dependency, and
-                    // `mdns-sd` re-exports `Receiver` but not its error types. Disconnection is
-                    // asked of the receiver instead, which is on the re-exported type.
-                    let Ok(event) = receiver.try_recv() else {
-                        if receiver.is_disconnected() {
-                            break 'outer; // daemon gone; nothing will ever arrive again
-                        }
-                        continue; // empty: try the next browse
-                    };
-                    idle = false;
-                    let info = match event {
-                        ServiceEvent::ServiceResolved(info) => info,
-                        other => {
-                            tracing::debug!("mdns: {other:?}");
-                            continue;
-                        }
-                    };
-                    let Some(host) = backend.parse_discovery(&info) else {
+                let receiver = match daemon.browse(service) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!("mdns: browse({service}) failed: {e}");
                         continue;
-                    };
-                    tracing::info!(
-                        "mdns: resolved {} at {}:{} ({:?})",
-                        host.name,
-                        host.addr,
-                        host.port,
-                        host.protocol
-                    );
-                    if tx.send(host).is_err() {
-                        break 'outer; // receiver gone — stop browsing
                     }
-                }
-                if idle {
-                    std::thread::sleep(BROWSE_POLL);
-                }
+                };
+                tracing::debug!("mdns: browsing {service}");
+                let tx = tx.clone();
+                let worker = std::thread::Builder::new()
+                    .name("punktfunk-webos-mdns-browse".into())
+                    .spawn(move || {
+                        while let Ok(event) = receiver.recv() {
+                            let info = match event {
+                                ServiceEvent::ServiceResolved(info) => info,
+                                other => {
+                                    tracing::debug!("mdns: {other:?}");
+                                    continue;
+                                }
+                            };
+                            let Some(host) = backend.parse_discovery(&info) else {
+                                continue;
+                            };
+                            tracing::info!(
+                                "mdns: resolved {} at {}:{} ({:?})",
+                                host.name,
+                                host.addr,
+                                host.port,
+                                host.protocol
+                            );
+                            if tx.send(host).is_err() {
+                                break; // receiver gone — stop browsing
+                            }
+                        }
+                    })
+                    .expect("spawn mdns browse thread");
+                workers.push(worker);
+            }
+            // Dropped here so the aggregate channel closes once the last worker's clone goes with
+            // it, rather than staying open on this thread's unused copy.
+            drop(tx);
+            for worker in workers {
+                let _ = worker.join();
             }
             tracing::debug!("mdns: receiver loop ended, shutting down");
             let _ = daemon.shutdown();

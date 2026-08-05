@@ -40,8 +40,8 @@ use crate::backend::gamestream::input::InputTranslator;
 use crate::backend::gamestream::query;
 use crate::platform::webos::ndl::{NdlCodec, NdlVideo};
 use crate::services::store::{CodecPref, ColorRangeOverride, GamepadType};
-use crate::session::sink::{FrameFlags, NdlSink, SinkConfig, SinkResult, VideoPlayer, VideoSink};
-use crate::session::StreamStats;
+use crate::session::sink::{FrameFlags, NdlSink, SinkConfig, SinkResult, VideoPlayer};
+use crate::session::{StreamStats, SHUTDOWN_JOIN_TIMEOUT};
 
 /// Bytes per video packet on the wire. Moonlight's own default, and the value Sunshine is tuned
 /// for; it is not a user setting on any client.
@@ -50,7 +50,7 @@ const PACKET_SIZE: u32 = 1392;
 /// IDR requests share the `ENet` control channel with gamepad input, so an unthrottled request
 /// loop directly inflates input latency — the whole subject of aurora-tv's
 /// `idr-throttle-input-latency` patch. Ten times punktfunk's interval, which pays nothing for a
-/// request on its own QUIC stream (see `sink::KEYFRAME_REQUEST_MIN_INTERVAL`).
+/// request on its own QUIC stream (see `session`'s own constant).
 const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Opus frames buffered between the crate's audio thread and the main loop's drain. At
@@ -58,9 +58,6 @@ const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// the bound is only reached if the main thread stalls, and then dropping the oldest frames is
 /// what the software path does anyway (see `audio::SOFT_QUEUED_LAG_MS`).
 const AUDIO_QUEUE_FRAMES: usize = 32;
-
-/// Ceiling on waiting for the video callback to stop during teardown; see [`GsStream::shutdown`].
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Everything [`connect`] needs. A struct rather than the 15 positional arguments
 /// `session::connect` grew — the plan wants that collapsed there too.
@@ -312,16 +309,16 @@ impl GsStream {
     pub fn shutdown(self) -> bool {
         self.stream.stop();
         // Wait for the crate's video callback to have run its `stop`, which is what drops the
-        // sink and with it one of the two `Arc<NdlVideo>` owners. Bounded for the same reason
-        // `session::SHUTDOWN_JOIN_TIMEOUT` is: the FFI calls between the driver's own stop checks
+        // sink and with it one of the two `Arc<NdlVideo>` owners. Bounded for the reason
+        // `SHUTDOWN_JOIN_TIMEOUT` documents: the FFI calls between the driver's own stop checks
         // have no timeout of their own, and a wedged vendor call must not freeze the app.
-        let deadline = std::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        let deadline = std::time::Instant::now() + SHUTDOWN_JOIN_TIMEOUT;
         while !self.shared.video_stopped.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         let clean = self.shared.video_stopped.load(Ordering::Relaxed);
         if !clean {
-            tracing::error!("GameStream video callback did not stop within {SHUTDOWN_TIMEOUT:?} — leaking it");
+            tracing::error!("GameStream video callback did not stop within {SHUTDOWN_JOIN_TIMEOUT:?} — leaking it");
         }
         // Our own handle goes last: while any `Arc<NdlVideo>` lives, the decoder stays loaded, so
         // releasing it only here is what keeps `play` from racing the unload.
@@ -500,7 +497,7 @@ fn resolve_app_id(host: &query::Host, app_id: Option<&str>) -> Result<AppId> {
     }
     let apps = query::app_list(host)?;
     apps.iter()
-        .find(|a| a.title.eq_ignore_ascii_case("desktop"))
+        .find(|a| crate::core::model::is_desktop_title(&a.title))
         .map(|a| a.id)
         // A host with no Desktop entry: the first app is a worse guess than an honest failure,
         // since it would silently launch a game the user didn't pick.
@@ -571,9 +568,8 @@ impl VideoDecoder for SinkDecoder {
                 return -1;
             }
         };
-        let app_id = std::env::var("APPID").unwrap_or_else(|_| "io.dyptan.punktfunk.webos".into());
         let ndl = match NdlVideo::load(
-            &app_id,
+            &crate::platform::webos::ndl::app_id(),
             setup.width as i32,
             setup.height as i32,
             codec,
@@ -627,13 +623,20 @@ impl VideoDecoder for SinkDecoder {
         let Some(sink) = self.sink.as_mut() else {
             return DecodeResult::NeedIdr;
         };
-        self.au.clear();
-        for buffer in &unit.buffers {
-            self.au.extend_from_slice(buffer.data);
-        }
+        // A single buffer already IS the contiguous unit NDL wants — feeding it directly saves a
+        // full-frame copy per frame, which at 120fps is the hot path. Only real chains concat.
+        let au: &[u8] = if unit.buffers.len() == 1 {
+            unit.buffers[0].data
+        } else {
+            self.au.clear();
+            for buffer in &unit.buffers {
+                self.au.extend_from_slice(buffer.data);
+            }
+            &self.au
+        };
         self.frames += 1;
         self.stats.frames.store(self.frames, Ordering::Relaxed);
-        self.stats.bytes.fetch_add(self.au.len() as u64, Ordering::Relaxed);
+        self.stats.bytes.fetch_add(au.len() as u64, Ordering::Relaxed);
 
         let index = unit.frame_number.0;
         // The crate never delivers an incomplete frame, so a hole in the numbering is a frame
@@ -648,7 +651,7 @@ impl VideoDecoder for SinkDecoder {
             loss,
             index: u64::from(index),
         };
-        match sink.submit(&self.au, pts_ns(&unit), flags) {
+        match sink.submit(au, pts_ns(&unit), flags) {
             // The crate turns `NeedIdr` into a `RequestIdr` control packet itself, which is why
             // the sink's throttle is what keeps it off the input channel's back.
             SinkResult::NeedKeyframe => DecodeResult::NeedIdr,
@@ -670,7 +673,7 @@ impl VideoDecoder for SinkDecoder {
 }
 
 /// The host's 90 kHz presentation timestamp in nanoseconds, which is the clock domain
-/// [`VideoSink::submit`] anchors against.
+/// [`NdlSink::submit`] anchors against.
 fn pts_ns(unit: &VideoDecodeUnit<&[u8]>) -> u64 {
     u64::try_from(unit.timestamp.as_nanos()).unwrap_or(u64::MAX)
 }
